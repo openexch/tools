@@ -1,0 +1,21 @@
+# Compiled binaries
+binance-replay/binance-replay
+loadgen/loadgen
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# Environment
+.env
+
+# OS
+.DS_Store
+Thumbs.db
