@@ -49,20 +49,28 @@ func (t *Taker) Tick(ctx context.Context, dt time.Duration) {
 		return
 	}
 
-	pBuy := clamp01(0.5 + 0.3*state.TakerBias)
+	// Direction: live taker bias + the regime trend (pumps get bought,
+	// dumps get sold — volume confirms the move, like a real market).
+	pBuy := clamp01(0.5 + 0.3*state.TakerBias + 400*state.Drift)
 	side := "SELL"
 	if rand.Float64() < pBuy {
 		side = "BUY"
 	}
 
-	// Cross the observed touch; fall back to the anchor when the feed has
-	// no opposite side yet.
+	// Cross the observed touch; back off entirely when the opposite side is
+	// thin — real takers face slippage on a thin book and stand down, and
+	// this keeps a pump from eating the visible book to zero faster than
+	// the depth keepers can re-ladder.
 	book := t.Env.Feed.View(t.Params.ID)
 	var ref float64
+	var oppLevels int
 	if side == "BUY" {
-		ref = book.BestAsk
+		ref, oppLevels = book.BestAsk, len(book.Asks)
 	} else {
-		ref = book.BestBid
+		ref, oppLevels = book.BestBid, len(book.Bids)
+	}
+	if oppLevels < 8 {
+		return
 	}
 	if ref <= 0 {
 		ref = state.Anchor

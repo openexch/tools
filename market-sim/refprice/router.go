@@ -45,7 +45,11 @@ type MarketState struct {
 	bandHi    float64
 	TradeRate float64 // EWMA trades/sec hint from live taker flow
 	TakerBias float64 // EWMA of taker direction, -1 (sells) .. +1 (buys)
-	history   []anchorAt
+	// Drift is the current regime trend (log-return/sec; 0 in calm periods).
+	// Takers bias their direction with it so volume confirms the move.
+	Drift   float64
+	history []anchorAt
+	regime  *regime
 }
 
 type anchorAt struct {
@@ -80,6 +84,7 @@ func NewRouter(live, fallback Source, bands []MarketBand) *Router {
 			Anchor: b.AnchorStart,
 			bandLo: b.BandLo + margin,
 			bandHi: b.BandHi - margin,
+			regime: newRegime(b.AnchorStart),
 		}
 	}
 	r.active = r.fallback.Name()
@@ -118,7 +123,29 @@ func (r *Router) Snapshot(symbol string) (MarketState, bool) {
 	if !ok {
 		return MarketState{}, false
 	}
-	return MarketState{Symbol: s.Symbol, Anchor: s.Anchor, TradeRate: s.TradeRate, TakerBias: s.TakerBias}, true
+	return MarketState{Symbol: s.Symbol, Anchor: s.Anchor, TradeRate: s.TradeRate,
+		TakerBias: s.TakerBias, Drift: s.Drift}, true
+}
+
+// Anchors returns the current anchor per market (persistence snapshot).
+func (r *Router) Anchors() map[string]float64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]float64, len(r.statuses))
+	for sym, s := range r.statuses {
+		out[sym] = s.Anchor
+	}
+	return out
+}
+
+// SetAnchor overrides a market's anchor (persistence restore), clamped to
+// the margin-buffered band. Call before Start.
+func (r *Router) SetAnchor(symbol string, anchor float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if s, ok := r.statuses[symbol]; ok && anchor > 0 {
+		s.Anchor = clampF(anchor, s.bandLo, s.bandHi)
+	}
 }
 
 // ActiveSource reports which source currently drives anchors.
@@ -149,6 +176,11 @@ func (r *Router) run() {
 	defer r.wg.Done()
 	health := time.NewTicker(time.Second)
 	defer health.Stop()
+	// Regime drift applies on its own clock, ON TOP of the active source's
+	// returns, so trends are visible whether binance or gbm drives the price.
+	const regimeStep = 250 * time.Millisecond
+	regimes := time.NewTicker(regimeStep)
+	defer regimes.Stop()
 	var liveTicks <-chan RefTick
 	if r.live != nil {
 		liveTicks = r.live.Ticks()
@@ -161,6 +193,16 @@ func (r *Router) run() {
 			r.consume(r.live.Name(), t)
 		case t := <-r.fallback.Ticks():
 			r.consume(r.fallback.Name(), t)
+		case <-regimes.C:
+			r.mu.Lock()
+			for _, s := range r.statuses {
+				drift := s.regime.step(s.Symbol, s.Anchor)
+				s.Drift = drift
+				if drift != 0 {
+					r.apply(s, drift*regimeStep.Seconds())
+				}
+			}
+			r.mu.Unlock()
 		case <-health.C:
 			r.checkFailover()
 		}
