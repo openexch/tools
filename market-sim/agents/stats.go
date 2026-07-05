@@ -15,6 +15,8 @@ type Stats struct {
 	Cancelled atomic.Int64
 	Throttled atomic.Int64
 	Errors    atomic.Int64
+	Fills     atomic.Int64 // maker fills observed via the OMS user-WS push
+	Orphans   atomic.Int64 // server-side orders reconciled away
 
 	mu      sync.Mutex
 	rejects map[string]int64
@@ -48,8 +50,9 @@ func (s *Stats) RejectCounts() map[string]int64 {
 
 func (s *Stats) Summary() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "placed=%d cancelled=%d throttled=%d errors=%d",
-		s.Placed.Load(), s.Cancelled.Load(), s.Throttled.Load(), s.Errors.Load())
+	fmt.Fprintf(&b, "placed=%d cancelled=%d fills=%d orphans=%d throttled=%d errors=%d",
+		s.Placed.Load(), s.Cancelled.Load(), s.Fills.Load(), s.Orphans.Load(),
+		s.Throttled.Load(), s.Errors.Load())
 	rej := s.RejectCounts()
 	keys := make([]string, 0, len(rej))
 	for k := range rej {
