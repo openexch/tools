@@ -33,6 +33,9 @@ func NewTaker(bot int64, p MarketParams, env Env) *Taker {
 
 // Tick performs one Poisson draw for the elapsed interval and maybe trades.
 func (t *Taker) Tick(ctx context.Context, dt time.Duration) {
+	if t.Env.Health != nil && t.Env.Health.Paused() {
+		return
+	}
 	state, ok := t.Env.Router.Snapshot(t.Params.Symbol)
 	if !ok {
 		return
@@ -86,7 +89,7 @@ func (t *Taker) Tick(ctx context.Context, dt time.Duration) {
 		return
 	}
 	if !resp.Accepted {
-		t.Env.Stats.Reject(resp.RejectReason)
+		t.Env.handleReject(resp.RejectReason)
 		return
 	}
 	t.Env.Stats.Placed.Add(1)
