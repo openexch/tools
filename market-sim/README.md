@@ -7,8 +7,6 @@ Binance returns when reachable, a GBM random walk when not. Doubles as the
 demo canary: it continuously proves that orders flow, fills happen, market
 data moves, and the browser-facing CORS surface works.
 
-Status: Phase 0 (scaffold). `run` mode lands in Phase 1.
-
 ## Modes
 
 ```bash
@@ -20,9 +18,33 @@ go build -o market-sim .
 # One-shot end-to-end check: create far-from-touch -> NEW -> cancel -> CANCELLED
 ./market-sim -mode=once
 
-# Continuous simulation + health server (Phase 1+)
-./market-sim
+# Continuous simulation + health server
+./market-sim -mode=run -source=auto -global-ops=60
 ```
+
+In deployment the admin gateway runs the sim as the managed service `sim`
+(pinned to the spare cores, `DependsOn: oms, market`).
+
+## Health surface (:8090)
+
+- `GET /health` — 200/503 plus per-check JSON. Critical checks: OMS
+  reachable, market data fresh, a real fill within 5 minutes, the canary
+  order round-trip (create → NEW → cancel → CANCELLED on bot 900999), and
+  the **CORS canary**: a browser-style preflight + GET asserting
+  `Access-Control-Allow-Origin` echoes the demo UI origin, against BOTH the
+  local OMS and the public edge (`-oms-public-url`). This is the check that
+  catches the regression class that once broke the demo for a day.
+- `GET /metrics` — Prometheus text (`sim_healthy`, `sim_check{name}`,
+  order/fill/reject counters, canary round-trip, feed staleness).
+- `POST /control` — `{"pause":true|false}` (suspend agents before ad-hoc
+  load tests) and `{"source":"auto"|"binance"|"gbm"}`.
+
+## Known server-side issues the sim works around
+
+- PUT amend silently loses orders (oms#67): cancel+repost only.
+- Open-order accounting drift (oms#65): OPEN_ORDER_LIMIT triggers an
+  immediate reconcile + placement hold-off.
+- The OMS REST server closes every connection (oms#66): keep-alives off.
 
 ## Key design points
 
