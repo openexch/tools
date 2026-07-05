@@ -36,18 +36,30 @@ type BinanceMarket struct {
 	BinanceSym string // e.g. "btcusdt"
 }
 
+// NOTE: encoding/json matches keys case-INsensitively, and Binance payloads
+// carry colliding key pairs ("b" bid price vs "B" bid qty, "e" event type vs
+// "E" event time, "m" buyer-is-maker vs "M" ignore-flag). Every colliding
+// key must be declared explicitly so exact-match wins; with only "b" tagged,
+// the later "B" value silently overwrites it (we shipped quantities as mids
+// before this was caught).
 type binanceTrade struct {
 	EventType    string `json:"e"`
+	EventTime    int64  `json:"E"`
 	Symbol       string `json:"s"`
+	TradeID      int64  `json:"t"`
 	Price        string `json:"p"`
 	Quantity     string `json:"q"`
+	TradeTime    int64  `json:"T"`
 	IsBuyerMaker bool   `json:"m"`
+	Ignore       bool   `json:"M"`
 }
 
 type binanceBookTicker struct {
 	Symbol   string `json:"s"`
 	BidPrice string `json:"b"`
+	BidQty   string `json:"B"`
 	AskPrice string `json:"a"`
+	AskQty   string `json:"A"`
 }
 
 func NewBinanceSource(baseURL string, markets []BinanceMarket) *BinanceSource {

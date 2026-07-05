@@ -27,6 +27,9 @@ func main() {
 	markets := flag.String("markets", "", "comma-separated market symbols to simulate (default: all)")
 	flag.Int64Var(&cfg.BotBase, "bot-base", cfg.BotBase, "first bot userId (population is contiguous)")
 	flag.IntVar(&cfg.BotsPerMarket, "bots-per-market", cfg.BotsPerMarket, "bots per market")
+	source := flag.String("source", envOr("SIM_SOURCE", "auto"), "reference price source: auto | binance | gbm")
+	binanceURL := flag.String("binance-url", envOr("SIM_BINANCE_URL", "wss://stream.binance.com:9443/ws"), "Binance WS base URL")
+	globalOps := flag.Float64("global-ops", 100, "global OMS operations/sec cap across all markets")
 	flag.Parse()
 	cfg.SelectMarkets(*markets)
 
@@ -49,7 +52,9 @@ func main() {
 		}
 		log.Print("once check OK")
 	case "run":
-		log.Fatal("run mode lands in Phase 1; use -mode=seed or -mode=once")
+		if err := run(ctx, &cfg, client, *source, *binanceURL, *globalOps); err != nil {
+			log.Fatalf("run failed: %v", err)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q\n", *mode)
 		os.Exit(2)
