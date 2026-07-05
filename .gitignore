@@ -1,6 +1,7 @@
 # Compiled binaries
 binance-replay/binance-replay
 loadgen/loadgen
+market-sim/market-sim
 *.exe
 *.exe~
 *.dll
