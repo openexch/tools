@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -18,20 +19,23 @@ type Client struct {
 	BaseURL       string
 	TokenTemplate string // fmt template receiving the userId, e.g. "dev:%d"
 	HTTP          *http.Client
+	transport     *http.Transport
 }
 
 func NewClient(baseURL, tokenTemplate string) *Client {
+	// The OMS REST server closes the TCP connection after EVERY response
+	// (RestApiHandler.sendResponse -> ChannelFutureListener.CLOSE) without a
+	// Connection: close header, so keep-alive reuse always races the server's
+	// close. Disable keep-alives: one connection per request, no corpse pool.
+	// (Filed against oms; flip this if the server gains real keep-alive.)
+	tr := &http.Transport{
+		DisableKeepAlives: true,
+	}
 	return &Client{
 		BaseURL:       baseURL,
 		TokenTemplate: tokenTemplate,
-		HTTP: &http.Client{
-			Timeout: 10 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConns:        32,
-				MaxIdleConnsPerHost: 32,
-				IdleConnTimeout:     90 * time.Second,
-			},
-		},
+		HTTP:          &http.Client{Timeout: 10 * time.Second, Transport: tr},
+		transport:     tr,
 	}
 }
 
@@ -41,7 +45,29 @@ func (c *Client) token(userID int64) string {
 
 // raw performs the request and returns status + body. Only transport-level
 // failures are errors; HTTP status interpretation is the caller's.
+// Stale keep-alive reuse (OMS closes idle connections) is retried once:
+// creates are idempotent via clientOrderId, cancels/amends by nature.
 func (c *Client) raw(ctx context.Context, method, path string, asUser int64, body any) (int, []byte, error) {
+	status, data, err := c.rawOnce(ctx, method, path, asUser, body)
+	if err != nil && ctx.Err() == nil && staleConnErr(err) {
+		// The whole idle pool likely died together (server-side timeout);
+		// flush it so the retry dials fresh instead of picking another corpse.
+		c.transport.CloseIdleConnections()
+		return c.rawOnce(ctx, method, path, asUser, body)
+	}
+	return status, data, err
+}
+
+// staleConnErr matches the reused-keep-alive failure modes (the server
+// closed the connection between our reuse check and the write).
+func staleConnErr(err error) bool {
+	s := err.Error()
+	return strings.Contains(s, "server closed idle connection") ||
+		strings.HasSuffix(s, ": EOF") ||
+		strings.Contains(s, "connection reset by peer")
+}
+
+func (c *Client) rawOnce(ctx context.Context, method, path string, asUser int64, body any) (int, []byte, error) {
 	var rd io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
