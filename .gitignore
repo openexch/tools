@@ -20,3 +20,4 @@ market-sim/market-sim
 # OS
 .DS_Store
 Thumbs.db
+anchors.json

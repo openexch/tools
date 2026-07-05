@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -33,6 +35,7 @@ func passiveChecks(ctx context.Context, cfg *Config, client *oms.Client, feedCli
 	defer ticker.Stop()
 	lastFills := stats.Fills.Load()
 	lastFillAt := time.Now()
+	startedAt := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -64,15 +67,32 @@ func passiveChecks(ctx context.Context, cfg *Config, client *oms.Client, feedCli
 			quiet := time.Since(lastFillAt)
 			registry.Set("fills_recent", quiet < 5*time.Minute,
 				fmt.Sprintf("last fill %s ago", quiet.Truncate(time.Second)), true)
+
+			// Book depth floor: the gateway broadcasts up to 20 levels per
+			// side; the depth keeper's job is to keep that view full. Warmup
+			// grace covers ladder build-up after a (re)start.
+			if time.Since(startedAt) < 2*time.Minute {
+				registry.Set("book_depth", true, "warming up", true)
+			} else {
+				thin := ""
+				for _, m := range cfg.Markets {
+					v := feedClient.View(m.ID)
+					if len(v.Bids) < 18 || len(v.Asks) < 18 {
+						thin += fmt.Sprintf("%s(%d/%d) ", m.Symbol, len(v.Bids), len(v.Asks))
+					}
+				}
+				registry.Set("book_depth", thin == "", strings.TrimSpace(thin), true)
+			}
 		}
 	}
 }
 
-// Population split within each market's bot pool.
+// Population split within each market's bot pool (10 bots per market).
 const (
 	makersPerMarket = 4
 	takersPerMarket = 3
-	noisePerMarket  = 3
+	depthPerMarket  = 2 // one per SIDE: a fast move re-ladders within per-user rate limits
+	noisePerMarket  = 1
 )
 
 // HealthOpts carries the Phase 3 observability configuration.
@@ -82,9 +102,44 @@ type HealthOpts struct {
 	PublicOMSURL string // public edge to probe ("" = local only)
 }
 
+// loadAnchors restores persisted reference prices so the chart continues
+// where it left off across sim restarts instead of snapping back to the
+// configured anchor start.
+func loadAnchors(path string, router *refprice.Router) {
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return // first run
+	}
+	var anchors map[string]float64
+	if json.Unmarshal(data, &anchors) != nil {
+		return
+	}
+	for sym, a := range anchors {
+		router.SetAnchor(sym, a)
+	}
+	log.Printf("[run] restored anchors from %s: %v", path, anchors)
+}
+
+func saveAnchors(path string, router *refprice.Router) {
+	if path == "" {
+		return
+	}
+	data, err := json.MarshalIndent(router.Anchors(), "", "  ")
+	if err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if os.WriteFile(tmp, data, 0644) == nil {
+		os.Rename(tmp, path)
+	}
+}
+
 // run wires the whole sim: reference-price router -> agents -> OMS, with the
 // observed book closing the loop, and blocks until ctx is cancelled.
-func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceURL string, globalOps float64, hOpts HealthOpts) error {
+func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceURL string, globalOps float64, hOpts HealthOpts, anchorFile string) error {
 	if err := client.Health(ctx); err != nil {
 		return fmt.Errorf("OMS not reachable: %w", err)
 	}
@@ -116,6 +171,7 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 	if !router.SetMode(source) {
 		return fmt.Errorf("invalid -source %q", source)
 	}
+	loadAnchors(anchorFile, router)
 	router.Start()
 	defer router.Stop()
 
@@ -124,8 +180,9 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 	feedClient.Start()
 	defer feedClient.Stop()
 
-	// Per-bot ceiling stays far under the OMS user limits (100/s, 1000/min).
-	governor := agents.NewGovernor(globalOps, globalOps, 5, 10)
+	// Per-bot ceiling stays far under the OMS user limits (100/s, 1000/min);
+	// the depth keepers need burst room to re-ladder through a price move.
+	governor := agents.NewGovernor(globalOps, globalOps, 8, 20)
 	stats := agents.NewStats()
 
 	// OMS user-WS base URL derives from the REST base (path /ws/v1; the
@@ -161,8 +218,18 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 		for j := makersPerMarket; j < makersPerMarket+takersPerMarket && j < len(bots); j++ {
 			s.Takers = append(s.Takers, agents.NewTaker(bots[j], params, env))
 		}
-		for j := makersPerMarket + takersPerMarket; j < makersPerMarket+takersPerMarket+noisePerMarket && j < len(bots); j++ {
+		j := makersPerMarket + takersPerMarket
+		for k := 0; k < depthPerMarket && j < len(bots); k++ {
+			side := "BUY"
+			if k%2 == 1 {
+				side = "SELL"
+			}
+			s.Depth = append(s.Depth, agents.NewDepth(bots[j], side, params, env))
+			j++
+		}
+		for k := 0; k < noisePerMarket && j < len(bots); k++ {
 			s.Noise = append(s.Noise, agents.NewNoise(bots[j], params, env))
+			j++
 		}
 		schedulers = append(schedulers, s)
 		s.Start()
@@ -214,17 +281,38 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 		defer srv.Close()
 	}
 
+	// Periodic re-seed keeps the bot population solvent forever: seeding is
+	// shortfall-only (top-up below 90% of target), so a healthy population
+	// is a no-op while a pump that drained the sell-side depth bot gets its
+	// float restored within minutes (top-ups are logged and counted).
+	go func() {
+		reseed := time.NewTicker(3 * time.Minute)
+		defer reseed.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-reseed.C:
+				if err := seed(ctx, cfg, client); err != nil && ctx.Err() == nil {
+					log.Printf("[run] re-seed: %v", err)
+				}
+			}
+		}
+	}()
+
 	report := time.NewTicker(30 * time.Second)
 	defer report.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			log.Print("[run] shutting down, clearing sim quotes...")
+			saveAnchors(anchorFile, router)
 			for _, s := range schedulers {
 				s.Stop(10 * time.Second)
 			}
 			return nil
 		case <-report.C:
+			saveAnchors(anchorFile, router)
 			anchors := ""
 			for _, m := range cfg.Markets {
 				if st, ok := router.Snapshot(m.Symbol); ok {

@@ -18,13 +18,15 @@ type Scheduler struct {
 	Makers []*Maker
 	Takers []*Taker
 	Noise  []*Noise
+	Depth  []*Depth
 
 	// Fills receives pushed OrderResponse events for this market's maker
 	// bots (fed by oms.UserWS followers in run.go).
 	Fills chan oms.OrderResponse
 
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	nextDepthRec time.Time
 }
 
 const tickInterval = 200 * time.Millisecond
@@ -57,12 +59,23 @@ func (s *Scheduler) run(ctx context.Context) {
 					n.Step(ctx)
 				}
 			}
+			for _, d := range s.Depth {
+				if d.Due(now) {
+					d.Step(ctx)
+				}
+			}
 			for _, m := range s.Makers {
 				if m.Due(now) {
 					m.Step(ctx)
 				}
 				if m.ReconcileDue(now) {
 					m.Reconcile(ctx)
+				}
+			}
+			if now.After(s.nextDepthRec) {
+				s.nextDepthRec = now.Add(45 * time.Second)
+				for _, d := range s.Depth {
+					d.Reconcile(ctx)
 				}
 			}
 		}
@@ -101,6 +114,9 @@ func (s *Scheduler) Stop(cleanupBudget time.Duration) {
 	}
 	for _, n := range s.Noise {
 		n.CancelAll(ctx)
+	}
+	for _, d := range s.Depth {
+		d.CancelAll(ctx)
 	}
 	log.Printf("[scheduler %s] stopped, quotes cleared", s.Symbol)
 }

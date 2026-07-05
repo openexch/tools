@@ -33,7 +33,7 @@ type BookView struct {
 	AskVersion int64
 }
 
-const topN = 10
+const topN = 20 // matches the gateway broadcast cap (GatewayOrderBook.MAX_LEVELS)
 
 // book is the mutable per-market state maintained by the WS client.
 type book struct {
