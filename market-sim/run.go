@@ -9,6 +9,7 @@ import (
 
 	"github.com/openexch/tools/market-sim/agents"
 	"github.com/openexch/tools/market-sim/feed"
+	"github.com/openexch/tools/market-sim/health"
 	"github.com/openexch/tools/market-sim/oms"
 	"github.com/openexch/tools/market-sim/refprice"
 )
@@ -24,6 +25,49 @@ func pump(in <-chan oms.OrderResponse, out chan<- oms.OrderResponse) {
 	}
 }
 
+// passiveChecks derives health from the flow the agents already generate:
+// OMS reachability, market-data freshness, and recent fills.
+func passiveChecks(ctx context.Context, cfg *Config, client *oms.Client, feedClient *feed.Client,
+	stats *agents.Stats, registry *health.Registry) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	lastFills := stats.Fills.Load()
+	lastFillAt := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			hctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			err := client.Health(hctx)
+			cancel()
+			detail := ""
+			if err != nil {
+				detail = err.Error()
+			}
+			registry.Set("oms_reachable", err == nil, detail, true)
+
+			stale := ""
+			for _, m := range cfg.Markets {
+				if age := time.Since(feedClient.View(m.ID).LastMsgAt); age > 30*time.Second {
+					stale += m.Symbol + " "
+				}
+			}
+			registry.Set("market_data_fresh", stale == "", strings.TrimSpace(stale), true)
+
+			// The takers guarantee steady fills; silence means the trade
+			// path (engine -> OMS -> user WS) stopped working end-to-end.
+			if f := stats.Fills.Load(); f != lastFills {
+				lastFills = f
+				lastFillAt = time.Now()
+			}
+			quiet := time.Since(lastFillAt)
+			registry.Set("fills_recent", quiet < 5*time.Minute,
+				fmt.Sprintf("last fill %s ago", quiet.Truncate(time.Second)), true)
+		}
+	}
+}
+
 // Population split within each market's bot pool.
 const (
 	makersPerMarket = 4
@@ -31,9 +75,16 @@ const (
 	noisePerMarket  = 3
 )
 
+// HealthOpts carries the Phase 3 observability configuration.
+type HealthOpts struct {
+	Addr         string // health server listen address ("" = disabled)
+	CORSOrigin   string // demo UI origin asserted by the CORS canary
+	PublicOMSURL string // public edge to probe ("" = local only)
+}
+
 // run wires the whole sim: reference-price router -> agents -> OMS, with the
 // observed book closing the loop, and blocks until ctx is cancelled.
-func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceURL string, globalOps float64) error {
+func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceURL string, globalOps float64, hOpts HealthOpts) error {
 	if err := client.Health(ctx); err != nil {
 		return fmt.Errorf("OMS not reachable: %w", err)
 	}
@@ -84,6 +135,7 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 
 	var schedulers []*agents.Scheduler
 	var followers []*oms.UserWS
+	var healths []*agents.MarketHealth
 	for i, m := range cfg.Markets {
 		params := agents.MarketParams{
 			ID: m.ID, Symbol: m.Symbol, Tick: m.Tick,
@@ -91,9 +143,10 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 			MinQty: m.MinQty, MaxQty: m.MaxQty,
 			BaseFloat: m.BaseFloat.Float(), BaseAssetID: m.BaseAssetID,
 		}
-		health := &agents.MarketHealth{Symbol: m.Symbol}
+		mh := &agents.MarketHealth{Symbol: m.Symbol}
+		healths = append(healths, mh)
 		env := agents.Env{Client: client, Router: router, Feed: feedClient,
-			Governor: governor, Stats: stats, Health: health}
+			Governor: governor, Stats: stats, Health: mh}
 		bots := cfg.Bots(i)
 		s := &agents.Scheduler{Symbol: m.Symbol, Fills: make(chan oms.OrderResponse, 256)}
 		for j := 0; j < makersPerMarket && j < len(bots); j++ {
@@ -121,6 +174,45 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 	}()
 	log.Printf("[run] simulating %d markets, %d makers + %d takers + %d noise each, source=%s",
 		len(cfg.Markets), makersPerMarket, takersPerMarket, noisePerMarket, router.ActiveSource())
+
+	// Phase 3: observability — the sim doubles as the demo canary.
+	if hOpts.Addr != "" {
+		registry := health.NewRegistry()
+		cm := cfg.Markets[len(cfg.Markets)-1] // least-visible market hosts the canary
+		canary := &health.Canary{
+			Client: client, Router: router, Registry: registry, Bot: cfg.CanaryBot,
+			MarketID: cm.ID, Symbol: cm.Symbol, Tick: cm.Tick,
+			BandLo: cm.BandLo, BandHi: cm.BandHi, MinQty: cm.MinQty,
+		}
+		go canary.Run(ctx)
+
+		targets := []health.Target{{Name: "local", BaseURL: cfg.OMSBaseURL, Critical: true}}
+		if hOpts.PublicOMSURL != "" {
+			targets = append(targets, health.Target{Name: "public", BaseURL: hOpts.PublicOMSURL, Critical: true})
+		}
+		cors := &health.CORSProbe{Registry: registry, Origin: hOpts.CORSOrigin, Targets: targets}
+		go cors.Run(ctx)
+
+		go passiveChecks(ctx, cfg, client, feedClient, stats, registry)
+
+		hs := &health.Server{
+			Addr: hOpts.Addr, Registry: registry, Stats: stats, Router: router, Canary: canary,
+			FeedStale: func() map[string]float64 {
+				out := map[string]float64{}
+				for _, m := range cfg.Markets {
+					out[m.Symbol] = time.Since(feedClient.View(m.ID).LastMsgAt).Seconds()
+				}
+				return out
+			},
+			Pause: func(p bool) {
+				for _, h := range healths {
+					h.SetManualPause(p)
+				}
+			},
+		}
+		srv := hs.Start()
+		defer srv.Close()
+	}
 
 	report := time.NewTicker(30 * time.Second)
 	defer report.Stop()

@@ -50,6 +50,14 @@ type MarketHealth struct {
 	mu          sync.Mutex
 	pausedUntil time.Time
 	reason      string
+	manual      bool // operator pause via /control (indefinite)
+}
+
+// SetManualPause suspends/resumes flow by operator request (/control).
+func (h *MarketHealth) SetManualPause(paused bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.manual = paused
 }
 
 // PauseFor pauses new order flow on this market.
@@ -68,7 +76,7 @@ func (h *MarketHealth) PauseFor(d time.Duration, reason string) {
 func (h *MarketHealth) Paused() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return time.Now().Before(h.pausedUntil)
+	return h.manual || time.Now().Before(h.pausedUntil)
 }
 
 // handleReject applies shared backoff policy for a rejected order and counts

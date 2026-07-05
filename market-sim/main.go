@@ -30,6 +30,9 @@ func main() {
 	source := flag.String("source", envOr("SIM_SOURCE", "auto"), "reference price source: auto | binance | gbm")
 	binanceURL := flag.String("binance-url", envOr("SIM_BINANCE_URL", "wss://stream.binance.com:9443/ws"), "Binance WS base URL")
 	globalOps := flag.Float64("global-ops", 100, "global OMS operations/sec cap across all markets")
+	healthAddr := flag.String("health-addr", envOr("SIM_HEALTH_ADDR", "127.0.0.1:8090"), "health/metrics/control listen address (empty = disabled)")
+	corsOrigin := flag.String("cors-origin", envOr("SIM_CORS_ORIGIN", "https://trade.openexch.io"), "browser origin asserted by the CORS canary")
+	publicOMS := flag.String("oms-public-url", envOr("SIM_PUBLIC_OMS_URL", "https://oms.openexch.io"), "public OMS edge probed by the CORS canary (empty = local only)")
 	flag.Parse()
 	cfg.SelectMarkets(*markets)
 
@@ -52,7 +55,8 @@ func main() {
 		}
 		log.Print("once check OK")
 	case "run":
-		if err := run(ctx, &cfg, client, *source, *binanceURL, *globalOps); err != nil {
+		hOpts := HealthOpts{Addr: *healthAddr, CORSOrigin: *corsOrigin, PublicOMSURL: *publicOMS}
+		if err := run(ctx, &cfg, client, *source, *binanceURL, *globalOps, hOpts); err != nil {
 			log.Fatalf("run failed: %v", err)
 		}
 	default:
