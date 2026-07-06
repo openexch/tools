@@ -32,6 +32,8 @@ type Depth struct {
 	seq    int64
 	orders map[string]*depthOrder
 	nextAt time.Time
+	// lastForcedRec rate-limits the thin-book emergency reconcile.
+	lastForcedRec time.Time
 }
 
 type depthOrder struct {
@@ -61,6 +63,22 @@ func NewDepth(bot int64, side string, p MarketParams, env Env) *Depth {
 
 func (d *Depth) Due(now time.Time) bool { return now.After(d.nextAt) }
 
+// OnOrderEvent applies a pushed order update (OMS user-WS). Without this,
+// rungs eaten by takers during a pump/dump stayed in d.orders as zombies
+// until the 45s reconcile — the keeper believed the ladder was full and
+// placed NOTHING while the visible side drained (the drained-book bug).
+func (d *Depth) OnOrderEvent(o oms.OrderResponse) {
+	if _, ok := d.orders[o.OmsOrderID]; !ok {
+		return
+	}
+	if oms.IsTerminalStatus(o.Status) {
+		if o.Status == "FILLED" {
+			d.Env.Stats.Fills.Add(1)
+		}
+		delete(d.orders, o.OmsOrderID)
+	}
+}
+
 // Step slides the ladder with the anchor: cancel rungs that fell out of the
 // window (or crossed the center after a move), then fill empty rungs. Ops
 // are budgeted per step so a fast move re-ladders over a few seconds rather
@@ -73,6 +91,23 @@ func (d *Depth) Step(ctx context.Context) {
 	}
 	center := d.Params.legalPrice(state.Anchor)
 	now := time.Now()
+
+	// Safety net for dropped WS events: if OUR side of the visible book is
+	// thin while the local ladder claims to be full, some entries are
+	// zombies (filled orders we never heard about) — reconcile against the
+	// server now instead of waiting for the 45s sweep, so the refill below
+	// works from real occupancy.
+	if len(d.orders) >= d.Levels*3/4 && now.Sub(d.lastForcedRec) > 3*time.Second {
+		book := d.Env.Feed.View(d.Params.ID)
+		visible := len(book.Bids)
+		if d.Side == "SELL" {
+			visible = len(book.Asks)
+		}
+		if visible < 16 {
+			d.lastForcedRec = now
+			d.Reconcile(ctx)
+		}
+	}
 	// Separate budgets so a sliding window (cancels at the far end) can
 	// never starve rebuilding the near end.
 	cancelBudget, placeBudget := 5, 10
