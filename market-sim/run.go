@@ -225,6 +225,12 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 				side = "SELL"
 			}
 			s.Depth = append(s.Depth, agents.NewDepth(bots[j], side, params, env))
+			// Follow depth-bot order updates too: eaten rungs must leave the
+			// ladder immediately or the keeper can't refill through a move.
+			f := oms.NewUserWS(wsBase, fmt.Sprintf(cfg.AuthTemplate, bots[j]), bots[j], 128)
+			f.Start()
+			followers = append(followers, f)
+			go pump(f.Out, s.Fills)
 			j++
 		}
 		for k := 0; k < noisePerMarket && j < len(bots); k++ {

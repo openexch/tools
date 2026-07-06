@@ -82,16 +82,26 @@ func (s *Scheduler) run(ctx context.Context) {
 	}
 }
 
-// drainFills routes pushed order events to their owning maker (same
-// goroutine as the makers, so no locking on their state).
+// drainFills routes pushed order events to their owning maker or depth
+// keeper (same goroutine as the agents, so no locking on their state).
 func (s *Scheduler) drainFills() {
 	for {
 		select {
 		case o := <-s.Fills:
+			routed := false
 			for _, m := range s.Makers {
 				if m.Bot == o.UserID {
 					m.OnOrderEvent(o)
+					routed = true
 					break
+				}
+			}
+			if !routed {
+				for _, d := range s.Depth {
+					if d.Bot == o.UserID {
+						d.OnOrderEvent(o)
+						break
+					}
 				}
 			}
 		default:
