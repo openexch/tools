@@ -100,6 +100,34 @@ type HealthOpts struct {
 	Addr         string // health server listen address ("" = disabled)
 	CORSOrigin   string // demo UI origin asserted by the CORS canary
 	PublicOMSURL string // public edge to probe ("" = local only)
+	EdgeWSURL    string // public market-data WS (the edge relay path) ("" = check disabled)
+}
+
+// edgeFeedCheck proves the path real viewers use: the public market WS
+// (market.openexch.io/ws → the market-relay Worker → Durable Object). The
+// local feed staying fresh while this one stalls is exactly the half-open
+// publisher failure seen live on 2026-07-07 — the gateway was healthy but
+// the edge served a frozen feed. Critical: a stale edge IS a demo outage,
+// so it pages through admin_demo_healthy / DemoUnhealthy.
+func edgeFeedCheck(ctx context.Context, edgeFeed *feed.Client, market MarketSpec, registry *health.Registry) {
+	const staleAfter = 60 * time.Second
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	startedAt := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if time.Since(startedAt) < 90*time.Second {
+				registry.Set("edge_feed_fresh", true, "warming up", true)
+				continue
+			}
+			age := time.Since(edgeFeed.View(market.ID).LastMsgAt)
+			registry.Set("edge_feed_fresh", age <= staleAfter,
+				fmt.Sprintf("%s last frame %s ago", market.Symbol, age.Truncate(time.Second)), true)
+		}
+	}
 }
 
 // loadAnchors restores persisted reference prices so the chart continues
@@ -268,6 +296,17 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 
 		go passiveChecks(ctx, cfg, client, feedClient, stats, registry)
 
+		// Watch the PUBLIC viewer path (edge relay) with its own feed client,
+		// subscribed to the first market only — one edge connection suffices
+		// to prove publisher->DO->viewer freshness.
+		var edgeFeed *feed.Client
+		if hOpts.EdgeWSURL != "" {
+			edgeFeed = feed.NewClient(hOpts.EdgeWSURL, []int{cfg.Markets[0].ID})
+			edgeFeed.Start()
+			defer edgeFeed.Stop()
+			go edgeFeedCheck(ctx, edgeFeed, cfg.Markets[0], registry)
+		}
+
 		hs := &health.Server{
 			Addr: hOpts.Addr, Registry: registry, Stats: stats, Router: router, Canary: canary,
 			FeedStale: func() map[string]float64 {
@@ -276,6 +315,12 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 					out[m.Symbol] = time.Since(feedClient.View(m.ID).LastMsgAt).Seconds()
 				}
 				return out
+			},
+			EdgeStale: func() float64 {
+				if edgeFeed == nil {
+					return -1 // check disabled
+				}
+				return time.Since(edgeFeed.View(cfg.Markets[0].ID).LastMsgAt).Seconds()
 			},
 			Pause: func(p bool) {
 				for _, h := range healths {
