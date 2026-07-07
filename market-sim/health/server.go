@@ -26,6 +26,9 @@ type Server struct {
 	// FeedStale returns per-market seconds since the last market-data
 	// message (map symbol->seconds).
 	FeedStale func() map[string]float64
+	// EdgeStale reports seconds since the last frame on the PUBLIC edge WS
+	// (market-relay viewer path); negative = check disabled.
+	EdgeStale func() float64
 	// Pause suspends/resumes all trading agents.
 	Pause func(bool)
 
@@ -93,6 +96,12 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "# TYPE sim_feed_stale_seconds gauge\n")
 		for sym, sec := range s.FeedStale() {
 			fmt.Fprintf(w, "sim_feed_stale_seconds{market=%q} %.1f\n", sym, sec)
+		}
+	}
+	if s.EdgeStale != nil {
+		if sec := s.EdgeStale(); sec >= 0 {
+			fmt.Fprintf(w, "# HELP sim_edge_feed_stale_seconds Seconds since the last frame on the public edge WS (market-relay viewer path).\n")
+			fmt.Fprintf(w, "# TYPE sim_edge_feed_stale_seconds gauge\nsim_edge_feed_stale_seconds %.1f\n", sec)
 		}
 	}
 }

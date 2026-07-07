@@ -33,6 +33,7 @@ func main() {
 	healthAddr := flag.String("health-addr", envOr("SIM_HEALTH_ADDR", "127.0.0.1:8090"), "health/metrics/control listen address (empty = disabled)")
 	corsOrigin := flag.String("cors-origin", envOr("SIM_CORS_ORIGIN", "https://trade.openexch.io"), "browser origin asserted by the CORS canary")
 	publicOMS := flag.String("oms-public-url", envOr("SIM_PUBLIC_OMS_URL", "https://oms.openexch.io"), "public OMS edge probed by the CORS canary (empty = local only)")
+	edgeWS := flag.String("edge-ws-url", envOr("SIM_EDGE_WS_URL", ""), "public market-data WS to watch (the edge relay viewer path; empty = check disabled)")
 	anchorFile := flag.String("anchor-file", envOr("SIM_ANCHOR_FILE", "anchors.json"), "reference-price persistence file (empty = disabled)")
 	flag.Parse()
 	cfg.SelectMarkets(*markets)
@@ -56,7 +57,7 @@ func main() {
 		}
 		log.Print("once check OK")
 	case "run":
-		hOpts := HealthOpts{Addr: *healthAddr, CORSOrigin: *corsOrigin, PublicOMSURL: *publicOMS}
+		hOpts := HealthOpts{Addr: *healthAddr, CORSOrigin: *corsOrigin, PublicOMSURL: *publicOMS, EdgeWSURL: *edgeWS}
 		if err := run(ctx, &cfg, client, *source, *binanceURL, *globalOps, hOpts, *anchorFile); err != nil {
 			log.Fatalf("run failed: %v", err)
 		}
