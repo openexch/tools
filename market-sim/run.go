@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/openexch/tools/market-sim/agents"
@@ -103,13 +104,83 @@ type HealthOpts struct {
 	EdgeWSURL    string // public market-data WS (the edge relay path) ("" = check disabled)
 }
 
+// edgeLagTracker measures the edge relay's ADDED latency by same-clock
+// diffing: the local and edge feed clients both see every BOOK_DELTA of the
+// watched market, identified by its unique v4 bookVersion, and both run on
+// this process's clock. Replayed deltas (subscribe/refresh re-sends after a
+// reconnect) would pair a fresh edge arrival with a stale local one — the
+// first edge arrival consumes the pair, and samples over lagMaxSample are
+// discarded rather than poisoning the average.
+type edgeLagTracker struct {
+	mu      sync.Mutex
+	local   map[int64]time.Time
+	order   []int64 // insertion order, for eviction
+	ewmaMs  float64
+	samples uint64
+}
+
+const (
+	lagWindow    = 4096
+	lagMaxSample = 2 * time.Second
+)
+
+func newEdgeLagTracker() *edgeLagTracker {
+	return &edgeLagTracker{local: make(map[int64]time.Time, lagWindow)}
+}
+
+func (t *edgeLagTracker) recordLocal(v int64) {
+	now := time.Now()
+	t.mu.Lock()
+	if _, dup := t.local[v]; !dup {
+		t.local[v] = now
+		t.order = append(t.order, v)
+		if len(t.order) > lagWindow {
+			delete(t.local, t.order[0])
+			t.order = t.order[1:]
+		}
+	}
+	t.mu.Unlock()
+}
+
+func (t *edgeLagTracker) recordEdge(v int64) {
+	now := time.Now()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	at, ok := t.local[v]
+	if !ok {
+		return
+	}
+	delete(t.local, v) // first edge arrival wins; replays cannot resample
+	lag := now.Sub(at)
+	if lag < 0 || lag > lagMaxSample {
+		return
+	}
+	ms := float64(lag.Microseconds()) / 1000.0
+	if t.samples == 0 {
+		t.ewmaMs = ms
+	} else {
+		t.ewmaMs = 0.8*t.ewmaMs + 0.2*ms
+	}
+	t.samples++
+}
+
+// LagMs returns the smoothed relay-added latency, or -1 before any sample.
+func (t *edgeLagTracker) LagMs() float64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.samples == 0 {
+		return -1
+	}
+	return t.ewmaMs
+}
+
 // edgeFeedCheck proves the path real viewers use: the public market WS
 // (market.openexch.io/ws → the market-relay Worker → Durable Object). The
 // local feed staying fresh while this one stalls is exactly the half-open
 // publisher failure seen live on 2026-07-07 — the gateway was healthy but
 // the edge served a frozen feed. Critical: a stale edge IS a demo outage,
 // so it pages through admin_demo_healthy / DemoUnhealthy.
-func edgeFeedCheck(ctx context.Context, edgeFeed *feed.Client, market MarketSpec, registry *health.Registry) {
+func edgeFeedCheck(ctx context.Context, edgeFeed *feed.Client, market MarketSpec, lag *edgeLagTracker, registry *health.Registry) {
 	const staleAfter = 60 * time.Second
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -124,8 +195,11 @@ func edgeFeedCheck(ctx context.Context, edgeFeed *feed.Client, market MarketSpec
 				continue
 			}
 			age := time.Since(edgeFeed.View(market.ID).LastMsgAt)
-			registry.Set("edge_feed_fresh", age <= staleAfter,
-				fmt.Sprintf("%s last frame %s ago", market.Symbol, age.Truncate(time.Second)), true)
+			detail := fmt.Sprintf("%s last frame %s ago", market.Symbol, age.Truncate(time.Second))
+			if ms := lag.LagMs(); ms >= 0 {
+				detail += fmt.Sprintf(", relay lag ~%.0fms", ms)
+			}
+			registry.Set("edge_feed_fresh", age <= staleAfter, detail, true)
 		}
 	}
 }
@@ -205,6 +279,18 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 
 	// Observed book: the closed loop against the real exchange.
 	feedClient := feed.NewClient(cfg.MarketWSURL, marketIDs)
+	// Edge-lag measurement taps BOTH feeds for the watched market's deltas;
+	// callbacks must be in place before Start (plain field, no lock).
+	var edgeLag *edgeLagTracker
+	if hOpts.EdgeWSURL != "" {
+		edgeLag = newEdgeLagTracker()
+		watchID := cfg.Markets[0].ID
+		feedClient.OnFrameVersion = func(marketID int, v int64) {
+			if marketID == watchID {
+				edgeLag.recordLocal(v)
+			}
+		}
+	}
 	feedClient.Start()
 	defer feedClient.Stop()
 
@@ -302,9 +388,10 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 		var edgeFeed *feed.Client
 		if hOpts.EdgeWSURL != "" {
 			edgeFeed = feed.NewClient(hOpts.EdgeWSURL, []int{cfg.Markets[0].ID})
+			edgeFeed.OnFrameVersion = func(_ int, v int64) { edgeLag.recordEdge(v) }
 			edgeFeed.Start()
 			defer edgeFeed.Stop()
-			go edgeFeedCheck(ctx, edgeFeed, cfg.Markets[0], registry)
+			go edgeFeedCheck(ctx, edgeFeed, cfg.Markets[0], edgeLag, registry)
 		}
 
 		hs := &health.Server{
@@ -321,6 +408,12 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 					return -1 // check disabled
 				}
 				return time.Since(edgeFeed.View(cfg.Markets[0].ID).LastMsgAt).Seconds()
+			},
+			EdgeLag: func() float64 {
+				if edgeLag == nil {
+					return -1
+				}
+				return edgeLag.LagMs()
 			},
 			Pause: func(p bool) {
 				for _, h := range healths {
