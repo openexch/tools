@@ -29,6 +29,9 @@ type Server struct {
 	// EdgeStale reports seconds since the last frame on the PUBLIC edge WS
 	// (market-relay viewer path); negative = check disabled.
 	EdgeStale func() float64
+	// EdgeLag reports the relay's added latency in ms (same-clock diff of
+	// identical deltas on the local vs edge feed); negative = no samples.
+	EdgeLag func() float64
 	// Pause suspends/resumes all trading agents.
 	Pause func(bool)
 
@@ -102,6 +105,12 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		if sec := s.EdgeStale(); sec >= 0 {
 			fmt.Fprintf(w, "# HELP sim_edge_feed_stale_seconds Seconds since the last frame on the public edge WS (market-relay viewer path).\n")
 			fmt.Fprintf(w, "# TYPE sim_edge_feed_stale_seconds gauge\nsim_edge_feed_stale_seconds %.1f\n", sec)
+		}
+	}
+	if s.EdgeLag != nil {
+		if ms := s.EdgeLag(); ms >= 0 {
+			fmt.Fprintf(w, "# HELP sim_edge_feed_lag_ms Relay-added latency: same-clock arrival diff of identical book deltas, local vs edge feed (EWMA).\n")
+			fmt.Fprintf(w, "# TYPE sim_edge_feed_lag_ms gauge\nsim_edge_feed_lag_ms %.1f\n", ms)
 		}
 	}
 }

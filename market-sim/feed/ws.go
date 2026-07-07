@@ -17,6 +17,12 @@ type Client struct {
 	wsURL   string
 	markets []int // marketIds
 
+	// OnFrameVersion, when set BEFORE Start, fires for every BOOK_DELTA
+	// carrying a v4 bookVersion. Two clients on the same clock watching the
+	// same market see the same versions, which is what the edge-lag
+	// measurement diffs (run.go edgeLagTracker).
+	OnFrameVersion func(marketID int, bookVersion int64)
+
 	mu     sync.Mutex
 	books  map[int]*book
 	cancel context.CancelFunc
@@ -65,14 +71,15 @@ func (c *Client) View(marketID int) BookView {
 // gateway wire shapes (JSON numbers; see GatewayOrderBook.buildJson,
 // GatewayStateManager.buildBookDeltaJson, TradeRingBuffer).
 type wsMessage struct {
-	Type       string     `json:"type"`
-	MarketID   int        `json:"marketId"`
-	BidVersion int64      `json:"bidVersion"`
-	AskVersion int64      `json:"askVersion"`
-	Bids       []wsLevel  `json:"bids"`
-	Asks       []wsLevel  `json:"asks"`
-	Changes    []wsChange `json:"changes"`
-	Trades     []wsTrade  `json:"trades"`
+	Type        string     `json:"type"`
+	MarketID    int        `json:"marketId"`
+	BidVersion  int64      `json:"bidVersion"`
+	AskVersion  int64      `json:"askVersion"`
+	BookVersion int64      `json:"bookVersion"` // v4 monotonic chain id
+	Bids        []wsLevel  `json:"bids"`
+	Asks        []wsLevel  `json:"asks"`
+	Changes     []wsChange `json:"changes"`
+	Trades      []wsTrade  `json:"trades"`
 }
 
 type wsLevel struct {
@@ -160,6 +167,9 @@ func (c *Client) session(ctx context.Context, marketID int, b *book) error {
 			}
 			b.replace(bids, asks, msg.BidVersion, msg.AskVersion)
 		case "BOOK_DELTA":
+			if c.OnFrameVersion != nil && msg.BookVersion > 0 {
+				c.OnFrameVersion(marketID, msg.BookVersion)
+			}
 			ok := true
 			for _, ch := range msg.Changes {
 				if !b.applyDelta(ch.Side, ch.UpdateType, ch.Price, ch.Quantity, msg.BidVersion, msg.AskVersion) {
