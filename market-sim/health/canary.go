@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/openexch/tools/market-sim/oms"
@@ -32,8 +33,10 @@ type Canary struct {
 	SLA      time.Duration // per-leg deadline, default 5s
 
 	seq int64
-	// RoundtripMs is exported to /metrics (last successful full cycle).
-	lastRoundtripMs int64
+	// lastRoundtripMs (last successful full cycle) is exported to /metrics from
+	// the HTTP handler goroutine while cycle() writes it from the canary
+	// goroutine, so it must be accessed atomically.
+	lastRoundtripMs atomic.Int64
 }
 
 func (c *Canary) Run(ctx context.Context) {
@@ -60,7 +63,7 @@ func (c *Canary) Run(ctx context.Context) {
 }
 
 // RoundtripMs returns the last successful cycle duration.
-func (c *Canary) RoundtripMs() int64 { return c.lastRoundtripMs }
+func (c *Canary) RoundtripMs() int64 { return c.lastRoundtripMs.Load() }
 
 func (c *Canary) cycle(ctx context.Context) (bool, string) {
 	state, okState := c.Router.Snapshot(c.Symbol)
@@ -95,8 +98,9 @@ func (c *Canary) cycle(ctx context.Context) (bool, string) {
 	if ok, why := c.awaitStatus(ctx, resp.OmsOrderID, "CANCELLED"); !ok {
 		return false, "await CANCELLED: " + why
 	}
-	c.lastRoundtripMs = time.Since(start).Milliseconds()
-	return true, fmt.Sprintf("roundtrip %dms", c.lastRoundtripMs)
+	rt := time.Since(start).Milliseconds()
+	c.lastRoundtripMs.Store(rt)
+	return true, fmt.Sprintf("roundtrip %dms", rt)
 }
 
 func (c *Canary) awaitStatus(ctx context.Context, id, want string) (bool, string) {
