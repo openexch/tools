@@ -57,7 +57,14 @@ func ParseMoney(s string) (Money, error) {
 		if c < '0' || c > '9' {
 			return 0, fmt.Errorf("malformed money %q", s)
 		}
-		v += int64(c-'0') * scale
+		// Guard the add: the coarse integer-part check above uses truncating
+		// division, so an integer part at the boundary can still overflow once
+		// the fractional digits are folded in (e.g. "92233720368.99999999").
+		add := int64(c-'0') * scale
+		if v > math.MaxInt64-add {
+			return 0, fmt.Errorf("money %q out of range", s)
+		}
+		v += add
 		scale /= 10
 	}
 	if neg {
