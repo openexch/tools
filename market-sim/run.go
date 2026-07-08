@@ -392,6 +392,11 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 			edgeFeed.Start()
 			defer edgeFeed.Stop()
 			go edgeFeedCheck(ctx, edgeFeed, cfg.Markets[0], edgeLag, registry)
+		} else {
+			// No edge URL => the freshness check never runs. Register it as a
+			// failing critical check rather than leaving it unregistered, so a
+			// misconfigured deploy reads unhealthy instead of silently green.
+			registry.Set("edge_feed_fresh", false, "SIM_EDGE_WS_URL not configured", true)
 		}
 
 		hs := &health.Server{
