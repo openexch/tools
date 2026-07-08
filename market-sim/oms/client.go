@@ -23,13 +23,14 @@ type Client struct {
 }
 
 func NewClient(baseURL, tokenTemplate string) *Client {
-	// The OMS REST server closes the TCP connection after EVERY response
-	// (RestApiHandler.sendResponse -> ChannelFutureListener.CLOSE) without a
-	// Connection: close header, so keep-alive reuse always races the server's
-	// close. Disable keep-alives: one connection per request, no corpse pool.
-	// (Filed against oms; flip this if the server gains real keep-alive.)
+	// Keep-alive is on: oms#93 gave the REST plane real HTTP/1.1 keep-alive, so
+	// the sim reuses pooled connections instead of dialing one per request. A
+	// single Transport backs every agent/follower/canary, so raise the per-host
+	// idle pool well above Go's default of 2 and reap idle conns after 90s.
 	tr := &http.Transport{
-		DisableKeepAlives: true,
+		MaxIdleConns:        128,
+		MaxIdleConnsPerHost: 64,
+		IdleConnTimeout:     90 * time.Second,
 	}
 	return &Client{
 		BaseURL:       baseURL,
@@ -45,13 +46,15 @@ func (c *Client) token(userID int64) string {
 
 // raw performs the request and returns status + body. Only transport-level
 // failures are errors; HTTP status interpretation is the caller's.
-// Stale keep-alive reuse (OMS closes idle connections) is retried once:
-// creates are idempotent via clientOrderId, cancels/amends by nature.
+// With keep-alive on, a pooled connection can be closed by the server's idle
+// timeout in the window between our reuse check and the write; retry once.
+// Safe because the ops are idempotent: creates via clientOrderId, cancels and
+// amends by nature.
 func (c *Client) raw(ctx context.Context, method, path string, asUser int64, body any) (int, []byte, error) {
 	status, data, err := c.rawOnce(ctx, method, path, asUser, body)
 	if err != nil && ctx.Err() == nil && staleConnErr(err) {
-		// The whole idle pool likely died together (server-side timeout);
-		// flush it so the retry dials fresh instead of picking another corpse.
+		// A batch of idle conns may have aged out together; flush the pool so
+		// the retry dials fresh instead of picking another stale one.
 		c.transport.CloseIdleConnections()
 		return c.rawOnce(ctx, method, path, asUser, body)
 	}
