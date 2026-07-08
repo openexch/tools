@@ -24,7 +24,10 @@ func TestParseMoneyRoundTrip(t *testing.T) {
 }
 
 func TestParseMoneyRejects(t *testing.T) {
-	for _, in := range []string{"", "1e5", "0.123456789", "abc", "1.2.3", "1,5"} {
+	for _, in := range []string{"", "1e5", "0.123456789", "abc", "1.2.3", "1,5",
+		"92233720368.99999999", // boundary: passes the coarse int check, overflows on the fractional fold
+		"99999999999.0",        // plainly over range
+	} {
 		if _, err := ParseMoney(in); err == nil {
 			t.Errorf("ParseMoney(%q) succeeded, want error", in)
 		}
