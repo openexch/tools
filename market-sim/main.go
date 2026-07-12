@@ -95,9 +95,33 @@ func seed(ctx context.Context, cfg *Config, client *oms.Client) error {
 	// sliver of each base asset via the first market's target row.
 	targets = append(targets, accounts.Target{UserID: cfg.CanaryBot, USD: cfg.USDFloat})
 	s := &accounts.Seeder{Client: client}
-	n, err := s.Seed(ctx, targets)
-	if err != nil {
-		return err
+	// Retry the whole pass on transient failure (e.g. the AE briefly unavailable
+	// at boot): a crash here disarms the sim service and takes the demo down
+	// (tools#18). Safe to retry because a pass re-reads each balance and deposits
+	// only the shortfall — a deposit that timed out UNKNOWN but actually applied
+	// just shows up as a smaller shortfall next pass, so this never double-funds
+	// ("do not retry blindly" is honored by recomputing from fresh balances).
+	const maxAttempts = 6
+	var n int
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		n, err = s.Seed(ctx, targets)
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if attempt == maxAttempts {
+			return fmt.Errorf("seeding bots: %w (after %d attempts)", err, maxAttempts)
+		}
+		backoff := time.Duration(attempt) * time.Second
+		log.Printf("[seed] attempt %d/%d failed (%v); retrying in %s", attempt, maxAttempts, err, backoff)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
 	}
 	log.Printf("[seed] %d bots checked, %d deposits made", len(targets), n)
 	return nil
