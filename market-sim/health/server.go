@@ -87,6 +87,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# TYPE sim_orphans_total counter\nsim_orphans_total %d\n", s.Stats.Orphans.Load())
 	fmt.Fprintf(w, "# TYPE sim_throttled_total counter\nsim_throttled_total %d\n", s.Stats.Throttled.Load())
 	fmt.Fprintf(w, "# TYPE sim_errors_total counter\nsim_errors_total %d\n", s.Stats.Errors.Load())
+	fmt.Fprintf(w, "# TYPE sim_stabilizer_actions_total counter\nsim_stabilizer_actions_total %d\n", s.Stats.Stabilized.Load())
 	fmt.Fprintf(w, "# TYPE sim_rejects_total counter\n")
 	for reason, n := range s.Stats.RejectCounts() {
 		fmt.Fprintf(w, "sim_rejects_total{reason=%q} %d\n", reason, n)

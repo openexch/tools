@@ -15,8 +15,9 @@ type Stats struct {
 	Cancelled atomic.Int64
 	Throttled atomic.Int64
 	Errors    atomic.Int64
-	Fills     atomic.Int64 // maker fills observed via the OMS user-WS push
-	Orphans   atomic.Int64 // server-side orders reconciled away
+	Fills      atomic.Int64 // maker fills observed via the OMS user-WS push
+	Orphans    atomic.Int64 // server-side orders reconciled away
+	Stabilized atomic.Int64 // stabilizer interventions (a broken book was corrected)
 
 	mu      sync.Mutex
 	rejects map[string]int64

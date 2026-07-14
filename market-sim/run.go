@@ -351,6 +351,18 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 			s.Noise = append(s.Noise, agents.NewNoise(bots[j], params, env))
 			j++
 		}
+		// The liquidity backstop: one privileged bot per market that wakes only
+		// when the book goes one-sided or crossed (e.g. after a regime dump) and
+		// otherwise stays dormant. Follow its order events so filled backfill
+		// rungs leave its ladder promptly.
+		if cfg.StabilizerEnabled {
+			stabBot := cfg.StabilizerBot(i)
+			s.Stabilizer = agents.NewStabilizer(stabBot, params, env)
+			f := oms.NewUserWS(wsBase, fmt.Sprintf(cfg.AuthTemplate, stabBot), stabBot, 128)
+			f.Start()
+			followers = append(followers, f)
+			go pump(f.Out, s.Fills)
+		}
 		schedulers = append(schedulers, s)
 		s.Start()
 	}

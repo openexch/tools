@@ -81,6 +81,13 @@ type Config struct {
 	BotsPerMarket int   // makers+takers+noise share this pool per market
 	CanaryBot     int64
 
+	// Stabilizer is the per-market liquidity backstop (one bot per market at
+	// StabilizerBase+i). Privileged-funded (StabilizerFundMult x the normal
+	// float) so it can always quote the missing side.
+	StabilizerEnabled  bool
+	StabilizerBase     int64
+	StabilizerFundMult int64
+
 	// Funding targets per bot (quote side; base side is per-market BaseFloat).
 	USDFloat oms.Money
 
@@ -98,6 +105,11 @@ func DefaultConfig() Config {
 		BotBase:       900001,
 		BotsPerMarket: 10,
 		CanaryBot:     900999,
+
+		StabilizerEnabled:  true,
+		StabilizerBase:     900900, // one per market: 900900..; clear of the 900001-900050 pool and the 900999 canary
+		StabilizerFundMult: 50,
+
 		USDFloat:      oms.MustMoney("1000000"),
 		BandMarginPct: 15,
 	}
@@ -129,6 +141,9 @@ func (c *Config) Bots(i int) []int64 {
 	}
 	return out
 }
+
+// StabilizerBot returns the backstop bot userId for market index i (0-based).
+func (c *Config) StabilizerBot(i int) int64 { return c.StabilizerBase + int64(i) }
 
 // AllBots returns every trading bot (excluding the canary).
 func (c *Config) AllBots() []int64 {

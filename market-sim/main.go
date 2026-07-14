@@ -91,6 +91,20 @@ func seed(ctx context.Context, cfg *Config, client *oms.Client) error {
 			})
 		}
 	}
+	// The per-market stabilizer is the liquidity backstop: fund it well above
+	// every other bot (both sides) so it can always quote the missing side.
+	if cfg.StabilizerEnabled {
+		mult := cfg.StabilizerFundMult
+		if mult < 1 {
+			mult = 1
+		}
+		for i, m := range cfg.Markets {
+			targets = append(targets, accounts.Target{
+				UserID: cfg.StabilizerBot(i), USD: cfg.USDFloat * oms.Money(mult),
+				BaseAsset: m.BaseAssetID, BaseFloat: m.BaseFloat * oms.Money(mult),
+			})
+		}
+	}
 	// The canary bot trades every market at tiny size; fund USD only plus a
 	// sliver of each base asset via the first market's target row.
 	targets = append(targets, accounts.Target{UserID: cfg.CanaryBot, USD: cfg.USDFloat})

@@ -14,11 +14,12 @@ import (
 // All agent state is confined to this goroutine; external inputs (user-WS
 // order events) arrive through the Fills channel and are drained here.
 type Scheduler struct {
-	Symbol string
-	Makers []*Maker
-	Takers []*Taker
-	Noise  []*Noise
-	Depth  []*Depth
+	Symbol     string
+	Makers     []*Maker
+	Takers     []*Taker
+	Noise      []*Noise
+	Depth      []*Depth
+	Stabilizer *Stabilizer // liquidity backstop; nil = disabled
 
 	// Fills receives pushed OrderResponse events for this market's maker
 	// bots (fed by oms.UserWS followers in run.go).
@@ -72,6 +73,9 @@ func (s *Scheduler) run(ctx context.Context) {
 					m.Reconcile(ctx)
 				}
 			}
+			if s.Stabilizer != nil && s.Stabilizer.Due(now) {
+				s.Stabilizer.Step(ctx)
+			}
 			if now.After(s.nextDepthRec) {
 				s.nextDepthRec = now.Add(45 * time.Second)
 				for _, d := range s.Depth {
@@ -100,9 +104,13 @@ func (s *Scheduler) drainFills() {
 				for _, d := range s.Depth {
 					if d.Bot == o.UserID {
 						d.OnOrderEvent(o)
+						routed = true
 						break
 					}
 				}
+			}
+			if !routed && s.Stabilizer != nil && s.Stabilizer.Bot == o.UserID {
+				s.Stabilizer.OnOrderEvent(o)
 			}
 		default:
 			return
@@ -127,6 +135,9 @@ func (s *Scheduler) Stop(cleanupBudget time.Duration) {
 	}
 	for _, d := range s.Depth {
 		d.CancelAll(ctx)
+	}
+	if s.Stabilizer != nil {
+		s.Stabilizer.CancelAll(ctx)
 	}
 	log.Printf("[scheduler %s] stopped, quotes cleared", s.Symbol)
 }
