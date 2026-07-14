@@ -48,21 +48,27 @@ type stabOrder struct {
 }
 
 const (
-	// stabMinSideLevels: fewer visible levels than this on a side wakes the
-	// backfill. Well below the depth keeper's 20-level target, so the
-	// stabilizer only steps in on a genuine one-sided book, not normal churn.
-	stabMinSideLevels = 6
+	// stabMinSideLevels: a side thinner than this wakes the backfill. One above
+	// the demo's book_depth floor (run.go requires >=18 both sides) so the
+	// stabilizer refills a side just BEFORE it would touch the floor, leaving a
+	// level of margin against a burst of takers between steps.
+	stabMinSideLevels = 19
+	// stabTargetLevels: refill a thin side up to this many levels, comfortably
+	// above the floor so it survives a burst of takers before the next step.
+	stabTargetLevels = 20
 	// stabStaleTolPct: a bid more than this fraction ABOVE fair (or an ask
 	// below fair) is a stale crossed level to arbitrage away. Comfortably
 	// outside the maker touch region so normal near-touch quotes are untouched.
 	stabStaleTolPct = 0.004
-	// stabBackfillLevels: ladder rungs the stabilizer restores on a thin side.
-	// Enough to lift the side off the floor, not enough to own the book.
-	stabBackfillLevels = 8
-	// per-step op budgets so a burst never blows through the rate governor.
+	// stabTouchOffsetTicks keeps a from-empty ladder a few ticks BEHIND the
+	// touch (like the depth keeper's minOff) so its rungs are not first in the
+	// taker firing line and instantly eaten.
+	stabTouchOffsetTicks = 4
+	// per-step op budgets so a burst never blows through the rate governor
+	// (excess is retried on the next step; the governor also gates each op).
 	stabClearBudget    = 6
-	stabBackfillBudget = 8
-	stabRetireBudget   = 8
+	stabBackfillBudget = 14
+	stabRetireBudget   = 14
 )
 
 func NewStabilizer(bot int64, p MarketParams, env Env) *Stabilizer {
@@ -110,7 +116,7 @@ func (s *Stabilizer) Step(ctx context.Context) {
 	//    instead of crossing a bid that should not be there.
 	cleared := s.clearStale(ctx, book, fair)
 
-	// 2. Backfill a side that has gone thin.
+	// 2. Backfill a side that has thinned below the depth floor.
 	askThin := len(book.Asks) < stabMinSideLevels
 	bidThin := len(book.Bids) < stabMinSideLevels
 	placed := 0
@@ -121,11 +127,11 @@ func (s *Stabilizer) Step(ctx context.Context) {
 		placed += s.backfill(ctx, "BUY", fair, book)
 	}
 
-	// 3. Withdraw once the organic book has recovered (both sides healthy and
-	//    nothing stale), or on TTL, so the stabilizer does not linger as a
-	//    permanent quoter and flatten the market.
-	healthy := !askThin && !bidThin && cleared == 0
-	s.retire(ctx, now, healthy)
+	// 3. Retire our rungs on TTL only: they age out on their own, so when the
+	//    organic depth has taken over the side simply stays full without them.
+	//    (Cancel-on-"healthy" would flap: our own rungs make the side healthy,
+	//    we cancel them, the side drops, we refill.)
+	s.retire(ctx, now, false)
 
 	if cleared > 0 || placed > 0 {
 		s.Env.Stats.Stabilized.Add(1)
@@ -204,36 +210,66 @@ func (s *Stabilizer) hit(ctx context.Context, side string, price oms.Money, leve
 	return true
 }
 
-// backfill lays a small resting GTC ladder on a thin side, starting just past
-// the touch (never crossing the opposite best) and stepping away from fair.
+// backfill tops a thin side up to the target level count by adding DISTINCT
+// rungs just BEYOND the current book edge (so it never over-stacks existing
+// levels), stepping away from the touch. From an empty side it starts a few
+// ticks behind the touch so its near rungs are not instantly eaten.
 func (s *Stabilizer) backfill(ctx context.Context, side string, fair oms.Money, book feed.BookView) int {
+	var have int
+	if side == "SELL" {
+		have = len(book.Asks)
+	} else {
+		have = len(book.Bids)
+	}
+	need := stabTargetLevels - have
+	if need <= 0 {
+		return 0
+	}
+
 	// spacing in ticks (~0.03% of price), at least 1 — same convention as Depth.
 	spacingTicks := int(fair.Float() * 0.0003 / s.Params.Tick.Float())
 	if spacingTicks < 1 {
 		spacingTicks = 1
 	}
-	// Anchor the ladder so a rung can never cross the resting opposite side.
-	base := fair
+
+	// edge = the worst existing level on this side (so new rungs extend the
+	// book rather than duplicate it); from empty, a few ticks behind the touch.
+	edge := fair
 	if side == "SELL" {
-		if book.BestBid > 0 {
-			if floor := oms.MoneyFromFloat(book.BestBid) + s.Params.Tick; floor > base {
-				base = floor
+		if have > 0 {
+			edge = oms.MoneyFromFloat(book.Asks[have-1].Price)
+		} else {
+			if book.BestBid > 0 {
+				if floor := oms.MoneyFromFloat(book.BestBid) + s.Params.Tick; floor > edge {
+					edge = floor
+				}
 			}
+			edge = s.Params.offsetTicks(edge, stabTouchOffsetTicks)
 		}
-	} else if book.BestAsk > 0 {
-		if ceil := oms.MoneyFromFloat(book.BestAsk) - s.Params.Tick; ceil < base {
-			base = ceil
+	} else {
+		if have > 0 {
+			edge = oms.MoneyFromFloat(book.Bids[have-1].Price)
+		} else {
+			if book.BestAsk > 0 {
+				if ceil := oms.MoneyFromFloat(book.BestAsk) - s.Params.Tick; ceil < edge {
+					edge = ceil
+				}
+			}
+			edge = s.Params.offsetTicks(edge, -stabTouchOffsetTicks)
 		}
 	}
 
 	budget := stabBackfillBudget
+	if budget > need {
+		budget = need
+	}
 	placed := 0
-	for i := 0; i < stabBackfillLevels && budget > 0; i++ {
+	for i := 1; i <= need && budget > 0; i++ {
 		ticks := i * spacingTicks
 		if side == "BUY" {
 			ticks = -ticks
 		}
-		price := s.Params.offsetTicks(base, ticks)
+		price := s.Params.offsetTicks(edge, ticks)
 		if !s.Env.Governor.Allow(s.Bot) {
 			s.Env.Stats.Throttled.Add(1)
 			break
@@ -263,15 +299,16 @@ func (s *Stabilizer) backfill(ctx context.Context, side string, fair oms.Money, 
 	return placed
 }
 
-// retire cancels our resting orders that have aged out, or all of them once the
-// organic book is healthy again, so the stabilizer steps back out of the market.
-func (s *Stabilizer) retire(ctx context.Context, now time.Time, healthy bool) {
+// retire cancels our resting rungs: those aged past their TTL, or (force=true,
+// on a halted market or shutdown) all of them. TTL-only aging lets our rungs
+// hand off to the organic depth without flapping.
+func (s *Stabilizer) retire(ctx context.Context, now time.Time, force bool) {
 	budget := stabRetireBudget
 	for id, o := range s.orders {
 		if budget == 0 {
 			break
 		}
-		if !healthy && now.Sub(o.placedAt) <= o.ttl {
+		if !force && now.Sub(o.placedAt) <= o.ttl {
 			continue
 		}
 		budget--
