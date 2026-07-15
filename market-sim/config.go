@@ -106,7 +106,7 @@ func DefaultConfig() Config {
 		BotsPerMarket: 10,
 		CanaryBot:     900999,
 
-		StabilizerEnabled:  true,
+		StabilizerEnabled:  false, // DISABLED 2026-07-15: pro-cyclical clearStale crashed BTC to the band floor in a downmove; needs redesign before re-enabling
 		StabilizerBase:     900900, // one per market: 900900..; clear of the 900001-900050 pool and the 900999 canary
 		StabilizerFundMult: 50,
 
