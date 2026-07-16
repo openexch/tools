@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -98,10 +100,11 @@ const (
 
 // HealthOpts carries the Phase 3 observability configuration.
 type HealthOpts struct {
-	Addr         string // health server listen address ("" = disabled)
-	CORSOrigin   string // demo UI origin asserted by the CORS canary
-	PublicOMSURL string // public edge to probe ("" = local only)
-	EdgeWSURL    string // public market-data WS (the edge relay path) ("" = check disabled)
+	Addr            string // health server listen address ("" = disabled)
+	CORSOrigin      string // demo UI origin asserted by the CORS canary
+	PublicOMSURL    string // public edge to probe ("" = local only)
+	EdgeWSURL       string // public market-data WS (the edge relay path) ("" = check disabled)
+	BridgeHealthURL string // settlement bridge health endpoint ("" = check disabled)
 }
 
 // edgeLagTracker measures the edge relay's ADDED latency by same-clock
@@ -200,6 +203,51 @@ func edgeFeedCheck(ctx context.Context, edgeFeed *feed.Client, market MarketSpec
 				detail += fmt.Sprintf(", relay lag ~%.0fms", ms)
 			}
 			registry.Set("edge_feed_fresh", age <= staleAfter, detail, true)
+		}
+	}
+}
+
+// settlementCheck probes the settlement bridge's health endpoint. A HALTED
+// bridge (it latches on a detected journal gap) forwards NOTHING to the Assets
+// Engine, so fills never draw down their holds — money stops settling and every
+// filled order's collateral leaks, draining every bot within ~an hour until the
+// book goes one-sided. The book_depth / fills_recent checks only catch that
+// LATE (once a side finally empties); this catches it the instant the bridge
+// halts. Critical: a stalled settlement IS a demo outage. The bridge returns
+// HTTP 503 + {"halted":true} when halted, 200 otherwise (assets-bridge
+// BridgeMetricsServer). This exact stall (ME restored a stale snapshot while the
+// AE reset to genesis, tradeId mismatch → bridge halt) caused the 2026-07-15
+// outage and read as a false-green because nothing watched settlement.
+func settlementCheck(ctx context.Context, healthURL string, registry *health.Registry) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	client := &http.Client{Timeout: 5 * time.Second}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+			if err != nil {
+				registry.Set("settlement_flowing", false, "bad bridge health URL: "+err.Error(), true)
+				continue
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				registry.Set("settlement_flowing", false, "settlement bridge unreachable: "+err.Error(), true)
+				continue
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			// 503 or an explicit halted:true both mean the bridge stopped forwarding.
+			halted := resp.StatusCode == http.StatusServiceUnavailable ||
+				strings.Contains(string(body), "\"halted\":true")
+			detail := ""
+			if halted {
+				detail = "settlement bridge HALTED — no money settling, holds leaking: " +
+					strings.TrimSpace(string(body))
+			}
+			registry.Set("settlement_flowing", !halted, detail, true)
 		}
 	}
 }
@@ -409,6 +457,15 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 			// failing critical check rather than leaving it unregistered, so a
 			// misconfigured deploy reads unhealthy instead of silently green.
 			registry.Set("edge_feed_fresh", false, "SIM_EDGE_WS_URL not configured", true)
+		}
+
+		// Watch the settlement bridge: a halt stops all money settlement and
+		// leaks every fill's hold (the 2026-07-15 outage). Register failing when
+		// unconfigured so a misconfigured deploy reads unhealthy, never green.
+		if hOpts.BridgeHealthURL != "" {
+			go settlementCheck(ctx, hOpts.BridgeHealthURL, registry)
+		} else {
+			registry.Set("settlement_flowing", false, "SIM_BRIDGE_HEALTH_URL not configured", true)
 		}
 
 		hs := &health.Server{

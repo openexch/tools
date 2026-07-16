@@ -34,6 +34,7 @@ func main() {
 	corsOrigin := flag.String("cors-origin", envOr("SIM_CORS_ORIGIN", "https://trade.openexch.io"), "browser origin asserted by the CORS canary")
 	publicOMS := flag.String("oms-public-url", envOr("SIM_PUBLIC_OMS_URL", "https://oms.openexch.io"), "public OMS edge probed by the CORS canary (empty = local only)")
 	edgeWS := flag.String("edge-ws-url", envOr("SIM_EDGE_WS_URL", ""), "public market-data WS to watch (the edge relay viewer path; empty = check disabled)")
+	bridgeHealth := flag.String("bridge-health-url", envOr("SIM_BRIDGE_HEALTH_URL", "http://127.0.0.1:9600/health"), "settlement bridge health endpoint; a HALTED bridge stops all money settlement and leaks holds (empty = check disabled)")
 	anchorFile := flag.String("anchor-file", envOr("SIM_ANCHOR_FILE", "anchors.json"), "reference-price persistence file (empty = disabled)")
 	flag.Parse()
 	cfg.SelectMarkets(*markets)
@@ -57,7 +58,7 @@ func main() {
 		}
 		log.Print("once check OK")
 	case "run":
-		hOpts := HealthOpts{Addr: *healthAddr, CORSOrigin: *corsOrigin, PublicOMSURL: *publicOMS, EdgeWSURL: *edgeWS}
+		hOpts := HealthOpts{Addr: *healthAddr, CORSOrigin: *corsOrigin, PublicOMSURL: *publicOMS, EdgeWSURL: *edgeWS, BridgeHealthURL: *bridgeHealth}
 		if err := run(ctx, &cfg, client, *source, *binanceURL, *globalOps, hOpts, *anchorFile); err != nil {
 			log.Fatalf("run failed: %v", err)
 		}
