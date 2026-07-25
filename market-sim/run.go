@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -207,21 +208,41 @@ func edgeFeedCheck(ctx context.Context, edgeFeed *feed.Client, market MarketSpec
 	}
 }
 
-// settlementCheck probes the settlement bridge's health endpoint. A HALTED
-// bridge (it latches on a detected journal gap) forwards NOTHING to the Assets
-// Engine, so fills never draw down their holds — money stops settling and every
-// filled order's collateral leaks, draining every bot within ~an hour until the
-// book goes one-sided. The book_depth / fills_recent checks only catch that
-// LATE (once a side finally empties); this catches it the instant the bridge
-// halts. Critical: a stalled settlement IS a demo outage. The bridge returns
-// HTTP 503 + {"halted":true} when halted, 200 otherwise (assets-bridge
-// BridgeMetricsServer). This exact stall (ME restored a stale snapshot while the
-// AE reset to genesis, tradeId mismatch → bridge halt) caused the 2026-07-15
-// outage and read as a false-green because nothing watched settlement.
+// settlementStallStrikes is how many consecutive probes may show "the bridge
+// started a new epoch but forwarded no trade" before this reads as an outage.
+// One strike is a benign resync (leader change, source restart, purge race); a
+// wedged bridge shows it on every probe, forever.
+const settlementStallStrikes = 3
+
+// settlementCheck watches the settlement bridge two ways, because a bridge that
+// settles NOTHING does not necessarily look unhealthy.
+//
+//  1. HALTED (it latches on a detected journal gap) — it forwards nothing, so
+//     fills never draw down their holds. Money stops settling, every filled
+//     order's collateral leaks, and the bots drain within ~an hour until the book
+//     goes one-sided. That stall (ME restored a stale snapshot while the AE reset
+//     to genesis) caused the 2026-07-15 outage.
+//
+//  2. LOOPING WITHOUT SETTLING — the 2026-07-25 outage, and the reason watching
+//     halted alone is not enough. /dev/shm filled up, the bridge's media driver
+//     could not map a journal replay image, so every epoch died on a connect
+//     timeout and resynced. halted was false and the AE session was up the whole
+//     time, so this check stayed GREEN for sixteen hours while 161k holds piled
+//     up and $9.15M of maker collateral froze. The tell is epoch churn: a healthy
+//     bridge sits in ONE epoch live-following the journal indefinitely, so epochs
+//     advancing while forwarded trades do not means it is failing and retrying.
+//
+// Both stay quiet in a genuinely quiet market: no fills means no forwarded
+// trades, but it also means no epoch churn, so (2) only fires when the bridge is
+// actually cycling. book_depth / fills_recent only catch either LATE, once a side
+// has finally emptied.
 func settlementCheck(ctx context.Context, healthURL string, registry *health.Registry) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	client := &http.Client{Timeout: 5 * time.Second}
+	metricsURL := strings.TrimSuffix(healthURL, "/health") + "/metrics"
+	prevEpochs, prevTrades := int64(-1), int64(-1)
+	strikes := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -242,14 +263,82 @@ func settlementCheck(ctx context.Context, healthURL string, registry *health.Reg
 			// 503 or an explicit halted:true both mean the bridge stopped forwarding.
 			halted := resp.StatusCode == http.StatusServiceUnavailable ||
 				strings.Contains(string(body), "\"halted\":true")
-			detail := ""
 			if halted {
-				detail = "settlement bridge HALTED — no money settling, holds leaking: " +
-					strings.TrimSpace(string(body))
+				registry.Set("settlement_flowing", false,
+					"settlement bridge HALTED — no money settling, holds leaking: "+
+						strings.TrimSpace(string(body)), true)
+				strikes, prevEpochs, prevTrades = 0, -1, -1
+				continue
 			}
-			registry.Set("settlement_flowing", !halted, detail, true)
+
+			epochs, trades, ok := bridgeProgress(ctx, client, metricsURL)
+			if !ok {
+				// Not halted, but progress is unknowable. Say so rather than imply
+				// settlement was verified — that wording is the whole 07-25 lesson.
+				registry.Set("settlement_flowing", true,
+					"bridge not halted (forward progress UNVERIFIED: metrics unreadable)", true)
+				strikes, prevEpochs, prevTrades = 0, -1, -1
+				continue
+			}
+			if prevEpochs >= 0 && epochs > prevEpochs && trades == prevTrades {
+				strikes++
+			} else {
+				strikes = 0
+			}
+			prevEpochs, prevTrades = epochs, trades
+			if strikes >= settlementStallStrikes {
+				registry.Set("settlement_flowing", false, fmt.Sprintf(
+					"settlement bridge is LOOPING WITHOUT SETTLING — epoch %d and climbing, "+
+						"forwarded trades stuck at %d. Holds are piling up and maker collateral "+
+						"is freezing; check the bridge log and /dev/shm on the cluster hosts",
+					epochs, trades), true)
+				continue
+			}
+			registry.Set("settlement_flowing", true,
+				fmt.Sprintf("%d trades forwarded, epoch %d", trades, epochs), true)
 		}
 	}
+}
+
+// bridgeProgress reads the two counters that distinguish "settling" from merely
+// "not halted": the epoch number and the forwarded-trade total. Returns ok=false
+// if either is missing, so the caller can report the unknown instead of guessing.
+func bridgeProgress(ctx context.Context, client *http.Client, metricsURL string) (epochs, trades int64, ok bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metricsURL, nil)
+	if err != nil {
+		return 0, 0, false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, false
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return 0, 0, false
+	}
+	gotEpochs, gotTrades := false, false
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		name, value, found := strings.Cut(line, " ")
+		if !found {
+			continue
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		if err != nil {
+			continue
+		}
+		switch name {
+		case "bridge_epochs_total":
+			epochs, gotEpochs = n, true
+		case "bridge_forwarded_trades_total":
+			trades, gotTrades = n, true
+		}
+	}
+	return epochs, trades, gotEpochs && gotTrades
 }
 
 // loadAnchors restores persisted reference prices so the chart continues
