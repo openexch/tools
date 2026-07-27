@@ -21,3 +21,7 @@ market-sim/market-sim
 .DS_Store
 Thumbs.db
 anchors.json
+
+# Maven build output (tb-bench)
+target/
+dependency-reduced-pom.xml
