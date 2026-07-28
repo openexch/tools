@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.openexchange</groupId>
+  <artifactId>tb-bench</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+
+  <!--
+    Two-phase TigerBeetle benchmark driver for the Open Exchange ledger evaluation.
+    Measures what the built-in `tigerbeetle benchmark` cannot: the real
+    pending -> post_pending / void_pending lifecycle, open-loop hold-path latency
+    (HdrHistogram, coordinated-omission-safe), and settlement throughput at our
+    measured op-mix (1 hold : ~0.39 settle : ~0.37 release).
+
+    Client version is pinned to the running server version (0.17.9); TB requires
+    that the client is never newer than the replica.
+  -->
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <tigerbeetle.version>0.17.9</tigerbeetle.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.tigerbeetle</groupId>
+      <artifactId>tigerbeetle-java</artifactId>
+      <version>${tigerbeetle.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.hdrhistogram</groupId>
+      <artifactId>HdrHistogram</artifactId>
+      <version>2.2.2</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <finalName>tb-bench</finalName>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.11.0</version>
+        <configuration>
+          <release>21</release>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.5.1</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>com.openexchange.tbbench.TbBench</mainClass>
+                </transformer>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>
