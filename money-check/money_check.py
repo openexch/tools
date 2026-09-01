@@ -263,6 +263,23 @@ DEPOSIT_RE = re.compile(
     r"deposited\s+(-?\d+(?:\.\d+)?)\s+of\s+asset\s+(\d+)\s+\(had\s+(-?\d+(?:\.\d+)?)")
 WITHDRAW_RE = re.compile(
     r"(?:withdrew|withdrawn)\s+(-?\d+(?:\.\d+)?)\s+of\s+asset\s+(\d+)")
+ROTATION_SUFFIX_RE = re.compile(r"\.(\d+)$")
+
+
+def _chronological_key(path):
+    """Oldest-first sort key for rotated logs: mtime, then rotation index.
+
+    mtimes can tie (coarse filesystem granularity, rapid successive
+    rotations), and the caller hands over a lexicographically sorted glob,
+    so a stable sort on mtime alone would silently keep that newest-first
+    order. Larger ".N" suffixes are older archives, so they sort before
+    smaller ones and before the live file (no suffix). The path itself is
+    only a final tie-break to keep the ordering total and independent of
+    input order.
+    """
+    m = ROTATION_SUFFIX_RE.search(path)
+    rot = int(m.group(1)) if m else -1
+    return (os.path.getmtime(path), -rot, path)
 
 
 def parse_ledger_log(paths):
@@ -283,9 +300,9 @@ def parse_ledger_log(paths):
     # paths alphabetically is newest-first under the usual "sim.log, sim.log.1,
     # ..." rotation names (the live file sorts ahead of its archives, and
     # "sim.log.10" before "sim.log.2"); modification time is naming-scheme
-    # independent.
+    # independent, with the rotation index as a deterministic tie-break.
     existing = [p for p in paths if os.path.exists(p)]
-    existing.sort(key=os.path.getmtime)
+    existing.sort(key=_chronological_key)
     for path in existing:
         files_used.append(path)
         with open(path, "r", errors="replace") as fh:

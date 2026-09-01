@@ -15,6 +15,7 @@ subtracted from an apparent conservation breach (2026-08-03), and the fixed-poin
 arithmetic that must never go through a float.
 """
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -319,6 +320,36 @@ class LedgerLog(unittest.TestCase):
         self.assertEqual(deposits, {0: 20 * SCALE})
         self.assertTrue(genesis)
         self.assertEqual(meta["files"], [oldest, newest])
+
+    def test_rotation_index_breaks_mtime_ties_oldest_first(self):
+        # mtimes can tie (coarse filesystem granularity, rapid successive
+        # rotations), and the caller passes a lexicographically sorted glob --
+        # a stable sort on mtime alone would then keep that newest-first
+        # order. Ties must resolve by rotation index instead: larger ".N" is
+        # older, and the live file ("sim.log", no suffix) is newest.
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        paths = {}
+        for name, text in [
+            ("sim.log.10",
+             "bot 1: deposited 15.00000000 of asset 0 (had 0, target 15.00000000)\n"),
+            ("sim.log.2",
+             "bot 1: deposited 5.00000000 of asset 0 (had 15.00000000, target 20.00000000)\n"),
+            ("sim.log",
+             "bot 1: deposited 1.00000000 of asset 0 (had 20.00000000, target 21.00000000)\n"),
+        ]:
+            p = os.path.join(d, name)
+            with open(p, "w") as fh:
+                fh.write(text)
+            paths[name] = p
+        for p in paths.values():
+            os.utime(p, (1_700_000_000, 1_700_000_000))  # identical mtimes
+        # Lexicographic order, as handed over by sorted(glob.glob(...)).
+        deposits, _, genesis, meta = parse_ledger_log(sorted(paths.values()))
+        self.assertEqual(meta["files"],
+                         [paths["sim.log.10"], paths["sim.log.2"], paths["sim.log"]])
+        self.assertEqual(deposits, {0: 21 * SCALE})
+        self.assertTrue(genesis)
 
 
 class ArgParsing(unittest.TestCase):
