@@ -299,6 +299,27 @@ class LedgerLog(unittest.TestCase):
         self.assertEqual(deposits, {0: SCALE})
         self.assertEqual(meta["lines"], 2)
 
+    def test_rotated_logs_are_read_oldest_first(self):
+        # A glob like --sim-log "sim.log*" sorts the LIVE file ahead of its
+        # archives ("sim.log" < "sim.log.1", and "sim.log.10" < "sim.log.2"),
+        # i.e. newest first. Genesis coverage keys on the FIRST deposit line
+        # per asset, so the parser must order files chronologically itself --
+        # otherwise a rotated soak reports conservation INDETERMINATE forever
+        # while the sweep still exits 0 (green), and a wipe+rotation can even
+        # read as a false breach (archived deposits counted, balances wiped).
+        oldest = self._log(
+            "bot 1: deposited 15.00000000 of asset 0 (had 0, target 15.00000000)\n")
+        newest = self._log(
+            "bot 1: deposited 5.00000000 of asset 0 (had 15.00000000, target 20.00000000)\n")
+        # mtime is the chronological source; pin it so the test is deterministic.
+        os.utime(oldest, (1_700_000_000, 1_700_000_000))
+        os.utime(newest, (1_700_000_100, 1_700_000_100))
+        # Pass newest first -- the order a sorted glob yields.
+        deposits, _, genesis, meta = parse_ledger_log([newest, oldest])
+        self.assertEqual(deposits, {0: 20 * SCALE})
+        self.assertTrue(genesis)
+        self.assertEqual(meta["files"], [oldest, newest])
+
 
 class ArgParsing(unittest.TestCase):
     def test_user_ranges_and_singles(self):

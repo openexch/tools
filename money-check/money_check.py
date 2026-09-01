@@ -278,9 +278,15 @@ def parse_ledger_log(paths):
     first_had = {}
     lines_seen = 0
     files_used = []
-    for path in paths:
-        if not os.path.exists(path):
-            continue
+    # Consume the logs oldest first: genesis coverage keys on the FIRST deposit
+    # line per asset, so rotated logs must be read chronologically. Sorting the
+    # paths alphabetically is newest-first under the usual "sim.log, sim.log.1,
+    # ..." rotation names (the live file sorts ahead of its archives, and
+    # "sim.log.10" before "sim.log.2"); modification time is naming-scheme
+    # independent.
+    existing = [p for p in paths if os.path.exists(p)]
+    existing.sort(key=os.path.getmtime)
+    for path in existing:
         files_used.append(path)
         with open(path, "r", errors="replace") as fh:
             for ln in fh:
