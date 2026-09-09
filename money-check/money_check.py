@@ -263,6 +263,30 @@ DEPOSIT_RE = re.compile(
     r"deposited\s+(-?\d+(?:\.\d+)?)\s+of\s+asset\s+(\d+)\s+\(had\s+(-?\d+(?:\.\d+)?)")
 WITHDRAW_RE = re.compile(
     r"(?:withdrew|withdrawn)\s+(-?\d+(?:\.\d+)?)\s+of\s+asset\s+(\d+)")
+ROTATION_SUFFIX_RE = re.compile(r"\.(\d+)$")
+TIMESTAMP_ROTATION_SUFFIX_RE = re.compile(r"\.(\d{8}-\d{6})$")
+
+
+def _chronological_key(path):
+    """Oldest-first sort key for rotated logs: mtime, then rotation index.
+
+    mtimes can tie (coarse filesystem granularity, rapid successive
+    rotations), and the caller hands over a lexicographically sorted glob,
+    so a stable sort on mtime alone would silently keep that newest-first
+    order. Larger ".N" suffixes are older archives, so they sort before
+    smaller ones and before the live file (no suffix). The path itself is
+    only a final tie-break to keep the ordering total and independent of
+    input order.
+    """
+    timestamp = TIMESTAMP_ROTATION_SUFFIX_RE.search(path)
+    if timestamp:
+        return (os.path.getmtime(path), 0, timestamp.group(1), path)
+
+    numeric = ROTATION_SUFFIX_RE.search(path)
+    if numeric:
+        return (os.path.getmtime(path), 1, -int(numeric.group(1)), path)
+
+    return (os.path.getmtime(path), 2, 0, path)
 
 
 def parse_ledger_log(paths):
@@ -278,9 +302,15 @@ def parse_ledger_log(paths):
     first_had = {}
     lines_seen = 0
     files_used = []
-    for path in paths:
-        if not os.path.exists(path):
-            continue
+    # Consume the logs oldest first: genesis coverage keys on the FIRST deposit
+    # line per asset, so rotated logs must be read chronologically. Sorting the
+    # paths alphabetically is newest-first under the usual "sim.log, sim.log.1,
+    # ..." rotation names (the live file sorts ahead of its archives, and
+    # "sim.log.10" before "sim.log.2"); modification time is naming-scheme
+    # independent, with the rotation index as a deterministic tie-break.
+    existing = [p for p in paths if os.path.exists(p)]
+    existing.sort(key=_chronological_key)
+    for path in existing:
         files_used.append(path)
         with open(path, "r", errors="replace") as fh:
             for ln in fh:

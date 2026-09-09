@@ -15,6 +15,7 @@ subtracted from an apparent conservation breach (2026-08-03), and the fixed-poin
 arithmetic that must never go through a float.
 """
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -298,6 +299,81 @@ class LedgerLog(unittest.TestCase):
         deposits, _, _, meta = parse_ledger_log([path])
         self.assertEqual(deposits, {0: SCALE})
         self.assertEqual(meta["lines"], 2)
+
+    def test_rotated_logs_are_read_oldest_first(self):
+        # A glob like --sim-log "sim.log*" sorts the LIVE file ahead of its
+        # archives ("sim.log" < "sim.log.1", and "sim.log.10" < "sim.log.2"),
+        # i.e. newest first. Genesis coverage keys on the FIRST deposit line
+        # per asset, so the parser must order files chronologically itself --
+        # otherwise a rotated soak reports conservation INDETERMINATE forever
+        # while the sweep still exits 0 (green), and a wipe+rotation can even
+        # read as a false breach (archived deposits counted, balances wiped).
+        oldest = self._log(
+            "bot 1: deposited 15.00000000 of asset 0 (had 0, target 15.00000000)\n")
+        newest = self._log(
+            "bot 1: deposited 5.00000000 of asset 0 (had 15.00000000, target 20.00000000)\n")
+        # mtime is the chronological source; pin it so the test is deterministic.
+        os.utime(oldest, (1_700_000_000, 1_700_000_000))
+        os.utime(newest, (1_700_000_100, 1_700_000_100))
+        # Pass newest first -- the order a sorted glob yields.
+        deposits, _, genesis, meta = parse_ledger_log([newest, oldest])
+        self.assertEqual(deposits, {0: 20 * SCALE})
+        self.assertTrue(genesis)
+        self.assertEqual(meta["files"], [oldest, newest])
+
+    def test_rotation_index_breaks_mtime_ties_oldest_first(self):
+        # mtimes can tie (coarse filesystem granularity, rapid successive
+        # rotations), and the caller passes a lexicographically sorted glob --
+        # a stable sort on mtime alone would then keep that newest-first
+        # order. Ties must resolve by rotation index instead: larger ".N" is
+        # older, and the live file ("sim.log", no suffix) is newest.
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        paths = {}
+        for name, text in [
+            ("sim.log.10",
+             "bot 1: deposited 15.00000000 of asset 0 (had 0, target 15.00000000)\n"),
+            ("sim.log.2",
+             "bot 1: deposited 5.00000000 of asset 0 (had 15.00000000, target 20.00000000)\n"),
+            ("sim.log",
+             "bot 1: deposited 1.00000000 of asset 0 (had 20.00000000, target 21.00000000)\n"),
+        ]:
+            p = os.path.join(d, name)
+            with open(p, "w") as fh:
+                fh.write(text)
+            paths[name] = p
+        for p in paths.values():
+            os.utime(p, (1_700_000_000, 1_700_000_000))  # identical mtimes
+        # Lexicographic order, as handed over by sorted(glob.glob(...)).
+        deposits, _, genesis, meta = parse_ledger_log(sorted(paths.values()))
+        self.assertEqual(meta["files"],
+                         [paths["sim.log.10"], paths["sim.log.2"], paths["sim.log"]])
+        self.assertEqual(deposits, {0: 21 * SCALE})
+        self.assertTrue(genesis)
+
+    def test_admin_timestamp_archives_with_equal_mtimes(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        paths = {}
+        for name, amount, had in [
+            ("sim.log.20260908-120000", 15, 0),
+            ("sim.log.20260908-130000", 5, 15),
+            ("sim.log", 1, 20),
+        ]:
+            path = os.path.join(d, name)
+            with open(path, "w") as fh:
+                fh.write(f"bot 1: deposited {amount}.00000000 of asset 0 (had {had}.00000000, target 21.00000000)\n")
+            os.utime(path, (1_700_000_000, 1_700_000_000))
+            paths[name] = path
+
+        deposits, _, genesis, meta = parse_ledger_log(sorted(paths.values()))
+        self.assertEqual(meta["files"], [
+            paths["sim.log.20260908-120000"],
+            paths["sim.log.20260908-130000"],
+            paths["sim.log"],
+        ])
+        self.assertEqual(deposits, {0: 21 * SCALE})
+        self.assertTrue(genesis)
 
 
 class ArgParsing(unittest.TestCase):
