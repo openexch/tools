@@ -264,6 +264,7 @@ DEPOSIT_RE = re.compile(
 WITHDRAW_RE = re.compile(
     r"(?:withdrew|withdrawn)\s+(-?\d+(?:\.\d+)?)\s+of\s+asset\s+(\d+)")
 ROTATION_SUFFIX_RE = re.compile(r"\.(\d+)$")
+TIMESTAMP_ROTATION_SUFFIX_RE = re.compile(r"\.(\d{8}-\d{6})$")
 
 
 def _chronological_key(path):
@@ -277,9 +278,15 @@ def _chronological_key(path):
     only a final tie-break to keep the ordering total and independent of
     input order.
     """
-    m = ROTATION_SUFFIX_RE.search(path)
-    rot = int(m.group(1)) if m else -1
-    return (os.path.getmtime(path), -rot, path)
+    timestamp = TIMESTAMP_ROTATION_SUFFIX_RE.search(path)
+    if timestamp:
+        return (os.path.getmtime(path), 0, timestamp.group(1), path)
+
+    numeric = ROTATION_SUFFIX_RE.search(path)
+    if numeric:
+        return (os.path.getmtime(path), 1, -int(numeric.group(1)), path)
+
+    return (os.path.getmtime(path), 2, 0, path)
 
 
 def parse_ledger_log(paths):

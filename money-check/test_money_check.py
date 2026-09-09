@@ -351,6 +351,30 @@ class LedgerLog(unittest.TestCase):
         self.assertEqual(deposits, {0: 21 * SCALE})
         self.assertTrue(genesis)
 
+    def test_admin_timestamp_archives_with_equal_mtimes(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        paths = {}
+        for name, amount, had in [
+            ("sim.log.20260908-120000", 15, 0),
+            ("sim.log.20260908-130000", 5, 15),
+            ("sim.log", 1, 20),
+        ]:
+            path = os.path.join(d, name)
+            with open(path, "w") as fh:
+                fh.write(f"bot 1: deposited {amount}.00000000 of asset 0 (had {had}.00000000, target 21.00000000)\n")
+            os.utime(path, (1_700_000_000, 1_700_000_000))
+            paths[name] = path
+
+        deposits, _, genesis, meta = parse_ledger_log(sorted(paths.values()))
+        self.assertEqual(meta["files"], [
+            paths["sim.log.20260908-120000"],
+            paths["sim.log.20260908-130000"],
+            paths["sim.log"],
+        ])
+        self.assertEqual(deposits, {0: 21 * SCALE})
+        self.assertTrue(genesis)
+
 
 class ArgParsing(unittest.TestCase):
     def test_user_ranges_and_singles(self):
