@@ -32,6 +32,9 @@ class Fixture:
         validate_manifest(self.m, self.manifest_path)
         if self.m.get('ports') != PORT_PROFILE:
             raise Inconclusive('explicit port profile does not match this frozen gateway fixture')
+        for role, cpu in self.m['limits'].get('cpu_quota_by_role', {}).items():
+            if role not in self.m['nodes'] or type(cpu) not in (int, float) or not 0 < cpu <= len(self.m['cpu_set']):
+                raise Violation('invalid bounded fixture CPU quota')
         self.root = Path(self.m['state_root'])
         self.run_id = self.m['run_id']
         self.gateway = str(ipaddress.ip_network(self.m['network']['subnet']).network_address + 1)
@@ -162,7 +165,7 @@ class Fixture:
                 '--user',f'{os.getuid()}:{os.getgid()}', '--workdir','/data','--read-only',
                 '--cap-drop','ALL','--security-opt','no-new-privileges','--pids-limit','256',
                 '--memory',str(limits['memory_mb']) + 'm','--memory-swap',str(limits['memory_mb']) + 'm',
-                '--cpuset-cpus',','.join(map(str,self.m['cpu_set'])),'--cpus','1',
+                '--cpuset-cpus',','.join(map(str,self.m['cpu_set'])),'--cpus',str(limits.get('cpu_quota_by_role', {}).get(name, 1)),
                 '--shm-size',str(limits['shm_mb']) + 'm','--tmpfs','/tmp:rw,nosuid,size=128m',
                 '--log-opt','max-size=32m','--log-opt','max-file=3',
                 '--mount',f'type=bind,src={state},dst=/data',

@@ -42,8 +42,10 @@ public final class BenchmarkProbe {
         int warmup = config.required("warmup_seconds").asInt();
         int seconds = config.required("measurement_seconds").asInt();
         int users = config.required("user_count").asInt();
+        int maxInflight = config.required("max_inflight").asInt();
         if (rate < 1 || rate > 2000 || warmup < 0 || warmup > 60 || seconds < 1 || seconds > 120
-                || users < 2 || users > 1000 || users % 2 != 0) throw new IllegalArgumentException("unbounded workload");
+                || users < 2 || users > 1000 || users % 2 != 0 || maxInflight < 1 || maxInflight > 4096)
+            throw new IllegalArgumentException("unbounded workload");
         String run = config.required("run_id").asText();
         String baseUrl = config.required("oms_url").asText();
         Path output = Path.of("/data/benchmark"); Files.createDirectory(output);
@@ -55,7 +57,7 @@ public final class BenchmarkProbe {
         var settlements = new AtomicInteger(); var httpErrors = new AtomicInteger();
         var loadMisses = new AtomicInteger(); var observerStop = new AtomicBoolean();
         var observerError = new AtomicReference<Throwable>();
-        var done = new CountDownLatch(total); var slots = new Semaphore(256);
+        var done = new CountDownLatch(total); var slots = new Semaphore(maxInflight);
         long start = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
         event(Map.of("event", "window", "start_ns", start, "warmup_seconds", warmup,
                      "measurement_seconds", seconds, "rate", rate, "total_scheduled", total));

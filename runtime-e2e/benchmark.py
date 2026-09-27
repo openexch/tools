@@ -6,9 +6,10 @@ import time
 from contracts import FP, Inconclusive, Violation
 from fixture import JAVA
 from faults import probe, counter
-from metrics import evaluate
-from observe import verify_genesis, stable_sample, sql_rows
+from metrics import evaluate, percentile
+from observe import verify_genesis, stable_sample, sql_rows, collect
 from scenarios import request, money, order_id
+from resources import Resources
 
 
 def benchmark(fixture, profile='normal', preflight=False):
@@ -34,14 +35,17 @@ def benchmark(fixture, profile='normal', preflight=False):
     config = {'run_id': fixture.run_id, 'rate': 20 if preflight else budget[profile + '_offered_orders_per_s'],
               'warmup_seconds': 2 if preflight else budget['warmup_seconds'],
               'measurement_seconds': 5 if preflight else budget['measurement_seconds'], 'user_count': 100,
+              'max_inflight':fixture.m['measurement_contract']['max_inflight'],
               'oms_url': f'http://{fixture.m["nodes"]["oms"]}:18080',
               'oms_jdbc': f'jdbc:postgresql://{fixture.gateway}:{fixture.pg_port}/r01_oms',
               'money_jdbc': f'jdbc:postgresql://{fixture.gateway}:{fixture.pg_port}/r01_money'}
     (fixture.root / 'benchmark-profile.json').write_text(json.dumps({'config':config, 'faults':faults,
         'preflight_only':preflight, 'scope':'single-host normal/N-1 steady load; no host-loss/failover-time claim'}, indent=2) + '\n')
-    child = fixture.execute('probe', JAVA + ['-cp', '/artifacts/oms.jar:/artifacts/benchmark-probe.jar',
-                            'BenchmarkProbe'], input=json.dumps(config), timeout=240)
+    with Resources(fixture):
+        child = fixture.execute('probe', JAVA + ['-cp', '/artifacts/oms.jar:/artifacts/benchmark-probe.jar',
+                                'BenchmarkProbe'], input=json.dumps(config), timeout=240)
     summary = json.loads(child.stdout)
+    (fixture.root / 'benchmark-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     events_path = fixture.root / 'state/probe/benchmark/events.jsonl'
     events = [json.loads(line) for line in events_path.read_text().splitlines()]
     accepted = []
@@ -63,10 +67,25 @@ def benchmark(fixture, profile='normal', preflight=False):
             (SELECT count(DISTINCT trade_id) FROM executions) AS trades''')[0]
         if rows == counts_before and rows['orders'] == len(accepted) and rows['pending'] == 0: break
         counts_before = rows; time.sleep(.5)
-    else: raise Inconclusive('benchmark backlog did not drain within declared budget')
+    else:
+        # Retain actual financial and latency observations even when the gate fails. A timeout
+        # must never discard the evidence or silently turn unfinished accepted work into zero work.
+        partial = collect(fixture)
+        (fixture.root / 'backlog-timeout-observation.json').write_text(json.dumps(partial, indent=2) + '\n')
+        lag = [(e['started_ns'] - e['intended_ns']) / 1_000_000 for e in events if e['event'] == 'intent']
+        notes = {'status':'FAIL', 'reason':'accepted-work backlog did not drain within declared budget',
+                 'durable_counts_at_deadline':rows, 'accepted_count':len(accepted),
+                 'generator_misses':summary['generator_misses'], 'generator_p99_lateness_ms_all_phases':percentile(lag,.99),
+                 'money_oracle':'INCONCLUSIVE_PENDING_WORK_NO_STABLE_BARRIER'}
+        try: notes['partial_quality'] = evaluate(events, partial['state'], budget, profile)
+        except (Violation, Inconclusive) as error: notes['partial_quality_error'] = str(error)
+        if summary['generator_misses'] or percentile(lag,.99) > budget['generator_p99_lateness_ms']:
+            notes['status'] = 'INCONCLUSIVE'
+        (fixture.root / 'quality-result.json').write_text(json.dumps(notes, indent=2) + '\n')
+        if notes['status'] == 'FAIL': raise Violation(notes['reason'])
+        raise Inconclusive('benchmark backlog and load-generator measurement bounds both failed')
     sample, exact = stable_sample(fixture, initial, funding, accepted, rows['trades'],
                                  timeout=budget['backlog_drain_seconds'])
-    (fixture.root / 'benchmark-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     if preflight:
         required = {'intent','http','durable','settled','window'}
         if not required.issubset({e['event'] for e in events}) or summary['accepted'] != 140 or summary['durable_observed'] != 140:
