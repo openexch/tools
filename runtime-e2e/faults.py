@@ -42,10 +42,12 @@ except urllib.error.HTTPError as e:print(json.dumps({'status':e.code,'body':e.re
     return json.loads(fixture.execute(node, ['python3', '-c', code]).stdout)
 
 
-def false_ready(fixture):
+def false_ready(fixture, engine='me'):
+    if engine not in {'me', 'ae'}:
+        raise Violation('false-ready target must be a fixture engine')
     baseline = critical_path_smoke(fixture)
     sample = json.loads((fixture.root / 'money-sample.json').read_text())
-    before = {name: probe(fixture, name) for name in ['me0', 'me1', 'me2']}
+    before = {name: probe(fixture, name) for name in [engine + str(i) for i in range(3)]}
     leaders = [name for name, obs in before.items() if counter(obs, 201) == 2]
     followers = [name for name, obs in before.items() if counter(obs, 201) == 0]
     if len(leaders) != 1 or len(followers) != 2:
@@ -57,7 +59,7 @@ def false_ready(fixture):
         raise Inconclusive('fault target was not running and connected')
     evidence = {'target': target, 'leader': leader, 'before_counters': before,
                 'baseline_money': baseline['money'], 'samples': [], 'reconnected': False}
-    path = fixture.root / 'false-ready.json'
+    path = fixture.root / ('false-ready.json' if engine == 'me' else 'false-ready-ae.json')
     def save(): path.write_text(json.dumps(evidence, indent=2) + '\n')
     try:
         fixture.command(['docker', 'network', 'disconnect', network, cid])

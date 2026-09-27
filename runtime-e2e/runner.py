@@ -48,7 +48,7 @@ def main():
         elif args.scenario == 'baseline-fault-reproduction':
             from aggregate import baseline_fault_reproduction
             result.update(baseline_fault_reproduction(manifest, args.manifest, args.output))
-        elif args.scenario in {'critical-path-smoke', 'false-ready', 'pruner-exception', 'offline-purge-rejoin',
+        elif args.scenario in {'critical-path-smoke', 'false-ready', 'false-ready-ae', 'pruner-exception', 'offline-purge-rejoin',
                               'benchmark-preflight', 'benchmark-normal', 'benchmark-n-minus-one'}:
             fixture = Fixture(args.manifest)
             result['state_root'] = str(fixture.root)
@@ -62,7 +62,8 @@ def main():
             else:
                 from faults import false_ready, pruner_exception, offline_purge
                 if args.scenario == 'pruner-exception': critical_path_smoke(fixture)
-                result.update({'false-ready': false_ready, 'pruner-exception': pruner_exception,
+                result.update({'false-ready': false_ready, 'false-ready-ae': lambda f: false_ready(f, 'ae'),
+                               'pruner-exception': pruner_exception,
                                'offline-purge-rejoin': offline_purge}[args.scenario](fixture))
         else:
             raise Inconclusive('scenario is not implemented and cannot pass: ' + args.scenario)
@@ -75,7 +76,8 @@ def main():
         result.update(status='INCONCLUSIVE', error=str(error), traceback=traceback.format_exc())
     finally:
         if fixture:
-            fault_name = {'false-ready': 'false-ready.json', 'pruner-exception': 'pruner-exception.json',
+            fault_name = {'false-ready': 'false-ready.json', 'false-ready-ae': 'false-ready-ae.json',
+                          'pruner-exception': 'pruner-exception.json',
                           'offline-purge-rejoin': 'offline-purge.json'}.get(args.scenario)
             if fault_name and (fixture.root / fault_name).is_file():
                 witness = json.loads((fixture.root / fault_name).read_text())
