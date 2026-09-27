@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Read exact fixture evidence. No tolerance, schema guessing or missing-data defaults."""
 import json
+import re
 import time
 
 from contracts import Inconclusive, Violation, fingerprint, reconcile
@@ -65,6 +66,26 @@ def verify_genesis(fixture, users):
     return [{'user': u, 'asset': a, 'total': 0} for u in users for a in (0, 1)]
 
 
+def request_intents(path):
+    specs = []
+    def fixed(value):
+        if type(value) is not str or not re.fullmatch(r'[0-9]+\.[0-9]{8}', value):
+            raise Inconclusive('request price/quantity is not the declared exact decimal format')
+        return int(value.replace('.', ''))
+    for line in path.read_text().splitlines():
+        req = json.loads(line)
+        if req['method'] != 'POST' or req['path'] != '/api/v1/orders': continue
+        reply = json.loads(req['response'].get('body', '{}'))
+        if reply.get('accepted') is not True: continue
+        value = reply['omsOrderId']
+        if not (type(value) is int or type(value) is str and re.fullmatch(r'[1-9][0-9]*', value)):
+            raise Inconclusive('invalid accepted request identity')
+        body = req['request']
+        specs.append({'id': int(value), 'user': req['user'], 'market': body['marketId'],
+                      'side': body['side'], 'price': fixed(body['price']), 'quantity': fixed(body['quantity'])})
+    return specs
+
+
 def stable_sample(fixture, initial, funding, accepted, expected_trades, timeout=30):
     deadline = time.monotonic() + timeout
     previous = None
@@ -81,8 +102,10 @@ def stable_sample(fixture, initial, funding, accepted, expected_trades, timeout=
                 and len(state['journal']) == len(funding) + expected_trades):
             if current['observation']['last_trade'] != max(e['trade'] for e in state['executions']):
                 raise Inconclusive('AE has not applied the last committed trade')
+            specs = request_intents(fixture.root / 'requests.jsonl')
             sample = {**state, 'initial_balances': initial, 'initial_snapshot_verified': True,
                       'funding': funding, 'accepted_order_ids': accepted, 'journal_first_seq': 1,
+                      'accepted_order_specs': specs,
                       'markets': {'1': {'base': 1, 'quote': 0}},
                       'barrier': {'input_closed': True, 'pending_orders': 0,
                                   'samples': [previous['observation'], current['observation']]}}

@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import signal
+import shutil
 import sys
 import time
 import traceback
@@ -35,23 +36,53 @@ def main():
         (args.output / 'manifest.json').write_bytes(args.manifest.read_bytes())
         result['harness_sources'] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                                      for p in sorted(Path(__file__).parent.glob('*.py'))}
+        sources = args.output / 'harness-source'; sources.mkdir()
+        for source in Path(__file__).parent.iterdir():
+            if source.is_file() and source.suffix in {'.py', '.sh', '.md'}:
+                shutil.copyfile(source, sources / source.name)
+        if (Path(__file__).parent / 'java').is_dir():
+            shutil.copytree(Path(__file__).parent / 'java', sources / 'java')
         if args.scenario == 'harness-negative-controls':
             from negative_controls import run
             result.update(run(args.output, manifest, args.manifest))
-        elif args.scenario == 'critical-path-smoke':
+        elif args.scenario == 'baseline-fault-reproduction':
+            from aggregate import baseline_fault_reproduction
+            result.update(baseline_fault_reproduction(manifest, args.manifest, args.output))
+        elif args.scenario in {'critical-path-smoke', 'false-ready', 'pruner-exception', 'offline-purge-rejoin',
+                              'benchmark-preflight', 'benchmark-normal', 'benchmark-n-minus-one'}:
             fixture = Fixture(args.manifest)
             result['state_root'] = str(fixture.root)
             fixture.start()
-            result.update(critical_path_smoke(fixture))
+            if args.scenario == 'critical-path-smoke':
+                result.update(critical_path_smoke(fixture))
+            elif args.scenario.startswith('benchmark-'):
+                from benchmark import benchmark
+                result.update(benchmark(fixture, 'n_minus_one' if args.scenario == 'benchmark-n-minus-one' else 'normal',
+                                        preflight=args.scenario == 'benchmark-preflight'))
+            else:
+                from faults import false_ready, pruner_exception, offline_purge
+                if args.scenario == 'pruner-exception': critical_path_smoke(fixture)
+                result.update({'false-ready': false_ready, 'pruner-exception': pruner_exception,
+                               'offline-purge-rejoin': offline_purge}[args.scenario](fixture))
         else:
             raise Inconclusive('scenario is not implemented and cannot pass: ' + args.scenario)
-        check_result(result)
+        if result['status'] == 'PASS': check_result(result)
+        elif result['status'] not in {'FAIL', 'INCONCLUSIVE'}:
+            raise Inconclusive('unsupported scenario decision: ' + str(result['status']))
     except Violation as error:
         result.update(status='FAIL', error=str(error), traceback=traceback.format_exc())
     except Exception as error:
         result.update(status='INCONCLUSIVE', error=str(error), traceback=traceback.format_exc())
     finally:
         if fixture:
+            fault_name = {'false-ready': 'false-ready.json', 'pruner-exception': 'pruner-exception.json',
+                          'offline-purge-rejoin': 'offline-purge.json'}.get(args.scenario)
+            if fault_name and (fixture.root / fault_name).is_file():
+                witness = json.loads((fixture.root / fault_name).read_text())
+                (args.output / fault_name).write_text(json.dumps(witness, indent=2) + '\n')
+                result['fault_evidence'] = str(args.output / fault_name)
+                result['known_product_red'] = witness.get('known_product_red', False)
+                result['observed_money'] = witness.get('after_fault_money', witness.get('baseline_money'))
             try:
                 fixture.close()
                 result['teardown'] = 'COMPLETE_OWNED_RESOURCES_ONLY'

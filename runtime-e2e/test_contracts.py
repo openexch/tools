@@ -25,6 +25,9 @@ def money_sample():
                      'market': 1, 'price': 10 * FP, 'quantity': FP}],
         'markets': {'1': {'base': 1, 'quote': 0}},
         'accepted_order_ids': [11, 12],
+        'accepted_order_specs': [
+            {'id': 11, 'user': 1, 'market': 1, 'side': 'BUY', 'price': 10 * FP, 'quantity': FP},
+            {'id': 12, 'user': 2, 'market': 1, 'side': 'SELL', 'price': 10 * FP, 'quantity': FP}],
         'orders': [{'id': 11, 'user': 1, 'market': 1, 'side': 'BUY', 'status': 'FILLED',
                     'price': 10 * FP, 'quantity': FP, 'filled': FP},
                    {'id': 12, 'user': 2, 'market': 1, 'side': 'SELL', 'status': 'FILLED',
@@ -55,6 +58,10 @@ def observe(sample):
 
 
 class MoneyContractTest(unittest.TestCase):
+    def test_submitted_order_price_cannot_silently_change_while_money_balances(self):
+        sample = money_sample(); sample['orders'][0]['price'] = 9 * FP
+        with self.assertRaises(Violation): reconcile(observe(sample))
+
     def test_exact_trade_has_expected_nonzero_counts(self):
         result = reconcile(money_sample())
         self.assertEqual(result, {'orders': 2, 'trades': 1, 'funding_events': 2, 'journal_rows': 3})

@@ -90,6 +90,14 @@ def validate_manifest(manifest, manifest_path):
                 digest = hashlib.file_digest(stream, 'sha256').hexdigest()
             if digest != artifact['sha256']:
                 raise Violation('artifact digest mismatch: ' + role)
+        for helper in [manifest.get('test_helper'), manifest.get('benchmark_helper')]:
+            if helper is None: continue
+            for path_key, digest_key in [('path', 'sha256'), ('source_path', 'source_sha256')]:
+                file = Path(helper[path_key])
+                if not file.is_absolute() or file.is_symlink() or not file.is_file():
+                    raise Inconclusive('missing test probe input: ' + path_key)
+                if hashlib.sha256(file.read_bytes()).hexdigest() != helper[digest_key]:
+                    raise Violation('test probe input changed: ' + path_key)
     except (KeyError, TypeError, ValueError) as error:
         if isinstance(error, (Violation, Inconclusive)):
             raise
@@ -98,7 +106,7 @@ def validate_manifest(manifest, manifest_path):
 
 def reconcile(sample):
     required = ['initial_balances','funding','journal','journal_first_seq','markets',
-                'accepted_order_ids','orders','executions','balances','holds','barrier']
+                'accepted_order_ids','accepted_order_specs','orders','executions','balances','holds','barrier']
     if any(field not in sample for field in required) or sample.get('initial_snapshot_verified') is not True:
         raise Inconclusive('genesis or required observation is missing')
     if not sample['accepted_order_ids'] or not sample['executions']:
@@ -161,6 +169,12 @@ def reconcile(sample):
     accepted = [integer(value) for value in sample['accepted_order_ids']]
     if len(orders) != len(sample['orders']) or len(set(accepted)) != len(accepted) or set(accepted) != set(orders):
         raise Violation('accepted orders missing, duplicated or unexpected')
+    specs = {integer(row['id']): row for row in sample['accepted_order_specs']}
+    if len(specs) != len(sample['accepted_order_specs']) or set(specs) != set(accepted):
+        raise Inconclusive('submitted order identity/intent evidence is incomplete')
+    for oid, expected in specs.items():
+        if any(orders[oid][key] != expected[key] for key in ['user', 'market', 'side', 'price', 'quantity']):
+            raise Violation('committed order differs from accepted request intent')
     fills = defaultdict(int)
     trade_rows = defaultdict(list)
     for execution in sample['executions']:

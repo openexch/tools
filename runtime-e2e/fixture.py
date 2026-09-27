@@ -144,6 +144,12 @@ class Fixture:
             path = dest / (role + '.jar'); shutil.copyfile(artifact['path'], path)
             if hashlib.sha256(path.read_bytes()).hexdigest() != artifact['sha256']:
                 raise Violation('artifact changed while staging')
+        for key, filename in [('test_helper', 'fixture-probe.jar'), ('benchmark_helper', 'benchmark-probe.jar')]:
+            if not self.m.get(key): continue
+            helper = self.m[key]; path = dest / filename
+            shutil.copyfile(helper['path'], path)
+            if hashlib.sha256(path.read_bytes()).hexdigest() != helper['sha256']:
+                raise Violation('test probe changed while staging')
 
     def spawn(self, name, command, environment=None):
         if name not in self.m['nodes'] or name in self.registry['containers']:
@@ -218,6 +224,7 @@ except Exception as e:print(json.dumps({'status':0,'error':str(e)}))
         self.spawn('probe',['sleep','infinity'])
         common = {'CLUSTER_PORT_STRIDE':'100','BASE_DIR':'/data/state','TRANSPORT_DRIVER_MODE':'embedded',
                   'TRANSPORT_IDLE_MODE':'backoff','TRANSPORT_TERM_LENGTH':'1m','TRANSPORT_LOG_TERM_LENGTH':'1m',
+                  'TRANSPORT_SNAPSHOT_TERM_LENGTH':'1m',
                   'MATCH_ENGINE_BOOK_CAPACITY':'4096','SNAPSHOT_LOG_BYTES':'1073741824','SNAPSHOT_INTERVAL_MINUTES':'5'}
         for engine, port in [('ae',19300),('me',9000)]:
             addresses = ','.join(self.m['nodes'][engine + str(i)] for i in range(3))
