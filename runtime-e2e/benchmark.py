@@ -25,6 +25,8 @@ def benchmark(fixture, profile='normal', preflight=False):
         if response.get('success') is not True: raise Inconclusive('benchmark funding failed')
         funding.append({'kind': 'deposit', 'user': user, 'asset': asset, 'amount': amount})
     faults = []
+    (fixture.root / 'benchmark-financial-inputs.json').write_text(json.dumps(
+        {'initial_balances':initial,'funding':funding,'initial_snapshot_verified':True}, indent=2) + '\n')
     if profile == 'n_minus_one':
         for engine in ['me', 'ae']:
             before = {engine + str(i): probe(fixture, engine + str(i)) for i in range(3)}

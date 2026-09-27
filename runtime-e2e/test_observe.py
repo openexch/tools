@@ -3,12 +3,43 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 
-from contracts import Violation
-from observe import request_outcomes
+from contracts import Violation, Inconclusive
+from observe import request_outcomes, stable_sample
+from test_contracts import money_sample, observe as bind_observations
 
 
 class RequestOutcomeTest(unittest.TestCase):
+    def test_stable_journal_divergence_is_failure_after_deadline_not_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); sample = money_sample()
+            sample['journal'].append(dict(sample['journal'][-1],seq=3,trade=8))
+            for entry in sample['journal']: entry['seq'] += 1
+            for row in sample['barrier']['samples']:
+                row.update(journal_seq=4,last_trade=8)
+            requests = []
+            for order in sample['orders']:
+                order['client'] = 'request-' + str(order['id'])
+                requests.append({'method':'POST','path':'/api/v1/orders','user':order['user'],
+                    'request':{'clientOrderId':order['client'],'marketId':1,'side':order['side'],
+                               'price':'10.00000000','quantity':'1.00000000'},
+                    'response':{'status':201,'body':json.dumps({'accepted':True,'omsOrderId':str(order['id'])})}})
+            (root/'requests.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in requests))
+            bind_observations(sample)
+            state = {k:sample[k] for k in ['orders','executions','journal','balances','holds']}
+            captured = {'state':state,'observation':sample['barrier']['samples'][0]}
+            with patch('observe.collect',return_value=captured), patch('observe.time.sleep'), \
+                    patch('observe.time.monotonic',side_effect=[0,0,1,3]):
+                with self.assertRaisesRegex(Violation,'committed executions and applied settlements differ'):
+                    stable_sample(SimpleNamespace(root=root),sample['initial_balances'],sample['funding'],[11,12],1,timeout=2)
+            changing = dict(captured, observation=dict(captured['observation'],ae_position=641))
+            with patch('observe.collect',side_effect=[captured,changing]), patch('observe.time.sleep'), \
+                    patch('observe.time.monotonic',side_effect=[0,0,1,3]):
+                with self.assertRaises(Inconclusive):
+                    stable_sample(SimpleNamespace(root=root),sample['initial_balances'],sample['funding'],[11,12],1,timeout=2)
+
     def test_reject_and_lost_response_have_distinct_proven_identities(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'requests.jsonl'

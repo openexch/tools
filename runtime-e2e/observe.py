@@ -132,9 +132,34 @@ def request_cancellations(path):
     return ids
 
 
+def sample_from_stable_observations(fixture, initial, funding, accepted, first, second):
+    if first['observation'] != second['observation']:
+        raise Inconclusive('changing observations cannot establish financial correctness')
+    state = second['state']
+    pending = sum(o['status'] not in {'NEW','PARTIALLY_FILLED','FILLED','CANCELLED','CANCELED','REJECTED','EXPIRED'} for o in state['orders'])
+    if pending: raise Inconclusive('financial outcome still pending')
+    specs = request_intents(fixture.root / 'requests.jsonl')
+    outcomes = request_outcomes(fixture.root / 'requests.jsonl', state['orders'])
+    if outcomes['unobserved_ambiguous_requests']:
+        raise Inconclusive('HTTP response lost and no durable outcome observed')
+    sample = {**state, 'initial_balances': initial, 'initial_snapshot_verified': True,
+              'funding': funding, 'accepted_order_ids': accepted, 'journal_first_seq': 1,
+              'accepted_order_specs': specs, **outcomes,
+              'cancelled_order_ids': request_cancellations(fixture.root / 'requests.jsonl'),
+              'markets': {'1': {'base': 1, 'quote': 0}},
+              'barrier': {'input_closed': True, 'pending_orders': 0,
+                          'samples': [first['observation'], second['observation']]}}
+    (fixture.root / 'money-sample.json').write_text(json.dumps(sample, indent=2) + '\n')
+    exact = reconcile(sample)
+    if second['observation']['last_trade'] != max(e['trade'] for e in state['executions']):
+        raise Inconclusive('AE checkpoint differs from exact committed trade set')
+    return sample, exact
+
+
 def stable_sample(fixture, initial, funding, accepted, expected_trades, timeout=30):
     deadline = time.monotonic() + timeout
     previous = None
+    stable_pair = None
     observations = fixture.root / 'observations.jsonl'
     while time.monotonic() < deadline:
         current = collect(fixture)
@@ -142,25 +167,19 @@ def stable_sample(fixture, initial, funding, accepted, expected_trades, timeout=
             out.write(json.dumps(current) + '\n')
         state = current['state']
         pending = sum(o['status'] not in {'NEW','PARTIALLY_FILLED','FILLED','CANCELLED','CANCELED','REJECTED','EXPIRED'} for o in state['orders'])
-        if (previous and previous['observation'] == current['observation'] and not pending
+        stable_pair = (previous, current) if previous and previous['observation'] == current['observation'] and not pending else None
+        if (stable_pair
                 and set(accepted).issubset({o['id'] for o in state['orders']})
                 and len(state['executions']) == 2 * expected_trades
                 and len(state['journal']) == len(funding) + expected_trades):
-            if current['observation']['last_trade'] != max(e['trade'] for e in state['executions']):
-                raise Inconclusive('AE has not applied the last committed trade')
-            specs = request_intents(fixture.root / 'requests.jsonl')
-            outcomes = request_outcomes(fixture.root / 'requests.jsonl', state['orders'])
-            if outcomes['unobserved_ambiguous_requests']:
-                raise Inconclusive('HTTP response lost and no durable outcome observed')
-            sample = {**state, 'initial_balances': initial, 'initial_snapshot_verified': True,
-                      'funding': funding, 'accepted_order_ids': accepted, 'journal_first_seq': 1,
-                      'accepted_order_specs': specs, **outcomes,
-                      'cancelled_order_ids': request_cancellations(fixture.root / 'requests.jsonl'),
-                      'markets': {'1': {'base': 1, 'quote': 0}},
-                      'barrier': {'input_closed': True, 'pending_orders': 0,
-                                  'samples': [previous['observation'], current['observation']]}}
-            (fixture.root / 'money-sample.json').write_text(json.dumps(sample, indent=2) + '\n')
-            return sample, reconcile(sample)
+            return sample_from_stable_observations(fixture, initial, funding, accepted, *stable_pair)
         previous = current
         time.sleep(.5)
+    if stable_pair:
+        # A stable but WRONG terminal state is not missing data. Wait out the declared drain
+        # budget first, then let the exact oracle expose lost fills, extra money or wrong cancels.
+        sample, exact = sample_from_stable_observations(fixture, initial, funding, accepted, *stable_pair)
+        if exact['trades'] != expected_trades:
+            raise Violation('stable completed trade count differs from the declared workload')
+        return sample, exact
     raise Inconclusive('exact committed/settled work did not reach a stable observation barrier')
