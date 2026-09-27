@@ -52,12 +52,16 @@ def main():
             from aggregate import readiness_lag_election_idle
             result.update(readiness_lag_election_idle(manifest, args.manifest, args.output))
         elif args.scenario in {'critical-path-smoke', 'false-ready', 'false-ready-ae', 'pruner-exception', 'offline-purge-rejoin',
-                              'benchmark-preflight', 'benchmark-normal', 'benchmark-n-minus-one', 'readiness-me', 'readiness-ae'}:
+                              'benchmark-preflight', 'benchmark-normal', 'benchmark-n-minus-one', 'readiness-me', 'readiness-ae',
+                              'log-channel-me', 'log-channel-ae'}:
             fixture = Fixture(args.manifest)
             result['state_root'] = str(fixture.root)
             fixture.start()
             if args.scenario == 'critical-path-smoke':
                 result.update(critical_path_smoke(fixture))
+            elif args.scenario.startswith('log-channel-'):
+                from log_channel_fault import log_channel_lag
+                result.update(log_channel_lag(fixture, args.scenario[-2:]))
             elif args.scenario.startswith('readiness-'):
                 from readiness import readiness_scenario
                 result.update(readiness_scenario(fixture, args.scenario[-2:]))
@@ -83,6 +87,7 @@ def main():
     finally:
         if fixture:
             fault_name = {'false-ready': 'false-ready.json', 'false-ready-ae': 'false-ready-ae.json',
+                          'log-channel-me': 'log-channel-me.json', 'log-channel-ae': 'log-channel-ae.json',
                           'readiness-me': 'readiness-me.json', 'readiness-ae': 'readiness-ae.json',
                           'pruner-exception': 'pruner-exception.json',
                           'offline-purge-rejoin': 'offline-purge.json'}.get(args.scenario)
