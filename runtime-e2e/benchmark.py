@@ -65,7 +65,7 @@ def benchmark(fixture, profile='normal', preflight=False):
             (SELECT count(*) FROM orders) AS orders,
             (SELECT count(*) FROM orders WHERE status IN ('PENDING_NEW','PENDING_TRIGGER')) AS pending,
             (SELECT count(DISTINCT trade_id) FROM executions) AS trades''')[0]
-        if rows == counts_before and rows['orders'] == len(accepted) and rows['pending'] == 0: break
+        if rows == counts_before and rows['orders'] >= len(accepted) and rows['pending'] == 0: break
         counts_before = rows; time.sleep(.5)
     else:
         # Retain actual financial and latency observations even when the gate fails. A timeout

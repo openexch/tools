@@ -167,19 +167,29 @@ def reconcile(sample):
 
     orders = {integer(row['id']): row for row in sample['orders']}
     accepted = [integer(value) for value in sample['accepted_order_ids']]
-    if len(orders) != len(sample['orders']) or len(set(accepted)) != len(accepted) or set(accepted) != set(orders):
+    rejected = {integer(row['id']): row for row in sample.get('rejected_order_specs', [])}
+    uncertain = {integer(row['id']): row for row in sample.get('unacknowledged_order_specs', [])}
+    if (len(rejected) != len(sample.get('rejected_order_specs', []))
+            or len(uncertain) != len(sample.get('unacknowledged_order_specs', []))
+            or set(accepted) & (set(rejected) | set(uncertain)) or set(rejected) & set(uncertain)):
+        raise Violation('request outcome identities overlap or are duplicated')
+    if (len(orders) != len(sample['orders']) or len(set(accepted)) != len(accepted)
+            or set(accepted) | set(rejected) | set(uncertain) != set(orders)):
         raise Violation('accepted orders missing, duplicated or unexpected')
     specs = {integer(row['id']): row for row in sample['accepted_order_specs']}
     if len(specs) != len(sample['accepted_order_specs']) or set(specs) != set(accepted):
         raise Inconclusive('submitted order identity/intent evidence is incomplete')
-    for oid, expected in specs.items():
-        if any(orders[oid][key] != expected[key] for key in ['user', 'market', 'side', 'price', 'quantity']):
+    for oid, expected in (specs | rejected | uncertain).items():
+        keys = ['user', 'market', 'side', 'price', 'quantity'] + (['client'] if 'client' in expected else [])
+        if any(orders[oid].get(key) != expected[key] for key in keys):
             raise Violation('committed order differs from accepted request intent')
+        if oid in rejected and (orders[oid]['status'] != 'REJECTED' or orders[oid]['filled'] != 0):
+            raise Violation('explicitly rejected request acquired a financial effect')
     fills = defaultdict(int)
     trade_rows = defaultdict(list)
     for execution in sample['executions']:
         oid = integer(execution['order'])
-        if oid not in orders:
+        if oid not in orders or oid in rejected:
             raise Violation('execution without an accepted order')
         order = orders[oid]
         if any(execution[key] != order[key] for key in ['user','market','side']):

@@ -44,7 +44,7 @@ public final class BenchmarkProbe {
         int users = config.required("user_count").asInt();
         int maxInflight = config.required("max_inflight").asInt();
         if (rate < 1 || rate > 2000 || warmup < 0 || warmup > 60 || seconds < 1 || seconds > 120
-                || users < 2 || users > 1000 || users % 2 != 0 || maxInflight < 1 || maxInflight > 4096)
+                || users < 2 || users > 1000 || users % 2 != 0 || maxInflight < 1 || maxInflight > 8192)
             throw new IllegalArgumentException("unbounded workload");
         String run = config.required("run_id").asText();
         String baseUrl = config.required("oms_url").asText();
@@ -52,7 +52,7 @@ public final class BenchmarkProbe {
         Files.writeString(output.resolve("config.json"), JSON.writeValueAsString(config));
         events = Files.newBufferedWriter(output.resolve("events.jsonl"));
         int total = Math.multiplyExact(rate, warmup + seconds);
-        var pending = new ConcurrentHashMap<Long, Pending>();
+        var pending = new ConcurrentHashMap<String, Pending>();
         var accepted = new AtomicInteger(); var durable = new AtomicInteger();
         var settlements = new AtomicInteger(); var httpErrors = new AtomicInteger();
         var loadMisses = new AtomicInteger(); var observerStop = new AtomicBoolean();
@@ -68,10 +68,10 @@ public final class BenchmarkProbe {
                      "runtime_fixture", "synthetic-fixture-only")) {
                 long journalSeq = 0;
                 while (!observerStop.get()) {
-                    List<Long> ids = new ArrayList<>(pending.keySet());
+                    List<String> ids = new ArrayList<>(pending.keySet());
                     if (!ids.isEmpty()) {
-                        try (var statement = orders.prepareStatement("SELECT oms_order_id,status FROM orders WHERE oms_order_id=ANY(?) AND status NOT IN ('PENDING_NEW','PENDING_TRIGGER')")) {
-                            var array = orders.createArrayOf("int8", ids.toArray(Long[]::new));
+                        try (var statement = orders.prepareStatement("SELECT oms_order_id,status,client_order_id FROM orders WHERE client_order_id=ANY(?) AND status NOT IN ('PENDING_NEW','PENDING_TRIGGER')")) {
+                            var array = orders.createArrayOf("varchar", ids.toArray(String[]::new));
                             try {
                                 statement.setArray(1, array); statement.setQueryTimeout(5);
                                 try (var rows = statement.executeQuery()) {
@@ -79,12 +79,13 @@ public final class BenchmarkProbe {
                                     // upper bound. Polling delay is retained, never subtracted from latency.
                                     long observed = System.nanoTime();
                                     while (rows.next()) {
-                                        long id = rows.getLong(1); Pending p = pending.remove(id);
+                                        long id = rows.getLong(1); String clientId = rows.getString(3);
+                                        Pending p = pending.remove(clientId);
                                         if (p != null) {
                                             durable.incrementAndGet();
                                             event(Map.of("event", "durable", "order_id", id, "status", rows.getString(2),
                                                 "index", p.index(), "intended_ns", p.intendedNs(),
-                                                "started_ns", p.startedNs(), "observed_ns", observed));
+                                                "started_ns", p.startedNs(), "observed_ns", observed, "client_id", clientId));
                                         }
                                     }
                                 }
@@ -133,6 +134,9 @@ public final class BenchmarkProbe {
                 var request = HttpRequest.newBuilder(URI.create(baseUrl + "/api/v1/orders"))
                     .header("Authorization", "Bearer dev:" + user).header("Content-Type", "application/json")
                     .timeout(Duration.ofSeconds(10)).POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(body))).build();
+                String clientId = (String)body.get("clientOrderId");
+                if (pending.putIfAbsent(clientId, new Pending(index, intended, sentAt)) != null)
+                    throw new IllegalStateException("duplicate submitted client identity");
                 client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).whenComplete((response, error) -> {
                     try {
                         long observed = System.nanoTime();
@@ -143,9 +147,7 @@ public final class BenchmarkProbe {
                             "response", Map.of("status", status, "body", responseBody)));
                         JsonNode parsed = JSON.readTree(responseBody);
                         if ((status == 200 || status == 201) && parsed.path("accepted").asBoolean(false)) {
-                            long id = Long.parseLong(parsed.required("omsOrderId").asText());
-                            if (pending.putIfAbsent(id, new Pending(index, intended, sentAt)) != null)
-                                throw new IllegalStateException("duplicate accepted order ID");
+                            Long.parseLong(parsed.required("omsOrderId").asText());
                             accepted.incrementAndGet();
                         } else httpErrors.incrementAndGet();
                     } catch (Throwable failure) { observerError.compareAndSet(null, failure); }

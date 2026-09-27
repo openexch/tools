@@ -20,7 +20,7 @@ def sql_rows(fixture, database, query):
 
 def collect(fixture):
     # Each collection has a deterministic ordering. A later second full observation must agree.
-    orders = sql_rows(fixture, 'r01_oms', '''SELECT oms_order_id AS id, user_id AS "user",
+    orders = sql_rows(fixture, 'r01_oms', '''SELECT oms_order_id AS id, client_order_id AS client, user_id AS "user",
         market_id AS market, side, status, price, quantity, filled_qty AS filled
         FROM orders ORDER BY oms_order_id''')
     executions = sql_rows(fixture, 'r01_oms', '''SELECT trade_id AS trade, oms_order_id AS "order",
@@ -82,8 +82,42 @@ def request_intents(path):
             raise Inconclusive('invalid accepted request identity')
         body = req['request']
         specs.append({'id': int(value), 'user': req['user'], 'market': body['marketId'],
-                      'side': body['side'], 'price': fixed(body['price']), 'quantity': fixed(body['quantity'])})
+                      'client': body['clientOrderId'], 'side': body['side'],
+                      'price': fixed(body['price']), 'quantity': fixed(body['quantity'])})
     return specs
+
+
+def request_outcomes(path, orders):
+    """Bind non-acknowledged database rows to the actual HTTP request, never infer acceptance."""
+    by_client = {row['client']: row for row in orders}
+    if len(by_client) != len(orders): raise Violation('duplicate persisted client order identity')
+    rejected, uncertain, unseen = [], [], []
+    seen = set()
+    for line in path.read_text().splitlines():
+        req = json.loads(line)
+        if req['method'] != 'POST' or req['path'] != '/api/v1/orders': continue
+        body = req['request']; client = body['clientOrderId']
+        if client in seen: raise Violation('duplicate submitted client order identity')
+        seen.add(client)
+        status = req['response']['status']
+        reply = json.loads(req['response'].get('body', '{}'))
+        if status in (200, 201) and reply.get('accepted') is True: continue
+        definitive = 400 <= status < 500 and reply.get('accepted') is False
+        if not definitive and status != 0 and status < 500:
+            raise Inconclusive('unmodelled HTTP order outcome')
+        row = by_client.get(client)
+        if row is None:
+            if not definitive: unseen.append(client)
+            continue
+        def fixed(value):
+            if type(value) is not str or not re.fullmatch(r'[0-9]+\.[0-9]{8}', value):
+                raise Inconclusive('unmodelled request decimal')
+            return int(value.replace('.', ''))
+        spec = {'id': row['id'], 'client': client, 'user': req['user'], 'market': body['marketId'],
+                'side': body['side'], 'price': fixed(body['price']), 'quantity': fixed(body['quantity'])}
+        (rejected if definitive else uncertain).append(spec)
+    return {'rejected_order_specs': rejected, 'unacknowledged_order_specs': uncertain,
+            'unobserved_ambiguous_requests': unseen}
 
 
 def stable_sample(fixture, initial, funding, accepted, expected_trades, timeout=30):
@@ -97,15 +131,18 @@ def stable_sample(fixture, initial, funding, accepted, expected_trades, timeout=
         state = current['state']
         pending = sum(o['status'] not in {'NEW','PARTIALLY_FILLED','FILLED','CANCELLED','CANCELED','REJECTED','EXPIRED'} for o in state['orders'])
         if (previous and previous['observation'] == current['observation'] and not pending
-                and len(state['orders']) == len(accepted)
+                and set(accepted).issubset({o['id'] for o in state['orders']})
                 and len(state['executions']) == 2 * expected_trades
                 and len(state['journal']) == len(funding) + expected_trades):
             if current['observation']['last_trade'] != max(e['trade'] for e in state['executions']):
                 raise Inconclusive('AE has not applied the last committed trade')
             specs = request_intents(fixture.root / 'requests.jsonl')
+            outcomes = request_outcomes(fixture.root / 'requests.jsonl', state['orders'])
+            if outcomes['unobserved_ambiguous_requests']:
+                raise Inconclusive('HTTP response lost and no durable outcome observed')
             sample = {**state, 'initial_balances': initial, 'initial_snapshot_verified': True,
                       'funding': funding, 'accepted_order_ids': accepted, 'journal_first_seq': 1,
-                      'accepted_order_specs': specs,
+                      'accepted_order_specs': specs, **outcomes,
                       'markets': {'1': {'base': 1, 'quote': 0}},
                       'barrier': {'input_closed': True, 'pending_orders': 0,
                                   'samples': [previous['observation'], current['observation']]}}

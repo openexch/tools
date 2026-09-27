@@ -35,6 +35,11 @@ class Fixture:
         for role, cpu in self.m['limits'].get('cpu_quota_by_role', {}).items():
             if role not in self.m['nodes'] or type(cpu) not in (int, float) or not 0 < cpu <= len(self.m['cpu_set']):
                 raise Violation('invalid bounded fixture CPU quota')
+        for role, cpus in self.m['limits'].get('cpu_set_by_role', {}).items():
+            if (role != 'probe' or not isinstance(cpus, list) or not cpus or len(set(cpus)) != len(cpus)
+                    or any(type(cpu) is not int or cpu < 0 or cpu >= os.cpu_count() for cpu in cpus)
+                    or set(cpus) & set(self.m['cpu_set'])):
+                raise Violation('measurement probe CPUs must be explicit and separate from service CPUs')
         self.root = Path(self.m['state_root'])
         self.run_id = self.m['run_id']
         self.gateway = str(ipaddress.ip_network(self.m['network']['subnet']).network_address + 1)
@@ -165,7 +170,8 @@ class Fixture:
                 '--user',f'{os.getuid()}:{os.getgid()}', '--workdir','/data','--read-only',
                 '--cap-drop','ALL','--security-opt','no-new-privileges','--pids-limit','256',
                 '--memory',str(limits['memory_mb']) + 'm','--memory-swap',str(limits['memory_mb']) + 'm',
-                '--cpuset-cpus',','.join(map(str,self.m['cpu_set'])),'--cpus',str(limits.get('cpu_quota_by_role', {}).get(name, 1)),
+                '--cpuset-cpus',','.join(map(str,limits.get('cpu_set_by_role', {}).get(name,self.m['cpu_set']))),
+                '--cpus',str(limits.get('cpu_quota_by_role', {}).get(name, 1)),
                 '--shm-size',str(limits['shm_mb']) + 'm','--tmpfs','/tmp:rw,nosuid,size=128m',
                 '--log-opt','max-size=32m','--log-opt','max-file=3',
                 '--mount',f'type=bind,src={state},dst=/data',

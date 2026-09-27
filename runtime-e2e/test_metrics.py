@@ -21,6 +21,25 @@ def measurement():
 
 
 class MeasurementTest(unittest.TestCase):
+    def test_lost_http_response_counts_durable_work_but_fails_http_success_gate(self):
+        events, sample, budget = measurement()
+        next(e for e in events if e['event'] == 'intent')['request'] = {'clientOrderId':'request-11'}
+        next(e for e in events if e['event'] == 'http')['response'] = {'status':0, 'body':'{"error":"timeout"}'}
+        next(e for e in events if e['event'] == 'durable')['client_id'] = 'request-11'
+        sample['orders'] = [{'id':11, 'client':'request-11'}]
+        result = evaluate(events, sample, budget, 'normal')
+        self.assertEqual(result['durable_completed'], 2)
+        self.assertEqual(result['http_success_ratio'], .5)
+        self.assertEqual(result['status'], 'FAIL')
+        sample['orders'][0]['client'] = 'different-request'
+        with self.assertRaises(Violation): evaluate(events, sample, budget, 'normal')
+
+    def test_http_callback_order_does_not_change_durable_latency(self):
+        events, sample, budget = measurement()
+        http = [e for e in events if e['event'] == 'http']
+        events = [e for e in events if e['event'] != 'http'] + http
+        self.assertEqual(evaluate(events, sample, budget, 'normal')['status'], 'PASS')
+
     def test_unaccepted_identity_cannot_supply_durable_latency(self):
         events, sample, budget = measurement()
         next(e for e in events if e['event'] == 'durable')['order_id'] = 999

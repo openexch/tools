@@ -27,6 +27,10 @@ def evaluate(events, sample, budgets, profile):
     latencies, lateness, measured_ids = [], [], set()
     commits_in_window = 0; committed = set()
     order_indices = {}
+    http_by_index = {e['index']: e for e in events if e['event'] == 'http'}
+    if len(http_by_index) != sum(e['event'] == 'http' for e in events):
+        raise Violation('duplicate HTTP result')
+    durable_orders = {row['id']: row for row in sample.get('orders', [])}
     for e in events:
         if e['event'] == 'http' and e['response']['status'] in (200, 201):
             import json
@@ -35,10 +39,18 @@ def evaluate(events, sample, budgets, profile):
                 oid = int(reply['omsOrderId'])
                 if oid in order_indices: raise Violation('duplicate accepted identity in measurement')
                 order_indices[oid] = e['index']
+    for e in events:
         if e['event'] != 'durable' or e['index'] not in cohort: continue
         if e['status'] not in {'NEW', 'PARTIALLY_FILLED', 'FILLED'}: continue
         if order_indices.get(e['order_id']) != e['index']:
-            raise Violation('durable latency does not belong to an accepted request identity')
+            origin = cohort[e['index']]
+            row = durable_orders.get(e['order_id'])
+            http = http_by_index.get(e['index'])
+            if (not row or not http or not (http['response']['status'] == 0 or http['response']['status'] >= 500)
+                    or not e.get('client_id') or e['client_id'] != origin.get('request', {}).get('clientOrderId')
+                    or e['client_id'] != row.get('client')):
+                raise Violation('durable latency does not belong to a proven request identity')
+            order_indices[e['order_id']] = e['index']
         if e['index'] in committed: raise Violation('duplicate durable observation')
         committed.add(e['index']); measured_ids.add(e['order_id'])
         origin = cohort[e['index']]
@@ -70,6 +82,8 @@ def evaluate(events, sample, budgets, profile):
     result = {'profile': profile, 'offered': len(cohort), 'durable_completed': len(committed),
               'failed_or_uncompleted': len(cohort) - len(committed), 'generator_misses': misses,
               'latency_samples': len(latencies), 'success_ratio': len(committed) / len(cohort),
+              'http_success_ratio':sum(i in http_by_index and http_by_index[i]['response']['status'] in (200,201)
+                                       for i in cohort) / len(cohort),
               'committed_orders_per_s': commits_in_window / seconds,
               'settled_trades_per_s': settlements_in_window / seconds,
               'generator_p99_lateness_ms': percentile(lateness, .99),
@@ -98,6 +112,8 @@ def evaluate(events, sample, budgets, profile):
         violations.append('settled goodput below absolute floor')
     if result['success_ratio'] < budgets['steady_success_ratio']:
         violations.append('valid-work success ratio below absolute floor')
+    if result['http_success_ratio'] < budgets['steady_success_ratio']:
+        violations.append('HTTP outcome success ratio below absolute floor')
     result.update(status='INCONCLUSIVE' if inconclusive else 'FAIL' if violations else 'PASS',
                   measurement_issues=inconclusive, budget_violations=violations)
     return result
