@@ -13,6 +13,38 @@ from observe import stable_sample
 from scenarios import critical_path_smoke, request, order_id
 
 
+def qualified_lag_samples(samples):
+    """Independent leader witnesses must exceed the predeclared byte/age bounds.
+
+    Catch-up replay uses a different port and can legitimately advance the node
+    while live log packets are dropped. Any instantaneous byte difference is
+    therefore insufficient evidence of an unready node under the bounded policy.
+    """
+    qualified = []
+    for index, sample in enumerate(samples):
+        low, high = sample['target'], sample['leader']
+        if (counter(low, 201) != 0 or counter(low, 207) != 17
+                or counter(high, 201) != 2 or counter(high, 207) != 17
+                or counter(low, 239) != counter(high, 239)):
+            continue
+        body = fields(sample['ready'])
+        if not 0 <= int(body['consensusAgeMs']) < 5000: continue
+        # Observations are sequential. Credit the furthest proven progress so a
+        # replica that catches up between CNC and HTTP reads is not falsely RED.
+        applied = max(sample['target_commit'], body['applied'])
+        if sample['leader_commit'] <= applied: continue
+        now = sample.get('observed_ns', sample['at_ns'])
+        old_bound = any(
+            1_000_000_000 <= now - old.get('observed_ns', old['at_ns'])
+            and old['leader_commit'] > applied
+            and counter(old['leader'], 201) == 2 and counter(old['leader'], 207) == 17
+            and counter(old['leader'], 239) == counter(high, 239)
+            for old in samples[:index])
+        if sample['leader_commit'] - applied > 65536 or old_bound:
+            qualified.append(sample)
+    return qualified
+
+
 def filter_arguments(manifest, target, action):
     if target not in {e + str(i) for e in ('me', 'ae') for i in range(3)}:
         raise Violation('log filter requires an explicit fixture engine member')
@@ -93,28 +125,27 @@ def log_channel_lag(fixture, engine):
         _, counts = stable_sample(fixture, money['initial_balances'], money['funding'], accepted, 13)
         evidence['money'] = counts; save()
         time.sleep(2)  # Exceeds the declared 1 s application-checkpoint age bound.
-        for _ in range(5):
+        for _ in range(8):
             low, high = probe(fixture, target), probe(fixture, leader)
             ready = local_ready(fixture, target)
             evidence['samples'].append({'target': low, 'leader': high, 'ready': ready,
                 'target_commit': counter(low, 203), 'leader_commit': counter(high, 203),
-                'at_ns': time.time_ns()}); save()
+                'at_ns': time.time_ns(), 'observed_ns': time.monotonic_ns()}); save()
             time.sleep(1)
         evidence['filter_counters'] = log_filter(fixture, target, 'counters'); save()
         drops = [line.split() for line in evidence['filter_counters'].splitlines() if 'DROP' in line]
         if len(drops) != 1 or int(drops[0][0]) <= 0:
             raise Inconclusive('selective log packet loss was not observed')
-        qualified = [s for s in evidence['samples'] if s['target_commit'] < s['leader_commit']
-            and counter(s['target'], 201) == 0 and counter(s['target'], 207) == 17
-            and counter(s['leader'], 201) == 2 and counter(s['leader'], 207) == 17
-            and counter(s['target'], 239) == counter(s['leader'], 239)
-            and 0 <= int(fields(s['ready'])['consensusAgeMs']) < 5000]
-        if len(qualified) < 3:
-            raise Inconclusive('log lag with live consensus/closed election was not sustained')
+        qualified = qualified_lag_samples(evidence['samples'])
+        evidence['qualified_samples'] = len(qualified); save()
+        # One independently proven safety violation is already FAIL. The minimum
+        # coverage count is a requirement for PASS, never a way to hide a RED.
         if any(s['ready']['status'] == 200 for s in qualified):
             evidence.update(status='FAIL', known_product_red=True,
                 reason='follower is ready despite sustained log lag with live consensus in the current term')
             save(); raise Violation(evidence['reason'])
+        if len(qualified) < 3:
+            raise Inconclusive('log lag with live consensus/closed election was not sustained')
         if any(s['ready']['status'] != 503 for s in qualified):
             raise Inconclusive('readiness was unreachable rather than explicitly unready')
     finally:
