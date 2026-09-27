@@ -42,7 +42,7 @@ except urllib.error.HTTPError as e:print(json.dumps({'status':e.code,'body':e.re
     return json.loads(fixture.execute(node, ['python3', '-c', code]).stdout)
 
 
-def false_ready(fixture, engine='me'):
+def false_ready(fixture, engine='me', on_partition=None):
     if engine not in {'me', 'ae'}:
         raise Violation('false-ready target must be a fixture engine')
     baseline = critical_path_smoke(fixture)
@@ -87,6 +87,8 @@ def false_ready(fixture, engine='me'):
                 evidence['reason'] = 'isolated follower advertises ready after quorum committed and settled new work beyond its log'
                 save()
                 raise Violation(evidence['reason'])
+            if len(evidence['samples']) == 1 and on_partition is not None:
+                on_partition(target)
             time.sleep(1)
         if not any(s['target_commit'] < s['leader_commit'] for s in evidence['samples']):
             raise Inconclusive('fault did not produce independently observed replication lag')

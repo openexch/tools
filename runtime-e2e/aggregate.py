@@ -10,9 +10,9 @@ from contracts import Inconclusive
 from fixture import Fixture
 
 
-def baseline_fault_reproduction(manifest, manifest_path, output):
+def baseline_fault_reproduction(manifest, manifest_path, output, scenarios=None):
     children = []
-    for scenario in ['false-ready', 'pruner-exception', 'offline-purge-rejoin']:
+    for scenario in scenarios or ['false-ready', 'pruner-exception', 'offline-purge-rejoin']:
         derived = json.loads(json.dumps(manifest))
         derived['run_id'] = 'r01-' + uuid.uuid4().hex[:12]
         parent = Path(manifest_path).absolute().parent
@@ -45,3 +45,10 @@ def baseline_fault_reproduction(manifest, manifest_path, output):
             'child_exit_codes': [c['exit_code'] for c in children],
             'three_baseline_reds_verified': baseline_red, 'children': children,
             'scope': 'three real cluster faults; observed baseline defects remain FAIL, never product PASS'}
+
+
+def readiness_lag_election_idle(manifest, manifest_path, output):
+    result = baseline_fault_reproduction(manifest, manifest_path, output, ['readiness-me', 'readiness-ae'])
+    result.pop('three_baseline_reds_verified')
+    result['scope'] = 'separate ME and AE idle, partition, rollout gate, leader loss and request-work fixtures'
+    return result
