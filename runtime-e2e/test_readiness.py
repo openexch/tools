@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
-from contracts import Inconclusive
-from readiness import authorize_next_restart
+from contracts import Inconclusive, Violation
+from readiness import authorize_next_restart, archive_restart_delay
 
 
 def topology():
@@ -12,6 +12,13 @@ def topology():
 
 
 class RollingRestartTest(unittest.TestCase):
+    def test_archive_restart_retains_liveness_wait_inside_recovery_budget(self):
+        self.assertAlmostEqual(archive_restart_delay(100, 103, 190), 7.1)
+        self.assertEqual(archive_restart_delay(100, 111, 190), 0)
+        with self.assertRaises(Inconclusive): archive_restart_delay(100, 99, 190)
+        with self.assertRaises(Violation): archive_restart_delay(100, 103, 110)
+        with self.assertRaises(Violation): archive_restart_delay(100, 191, 190)
+
     def test_ready_replica_has_applied_leader_checkpoint(self):
         result = authorize_next_restart('me', 'me2', topology(), 101)
         self.assertEqual(result['checkpoint'], 100)

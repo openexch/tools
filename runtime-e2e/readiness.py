@@ -1,11 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 """Readiness fault evidence and a fail-closed, fixture-only rolling restart gate."""
 import json
+import hashlib
 import time
 from contracts import Inconclusive, Violation
 from faults import counter, false_ready, local_ready, probe
 from observe import stable_sample
 from scenarios import request, order_id
+
+
+def archive_restart_delay(exit_observed_at, now, deadline):
+    # Aeron 1.53.0 Archive.Configuration: 10 * 1000 ms mark-file liveness.
+    # Start from confirmed process exit, not the last (possibly older) heartbeat.
+    # Retain the state and give the check a 100 ms scheduling margin.
+    if now < exit_observed_at:
+        raise Inconclusive('monotonic clock regressed before archive restart')
+    remaining = max(0, exit_observed_at + 10.1 - now)
+    if now + remaining >= deadline:
+        raise Violation('archive restart precondition exceeded recovery budget')
+    return remaining
 
 
 def fields(response):
@@ -77,8 +90,9 @@ def readiness_scenario(fixture, engine):
         value = observations(fixture, engine)
         evidence['samples'].append({'stage': stage, 'members': value}); save()
         return value
-    def await_certificate(recovering, stage):
-        deadline = time.monotonic() + fixture.m['budgets']['maximum_recovery_seconds']
+    def await_certificate(recovering, stage, deadline=None):
+        if deadline is None:
+            deadline = time.monotonic() + fixture.m['budgets']['maximum_recovery_seconds']
         while time.monotonic() < deadline:
             current = sample(stage)
             try: certificate = authorize_next_restart(engine, recovering, current, time.monotonic_ns())
@@ -127,9 +141,13 @@ def readiness_scenario(fixture, engine):
     leader = certificate['leader']
     before = probe(fixture, leader)
     if counter(before, 201) != 2: raise Inconclusive('leadership changed before fault injection')
-    evidence['leader_kill'] = fixture.kill(leader); save()
+    fault_started_at = time.monotonic()
+    evidence['leader_kill'] = fixture.kill(leader)
+    exit_observed_at = time.monotonic()
+    recovery_deadline = fault_started_at + fixture.m['budgets']['maximum_recovery_seconds']
+    save()
     old_term = certificate['term']
-    deadline = time.monotonic() + fixture.m['budgets']['maximum_failover_seconds']
+    deadline = fault_started_at + fixture.m['budgets']['maximum_failover_seconds']
     replacement = None
     while time.monotonic() < deadline:
         current = sample('leader-loss')
@@ -141,9 +159,26 @@ def readiness_scenario(fixture, engine):
         time.sleep(.2)
     if replacement is None: raise Violation('no ready replacement leader within failover budget')
     evidence['replacement_leader'] = replacement; save()
-    cid = fixture.registry['containers'][leader]; fixture.inspect('container', cid)
+    cid = fixture.registry['containers'][leader]
+    mark = fixture.root / 'state' / leader / 'state/archive/archive-mark.dat'
+    mark_digest = hashlib.sha256(mark.read_bytes()).hexdigest()
+    delay = archive_restart_delay(exit_observed_at, time.monotonic(), recovery_deadline)
+    time.sleep(delay)
+    state = fixture.inspect('container', cid)['State']
+    if state['Running'] or state['Pid'] != 0 or state['ExitCode'] != 137:
+        raise Inconclusive('killed process exit no longer verified before restart')
+    if hashlib.sha256(mark.read_bytes()).hexdigest() != mark_digest:
+        raise Inconclusive('archive mark changed after confirmed process exit')
+    if archive_restart_delay(exit_observed_at, time.monotonic(), recovery_deadline) != 0:
+        raise Inconclusive('archive restart wait did not expire')
+    evidence['restart_precondition'] = {'exit_observed_at': exit_observed_at,
+        'restart_at': time.monotonic(), 'recovery_deadline': recovery_deadline,
+        'archive_liveness_seconds': 10, 'wait_after_exit_seconds': time.monotonic() - exit_observed_at,
+        'unchanged_archive_mark_sha256': mark_digest, 'pid': state['Pid'], 'exit_code': state['ExitCode']}
+    save()
     fixture.command(['docker', 'start', cid])
-    after = await_certificate(leader, 'leader-rejoin')
+    after = await_certificate(leader, 'leader-rejoin', recovery_deadline)
+    evidence['recovery_seconds_from_kill'] = time.monotonic() - fault_started_at; save()
     if after['term'] <= old_term: raise Violation('new leadership term was not observed')
 
     # Sustained nonzero request work with exact finances; full capacity/latency
