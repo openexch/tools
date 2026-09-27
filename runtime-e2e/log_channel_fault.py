@@ -8,7 +8,7 @@ import time
 from contracts import Inconclusive, Violation
 from fixture import LABEL
 from faults import counter, local_ready, probe
-from readiness import fields
+from readiness import fields, observations, authorize_next_restart
 from observe import stable_sample
 from scenarios import critical_path_smoke, request, order_id
 
@@ -117,10 +117,21 @@ def log_channel_lag(fixture, engine):
             save(); raise Violation(evidence['reason'])
         if any(s['ready']['status'] != 503 for s in qualified):
             raise Inconclusive('readiness was unreachable rather than explicitly unready')
-        evidence['status'] = 'PASS'; save()
-        return {'status': 'PASS', 'assertions': len(qualified), 'processed': counts['trades'],
-                'skipped': 0, 'child_exit_codes': [0], 'money': counts,
-                'scope': 'selective log UDP loss with current-term closed election and committed financial work'}
     finally:
         evidence['filter_delete'] = log_filter(fixture, target, 'delete')
         evidence['filter_removed'] = True; save()
+    recovery_start = time.monotonic()
+    deadline = recovery_start + fixture.m['budgets']['maximum_recovery_seconds']
+    evidence['recovery_samples'] = []
+    while time.monotonic() < deadline:
+        current = observations(fixture, engine)
+        evidence['recovery_samples'].append(current); save()
+        try: certificate = authorize_next_restart(engine, target, current, time.monotonic_ns())
+        except Inconclusive:
+            time.sleep(.2); continue
+        evidence.update(status='PASS', recovery_certificate=certificate,
+                        recovery_seconds=time.monotonic() - recovery_start); save()
+        return {'status': 'PASS', 'assertions': len(qualified) + 1, 'processed': counts['trades'],
+                'skipped': 0, 'child_exit_codes': [0], 'money': counts,
+                'scope': 'selective log UDP loss with live consensus, exact finances and verified rejoin'}
+    raise Violation('log-lagged follower did not recover after removing the filter')

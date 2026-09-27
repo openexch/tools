@@ -48,7 +48,8 @@ def baseline_fault_reproduction(manifest, manifest_path, output, scenarios=None)
 
 
 def readiness_lag_election_idle(manifest, manifest_path, output):
-    result = baseline_fault_reproduction(manifest, manifest_path, output, ['readiness-me', 'readiness-ae'])
+    result = baseline_fault_reproduction(manifest, manifest_path, output,
+        ['readiness-me', 'readiness-ae', 'log-channel-me', 'log-channel-ae'])
     result.pop('three_baseline_reds_verified')
-    result['scope'] = 'separate ME and AE idle, partition, rollout gate, leader loss and request-work fixtures'
+    result['scope'] = 'ME/AE idle, partition, rollout gate, leader loss, request work and selective log loss with verified rejoin'
     return result
