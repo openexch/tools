@@ -58,6 +58,16 @@ def observe(sample):
 
 
 class MoneyContractTest(unittest.TestCase):
+    def test_unrequested_cancellation_cannot_hide_lost_accepted_work(self):
+        sample = money_sample()
+        spec = {'id':13,'user':1,'market':1,'side':'BUY','price':10*FP,'quantity':FP}
+        sample['accepted_order_ids'].append(13)
+        sample['accepted_order_specs'].append(spec)
+        sample['orders'].append(dict(spec, status='CANCELLED', filled=0))
+        with self.assertRaises(Violation): reconcile(observe(sample))
+        sample['cancelled_order_ids'] = [13]
+        self.assertEqual(reconcile(observe(sample))['orders'], 3)
+
     def test_proven_rejected_order_is_zero_effect_not_unfinished_accepted_work(self):
         sample = money_sample()
         spec = {'id': 13, 'user': 1, 'market': 1, 'side': 'BUY', 'price': 10 * FP, 'quantity': FP}

@@ -221,12 +221,16 @@ def reconcile(sample):
         totals[(sell['user'], market['quote'])] += quote_amount
 
     expected_holds = {}
+    cancellations = {integer(value) for value in sample.get('cancelled_order_ids', [])}
+    if not cancellations.issubset(accepted): raise Violation('cancel identity was not accepted')
     for oid, order in orders.items():
         filled = integer(order['filled']); quantity = integer(order['quantity'])
         if filled != fills[oid] or not 0 <= filled <= quantity:
             raise Violation('order fill sum mismatch')
         if order['status'] == 'FILLED' and filled != quantity:
             raise Violation('FILLED order is incomplete')
+        if order['status'] in {'CANCELLED','CANCELED'} and oid not in cancellations:
+            raise Violation('accepted work cancelled without a submitted cancellation')
         if order['status'] not in {'NEW','PARTIALLY_FILLED','FILLED','CANCELLED','CANCELED','REJECTED','EXPIRED'}:
             raise Inconclusive('pending/unmodelled order state')
         if order['status'] in {'NEW','PARTIALLY_FILLED'}:

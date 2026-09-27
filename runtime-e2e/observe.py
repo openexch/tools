@@ -120,6 +120,18 @@ def request_outcomes(path, orders):
             'unobserved_ambiguous_requests': unseen}
 
 
+def request_cancellations(path):
+    ids = []
+    for line in path.read_text().splitlines():
+        request = json.loads(line)
+        if request['method'] != 'DELETE': continue
+        match = re.fullmatch(r'/api/v1/orders/([1-9][0-9]*)', request['path'])
+        if match and request['response']['status'] in (200, 201):
+            response = json.loads(request['response']['body'])
+            if response.get('accepted') is True: ids.append(int(match.group(1)))
+    return ids
+
+
 def stable_sample(fixture, initial, funding, accepted, expected_trades, timeout=30):
     deadline = time.monotonic() + timeout
     previous = None
@@ -143,6 +155,7 @@ def stable_sample(fixture, initial, funding, accepted, expected_trades, timeout=
             sample = {**state, 'initial_balances': initial, 'initial_snapshot_verified': True,
                       'funding': funding, 'accepted_order_ids': accepted, 'journal_first_seq': 1,
                       'accepted_order_specs': specs, **outcomes,
+                      'cancelled_order_ids': request_cancellations(fixture.root / 'requests.jsonl'),
                       'markets': {'1': {'base': 1, 'quote': 0}},
                       'barrier': {'input_closed': True, 'pending_orders': 0,
                                   'samples': [previous['observation'], current['observation']]}}

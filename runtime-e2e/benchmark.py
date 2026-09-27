@@ -41,8 +41,18 @@ def benchmark(fixture, profile='normal', preflight=False):
               'money_jdbc': f'jdbc:postgresql://{fixture.gateway}:{fixture.pg_port}/r01_money'}
     (fixture.root / 'benchmark-profile.json').write_text(json.dumps({'config':config, 'faults':faults,
         'preflight_only':preflight, 'scope':'single-host normal/N-1 steady load; no host-loss/failover-time claim'}, indent=2) + '\n')
+    jvm = fixture.m.get('measurement_jvm')
+    measurement_options = []
+    if jvm is not None:
+        if (jvm.get('collector') not in {'g1', 'generational-zgc'}
+                or type(jvm.get('heap_mb')) is not int or not 512 <= jvm['heap_mb'] <= 1024):
+            raise Inconclusive('measurement JVM must use a declared bounded heap and collector')
+        measurement_options = [f'-Xms{jvm["heap_mb"]}m', f'-Xmx{jvm["heap_mb"]}m',
+            '-Xlog:gc*,safepoint:file=/data/benchmark-gc.log:time,uptime,level,tags:filecount=3,filesize=8m']
+        measurement_options += (['-XX:+UseZGC', '-XX:+ZGenerational']
+                                if jvm['collector'] == 'generational-zgc' else ['-XX:+UseG1GC'])
     with Resources(fixture):
-        child = fixture.execute('probe', JAVA + ['-cp', '/artifacts/oms.jar:/artifacts/benchmark-probe.jar',
+        child = fixture.execute('probe', JAVA + measurement_options + ['-cp', '/artifacts/oms.jar:/artifacts/benchmark-probe.jar',
                                 'BenchmarkProbe'], input=json.dumps(config), timeout=240)
     summary = json.loads(child.stdout)
     (fixture.root / 'benchmark-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
