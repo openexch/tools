@@ -65,6 +65,9 @@ def validate_manifest(manifest, manifest_path):
         if net.version != 4 or net.prefixlen != 24 or not any(net.subnet_of(n) for n in private) or manifest['network']['internal'] is not True:
             raise Violation('fixture needs its own internal RFC1918 /24 network')
         roles = {'me0','me1','me2','ae0','ae1','ae2','bridge','oms','market','projector','probe'}
+        cutover = manifest.get('journal_cutover')
+        if cutover is not None:
+            roles = roles | {'xprojector'}
         if set(manifest['nodes']) != roles or len(set(manifest['nodes'].values())) != len(roles):
             raise Violation('exactly three ME, three AE and the critical path are required')
         for value in manifest['nodes'].values():
@@ -90,6 +93,8 @@ def validate_manifest(manifest, manifest_path):
                 digest = hashlib.file_digest(stream, 'sha256').hexdigest()
             if digest != artifact['sha256']:
                 raise Violation('artifact digest mismatch: ' + role)
+        if cutover is not None:
+            validate_journal_cutover(cutover)
         for helper in [manifest.get('test_helper'), manifest.get('benchmark_helper')]:
             if helper is None: continue
             for path_key, digest_key in [('path', 'sha256'), ('source_path', 'source_sha256')]:
@@ -102,6 +107,28 @@ def validate_manifest(manifest, manifest_path):
         if isinstance(error, (Violation, Inconclusive)):
             raise
         raise Inconclusive('incomplete manifest: ' + str(error)) from error
+
+
+def validate_journal_cutover(cutover):
+    """Execution writer cutover: the C++ projector is the execution writer and the OMS a journal consumer."""
+    if set(cutover) != {'binary', 'libpq', 'schema', 'recording_id', 'source_node', 'durable_me_commands'}:
+        raise Violation('journal cutover needs exactly binary, libpq, schema, recording, source and command mode')
+    for key in ['binary', 'libpq', 'schema']:
+        entry = cutover[key]
+        file = Path(entry['path'])
+        if not file.is_absolute() or file.is_symlink() or not file.is_file():
+            raise Inconclusive('missing/untrusted journal cutover input: ' + key)
+        if hashlib.sha256(file.read_bytes()).hexdigest() != entry['sha256']:
+            raise Violation('journal cutover input changed: ' + key)
+        provenance = entry.get('source_sha') if key != 'libpq' else entry.get('package')
+        if not isinstance(provenance, str) or not provenance:
+            raise Inconclusive('missing journal cutover provenance: ' + key)
+    if cutover['source_node'] not in {'me0', 'me1', 'me2'}:
+        raise Violation('journal source must be a fixture ME node')
+    if type(cutover['recording_id']) is not int or cutover['recording_id'] < 0:
+        raise Violation('journal recording id must be a nonnegative integer')
+    if type(cutover['durable_me_commands']) is not bool:
+        raise Violation('durable command mode must be explicit')
 
 
 def reconcile(sample):

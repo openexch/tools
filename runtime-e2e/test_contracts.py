@@ -190,6 +190,35 @@ class ManifestContractTest(unittest.TestCase):
         self.m['limits']['shm_mb'] = 0
         with self.assertRaises(Violation): validate_manifest(self.m, self.path)
 
+    def _cutover(self):
+        inputs = {}
+        for key in ['binary', 'libpq', 'schema']:
+            file = Path(self.tmp.name) / key; file.write_bytes(('synthetic ' + key).encode())
+            entry = {'path': str(file), 'sha256': hashlib.sha256(file.read_bytes()).hexdigest()}
+            entry.update({'package': 'libpq5 16'} if key == 'libpq' else {'source_sha': 'c' * 40})
+            inputs[key] = entry
+        m = copy.deepcopy(self.m)
+        m['nodes']['xprojector'] = '172.30.217.30'
+        m['journal_cutover'] = {**inputs, 'recording_id': 0, 'source_node': 'me0', 'durable_me_commands': True}
+        return m
+
+    def test_journal_cutover_manifest_is_accepted(self):
+        validate_manifest(self._cutover(), self.path)
+
+    def test_journal_cutover_requires_its_node_and_exact_inputs(self):
+        cases = []
+        m = self._cutover(); del m['nodes']['xprojector']; cases.append(('no node', m))
+        m = self._cutover(); m['journal_cutover']['binary']['sha256'] = '0' * 64; cases.append(('changed binary', m))
+        m = self._cutover(); del m['journal_cutover']['schema']['source_sha']; cases.append(('no provenance', m))
+        m = self._cutover(); m['journal_cutover']['source_node'] = 'ae0'; cases.append(('foreign source', m))
+        m = self._cutover(); m['journal_cutover']['recording_id'] = -1; cases.append(('bad recording', m))
+        m = self._cutover(); m['journal_cutover']['durable_me_commands'] = 'yes'; cases.append(('implicit mode', m))
+        m = self._cutover(); m['journal_cutover']['extra'] = 1; cases.append(('unknown key', m))
+        m = copy.deepcopy(self.m); m['nodes']['xprojector'] = '172.30.217.30'; cases.append(('node without cutover', m))
+        for name, manifest in cases:
+            with self.subTest(case=name), self.assertRaises((Violation, Inconclusive)):
+                validate_manifest(manifest, self.path)
+
 
 if __name__ == '__main__':
     unittest.main()

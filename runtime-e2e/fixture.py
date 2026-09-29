@@ -5,6 +5,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import time
@@ -145,6 +146,12 @@ class Fixture:
                 if not schemas: raise Inconclusive('missing packaged database schema: ' + role)
                 for name in schemas:
                     self.psql(database, jar.read(name).decode())
+        if self.m.get('journal_cutover'):
+            # Genesis-only cutover: no legacy writer ever runs. Install the projector schema, then
+            # hand execution ownership to the Archive worker through the audited paused state.
+            self.psql('r01_oms', (self.root / 'artifacts/xprojector/projector.sql').read_text())
+            self.psql('r01_oms', "SELECT transition_execution_writer('legacy',1,'paused','fixture genesis: no legacy writer')")
+            self.psql('r01_oms', "SELECT transition_execution_writer('paused',2,'archive','fixture genesis: projector owns executions')")
 
     def stage_artifacts(self):
         dest = self.root / 'artifacts'; dest.mkdir()
@@ -152,6 +159,14 @@ class Fixture:
             path = dest / (role + '.jar'); shutil.copyfile(artifact['path'], path)
             if hashlib.sha256(path.read_bytes()).hexdigest() != artifact['sha256']:
                 raise Violation('artifact changed while staging')
+        cutover = self.m.get('journal_cutover')
+        if cutover:
+            target = dest / 'xprojector'; target.mkdir()
+            for key, filename in [('binary', 'execution-projector'), ('libpq', 'libpq.so.5'), ('schema', 'projector.sql')]:
+                path = target / filename; shutil.copyfile(cutover[key]['path'], path)
+                if hashlib.sha256(path.read_bytes()).hexdigest() != cutover[key]['sha256']:
+                    raise Violation('journal cutover input changed while staging: ' + key)
+            (target / 'execution-projector').chmod(0o755)
         for key, filename in [('test_helper', 'fixture-probe.jar'), ('benchmark_helper', 'benchmark-probe.jar')]:
             if not self.m.get(key): continue
             helper = self.m[key]; path = dest / filename
@@ -254,6 +269,9 @@ except Exception as e:print(json.dumps({'status':0,'error':str(e)}))
               'PROJECTOR_AE_JOURNAL_ARCHIVES':','.join(self.m['nodes'][f'ae{i}'] + ':' + str(19301 + 100*i) for i in range(3)),
               'PROJECTOR_LOCAL_HOST':self.m['nodes']['projector'],'PROJECTOR_METRICS_PORT':'9601'}
         self.spawn('projector',JAVA + ['-jar','/artifacts/projector.jar'],db)
+        cutover = self.m.get('journal_cutover')
+        if cutover:
+            self.start_execution_projector(cutover)
         env = {'OMS_HTTP_PORT':'18080','OMS_GRPC_PORT':'19091','OMS_AUTH_MODE':'dev','OMS_AUDIT_LOG':'off',
                'OMS_POSTGRES_URL':f'jdbc:postgresql://{self.gateway}:{self.pg_port}/r01_oms',
                'OMS_POSTGRES_USER':'runtime_fixture','OMS_POSTGRES_PASSWORD':'synthetic-fixture-only',
@@ -262,6 +280,9 @@ except Exception as e:print(json.dumps({'status':0,'error':str(e)}))
                'CLUSTER_PORT_BASE':'9000','EGRESS_HOST':self.m['nodes']['oms'],'EGRESS_PORT':'19093',
                'AE_CLUSTER_ADDRESSES':','.join(self.m['nodes'][f'ae{i}'] for i in range(3)),
                'AE_CLUSTER_PORT_BASE':'19300','AE_EGRESS_HOST':self.m['nodes']['oms'],'AE_EGRESS_PORT':'19393'}
+        if cutover:
+            env['OMS_JOURNAL_CONSUMER'] = 'true'
+            env['OMS_DURABLE_ME_COMMANDS'] = 'true' if cutover['durable_me_commands'] else 'false'
         self.spawn('oms',JAVA + ['-jar','/artifacts/oms.jar'],env)
         market = {'CLUSTER_ADDRESSES':env['CLUSTER_ADDRESSES'],'CLUSTER_PORT_BASE':'9000','CLUSTER_PORT_STRIDE':'100',
                   'EGRESS_HOST':self.m['nodes']['market'],'EGRESS_PORT':'19094','GATEWAY_TYPE':'market',
@@ -272,10 +293,41 @@ except Exception as e:print(json.dumps({'status':0,'error':str(e)}))
         self.wait_http('bridge',9600,'/health',predicate=lambda r: json.loads(r['body']).get('aeConnected') is True)
         self.wait_http('projector',9601,'/health')
         self.wait_http('market',8081,'/health')
+        if cutover:
+            # Journal mode keeps admission closed until the consumer has caught up with the projector.
+            self.wait_http('oms',18080,'/metrics',predicate=lambda r: 'oms_admission_ready 1.0' in r['body'])
         self.registry['startup_complete'] = True; self.save()
 
+    def start_execution_projector(self, cutover):
+        """C++ execution projector with its own media driver, following the pinned ME journal recording."""
+        node = cutover['source_node']; index = int(node[-1])
+        me, xp = self.m['nodes'][node], self.m['nodes']['xprojector']
+        driver = shlex.join(JAVA + ['-cp', '/artifacts/me.jar', 'io.aeron.driver.MediaDriver'])
+        worker = ['/artifacts/xprojector/execution-projector', '--aeron-dir', '/dev/shm/aeron',
+                  '--control-channel', f'aeron:udp?endpoint={me}:{9010 + 100 * index}', '--control-stream', '4010',
+                  '--response-channel', f'aeron:udp?endpoint={xp}:0',
+                  '--replay-channel', f'aeron:udp?endpoint={xp}:19810', '--replay-stream', '4012',
+                  '--recording', str(cutover['recording_id']),
+                  '--source', f'{node}-journal-recording-{cutover["recording_id"]}',
+                  '--mode', 'follow', '--monitor-port', '9602']
+        script = (driver + ' & i=0; while [ ! -f /dev/shm/aeron/cnc.dat ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done; '
+                  'exec ' + shlex.join(worker))
+        self.spawn('xprojector', ['sh', '-c', script],
+                   {'LD_LIBRARY_PATH': '/artifacts/xprojector',
+                    'OE_PROJECTOR_PG': f'host={self.gateway} port={self.pg_port} user=runtime_fixture dbname=r01_oms'})
+        deadline = time.monotonic() + 90
+        fresh = "SELECT COALESCE(NOW()-observed_at < interval '3 seconds', false) FROM execution_projector_checkpoint"
+        while time.monotonic() < deadline:
+            if self.psql('r01_oms', fresh) == 't':
+                return
+            state = self.inspect('container', self.registry['containers']['xprojector'])['State']
+            if not state['Running']:
+                raise Inconclusive(f'execution projector exited {state["ExitCode"]} before observing the journal')
+            time.sleep(.5)
+        raise Inconclusive('execution projector never published a fresh journal observation')
+
     def kill(self, name):
-        if name not in {'me0','me1','me2','ae0','ae1','ae2','oms','bridge','market','projector'}:
+        if name not in {'me0','me1','me2','ae0','ae1','ae2','oms','bridge','market','projector','xprojector'}:
             raise Violation('unsupported fault target')
         cid = self.registry['containers'][name]
         before = self.inspect('container',cid)['State']
