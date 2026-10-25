@@ -53,12 +53,24 @@ def main():
             result.update(readiness_lag_election_idle(manifest, args.manifest, args.output))
         elif args.scenario in {'critical-path-smoke', 'false-ready', 'false-ready-ae', 'pruner-exception', 'offline-purge-rejoin',
                               'benchmark-preflight', 'benchmark-normal', 'benchmark-n-minus-one', 'readiness-me', 'readiness-ae',
-                              'log-channel-me', 'log-channel-ae', 'journal-oms-restart'}:
+                              'log-channel-me', 'log-channel-ae', 'journal-oms-restart', 'oms-recovery-admission', 'oms-durable-request-id', 'execution-projector-replay-crash', 'oms-hold-release-authority'}:
             fixture = Fixture(args.manifest)
             result['state_root'] = str(fixture.root)
             fixture.start()
             if args.scenario == 'critical-path-smoke':
                 result.update(critical_path_smoke(fixture))
+            elif args.scenario == 'oms-hold-release-authority':
+                from r02_acceptance import oms_hold_release_authority
+                result.update(oms_hold_release_authority(fixture))
+            elif args.scenario == 'execution-projector-replay-crash':
+                from r02_acceptance import execution_projector_replay_crash
+                result.update(execution_projector_replay_crash(fixture))
+            elif args.scenario == 'oms-durable-request-id':
+                from r02_acceptance import oms_durable_request_id
+                result.update(oms_durable_request_id(fixture))
+            elif args.scenario == 'oms-recovery-admission':
+                from r02_acceptance import oms_recovery_admission
+                result.update(oms_recovery_admission(fixture))
             elif args.scenario == 'journal-oms-restart':
                 from journal_cutover import journal_oms_restart
                 result.update(journal_oms_restart(fixture))
@@ -92,7 +104,7 @@ def main():
             fault_name = {'false-ready': 'false-ready.json', 'false-ready-ae': 'false-ready-ae.json',
                           'log-channel-me': 'log-channel-me.json', 'log-channel-ae': 'log-channel-ae.json',
                           'readiness-me': 'readiness-me.json', 'readiness-ae': 'readiness-ae.json',
-                          'pruner-exception': 'pruner-exception.json', 'journal-oms-restart': 'journal-oms-restart.json',
+                          'pruner-exception': 'pruner-exception.json', 'journal-oms-restart': 'journal-oms-restart.json', 'oms-recovery-admission': 'oms-recovery-admission.json', 'oms-durable-request-id': 'oms-durable-request-id.json', 'execution-projector-replay-crash': 'execution-projector-replay-crash.json', 'oms-hold-release-authority': 'oms-hold-release-authority.json',
                           'offline-purge-rejoin': 'offline-purge.json'}.get(args.scenario)
             if fault_name and (fixture.root / fault_name).is_file():
                 witness = json.loads((fixture.root / fault_name).read_text())

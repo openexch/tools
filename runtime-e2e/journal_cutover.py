@@ -86,11 +86,8 @@ def _percentiles(values):
             'p99_us': pick(.99) // 1000, 'max_us': ordered[-1] // 1000}
 
 
-def journal_oms_restart(fixture, latency_pairs=20, outage_pairs=6):
-    if not fixture.m.get('journal_cutover'):
-        raise Inconclusive('W6 requires the journal cutover topology')
-    evidence = {'latency_pairs': latency_pairs, 'outage_pairs': outage_pairs}
-    save = lambda: (fixture.root / 'journal-oms-restart.json').write_text(json.dumps(evidence, indent=2) + '\n')
+def fund(fixture):
+    """Verified empty genesis, then one deposit per side; returns (initial balances, funding events)."""
     initial = verify_genesis(fixture, (BUYER, SELLER))
     funding = []
     for kind, user, asset, amount in [('deposit', BUYER, 0, 50_000 * FP), ('deposit', SELLER, 1, FP)]:
@@ -98,6 +95,33 @@ def journal_oms_restart(fixture, latency_pairs=20, outage_pairs=6):
         if reply.get('success') is not True:
             raise Violation('funding was not acknowledged')
         funding.append({'kind': kind, 'user': user, 'asset': asset, 'amount': amount})
+    return initial, funding
+
+
+def admission(fixture):
+    """1 or 0 from the OMS admission gauge; None when the OMS does not answer."""
+    reply = fixture.http('oms', 18080, '/metrics')
+    if reply['status'] != 200: return None
+    for line in reply['body'].splitlines():
+        if line.startswith('oms_admission_ready'):
+            return int(float(line.split()[-1]))
+    raise Inconclusive('OMS metrics carry no admission gauge')
+
+
+def wait_admission(fixture, want, timeout):
+    started = time.monotonic()
+    while time.monotonic() - started < timeout:
+        if admission(fixture) == want: return int((time.monotonic() - started) * 1000)
+        time.sleep(.2)
+    raise Violation(f'OMS admission did not become {want} within {timeout} s')
+
+
+def journal_oms_restart(fixture, latency_pairs=20, outage_pairs=6):
+    if not fixture.m.get('journal_cutover'):
+        raise Inconclusive('W6 requires the journal cutover topology')
+    evidence = {'latency_pairs': latency_pairs, 'outage_pairs': outage_pairs}
+    save = lambda: (fixture.root / 'journal-oms-restart.json').write_text(json.dumps(evidence, indent=2) + '\n')
+    initial, funding = fund(fixture)
 
     # 1. Fill visibility: taker acknowledged -> OMS reports FILLED, journal path end to end.
     pairs, accepted = _probe(fixture, 'lat', latency_pairs, poll=True)
