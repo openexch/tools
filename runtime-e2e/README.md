@@ -73,3 +73,55 @@ The money oracle uses integer units (1e-8), fixed-price LIMIT orders, no fees or
 two equal observations after input closes. Missing genesis, pending state or an unmodeled movement
 is inconclusive. Raw collections, barrier hashes, each accepted order ID and all funding events
 are retained. Smoke request timings include orchestration and are not performance measurements.
+
+## Core topology (fixture v2, RC2 S14)
+
+Manifest `schema_version: 2`, `topology: core` (validated by `core_contracts.py`) runs the OMS + ledger
+core instead of the legacy OMS path: `me0-2`, `ae0-2`, `fwd0`, `fwd1`, `bridge0`, `bridge1`,
+`projector`, the reserved `shadow0` and `probe`. `oms`, `market` and the legacy `bridge` are refused.
+PostgreSQL carries only the money-journal history projection.
+
+* Credentials: every run mints fresh 32-byte secrets (`credentials.py`). The AE gets
+  `ASSETS_AUTH_KEYS`, each client one `AE_AUTH_CREDENTIAL`; the ME gets the key table named by
+  `credentials.me.keys_env` (classes FORWARDER, ADMIN). `credentials.me.mode` must say whether the ME
+  artifact enforces it (`not_enforced_by_artifact` until RC2 S6). Evidence keeps key ids and classes;
+  secrets are redacted from every retained command line, output, container log and probe state file
+  (`tap.out`, `tap.err`, `tap.jsonl`) before teardown. `shadow0` gets no key until
+  `SessionClass.REPLICA` exists (RC2 S1); RCS S9 fills that slot.
+* Slots: `fwd0/1` and `bridge0/1` start a pinned binary named in `slot_artifacts` (artifacts
+  `forwarder[_b]`, `bridge[_b]`, `driver: embedded | java_media_driver`, optional `libs`). A `null`
+  slot is recorded `SKIPPED_ABSENT`, never faked. The environment follows rc2-forwarder.md 2.11 and
+  rc2-bridge-cpp.md 2.11; the bridge must keep the `/health` `{halted, aeConnected}` contract.
+* D20: `timeouts: production` is mandatory. Allowlists, not denylists: top-level manifest keys
+  (`core_contracts.MANIFEST_KEYS`), environment names a fixture process may receive (`PROCESS_ENV`),
+  and the pinned image's own `Config.Env` names (`IMAGE_ENV`, checked by `docker image inspect` at
+  start, names recorded in `owner.json`); no value, Entrypoint or Cmd may carry a `-D...timeout`
+  style override. Every engine member is pinned to its own disjoint cpuset.
+  D18: the network is `--internal`; no archive control port leaves it.
+* Probes (`build_core_probes.py`): `CoreProbe` (against the AE jar: money-journal, core-config, risk,
+  gate, deposit/withdraw, create/cancel/amend, order-dump, money-dump, pending-dump, tap, unauth) and
+  `JournalProbe` (against the ME jar: verbatim journal frame dump, OpenOrdersSnapshot). The journal is
+  decoded in Python from the pinned schema XML (`schemas/`, `journal_decode.py`); RC2 S1's journal
+  schema 4 drops in as `schemas/me-journal-schema-4.xml` plus its SHA-256 in
+  `schemas/journal-profiles.json` (profile `me-journal-4`, now `pending`). Unknown records stop loudly.
+* Oracles: `core_oracle.py` (money M1-M14) and `order_oracle.py` (order O1-O12) judge one
+  `core-sample-v2` document (format in `oracle_model.py`) per rule: FAIL > INCONCLUSIVE > PASS.
+  `oracle_samples.py <new dir>` writes the clean synthetic samples for the Java mirror.
+* Fault helpers: `CoreFixture.kill(role)`, `CoreFixture.partition(src, dst, kind, add|delete)` for
+  client-to-engine UDP paths (G10), `metrics(role, port)`.
+
+**H0 G2 RED witness, substituted (2026-10-26).** The spec asks for "a boot of a9a865d with today's
+fixture fails on authentication". The v1 fixture cannot boot on the dev box: the host PostgreSQL 16
+TimescaleDB packaging (library 2.31.0, scripts up to 2.28.2) fails `CREATE EXTENSION timescaledb`
+before any engine starts, an environment fault that is left as is. The equivalent witness is in
+`core-boot`: `CoreProbe unauth mode=legacy_none` connects with no credential, exactly what every
+pre-RC1 client (and the v1 fixture) presents, and the RC1 core refuses it with
+`AuthenticationException`; the refusal is recorded as `auth_controls.g2_legacy_witness`, and the
+genesis is re-verified unchanged afterwards.
+
+Scenarios: `core-boot` (genesis, four authentication refusals, one core authority refusal that
+moves `assets_ingress_unauthorised_total`), `core-smoke` (H0: funding at GENESIS, gate OPEN, creates
+reach DISPATCH_PENDING; without a forwarder O7/O10 must be INCONCLUSIVE, a PASS fails the smoke) and
+`core-boots-N` (G15: N fresh boots, `ten_consecutive_boots.json` for N = 10).
+
+The T2 nightly runs from a local systemd user timer (`systemd/`, `nightly.py`), not GitHub (D20).
