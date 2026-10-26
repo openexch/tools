@@ -31,7 +31,12 @@ def main():
         signal.signal(sig, lambda number, frame: (_ for _ in ()).throw(Inconclusive('runner interrupted: ' + str(number))))
     try:
         manifest = json.loads(args.manifest.read_text())
-        validate_manifest(manifest, args.manifest)
+        core_topology = manifest.get('schema_version') == 2
+        if core_topology:
+            from core_contracts import validate_core_manifest
+            validate_core_manifest(manifest, args.manifest)
+        else:
+            validate_manifest(manifest, args.manifest)
         result['manifest_sha256'] = hashlib.sha256(args.manifest.read_bytes()).hexdigest()
         (args.output / 'manifest.json').write_bytes(args.manifest.read_bytes())
         result['harness_sources'] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
@@ -42,7 +47,21 @@ def main():
                 shutil.copyfile(source, sources / source.name)
         if (Path(__file__).parent / 'java').is_dir():
             shutil.copytree(Path(__file__).parent / 'java', sources / 'java')
-        if args.scenario == 'harness-negative-controls':
+        if core_topology != args.scenario.startswith('core-'):
+            raise Inconclusive('core-* scenarios need a schema v2 core manifest and only they accept one')
+        if args.scenario.startswith('core-boots-'):
+            from core_scenarios import consecutive_boots
+            count = int(args.scenario.rsplit('-', 1)[1])
+            if not 1 <= count <= 20: raise Inconclusive('boot count must be 1..20')
+            result.update(consecutive_boots(manifest, args.manifest, args.output, count))
+        elif args.scenario in {'core-boot', 'core-smoke'}:
+            from core_fixture import CoreFixture
+            import core_scenarios
+            fixture = CoreFixture(args.manifest)
+            result['state_root'] = str(fixture.root)
+            fixture.start()
+            result.update({'core-boot': core_scenarios.core_boot, 'core-smoke': core_scenarios.core_smoke}[args.scenario](fixture))
+        elif args.scenario == 'harness-negative-controls':
             from negative_controls import run
             result.update(run(args.output, manifest, args.manifest))
         elif args.scenario == 'baseline-fault-reproduction':
@@ -105,7 +124,8 @@ def main():
                           'log-channel-me': 'log-channel-me.json', 'log-channel-ae': 'log-channel-ae.json',
                           'readiness-me': 'readiness-me.json', 'readiness-ae': 'readiness-ae.json',
                           'pruner-exception': 'pruner-exception.json', 'journal-oms-restart': 'journal-oms-restart.json', 'oms-recovery-admission': 'oms-recovery-admission.json', 'oms-durable-request-id': 'oms-durable-request-id.json', 'execution-projector-replay-crash': 'execution-projector-replay-crash.json', 'oms-hold-release-authority': 'oms-hold-release-authority.json',
-                          'offline-purge-rejoin': 'offline-purge.json'}.get(args.scenario)
+                          'offline-purge-rejoin': 'offline-purge.json', 'core-boot': 'core-boot.json',
+                          'core-smoke': 'core-smoke.json'}.get(args.scenario)
             if fault_name and (fixture.root / fault_name).is_file():
                 witness = json.loads((fixture.root / fault_name).read_text())
                 (args.output / fault_name).write_text(json.dumps(witness, indent=2) + '\n')
@@ -119,7 +139,10 @@ def main():
                 result.update(status='INCONCLUSIVE', teardown_error=str(error))
             commands = fixture.root / 'commands.jsonl'
             if commands.exists():
-                result['child_exit_codes'] = [json.loads(line)['exit_code'] for line in commands.read_text().splitlines()]
+                # A row may declare exit codes that are evidence (a probe's REFUSED/UNKNOWN), judged by the scenario.
+                rows = [json.loads(line) for line in commands.read_text().splitlines()]
+                result['child_exit_codes'] = [0 if r['exit_code'] in r.get('accepted_exit_codes', [0]) else r['exit_code']
+                                              for r in rows]
                 if result['status'] == 'PASS':
                     try: check_result(result)
                     except Exception as error: result.update(status='INCONCLUSIVE', error=str(error))

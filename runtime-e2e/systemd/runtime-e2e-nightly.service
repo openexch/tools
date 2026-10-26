@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# T2 core-topology fixture nightly (RC2 critic D20). User unit; install by hand:
+#   cp runtime-e2e-nightly.{service,timer} ~/.config/systemd/user/
+#   edit RUNTIME_E2E_* below, then: systemctl --user daemon-reload && systemctl --user enable --now runtime-e2e-nightly.timer
+# Production timeouts are part of the template manifest (timeouts: production) and are not overridable here.
+[Unit]
+Description=Open Exchange runtime-e2e core fixture nightly (T2)
+After=docker.service
+
+[Service]
+Type=oneshot
+Environment=RUNTIME_E2E_DIR=%h/Apps/openexchange/tools/runtime-e2e
+Environment=RUNTIME_E2E_TEMPLATE=%h/Apps/openexchange/.runtime-handoff/nightly/manifests/core-template.json
+Environment=RUNTIME_E2E_EVIDENCE=%h/Apps/openexchange/.runtime-handoff/nightly/evidence
+ExecStart=/usr/bin/python3 ${RUNTIME_E2E_DIR}/nightly.py --template ${RUNTIME_E2E_TEMPLATE} --evidence-root ${RUNTIME_E2E_EVIDENCE}
+# One nightly at a time; a hung fixture is bounded by the runner's own orchestration limits.
+TimeoutStartSec=3h
+Nice=5

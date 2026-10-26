@@ -1,0 +1,55 @@
+{
+  "comment": "ME journal decoder profiles. A profile maps (schemaId, version, templateId) of each journal frame to a normalized oracle event. Each schema file is pinned by SHA-256. RC2 S1 freezes ME journal schema 4: drop its XML as schemas/me-journal-schema-4.xml, set its sha256, adjust the field names below if S1 named them differently, and set status to active. Loading refuses a pending profile, a changed file, and a mapped field the XML does not declare.",
+  "profiles": {
+    "me-journal-v1": {
+      "status": "active",
+      "source": "match 11fdd4b: settlement journal schema 3 v1 (trade, terminal) + order-schema 1 v11 template 28 (command outcome)",
+      "has_journal_seq": false,
+      "schemas": [
+        {"file": "settlement-journal-schema.xml", "sha256": "7b2361ac727db3bd53f6db2a3343dbfee8adb44ba57a84e2198d1e47bd3bc848"},
+        {"file": "order-schema.xml", "sha256": "a28e43ed2cabac23b8a6954fba045e7b11ac0b3f866835c9d0c3cac5c49c6a50"}
+      ],
+      "records": [
+        {"schema_id": 3, "template_id": 1, "type": "trade", "fields": {
+          "trade_id": "tradeId", "market": "marketId", "price": "price", "quantity": "quantity",
+          "taker_leg": "takerOrderId", "taker_user": "takerUserId", "maker_leg": "makerOrderId", "maker_user": "makerUserId",
+          "taker_is_buy": "takerIsBuy", "taker_order": "takerOmsOrderId", "maker_order": "makerOmsOrderId"}},
+        {"schema_id": 3, "template_id": 2, "type": "terminal", "fields": {
+          "leg": "orderId", "user": "userId", "market": "marketId", "status": "status", "order": "omsOrderId"}},
+        {"schema_id": 1, "template_id": 28, "type": "outcome", "fields": {
+          "command_id_high": "commandIdHigh", "command_id_low": "commandIdLow", "user": "userId", "order": "omsOrderId",
+          "old_leg": "oldOrderId", "market": "marketId", "kind": "commandKind", "applied_position": "appliedPosition",
+          "leg": "orderId", "status": "status", "reason": "reason", "result": "result", "price": "price", "quantity": "quantity"}}
+      ]
+    },
+    "me-journal-4": {
+      "status": "pending",
+      "source": "RC2 S1 wire freeze (critic.md 5.1 S1): ME journal schemaId 4 v1, records 1-5, every record with journalSeq + meEpoch",
+      "has_journal_seq": true,
+      "schemas": [
+        {"file": "me-journal-schema-4.xml", "sha256": null}
+      ],
+      "records": [
+        {"schema_id": 4, "template_id": 1, "type": "trade", "fields": {
+          "journal_seq": "journalSeq", "me_epoch": "meEpoch",
+          "trade_id": "tradeId", "market": "marketId", "price": "price", "quantity": "quantity",
+          "taker_leg": "takerOrderId", "taker_user": "takerUserId", "maker_leg": "makerOrderId", "maker_user": "makerUserId",
+          "taker_is_buy": "takerIsBuy", "taker_order": "takerOmsOrderId", "maker_order": "makerOmsOrderId"}},
+        {"schema_id": 4, "template_id": 2, "type": "terminal", "fields": {
+          "journal_seq": "journalSeq", "me_epoch": "meEpoch",
+          "leg": "orderId", "user": "userId", "market": "marketId", "status": "status", "order": "omsOrderId",
+          "reject_reason": "rejectReason"}},
+        {"schema_id": 4, "template_id": 3, "type": "outcome", "fields": {
+          "journal_seq": "journalSeq", "me_epoch": "meEpoch",
+          "command_id_high": "commandIdHigh", "command_id_low": "commandIdLow", "user": "userId", "order": "omsOrderId",
+          "old_leg": "oldOrderId", "market": "marketId", "kind": "commandKind", "applied_position": "appliedPosition",
+          "leg": "orderId", "status": "status", "reason": "reason", "result": "result", "price": "price", "quantity": "quantity",
+          "ledger_size": "ledgerSize", "ledger_capacity": "ledgerCapacity", "behavior_version": "behaviorVersion"}},
+        {"schema_id": 4, "template_id": 4, "type": "release", "fields": {
+          "journal_seq": "journalSeq", "me_epoch": "meEpoch"}},
+        {"schema_id": 4, "template_id": 5, "type": "engine_config", "fields": {
+          "journal_seq": "journalSeq", "me_epoch": "meEpoch"}}
+      ]
+    }
+  }
+}
