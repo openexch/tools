@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Per-run session keys for the core topology (harness 2.7 item 2, critic G2/G31).
 
-Every run mints fresh 32-byte secrets. The AE table uses the RC1 K6 v1 spec
-(``keyId:CLASS:secretHex``, entries joined by ``;``, AuthKeyTable.fromSpec); clients receive one
-``keyId:CLASS:secretHex`` credential. The ME table (classes FORWARDER and ADMIN, RC2 L5) uses the same
-format, since S6 ports the same authenticator into cluster-kit. Evidence carries key ids and classes
+Every run mints fresh 32-byte secrets. Both tables use the K6 v1 key spec of the cluster-kit
+authenticator (RC2 S6): ``keyId:CLASS:secretHex::users=*`` entries joined by ``;``. Decision A16: the users
+field is mandatory and ``users=*`` is the only any-user form (a key with no users field fails the load);
+every fixture principal is any-user. Clients receive one ``keyId:CLASS:secretHex`` credential (unchanged).
+The ME table holds classes FORWARDER and ADMIN (RC2 L5). Evidence carries key ids and classes
 only; ``secrets()`` is what the fixture redacts from every retained log.
 """
 import secrets
@@ -41,7 +42,7 @@ class KeyRing:
             raise ValueError('duplicate key id within one cluster')
 
     def table(self, cluster):
-        return ';'.join(f'{k}:{c}:{s}' for (_, cl), (k, c, s) in sorted(self.keys.items(), key=lambda i: i[1][0])
+        return ';'.join(f'{k}:{c}:{s}::users=*' for (_, cl), (k, c, s) in sorted(self.keys.items(), key=lambda i: i[1][0])
                         if cl == cluster)
 
     def credential(self, principal, cluster):

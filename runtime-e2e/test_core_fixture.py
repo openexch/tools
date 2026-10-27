@@ -167,6 +167,8 @@ class CredentialsTest(unittest.TestCase):
         self.assertEqual({e.split(':')[1] for e in ae}, {'GATEWAY', 'ADMIN', 'TOOL', 'FORWARDER', 'BRIDGE'})
         self.assertEqual({e.split(':')[1] for e in ring.table('me').split(';')}, {'FORWARDER', 'ADMIN'})
         self.assertTrue(all(len(e.split(':')[2]) == 64 for e in ae))
+        # RC2 S6 (A16): every key carries the explicit any-user scope; a missing users field fails the load
+        self.assertTrue(all(e.endswith('::users=*') for e in ae + ring.table('me').split(';')))
         self.assertTrue(ring.credential('bridge0', 'ae').startswith('31:BRIDGE:'))
         self.assertTrue(ring.credential('fwd1', 'me').startswith('122:FORWARDER:'))
         evidence = json.dumps(ring.evidence())
