@@ -336,6 +336,60 @@ def parse_ledger_log(paths):
 # --------------------------------------------------------------------------- #
 # OMS open orders -> authoritative expected locked (invariant 2)
 # --------------------------------------------------------------------------- #
+def parse_extra_deposits(path, asset_map=None):
+    """Sum manual deposits (ts/user/asset/amount) from a FILE into per-asset totals.
+
+    Accepts JSON (a list of objects with keys ts/user/asset/amount, or an object
+    keyed by asset) or whitespace/comma-delimited lines. Asset may be a numeric
+    id or a symbol resolvable through asset_map.
+    """
+    asset_map = asset_map or {}
+    totals = defaultdict(int)
+    if not path:
+        return {}
+    with open(os.path.expanduser(path), "r", errors="replace") as fh:
+        raw = fh.read().strip()
+    if not raw:
+        return {}
+    # JSON first
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        data = None
+    records = []
+    if isinstance(data, list):
+        for row in data:
+            records.append((row.get("asset"), row.get("amount")))
+    elif isinstance(data, dict):
+        for k, v in data.items():
+            if isinstance(v, dict):
+                records.append((k, v.get("amount")))
+            else:
+                records.append((k, v))
+    else:
+        for ln in raw.splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            parts = [p.strip() for p in ln.replace(",", " ").split()]
+            if len(parts) < 4:
+                continue
+            # ts user asset amount
+            records.append((parts[2], parts[3]))
+    for asset, amt in records:
+        if asset is None or amt is None:
+            continue
+        s = str(asset).strip()
+        if s.isdigit():
+            aid = int(s)
+        else:
+            aid = asset_map.get(s)
+            if aid is None:
+                continue
+        totals[aid] += parse_fixed(amt)
+    return dict(totals)
+
+
 def http_get_json(url, bearer, timeout):
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {bearer}"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -509,6 +563,10 @@ def run_sweep(args, asset_map):
     for p in args.sim_log:
         log_paths.extend(sorted(glob.glob(os.path.expanduser(p))) or [os.path.expanduser(p)])
     deposits, withdrawals, genesis_covered, log_meta = parse_ledger_log(log_paths)
+    if args.extra_deposits:
+        extra = parse_extra_deposits(args.extra_deposits, asset_map)
+        for a, amt in extra.items():
+            deposits[a] = deposits.get(a, 0) + amt
     result["log_meta"] = log_meta
 
     # 3. OMS expected locked
@@ -519,7 +577,15 @@ def run_sweep(args, asset_map):
     oms_stats = {}
     expected = {}
     try:
-        bearer_user = user_ids[0] if user_ids else 900001
+        bearer_user = 1
+        if user_ids:
+            sim = [u for u in user_ids if 900001 <= u <= 900999]
+            if sim:
+                bearer_user = sim[0]
+            elif 1 in user_ids:
+                bearer_user = 1
+            else:
+                bearer_user = user_ids[0]
         markets = load_markets(args.oms_url, asset_map, args.http_timeout, bearer_user)
         expected, oms_stats = collect_oms_expected(args.oms_url, user_ids, markets, args.http_timeout)
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, socket.timeout, RuntimeError) as e:
@@ -630,7 +696,8 @@ def build_arg_parser():
     p.add_argument("--max-sweeps", type=int, default=None,
                   help="stop after N sweeps (for bounded soak runs)")
     p.add_argument("--json", action="store_true", help="emit one JSON object per sweep")
-    p.add_argument("--verbose", action="store_true", help="print every drift row, not just the first 20")
+    p.add_argument("--extra-deposits", default=None,
+                  help="FILE of manual deposits (ts user asset amount) to add to the sim-log ledger")
     return p
 
 
