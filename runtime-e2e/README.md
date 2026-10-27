@@ -81,7 +81,8 @@ core instead of the legacy OMS path: `me0-2`, `ae0-2`, `fwd0`, `fwd1`, `bridge0`
 `projector`, the reserved `shadow0` and `probe`. `oms`, `market` and the legacy `bridge` are refused.
 PostgreSQL carries only the money-journal history projection.
 
-* Credentials: every run mints fresh 32-byte secrets (`credentials.py`). The AE gets
+* Credentials: every run mints fresh 32-byte secrets (`credentials.py`). Key tables are
+  `keyId:CLASS:secretHex::users=*` entries joined by `;` (RC2 S6, A16: the users field is mandatory). The AE gets
   `ASSETS_AUTH_KEYS`, each client one `AE_AUTH_CREDENTIAL`; the ME gets the key table named by
   `credentials.me.keys_env` (classes FORWARDER, ADMIN). `credentials.me.mode` must say whether the ME
   artifact enforces it (`not_enforced_by_artifact` until RC2 S6). Evidence keeps key ids and classes;
