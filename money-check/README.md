@@ -40,6 +40,11 @@ BUY  order locks the QUOTE asset (USD):  price × remainingQty
 SELL order locks the BASE  asset:        remainingQty
 ```
 
+The OMS dev-token backdoor accepts only userId 1 and 900000-900999, so the tool reads markets as
+a sim user in scope (else userId 1), never as an arbitrary reconciled id. A 401 from that read is
+reported as **OMS reachable but unauthorized** instead of unreachable, so a rejected token cannot
+degrade invariant 2 to a silent SKIP.
+
 **3. Non-negativity.** No `available < 0` and no `locked < 0`, ever.
 
 Amounts are 8-decimal fixed-point `int64` throughout.

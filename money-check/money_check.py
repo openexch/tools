@@ -56,6 +56,13 @@ DEFAULT_ASSET_MAP = {"USD": 0, "BTC": 1, "ETH": 2, "SOL": 3, "XRP": 4, "DOGE": 5
 
 TERMINAL_STATUSES = {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "DONE"}
 
+# The OMS dev-token backdoor accepts only userId 1 and the sim-owned range
+# 900000-900999 (DemoAuthenticationProvider). Every other userId gets a 401, so
+# a reconciled user from an arbitrary seed range must never become the bearer.
+DEV_USER_ID = 1
+DEV_RANGE_LO = 900000
+DEV_RANGE_HI = 900999
+
 
 # --------------------------------------------------------------------------- #
 # fixed-point helpers
@@ -415,6 +422,35 @@ def load_markets(base_url, asset_map, timeout, bearer_user):
     return out
 
 
+def dev_token_allowed(user_id):
+    """True when the OMS dev-token backdoor will accept this userId."""
+    return user_id == DEV_USER_ID or DEV_RANGE_LO <= user_id <= DEV_RANGE_HI
+
+
+def oms_bearer(user_ids):
+    """Pick a bearer the OMS dev backdoor accepts for the /markets read.
+
+    Prefer a sim-owned user in scope; the backdoor always accepts the dev user,
+    so an arbitrary (out-of-range) seed id never leaks into the bearer.
+    """
+    for uid in user_ids:
+        if uid != DEV_USER_ID and dev_token_allowed(uid):
+            return uid
+    return DEV_USER_ID
+
+
+def oms_access_failure(exc):
+    """Classify an OMS access failure for the sweep's oms_stats.
+
+    A 401/403 is not an unreachable OMS: the OMS answered and rejected the dev
+    token. Folding it into "unreachable" turns invariant 2 into a silent SKIP.
+    """
+    if isinstance(exc, urllib.error.HTTPError) and exc.code in (401, 403):
+        return {"error": f"HTTP {exc.code} {exc.reason}: dev token rejected",
+                "http_status": exc.code, "unauthorized": True}
+    return {"error": str(exc)}
+
+
 def expected_locked_for_user(orders, markets):
     """Per-asset expected locked from one user's open orders. Returns (per_asset, n_open, n_unpriced)."""
     exp = defaultdict(int)
@@ -493,10 +529,10 @@ def check_conservation(balances, deposits, withdrawals, genesis_covered, asset_m
             "drifts": drifts}
 
 
-def check_locked(balances, expected, asset_map, tol, have_oms):
+def check_locked(balances, expected, asset_map, tol, have_oms, skip_reason=None):
     if not have_oms:
         return {"name": "locked_vs_holds", "status": "SKIP",
-                "reason": "OMS unreachable; cannot compute authoritative expected locked",
+                "reason": skip_reason or "OMS unreachable; cannot compute authoritative expected locked",
                 "drifts": []}
     drifts = []
     keys = set(k for k, rec in balances.items() if rec["locked"] != 0) | set(expected.keys())
@@ -577,26 +613,25 @@ def run_sweep(args, asset_map):
     oms_stats = {}
     expected = {}
     try:
-        bearer_user = 1
-        if user_ids:
-            sim = [u for u in user_ids if 900001 <= u <= 900999]
-            if sim:
-                bearer_user = sim[0]
-            elif 1 in user_ids:
-                bearer_user = 1
-            else:
-                bearer_user = user_ids[0]
+        bearer_user = oms_bearer(user_ids)
         markets = load_markets(args.oms_url, asset_map, args.http_timeout, bearer_user)
         expected, oms_stats = collect_oms_expected(args.oms_url, user_ids, markets, args.http_timeout)
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, socket.timeout, RuntimeError) as e:
         have_oms = False
-        oms_stats = {"error": str(e)}
+        oms_stats = oms_access_failure(e)
     result["oms_stats"] = oms_stats
 
     # 4. checks
     result["checks"].append(check_conservation(balances, deposits, withdrawals,
                                               genesis_covered, asset_map, args.tolerance))
-    result["checks"].append(check_locked(balances, expected, asset_map, args.tolerance, have_oms))
+    locked_skip = None
+    if not have_oms:
+        locked_skip = ("OMS reachable but the dev token was rejected; cannot compute "
+                       "authoritative expected locked"
+                       if oms_stats.get("unauthorized")
+                       else "OMS unreachable; cannot compute authoritative expected locked")
+    result["checks"].append(check_locked(balances, expected, asset_map, args.tolerance,
+                                         have_oms, skip_reason=locked_skip))
     result["checks"].append(check_nonnegative(balances, asset_map))
     ae_internal = check_ae_internal(balances, store["holds"], asset_map, args.tolerance)
     if ae_internal is not None:
@@ -648,7 +683,9 @@ def print_human(result, verbose):
                   f"expected={d['expected']} actual={d['actual']} "
                   f"gap={d['gap']:+d} (={fmt_fixed(d['gap'])})")
     oms = result.get("oms_stats", {})
-    if oms.get("error"):
+    if oms.get("unauthorized"):
+        print(f"   OMS: REACHABLE but UNAUTHORIZED ({oms['error'][:160]})")
+    elif oms.get("error"):
         print(f"   OMS: UNREACHABLE ({oms['error'][:160]})")
     elif oms:
         print(f"   OMS: {oms.get('users_queried', 0)} users, {oms.get('open_orders', 0)} open orders"

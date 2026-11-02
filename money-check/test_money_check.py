@@ -19,6 +19,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -28,8 +29,11 @@ from money_check import (  # noqa: E402
     check_conservation,
     check_locked,
     check_nonnegative,
+    dev_token_allowed,
     expected_locked_for_user,
     fmt_fixed,
+    oms_access_failure,
+    oms_bearer,
     parse_asset_map,
     parse_fixed,
     parse_ledger_log,
@@ -383,6 +387,48 @@ class ArgParsing(unittest.TestCase):
 
     def test_asset_map_is_symbol_equals_id(self):
         self.assertEqual(parse_asset_map("USD=0,BTC=1"), {"USD": 0, "BTC": 1})
+
+
+class DevTokenBearer(unittest.TestCase):
+    def test_sim_user_is_preferred_as_the_markets_bearer(self):
+        self.assertEqual(oms_bearer([800001, 900005]), 900005)
+
+    def test_out_of_range_users_fall_back_to_the_dev_user(self):
+        # Seeding harnesses use bases like 800000-810000, outside the OMS
+        # dev-token range. Using one as the bearer 401'd /api/v1/markets, and the
+        # sweep still exited 0 with invariant 2 silently skipped.
+        self.assertEqual(oms_bearer([800000, 800001, 800002]), 1)
+
+    def test_empty_or_dev_only_user_set_still_produces_a_valid_bearer(self):
+        self.assertEqual(oms_bearer([]), 1)
+        self.assertEqual(oms_bearer([1]), 1)
+
+    def test_range_matches_the_oms_dev_backdoor(self):
+        for uid in (1, 900000, 900001, 900999):
+            self.assertTrue(dev_token_allowed(uid), uid)
+        for uid in (0, 2, 800000, 810000, 901000):
+            self.assertFalse(dev_token_allowed(uid), uid)
+
+
+class OmsAccessFailure(unittest.TestCase):
+    def _http_error(self, code, reason):
+        return urllib.error.HTTPError("http://oms/api/v1/markets", code, reason, {}, None)
+
+    def test_401_is_unauthorized_not_unreachable(self):
+        stats = oms_access_failure(self._http_error(401, "Unauthorized"))
+        self.assertTrue(stats["unauthorized"])
+        self.assertEqual(stats["http_status"], 401)
+
+    def test_network_failure_is_still_unreachable(self):
+        stats = oms_access_failure(urllib.error.URLError("connection refused"))
+        self.assertFalse(stats.get("unauthorized"))
+        self.assertNotIn("http_status", stats)
+
+    def test_locked_check_reports_why_it_skipped(self):
+        r = check_locked({}, {}, ASSETS, 0, False,
+                         skip_reason="OMS reachable but the dev token was rejected")
+        self.assertEqual(r["status"], "SKIP")
+        self.assertIn("dev token", r["reason"])
 
 
 if __name__ == "__main__":
