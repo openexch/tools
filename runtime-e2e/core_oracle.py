@@ -110,7 +110,7 @@ def m4(m):
             raise Violation(f'hold for order {oid} which is not live (terminal orders hold nothing)')
         create = m.orders.get(oid)
         if create is None:
-            raise Violation(f'hold for order {oid} that no accepted request created')
+            raise m.unaccounted(f'hold for order {oid} that no accepted request created')
         side_asset = m.hold_asset(create)
         if order['user'] != user or order['hold_asset'] != asset or asset != side_asset or user != create['user']:
             raise Violation(f'hold for order {oid} sits on ({user}, {asset}); order says ({order["user"]}, '
@@ -152,9 +152,15 @@ def expected_create_hold(m, oid):
 def _create_hold(m, oid):
     create = m.orders[oid]
     reply = create['reply']
-    if reply['hold_asset'] != m.hold_asset(create):
+    replay = reply.get('source') == 'replay'
+    # S15 W5: a replayed create (6.1: the duplicate ACK of a re-sent UNKNOWN) reports the order's CURRENT hold block, which is
+    # (asset 0, amount 0) once the order's hold is gone (first coreleader run: a filled SELL replied hold_asset 0). Only a
+    # first reply states the create-time asset; a live replayed order's hold asset is still judged against the core's holds.
+    if not replay and reply['hold_asset'] != m.hold_asset(create):
         raise Violation(f'order {oid}: hold asset {reply["hold_asset"]} is not the side\'s asset')
     expected = expected_create_hold(m, oid)
+    if replay:
+        return expected   # S15 6.1: a replayed create reports the order's current hold, not the create-time one
     if integer(reply['hold_amount']) != expected:
         raise Violation(f'order {oid}: {create["side"]} {create["type"]} create hold {reply["hold_amount"]} '
                         f'!= recomputed from the intent {expected}')
@@ -165,7 +171,7 @@ def residual(m, oid):
     """Bookkept hold residual: create hold + resolved amend deltas - fill draws (record formula)."""
     create = m.orders.get(oid)
     if create is None:
-        raise Violation(f'live order {oid} was never accepted by a create request')
+        raise m.unaccounted(f'live order {oid} was never accepted by a create request')
     create_hold = _create_hold(m, oid)   # recomputed from the intent, never the engine's ACK
     chain, _, qty = m.amend_chain(oid)
     pending = [link for link in chain if not link['resolved']]
@@ -216,11 +222,22 @@ def m6(m):
             raise Violation(f'terminal order {oid} drew {-left} more than it held without a declared OrderFault')
 
 
+def settle_epoch(m, row):
+    """The money projection carries no meEpoch column (projector V-schema, S15 W3 smoke): with exactly one declared epoch
+    every settle row belongs to it; with more, the per-epoch match needs the epoch on the row (S16 A04)."""
+    if row.get('me_epoch') is not None:
+        return row['me_epoch']
+    declared = m.declared.get('epochs') or [None]
+    if len(declared) != 1:
+        raise Inconclusive('settle rows carry no meEpoch and the drill declared several epochs')
+    return declared[0]
+
+
 def m7(m):
     by_trade = {}
     for row in m.s['money_journal']:
         if row['kind'] == 'settle':
-            by_trade.setdefault((row.get('me_epoch'), integer(row['trade'])), row)
+            by_trade.setdefault((settle_epoch(m, row), integer(row['trade'])), row)
     for trade in m.trades:
         if integer(trade['price']) <= 0 or integer(trade['quantity']) <= 0:
             raise Violation('ME trade with non-positive price/quantity')
@@ -236,7 +253,7 @@ def m7(m):
 
 
 def m8(m):
-    settles = Counter((row.get('me_epoch'), integer(row['trade'])) for row in m.s['money_journal'] if row['kind'] == 'settle')
+    settles = Counter((settle_epoch(m, row), integer(row['trade'])) for row in m.s['money_journal'] if row['kind'] == 'settle')
     dup = [k for k, n in settles.items() if n > 1]
     if dup:
         raise Violation(f'duplicate settle rows for trades {dup[:5]}')
@@ -306,7 +323,7 @@ def m12(m):
         expected_seq[event['me_epoch']] += 1
         if event['journal_seq'] != expected_seq[event['me_epoch']]:
             raise Violation(f'epoch {event["me_epoch"]}: journalSeq {event["journal_seq"]} breaks density')
-    settled = {(r.get('me_epoch'), r['trade']) for r in m.s['money_journal'] if r['kind'] == 'settle'}
+    settled = {(settle_epoch(m, r), r['trade']) for r in m.s['money_journal'] if r['kind'] == 'settle'}
     for trade in m.trades:
         if (trade['me_epoch'], trade['trade_id']) not in settled:
             raise Violation(f'epoch {trade["me_epoch"]} trade {trade["trade_id"]} swallowed (old id after re-genesis?)')
@@ -373,7 +390,7 @@ def run_rules(sample, rules):
     for name, rule in rules:
         try:
             outcome = rule(model)
-            results[name] = {'status': outcome or 'PASS'}
+            results[name] = dict(outcome) if isinstance(outcome, dict) else {'status': outcome or 'PASS'}
         except Violation as error:
             results[name] = {'status': 'FAIL', 'detail': str(error)}
         except (Inconclusive, KeyError, TypeError, ValueError) as error:

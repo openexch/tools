@@ -51,6 +51,11 @@ class Profile:
             missing = [xml for xml in record['fields'].values() if xml not in message.field_names()]
             if missing:
                 raise JournalSchemaError(f'profile {name}: template {key} lacks mapped fields {missing}')
+            for group in record.get('groups', {}):
+                if message.group is None or message.group.name != group:
+                    raise JournalSchemaError(f'profile {name}: template {key} lacks mapped group {group}')
+            if message.group is not None and message.group.name not in record.get('groups', {}):
+                raise JournalSchemaError(f'profile {name}: template {key} carries group {message.group.name} that the profile does not map')
             if self.has_journal_seq and not {'journal_seq', 'me_epoch'} <= set(record['fields']):
                 raise JournalSchemaError(f'profile {name}: template {key} must map journal_seq and me_epoch')
             self.records[key] = record
@@ -70,6 +75,8 @@ class Profile:
             raise JournalSchemaError(f'profile {self.name}: {error}') from error
         event = {'type': record['type']}
         for normalized, xml in record['fields'].items():
+            event[normalized] = values[xml]
+        for xml, normalized in record.get('groups', {}).items():
             event[normalized] = values[xml]
         if not self.has_journal_seq:
             event['journal_seq'] = None

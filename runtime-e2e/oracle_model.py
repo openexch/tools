@@ -36,7 +36,15 @@ user other than the creating user is a FAIL (M2, O4). Holds are recomputed from 
   faults           {"settle_fault", "settle_rejected", "order_fault", "quarantined"}  observed counts
   counters         optional {"stale_outcomes","redundant_outcomes","stale_terminals","conflicts"} (G6 export)
   declared         {"settle_fault","settle_rejected","order_fault","quarantined","halt","fault_open",
-                    "forwarder_absent","gate_sequence": [[state, reason], ...] | null, "epochs": [e, ...]}
+                    "forwarder_absent","gate_sequence": [[state, reason], ...] | null, "epochs": [e, ...],
+                    "ordering_exception": null | {"me_term", "until_seq", "from_journal_seq" (optional)}}  (S15 7)
+  tap_continuity   optional (S15 5.7) {"transitions": [CoreProbe tap session notes], "summary": {...}}; the dispatch
+                   density is computed from the rows themselves against core.pending_dispatch.head
+  story rows       (S15 6.1) request rows may carry "id", "resolves" and "resolved_by": an UNKNOWN original resolved by
+                   a same-requestId re-send counts as the re-send's verdict (Model.creates/amends/cancels)
+  dispatch_tap rows of kind RELEASE_ID carry a create's command id again (W0 F-S15-25); rows with
+                   "source": "backfill" were rebuilt at the barrier from pending-dump (seq known) or from the ME journal
+                   outcome (seq null)
   barrier          {"input_closed": true, "samples": [obs, obs]} with obs.<collection>_digest = fingerprint
 """
 from collections import defaultdict
@@ -44,6 +52,8 @@ from collections import defaultdict
 from contracts import FP, Inconclusive, Violation, fingerprint, integer
 
 TERMINAL = {'FILLED', 'CANCELLED', 'REJECTED', 'EXPIRED'}
+RELEASE_KIND = 'RELEASE_ID'           # money-schema DispatchKind 3: forwarder-only, carries a create's command id again
+RESULT_RELEASED = 7                   # me-journal-schema CommandOutcome.result 7 RELEASED (L8 item 4)
 PENDING = {'PENDING_NEW', 'PENDING_CANCEL', 'PENDING_REPLACE'}
 KIND_CODES = {'CREATE': 0, 'CANCEL': 1, 'AMEND': 2}
 BARRIER_COLLECTIONS = ['core', 'core_events', 'dispatch_tap', 'me_journal', 'me_open_legs', 'money_journal',
@@ -85,6 +95,66 @@ def check_barrier(sample):
             raise Inconclusive('observation does not belong to the barrier: ' + name)
 
 
+def resolve_requests(rows):
+    """S15 6.1 rule 2. Returns (effective rows in submission order, unresolved UNKNOWN originals).
+
+    An UNKNOWN original whose same-requestId re-send got a duplicate ACK was committed at its own position: it stands as
+    that ACK (``source: replay``, the replay reports the order's CURRENT hold, so M5 does not compare it with the
+    intent). A fresh ACK or a REJECT of the re-send means the original never committed: the original is dropped and the
+    re-send stands at its own position. The duplicate re-send itself is the replay of the original and is dropped.
+    Rows without story ids (smoke, synthetic samples) pass unchanged.
+    """
+    by_id = {}
+    for row in rows:
+        if 'id' in row:
+            if row['id'] in by_id:
+                raise Inconclusive(f'story row id {row["id"]} repeats')
+            by_id[row['id']] = row
+    effective, unresolved = [], []
+    for row in rows:
+        reply = row['reply']
+        if 'resolves' in row:
+            original = by_id.get(row['resolves'])
+            if original is None or original.get('resolved_by') != row.get('id') or original['request'] != row['request']:
+                raise Inconclusive(f'resolution row {row.get("id")} does not name an UNKNOWN original with its requestId')
+            if reply.get('outcome') == 'ACK' and reply.get('duplicate'):
+                continue
+            if reply.get('outcome') not in {'ACK', 'REJECT'}:
+                raise Inconclusive(f'resolution row {row.get("id")} carries no verdict')
+            effective.append(row)
+            continue
+        if reply.get('outcome') == 'UNKNOWN':
+            resolver = by_id.get(row.get('resolved_by')) if row.get('resolved_by') is not None else None
+            if row.get('resolved_by') is not None and (resolver is None or resolver.get('resolves') != row.get('id')):
+                raise Inconclusive(f'UNKNOWN row {row.get("id")} names resolver {row.get("resolved_by")} that does not resolve it')
+            if resolver is None:
+                unresolved.append(row)
+            elif resolver['reply'].get('outcome') == 'ACK' and resolver['reply'].get('duplicate'):
+                effective.append(dict(row, reply=dict(resolver['reply'], duplicate=False, source='replay'),
+                                      resolution={'by': resolver['id'], 'committed': True}))
+            continue
+        effective.append(row)
+    return effective, unresolved
+
+
+def attempt(row):
+    return integer(row['id_low']) >> 2
+
+
+def seq_gaps(seqs, low, high):
+    """Inclusive [a, b] ranges of the integers in [low, high] that ``seqs`` does not contain."""
+    gaps, expected = [], low
+    for seq in sorted(set(seqs)):
+        if seq < low or seq > high:
+            continue
+        if seq > expected:
+            gaps.append([expected, seq - 1])
+        expected = seq + 1
+    if expected <= high:
+        gaps.append([expected, high])
+    return gaps
+
+
 class Model:
     """Indexes built once; rules read them and never mutate."""
 
@@ -102,10 +172,15 @@ class Model:
             if oid in self.live:
                 raise Violation('core order snapshot repeats order ' + str(oid))
             self.live[oid] = row
+        # S15 6.1: UNKNOWN replies resolved by their same-requestId re-send; the rules read these, never the raw lists.
+        self.creates, unresolved_creates = resolve_requests(sample['creates'])
+        self.amends, unresolved_amends = resolve_requests(sample['amends'])
+        self.cancels, unresolved_cancels = resolve_requests(sample['cancels'])
+        self.unresolved = unresolved_creates + unresolved_amends + unresolved_cancels
         # Accepted creates: first non-duplicate ACK per requestId defines the order.
         self.orders = {}
         self.create_by_request = {}
-        for create in sample['creates']:
+        for create in self.creates:
             reply = create['reply']
             if reply.get('outcome') != 'ACK':
                 continue
@@ -130,18 +205,97 @@ class Model:
                 self.quote[order] += quote(trade['price'], trade['quantity'])
                 self.trade_legs[order].add(leg)
                 self.trade_prices[order].append((integer(trade['price']), buy))
-        self.tap = {}
+        # The command dispatches, keyed by command id. RELEASE_ID rows repeat a create's id by design (W0 F-S15-25):
+        # they are kept apart, keyed by (id, kind), and never count as a second dispatch of the command.
+        self.tap, self.release_dispatches = {}, {}
         for row in sample['dispatch_tap']:
             key = (integer(row['id_high']), integer(row['id_low']))
+            if row['kind'] == RELEASE_KIND:
+                if key in self.release_dispatches:
+                    raise Violation('dispatch tap saw a RELEASE_ID twice for command id ' + str(key))
+                self.release_dispatches[key] = row
+                continue
             if key in self.tap:
                 raise Violation('dispatch tap saw command id twice as a new dispatch: ' + str(key))
             self.tap[key] = row
         self.first_outcome = {}
         self.outcome_copies = defaultdict(list)
-        for event in self.outcomes:
+        self.released_repeats = []
+        released_before = set()
+        for event in self.journal:
+            if event['type'] == 'release':
+                released_before.update(integer(entry['commandIdHigh']) for entry in event.get('releases') or [])
+                continue
+            if event['type'] != 'outcome':
+                continue
             key = (integer(event['command_id_high']), integer(event['command_id_low']))
+            if key in self.first_outcome and event['result'] == RESULT_RELEASED:
+                # L8 item 4: a frame offered after its order was released journals RELEASED and creates nothing
+                if event['leg']:
+                    raise Violation(f'command {key}: RELEASED repeat carries leg {event["leg"]}')
+                if key[0] not in released_before:
+                    raise Violation(f'command {key}: RELEASED outcome without an earlier release of order {key[0]}')
+                self.released_repeats.append(event)
             self.outcome_copies[key].append(event)
             self.first_outcome.setdefault(key, event)
+        self.continuity = self._continuity(sample)
+
+    def _continuity(self, sample):
+        """S15 5.7: dispatch gaps (the tap's own rows against [1, core head]) and order-event loss windows."""
+        tapped = [integer(r['seq']) for r in sample['dispatch_tap'] if r.get('source') != 'backfill']
+        head = sample['core'].get('pending_dispatch', {}).get('head')
+        high = max([head if type(head) is int else 0] + tapped) if tapped or type(head) is int else 0
+        gaps = seq_gaps(tapped, 1, high)
+        backfill = [r for r in sample['dispatch_tap'] if r.get('source') == 'backfill']
+        events = [integer(e['seq']) for e in sample['core_events']]
+        windows = seq_gaps(events, min(events), max(events)) if events else []
+        for note in (sample.get('tap_continuity') or {}).get('transitions', []):
+            if note.get('event') in {'registered'}:
+                continue
+            last = note.get('last_event_seq', 0)
+            after = [s for s in events if s > last]
+            windows.append([last + 1, min(after) - 1] if after else [last + 1, None])
+        windows = [w for w in windows if w[1] is None or w[1] >= w[0]]
+        return {'gaps': gaps, 'backfill': backfill, 'event_windows': windows, 'head': head}
+
+    def tap_closed(self):
+        """None when every dispatch gap is accounted for by backfill rows (count over the gap), else the first open gap.
+
+        A backfill row with a known seq must sit inside a gap; rows without a seq (resolved at the ME, rebuilt from its
+        journal) are pooled across the gaps, so the check is: for every gap, known rows <= its size, and the pooled
+        rows cover the remainder exactly."""
+        gaps, backfill = self.continuity['gaps'], self.continuity['backfill']
+        known = [integer(r['seq']) for r in backfill if r.get('seq') is not None]
+        pooled = sum(1 for r in backfill if r.get('seq') is None)
+        deficit, first_open = 0, None
+        for a, b in gaps:
+            inside = sum(1 for seq in known if a <= seq <= b)
+            missing = (b - a + 1) - inside
+            if missing and first_open is None:
+                first_open = [a, b]
+            deficit += missing
+        stray = [seq for seq in known if not any(a <= seq <= b for a, b in gaps)]
+        if stray:
+            raise Inconclusive(f'backfill rows at seqs {stray[:5]} that the tap did not miss')
+        if pooled > deficit:
+            raise Inconclusive(f'{pooled} backfill rows without a seq but only {deficit} missing dispatch seqs')
+        return None if deficit == pooled else first_open
+
+    def require_tap_closed(self):
+        gap = self.tap_closed()
+        if gap is not None:
+            raise Inconclusive(f'tap gap [{gap[0]}, {gap[1]}] not closed')
+
+    def in_event_window(self, last_seen):
+        """True when an order whose last tapped event seq is ``last_seen`` could have lost a later event in a window."""
+        return any(b is None or b > last_seen for a, b in self.continuity['event_windows'])
+
+    def unaccounted(self, text):
+        """S15 6.1 rule 4: an order no accepted request created is a FAIL, unless a gateway reply is still unresolved
+        (that request may be the one that committed it): then the run is INCONCLUSIVE, never a false FAIL."""
+        if self.unresolved:
+            return Inconclusive(f'unresolved gateway reply ({len(self.unresolved)}): {text}')
+        return Violation(text)
 
     def check_ownership(self):
         """Every ME trade leg, dispatch and resting leg belongs to the user who created the order."""
@@ -149,10 +303,10 @@ class Model:
             for order, user in [(trade['taker_order'], trade['taker_user']), (trade['maker_order'], trade['maker_user'])]:
                 create = self.orders.get(order)
                 if create is None:
-                    raise Violation(f'ME trade {trade["trade_id"]} on order {order} that no accepted request created')
+                    raise self.unaccounted(f'ME trade {trade["trade_id"]} on order {order} that no accepted request created')
                 if create['user'] != user:
                     raise Violation(f'ME trade {trade["trade_id"]}: order {order} belongs to {create["user"]}, trade says {user}')
-        for row in self.s['dispatch_tap']:
+        for row in self.tap.values():   # a RELEASE_ID row carries only the command id (order 0, user 0)
             create = self.orders.get(row['order'])
             if create is not None and create['user'] != row['user']:
                 raise Violation(f'dispatch {row["seq"]}: order {row["order"]} belongs to {create["user"]}, dispatch says {row["user"]}')
@@ -180,9 +334,9 @@ class Model:
         """Resolved amends of one order in submission order: (new_price, new_qty, delta, applied, resolved)."""
         create = self.orders[oid]
         price, qty = create['price'], create['quantity']
-        dispatches = sorted((row for row in self.s['dispatch_tap'] if row['order'] == oid and row['kind'] == 'AMEND'),
-                            key=lambda row: row['seq'])
-        acked = [a for a in self.s['amends'] if a['order'] == oid and a['reply'].get('outcome') == 'ACK'
+        # attempt order == mint order, and it is known for a backfilled row whose seq is not (S15 5.7 rule 3)
+        dispatches = sorted((row for row in self.tap.values() if row['order'] == oid and row['kind'] == 'AMEND'), key=attempt)
+        acked = [a for a in self.amends if a['order'] == oid and a['reply'].get('outcome') == 'ACK'
                  and not a['reply'].get('duplicate')]
         if len(acked) != len(dispatches):
             raise Inconclusive(f'order {oid}: {len(acked)} accepted amends but {len(dispatches)} AMEND dispatches tapped')

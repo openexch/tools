@@ -22,8 +22,13 @@ import order_oracle
 from oracle_model import BARRIER_COLLECTIONS
 
 BUYER, SELLER = 72001, 72002
-PRICE, QTY = 100_000 * FP, FP // 100
+# The ME price band of BTC-USD is 0.01..100.00 (W0 answer 7), so the smoke prices inside it (S14's 100,000 predates the band).
+PRICE, QTY = 50 * FP, FP // 100
 SLIPPAGE_BPS = 500
+# Genesis plan of core-smoke (contract 5.3): funded at genesis through the TOOL principal, no forwarder slot.
+SMOKE_PLAN = {'users': [BUYER, SELLER], 'markets': [1],
+              'funding': [{'user': BUYER, 'asset': 0, 'amount': 50_000 * FP}, {'user': SELLER, 'asset': 1, 'amount': FP}],
+              'risk': {'slippage_bps': SLIPPAGE_BPS, 'collar_bps': 5000, 'per_sec': 200, 'max_open': 40}, 'tap_ms': 60_000}
 # legacy_none is the H0 G2 RED witness (substituted, see README): a client presenting no credential, as
 # every pre-RC1 client and today's v1 fixture does, is refused by the RC1 core.
 AUTH_MODES = ['legacy_none', 'unknown_key', 'wrong_secret', 'class_mismatch']
@@ -66,6 +71,20 @@ def verify_core_genesis(fixture):
     return {'verified': True, 'balances': [], 'holds': [], 'live_orders': [], 'last_applied_trade_id': 0}
 
 
+def me_refusal_control(fixture):
+    """core-boot control (RC2 S15 5.3): an S6 ME refuses a session that presents no credential. Closes the
+    ENFORCED_NOT_YET_EXERCISED placeholder; a not-enforced artifact is recorded as such, never as a pass."""
+    if fixture.m['credentials']['me']['mode'] != 'enforced':
+        return 'NOT_ENFORCED_BY_ARTIFACT: ME keys provisioned; refusal lands with RC2 S6'
+    result = fixture.me_open_legs_unauthenticated()
+    text = (result.stdout or '') + (result.stderr or '')
+    if result.returncode == 0:
+        raise Violation('ME session without a credential was not refused')
+    if 'AuthenticationException' not in text:
+        raise Inconclusive('ME connect without a credential failed, but not by an authentication refusal: ' + text[-200:])
+    return {'result': 'REFUSED', 'error': 'AuthenticationException'}
+
+
 def authentication_controls(fixture):
     """Refusals the core must make; each control is evidence only when the refusal is observed."""
     controls = {}
@@ -92,9 +111,7 @@ def authentication_controls(fixture):
     if not all(a > b for a, b in zip(after, before)):
         raise Violation(f'assets_ingress_unauthorised_total did not move on every member: {before} -> {after}')
     controls['authority'] = {'reply': reply['replies'][0], 'unauthorised_before': before, 'unauthorised_after': after}
-    me = fixture.m['credentials']['me']
-    controls['me'] = ('ENFORCED_NOT_YET_EXERCISED' if me['mode'] == 'enforced'
-                      else 'NOT_ENFORCED_BY_ARTIFACT: ME keys provisioned; refusal lands with RC2 S6')
+    controls['me'] = me_refusal_control(fixture)
     return controls
 
 
@@ -171,15 +188,67 @@ def money_journal(fixture):
     return journal, legs
 
 
+def merge_member_lives(events, has_journal_seq):
+    """One member's journal as one logical sequence. A member that was killed and restarted starts a NEW archive recording
+    and re-journals the whole log it replays from journalSeq 1 (S15 W5 finding F-S15-31: me2 of lifecycle-faults held two
+    recordings, 1..1233 then 1..1465, a second engine_config included). A journalSeq that appears in more than one
+    recording must carry the same content in each (the journal is a function of the log), then it counts once; the same
+    seq with different content is a divergence and stays a Violation. Without journalSeq (legacy profiles) nothing is merged."""
+    plain = [{k: v for k, v in e.items() if k not in {'source', 'recording', 'position'}} for e in events]
+    if not has_journal_seq or len({e.get('recording') for e in events}) <= 1:
+        return plain
+    by_seq = {}
+    for e in plain:
+        seen = by_seq.setdefault(e['journal_seq'], e)
+        if seen != e:
+            raise Violation(f'journalSeq {e["journal_seq"]} differs between two recordings of one ME member')
+    return [by_seq[k] for k in sorted(by_seq)]
+
+
 def me_journal(fixture):
     profile = journal_decode.load_profile(fixture.m['me_journal_profile'])
     decoded = {}
     for i in range(3):
         events = journal_decode.decode_dump(fixture.journal_dump(f'me{i}'), profile, require_end=True)
-        decoded[f'me{i}'] = [{k: v for k, v in e.items() if k not in {'source', 'recording', 'position'}} for e in events]
+        decoded[f'me{i}'] = merge_member_lives(events, profile.has_journal_seq)
     if len({fingerprint(v) for v in decoded.values()}) != 1:
         raise Violation('ME members journaled different logical event sequences')
     return decoded['me0'], profile.has_journal_seq
+
+
+# G6 export of the AE leader -> sample['counters'] (OM:37), so O11 is judged (OO:231-237)
+COUNTER_METRICS = {'stale_outcomes': 'assets_order_stale_outcomes_total', 'redundant_outcomes': 'assets_order_redundant_outcomes_total',
+                   'stale_terminals': 'assets_order_stale_terminals_total', 'conflicts': 'assets_order_conflicts_total',
+                   'released_late': 'assets_released_late_total'}    # U1: RELEASED copies (L8 item 4, O11 W3)
+SCRAPE_PREFIXES = {
+    'ae': ('assets_cluster_role', 'assets_pending_commands', 'assets_order_', 'assets_release_confirm_stale_total', 'assets_market_',
+           'assets_released_late_total', 'assets_me_release_early_total', 'assets_late_apply_on_dead_order_total',
+           'assets_release_backlog', 'assets_me_ledger_size'),                  # O-F4 (RUN:372-380)
+    'me': ('match_cluster_role', 'match_engine_next_journal_seq', 'match_durable_', 'match_command_ledger_size',
+           'match_ingress_decode_rejects_total', 'match_ingress_unauthorized_total'),   # O-F1 (RUN:331-338)
+    'fwd': ('forwarder_resync_total', 'forwarder_session_reconnect_total', 'forwarder_session_new_leader_total',
+            'forwarder_dispatch_seq', 'forwarder_ready'),
+    'bridge': ('bridge_ae_connected', 'bridge_ready', 'bridge_not_ready_bits', 'bridge_state', 'bridge_halted',
+               'bridge_client_sessions_opened_total')}
+
+
+def barrier_scrape(fixture):
+    """The contract 5.6 scrape set, per role. Names a role does not export are simply absent (the oracle reads
+    sample.counters, this is evidence); a slot that is not STARTED is not scraped."""
+    ports = fixture.m['ports']
+    targets = [(f'{e}{i}', e, ports[e + '_metrics']) for e in ('ae', 'me') for i in range(3)]
+    for slot, state in (getattr(fixture, 'slots', None) or {}).items():
+        if state.get('state') == 'STARTED':
+            targets.append((slot, 'fwd' if slot.startswith('fwd') else 'bridge', ports['forwarder_http' if slot.startswith('fwd') else 'bridge_http']))
+    scrape = {}
+    for role, kind, port in targets:
+        try:
+            metrics = fixture.metrics(role, port)
+        except Inconclusive as error:
+            scrape[role] = {'unavailable': str(error)}
+            continue
+        scrape[role] = {k: v for k, v in metrics.items() if k.startswith(SCRAPE_PREFIXES[kind])}
+    return scrape
 
 
 def observe(fixture):
@@ -188,41 +257,44 @@ def observe(fixture):
     journal, has_seq = me_journal(fixture)
     legs = fixture.me_open_legs()
     mj, mlegs = money_journal(fixture)
-    gauges = {}
+    gauges, leaders = {}, []
     for i in range(3):
         metrics = fixture.metrics(f'ae{i}', fixture.m['ports']['ae_metrics'])
         gauges[f'ae{i}'] = {k: int(metrics[k]) for k in ['assets_settle_faults_total', 'assets_settle_rejects_total']}
+        if metrics.get('assets_cluster_role') == 2.0:
+            leaders.append(metrics)
+    if len(leaders) != 1:
+        raise Inconclusive(f'no AE leader at the barrier: {len(leaders)} members report role 2')
+    counters = {}
+    for name, metric in COUNTER_METRICS.items():
+        if metric not in leaders[0]:
+            raise Inconclusive('AE leader does not export ' + metric)
+        counters[name] = int(leaders[0][metric])
     core = {'balances': sorted(({'user': b['user'], 'asset': b['asset'], 'available': b['available'], 'locked': b['locked']}
                                 for b in money['balances']), key=lambda b: (b['user'], b['asset'])),
             'holds': sorted(money['holds'], key=lambda h: h['order']),
             'live_orders': orders, 'last_applied_trade_id': money['lastAppliedTradeId'],
             'pending_dispatch': {'count': pending['count'], 'head': pending['head']}}
     return {'core': core, 'me_journal': journal, 'me_journal_seq': has_seq, 'me_open_legs': legs,
-            'money_journal': mj, 'money_journal_legs': mlegs, 'gauges': gauges, 'pending': pending}
+            'money_journal': mj, 'money_journal_legs': mlegs, 'gauges': gauges, 'pending': pending, 'counters': counters,
+            'scrape': barrier_scrape(fixture)}
 
 
 def core_smoke(fixture):
-    genesis = verify_core_genesis(fixture)
-    tap_seconds = 40
-    tap_path = fixture.start_tap(tap_seconds * 1000)
-    tap_started = time.monotonic()
-    time.sleep(3)   # the tap registers before the first command
-    funding, creates = [], []
-    _ok(*fixture.core('core-config', 'probe-admin', version=1, behavior=1, tick=1, min=1, max=10**18, lot=0), 'core-config')
-    _ok(*fixture.core('risk', 'probe-admin', version=1, market=1, min_qty=1, max_qty=10**6 * FP, collar_bps=2000,
-                      per_sec=200, max_open=40, slippage_bps=SLIPPAGE_BPS), 'risk')
-    _fund(fixture, funding, 'deposit', BUYER, 0, 50_000 * FP, 1, 'SUSPENDED')        # M9: money moves at GENESIS
-    _ok(*fixture.core('gate', 'probe-admin', market=0, state='OPEN', reason='ADMIN'), 'gate')
-    _fund(fixture, funding, 'deposit', SELLER, 1, FP, 2, 'OPEN')
+    """The genesis (empty snapshot, tap, ME genesis, bridges, core genesis, risk, funding) ran in fixture.start(SMOKE_PLAN)."""
+    genesis = fixture.registry['genesis_snapshot']
+    tap_path = Path(fixture.registry['tap']['path'])
+    tap_end_ns = fixture.registry['tap']['started_ns'] + fixture.registry['tap']['duration_ms'] * 1_000_000
+    funding, creates = [dict(f) for f in fixture.registry['funding']], []
     _create(fixture, creates, SELLER, 'SELL', 1, 101)
     _create(fixture, creates, BUYER, 'BUY', 2, 102)
     _create(fixture, creates, BUYER, 'BUY', 2, 102)                                    # O1: replayed requestId
-    remaining = tap_seconds - (time.monotonic() - tap_started) + 2
+    remaining = (tap_end_ns - time.time_ns()) / 1e9 + 2
     if remaining > 0: time.sleep(remaining)
     tap = read_tap(tap_path)
     first = observe(fixture); time.sleep(1); second = observe(fixture)
     sample = {'version': 'core-sample-v2', 'markets': {'1': {'base': 1, 'quote': 0}},
-              'risk': {'1': {'slippage_bps': SLIPPAGE_BPS}}, 'genesis': genesis,
+              'risk': fixture.registry['risk'], 'genesis': genesis, 'counters': second['counters'],
               'funding': [{k: v for k, v in f.items() if k != 'reply'} for f in funding],
               'creates': creates, 'amends': [], 'cancels': [],
               'core_events': tap['order_event'], 'admission': tap['admission'], 'dispatch_tap': tap['dispatch'],
@@ -233,7 +305,8 @@ def core_smoke(fixture):
                          'quarantined': sum(1 for e in tap['order_event'] if e['kind'] == 'QUARANTINED')},
               'declared': {'settle_fault': 0, 'settle_rejected': 0, 'order_fault': 0, 'quarantined': 0, 'halt': False,
                            'fault_open': False, 'forwarder_absent': all(fixture.slots[s]['state'] != 'STARTED' for s in ('fwd0', 'fwd1')),
-                           'gate_sequence': [['SUSPENDED', 'GENESIS'], ['OPEN', 'ADMIN']], 'epochs': [None]}}
+                           'gate_sequence': [['SUSPENDED', 'GENESIS'], ['OPEN', 'ADMIN']],
+                           'epochs': [int(fixture.genesis_id(), 16)]}}    # W0: the journal's meEpoch is the genesis id
     observations = []
     for obs in (first, second):
         view = dict(sample, **{k: obs[k] for k in ['core', 'me_journal', 'me_open_legs', 'money_journal', 'money_journal_legs']})

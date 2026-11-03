@@ -160,6 +160,64 @@ class OrderOracleTest(unittest.TestCase):
     def test_o11_unexpected_quarantine(self):
         self.assertRule(variant(clean_sample(), lambda s: s['faults'].update(quarantined=1)), 'O11')
 
+    # ---- S15 W5: three rule corrections found by the first full-rule T2 runs (evidence/w5/findings.txt)
+
+    def test_o3_triggered_stop_child_starts_at_attempt_one(self):
+        def edit(s):
+            next(r for r in s['dispatch_tap'] if r['seq'] == 10)['id_low'] = 1 << 2
+            s['me_journal'][outcome_index(s, 1007, 0)]['command_id_low'] = 1 << 2
+        result = order_oracle.judge(variant(clean_sample(), edit))
+        self.assertEqual(result['rules']['O3']['status'], 'PASS', result)
+
+    def test_o3_attempt_one_first_is_still_a_skip_for_an_untriggered_order(self):
+        def edit(s):
+            next(r for r in s['dispatch_tap'] if r['seq'] == 5)['id_low'] = 1 << 2
+            s['me_journal'][outcome_index(s, 1004, 0)]['command_id_low'] = 1 << 2
+        self.assertRule(variant(clean_sample(), edit), 'O3')
+
+    def _lost_cancel(self, order, seq=11):
+        def edit(s):
+            base = next(r for r in s['dispatch_tap'] if r['id_high'] == order)
+            attempts = [r['id_low'] >> 2 for r in s['dispatch_tap'] if r['id_high'] == order]
+            s['dispatch_tap'].append(dict(base, seq=seq, id_low=(max(attempts) + 1) << 2 | 1, kind='CANCEL'))
+        return edit
+
+    def test_o10_lost_cancel_of_an_order_the_me_ended_is_moot(self):
+        result = order_oracle.judge(variant(clean_sample(), self._lost_cancel(1001)))
+        self.assertEqual(result['rules']['O10']['status'], 'PASS', result)
+        self.assertEqual(result['rules']['O10']['moot_excused'], 1)      # review FIX-1: the count is recorded per run
+
+    def test_o10_lost_cancel_of_a_live_order_still_fails(self):
+        self.assertRule(variant(clean_sample(), self._lost_cancel(1003)), 'O10')
+
+    def test_o10_a_create_is_never_moot(self):
+        def edit(s):
+            # order 1001 ended at the ME, but a CREATE of it that the ME never journaled is still owed
+            del s['me_journal'][outcome_index(s, 1001, 0)]
+        self.assertRule(variant(clean_sample(), edit), 'O10')
+
+    def _unknown_leg_cancel(self, order, bump):
+        def edit(s):
+            base = next(e for e in s['me_journal'] if e['type'] == 'outcome' and e['command_id_high'] == order)
+            attempts = [r['id_low'] >> 2 for r in s['dispatch_tap'] if r['id_high'] == order]
+            row = dict(next(r for r in s['dispatch_tap'] if r['id_high'] == order), seq=11,
+                       id_low=(max(attempts) + 1) << 2 | 1, kind='CANCEL')
+            s['dispatch_tap'].append(row)
+            s['me_journal'].append(dict(base, command_id_low=row['id_low'], kind=1, leg=0, result=4, status=-1, price=0, quantity=0,
+                                        applied_position=base['applied_position'] + 7))
+            s['counters']['stale_outcomes'] += bump
+        return edit
+
+    def test_o11_unknown_leg_cancel_after_the_me_ended_the_order_is_counted_as_stale(self):
+        result = order_oracle.judge(variant(clean_sample(), self._unknown_leg_cancel(1001, 1)))
+        self.assertEqual(result['rules']['O11']['status'], 'PASS', result)
+
+    def test_o11_the_same_outcome_without_the_core_counting_it_fails(self):
+        self.assertRule(variant(clean_sample(), self._unknown_leg_cancel(1001, 0)), 'O11')
+
+    def test_o11_unknown_leg_cancel_of_a_live_order_is_not_explained(self):
+        self.assertRule(variant(clean_sample(), self._unknown_leg_cancel(1003, 1)), 'O11')
+
     def test_o12_gate_never_opened(self):
         self.assertRule(variant(clean_sample(), lambda s: s['admission'].pop()), 'O12')
 

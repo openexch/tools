@@ -90,7 +90,7 @@ PostgreSQL carries only the money-journal history projection.
   (`tap.out`, `tap.err`, `tap.jsonl`) before teardown. `shadow0` gets no key until
   `SessionClass.REPLICA` exists (RC2 S1); RCS S9 fills that slot.
 * Slots: `fwd0/1` and `bridge0/1` start a pinned binary named in `slot_artifacts` (artifacts
-  `forwarder[_b]`, `bridge[_b]`, `driver: embedded | java_media_driver`, optional `libs`). A `null`
+  `forwarder[_b]`, `bridge[_b]`, `driver: embedded | external` (S15: `java_media_driver` is retired), optional `libs`). A `null`
   slot is recorded `SKIPPED_ABSENT`, never faked. The environment follows rc2-forwarder.md 2.11 and
   rc2-bridge-cpp.md 2.11; the bridge must keep the `/health` `{halted, aeConnected}` contract.
 * D20: `timeouts: production` is mandatory. Allowlists, not denylists: top-level manifest keys
@@ -104,7 +104,7 @@ PostgreSQL carries only the money-journal history projection.
   `JournalProbe` (against the ME jar: verbatim journal frame dump, OpenOrdersSnapshot). The journal is
   decoded in Python from the pinned schema XML (`schemas/`, `journal_decode.py`); RC2 S1's journal
   schema 4 drops in as `schemas/me-journal-schema-4.xml` plus its SHA-256 in
-  `schemas/journal-profiles.json` (profile `me-journal-4`, now `pending`). Unknown records stop loudly.
+  `schemas/journal-profiles.json` (profile `me-journal-4`, active since S15). Unknown records stop loudly.
 * Oracles: `core_oracle.py` (money M1-M14) and `order_oracle.py` (order O1-O12) judge one
   `core-sample-v2` document (format in `oracle_model.py`) per rule: FAIL > INCONCLUSIVE > PASS.
   `oracle_samples.py <new dir>` writes the clean synthetic samples for the Java mirror.
@@ -126,3 +126,31 @@ reach DISPATCH_PENDING; without a forwarder O7/O10 must be INCONCLUSIVE, a PASS 
 `core-boots-N` (G15: N fresh boots, `ten_consecutive_boots.json` for N = 10).
 
 The T2 nightly runs from a local systemd user timer (`systemd/`, `nightly.py`), not GitHub (D20).
+
+## Docker drills A01 + A02 (RC2 S15, 2026-11-02)
+
+Contract: `notebook/reports/runtime-handoff-execution/RC2-me-link/S15/contract.md`. Nine T2 drills, two REDs, four
+non-vacuity controls, two embedded-driver repeats. Scenario names: `core-drill-<name>` (lostack, coreleader, meleader,
+fwdrestart, partition, fwdpause, driverkill, lifecycle, lifecycle-faults), `core-control-<line>`, `core-red-1`,
+`core-red-2`, `core-red-2-negctl`. Code: `core_drills.py` (drills, barrier, backfill, branch records), `core_fixture.py`
+(genesis phases, fault helpers, `/ready`), `java/CoreProbe.java` (`story`, `tap`).
+
+* Run state: manifests and state roots live in a run directory outside every repository (`$RUNS`, a sibling of the
+  workspace), never under the notebook. `validate_core_manifest` forces `state_root` under the manifest directory, so a
+  manifest inside `evidence/` would put staged nc binaries one `git add` from a commit. Only the sealed subset is copied.
+* Binaries: bind-mounted host build of `cluster-tools` (ct-forwarder, ct-bridge, aeronmd and its two `.so` files), pinned by
+  sha256 and `source_sha`; no image build. The nc builds (`forwarder_b`, `bridge_b`) are never published.
+* Drivers: slot driver is `external` (a staged aeronmd started by the slot wrapper after `rm -rf` of the dir) or
+  `embedded`. `T1MeDriver` and `T1CoreDriver` are compiled from `cluster-tools` sources (never copied) and used as genesis
+  probes; they read `T1_LOCAL_HOST` for the egress host. D20: the only exempt timeout names are exactly
+  `FWD_DRIVER_TIMEOUT_MS=5000` and `BRIDGE_DRIVER_TIMEOUT_MS=5000`.
+* Story: `CoreProbe story script=a01-mix|a02-lifecycle|funding`. One GATEWAY session, open loop, paced by wall clock. A
+  per-user cap of 256 retained requests per 15 minutes applies, so a01-mix needs at least 29 funded users (the plan uses 40).
+  Every UNKNOWN reply is re-sent once with the same `requestId` after the heal (6.1); an unresolved one makes the run
+  INCONCLUSIVE, never FAIL.
+* Tap: `CoreProbe tap` re-registers on a leader change and reports density. The tap goes blind across an AE leader change,
+  so the drill compares the tap's last seq with the core head and closes gaps by backfill from pending-dump and the ME
+  journal. A gap that cannot be closed is INCONCLUSIVE.
+* Pitfalls seen in real runs: restarting an AE member within about 12 s of a kill hangs the JVM ("active mark file");
+  the in-container aeronmd pid is always 9, so driver identity is the `cnc.dat` mtime plus the container `StartedAt`;
+  `/dev/shm` peaks were 1040 to 1047 MB per ME member and 927 to 948 MB per AE member (limit 1536 MB each), bridges 60 MB, forwarders 56 MB.

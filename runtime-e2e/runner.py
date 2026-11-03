@@ -59,8 +59,16 @@ def main():
             import core_scenarios
             fixture = CoreFixture(args.manifest)
             result['state_root'] = str(fixture.root)
-            fixture.start()
+            # core-boot checks the EMPTY genesis (S14 shape); core-smoke runs the contract 5.3 genesis phases (RC2 S15 W1)
+            fixture.start(core_scenarios.SMOKE_PLAN if args.scenario == 'core-smoke' else None)
             result.update({'core-boot': core_scenarios.core_boot, 'core-smoke': core_scenarios.core_smoke}[args.scenario](fixture))
+        elif args.scenario.startswith(('core-drill-', 'core-control-', 'core-red-')):
+            # RC2 S15: the T2 drills, the 8.4 controls and the two REDs; drill=True refuses a non-enforced ME (5.1)
+            from core_fixture import CoreFixture
+            import core_drills
+            fixture = CoreFixture(args.manifest, drill=True)
+            result['state_root'] = str(fixture.root)
+            result.update(core_drills.scenario(fixture, args.scenario, args.output))
         elif args.scenario == 'harness-negative-controls':
             from negative_controls import run
             result.update(run(args.output, manifest, args.manifest))
