@@ -16,6 +16,7 @@ from unittest import mock
 
 import core_drills as cd
 import core_oracle
+import core_scenarios
 import order_oracle
 from contracts import FP, Inconclusive, Violation
 from oracle_model import Model, resolve_requests
@@ -881,6 +882,8 @@ class VerdictTest(unittest.TestCase):
 
 
 class StubFixture:
+    clock, sleep = staticmethod(time.time), staticmethod(lambda s: None)
+
     def __init__(self, slots=None, artifacts=None):
         self.m = {'seed': 0x1234, 'slot_artifacts': slots or {'fwd0': 'forwarder', 'fwd1': 'forwarder', 'bridge0': 'bridge',
                                                                'bridge1': 'bridge', 'shadow0': None},
@@ -890,8 +893,8 @@ class StubFixture:
 
 class TableTest(unittest.TestCase):
     def test_every_drill_has_a_schedule_and_known_lines(self):
-        self.assertEqual(set(cd.DRILLS), {'lostack', 'coreleader', 'meleader', 'fwdrestart', 'fwdpause', 'partition',
-                                          'driverkill', 'lifecycle', 'lifecycle-faults'})
+        self.assertTrue({'lostack', 'coreleader', 'meleader', 'fwdrestart', 'fwdpause', 'partition', 'driverkill', 'lifecycle',
+                         'lifecycle-faults'} <= set(cd.DRILLS))           # S16 adds its nine (S16TableTest)
         for name, spec in cd.DRILLS.items():
             self.assertTrue(hasattr(cd.DrillRun, 'faults_' + spec['faults']), name)
             for line in spec['lines']:
@@ -909,12 +912,12 @@ class TableTest(unittest.TestCase):
         for name, spec in cd.DRILLS.items():
             story = spec['story']
             plan = cd.plan_for(spec, 1)
-            self.assertEqual(plan['funding_for'], story['script'])
+            self.assertEqual(plan['funding_for'], cd.funding_script(story))     # S16: a03-fill funds as a01-mix
             if story['script'] == 'a01-mix':
                 requests = (story['rate'] + story['rate'] // 5) * story['seconds']
                 self.assertLessEqual(requests / len(story['users']), 256, name)    # A7 RequestTable.PER_USER_CAP
                 self.assertEqual(len(story['users']) % 2, 0)
-            self.assertGreaterEqual(plan['tap_ms'] / 1000, story['seconds'] + cd.PRE_BARRIER_S + 60, name)
+            self.assertGreaterEqual(plan['tap_ms'] / 1000, cd.story_seconds(story) + cd.PRE_BARRIER_S + 60, name)
             self.assertGreaterEqual(plan['risk']['per_sec'], 2 * story['rate'])
 
     def test_scenario_refuses_unknown_and_mismatched_runs(self):
@@ -1095,6 +1098,697 @@ class RecordedRunTest(unittest.TestCase):
         sample = recorded()
         sample['declared']['epochs'] = [sample['declared']['epochs'][0], 99]
         self.assertEqual(rule(core_oracle.judge(sample), 'M8')['status'], 'INCONCLUSIVE')
+
+
+# ================================================================== RC2 S16 W3: the nine drills, lines, REDs (contract 5.4, 7, 8, 9)
+# No S16 drill has run yet (W5/W6): every line is proven on synthesized witnesses with the shapes of the W0 dry-run
+# evidence (S16/evidence/dry-run/), each with its control (the same witness with the fault switched off).
+
+
+def S(t, **roles):
+    """One 1 s sampler row: wall seconds and per-role metric values (the sampler's shape)."""
+    return {'t0': t, 't1': t, 'roles': {r: dict(v) for r, v in roles.items()}}
+
+
+def lead(engine, value=2.0):
+    return {('assets_cluster_role' if engine == 'ae' else 'match_cluster_role'): value}
+
+
+def release_event(seq, entries, epoch=7):
+    return {'type': 'release', 'journal_seq': seq, 'me_epoch': epoch,
+            'releases': [dict({'scope': 'UP_TO', 'result': 'APPLIED', 'removed': 1}, **e) for e in entries]}
+
+
+class DeclaredS16Test(unittest.TestCase):
+    def test_declared_blocks_per_drill_section_7(self):
+        """RED 6380b01: declared_block takes no gate_sequence / halt / order_fault (one constant block, CD:182-186)."""
+        g = cd.GATE_SEQUENCE
+        self.assertEqual(cd.declared_for('a03-lifetime', {}, 1)['gate_sequence'],
+                         g + [['SUSPENDED', 'ME_CAPACITY'], ['OPEN', 'ADMIN']])
+        life1 = cd.declared_for('a04-regenesis', {}, 1)
+        self.assertEqual((life1['gate_sequence'], life1['halt'], life1['order_fault']),
+                         (g + [['SUSPENDED', 'BRIDGE_HALT']], True, 1))
+        life2 = cd.declared_for('a04-regenesis', {}, 2)
+        self.assertEqual((life2['gate_sequence'], life2['halt'], life2['order_fault']), (g, False, 0))
+        for name in ('a04-one-bridge-halt', 'a05-fwd-upgrade', 'a05-fwd-kill', 'a05-bridge-upgrade',
+                     'a06-two-forwarders-ticks', 'a01-fwdring', 'c13-enginedriverkill'):
+            self.assertEqual(cd.declared_for(name, {}, 1), {'gate_sequence': g, 'halt': False, 'order_fault': 0}, name)
+        # the controls that switch the close / the halt off declare the two-step sequence, so the oracles can PASS
+        self.assertEqual(cd.declared_for('a03-lifetime', {'ledger_capacity': 100_000}, 1)['gate_sequence'], g)
+        self.assertEqual(cd.declared_for('a03-lifetime', {'hold': False}, 1)['gate_sequence'], g)
+        self.assertEqual(cd.declared_for('a04-regenesis', {'regen': False}, 1), {'gate_sequence': g, 'halt': False, 'order_fault': 0})
+        d = cd.declared_block(cd.Ledger(), 0x99, **cd.declared_for('a04-regenesis', {}, 1))
+        self.assertEqual((d['halt'], d['order_fault'], d['epochs']), (True, 1, [0x99]))
+
+    def test_two_lives_each_reset_the_declared_block(self):
+        """C4: a life-1 ledger with a healed regenesis row and a fresh life-2 ledger: each life declares from its own
+        ledger and its own genesis id, never the other life's."""
+        one, two = cd.Ledger(), cd.Ledger()
+        row = one.open('regenesis', 'me')
+        d1 = cd.declared_block(one, 0x11, **cd.declared_for('a04-regenesis', {}, 1))
+        self.assertTrue(d1['fault_open'])
+        one.heal(row, 'halt_barrier')
+        d1 = cd.declared_block(one, 0x11, **cd.declared_for('a04-regenesis', {}, 1))
+        d2 = cd.declared_block(two, 0x13, **cd.declared_for('a04-regenesis', {}, 2))
+        self.assertEqual((d1['fault_open'], d1['epochs'], d2['fault_open'], d2['epochs']), (False, [0x11], False, [0x13]))
+
+
+class LatencyTest(unittest.TestCase):
+    """5.4 / 20.1 line 9: per-id first apply from the dispatch's cluster ms to the ME record-3 timestamp."""
+
+    def journal(self):
+        return [{'type': 'outcome', 'journal_seq': 1, 'command_id_high': 1, 'command_id_low': 0, 'timestamp': 1005},
+                {'type': 'outcome', 'journal_seq': 2, 'command_id_high': 2, 'command_id_low': 0, 'timestamp': 1012},
+                {'type': 'outcome', 'journal_seq': 3, 'command_id_high': 1, 'command_id_low': 0, 'timestamp': 1020}]
+
+    def test_first_apply_skips_release_rows_and_backfilled_rows(self):
+        """RED 6380b01: no latency_table. A RELEASE_ID row repeats its create's id after the outcome; matching it gives the
+        negative values W0 saw (answers-14.2 item 6: 41 percent), so it never enters the table; backfill rows (seq null)
+        have no dispatch time."""
+        tap = [{'seq': 1, 'id_high': 1, 'id_low': 0, 'kind': 'CREATE', 'at_ms': 1001},
+               {'seq': 2, 'id_high': 2, 'id_low': 0, 'kind': 'CREATE', 'at_ms': 1002},
+               {'seq': 3, 'id_high': 1, 'id_low': 0, 'kind': 'RELEASE_ID', 'at_ms': 1030},
+               {'seq': None, 'id_high': 3, 'id_low': 0, 'kind': 'CREATE', 'at_ms': None, 'source': 'backfill'}]
+        table = cd.latency_table(tap, self.journal())
+        self.assertEqual(table, [{'seq': 1, 'id': [1, 0], 'dispatch_ms': 1001, 'first_apply_ms': 1005, 'ms': 4},
+                                 {'seq': 2, 'id': [2, 0], 'dispatch_ms': 1002, 'first_apply_ms': 1012, 'ms': 10}])
+
+    def test_window_summaries_and_nearest_rank_percentiles(self):
+        table = [{'dispatch_ms': 1000 + i, 'ms': i % 10} for i in range(1000)]
+        out = cd.window_summaries(table, {'all': [(1000, 2000)], 'none': [(5000, 6000)], 'two': [(1000, 1010), (1990, 2000)]})
+        self.assertEqual(out['all'], {'count': 1000, 'p50': 4, 'p99': 9, 'p99.9': 9, 'max': 9})
+        self.assertEqual(out['none']['count'], 0)
+        self.assertEqual(out['two']['count'], 20)
+
+    def w(self, base_ms, swap_ms, windows_s=((30.0, 31.6), (50.0, 51.5))):
+        t0 = 1_000_000
+        table = [{'dispatch_ms': t0 + 10_000 + i * 10, 'ms': base_ms[i % len(base_ms)]} for i in range(2000)]
+        swaps = []
+        for n, (a, b) in enumerate(windows_s):
+            table += [{'dispatch_ms': t0 + int(a * 1000) + i * 10, 'ms': swap_ms[i % len(swap_ms)]} for i in range(int((b - a) * 100))]
+            swaps.append({'slot': f'fwd{n}', 'start_s': a, 'ready_s': b})
+        return {'latency': table, 't0_ms': t0, 'swaps': swaps, 'settings': dict(cd.SETTINGS)}
+
+    def test_no_delay_rule_a_and_its_n1_control(self):
+        ok = cd.line_no_delay(self.w([3, 4, 12, 55], [3, 5, 14, 18]))
+        self.assertTrue(ok['holds'], ok)
+        slow = cd.line_no_delay(self.w([3, 4, 12, 55], [3, 400, 900, 1500]))     # a05-fwd-upgrade-n1: no survivor
+        self.assertFalse(slow['holds'])
+        self.assertFalse(slow.get('inconclusive'))
+        empty = self.w([3], [3]); empty['latency'] = [r for r in empty['latency'] if r['dispatch_ms'] < 1_030_000]
+        self.assertTrue(cd.line_no_delay(empty).get('inconclusive'))    # no swap-window row: a gap, never PASS
+
+
+class A03LinesTest(unittest.TestCase):
+    CAP = 2000
+
+    def samples(self, peak=1600, after=0, reasons=16.0):
+        rows = []
+        for i, est in enumerate([0, 400, 800, 1200, peak, peak, after, after]):
+            rows.append(S(100 + i, ae1=dict(lead('ae'), assets_me_capacity_estimate=float(est), assets_release_backlog=float(est),
+                                            assets_order_entry_gate_reasons=reasons if est >= 0.8 * self.CAP else 0.0),
+                          me0=dict(lead('me'), match_command_ledger_size=float(est))))
+        return rows
+
+    def w(self, **kw):
+        admission = [{'market': 0, 'state': 'SUSPENDED', 'reason': 'GENESIS'}, {'market': 0, 'state': 'OPEN', 'reason': 'ADMIN'},
+                     {'market': 0, 'state': 'SUSPENDED', 'reason': 'ME_CAPACITY'}, {'market': 0, 'state': 'OPEN', 'reason': 'ADMIN'}]
+        tap = [{'seq': 10 + i, 'id_high': 100 + i, 'id_low': 0, 'kind': 'RELEASE_ID', 'at_ms': 1} for i in range(3)]
+        journal = [{'type': 'outcome', 'journal_seq': 1}, release_event(900, [{'commandIdHigh': 100 + i, 'idLowFloor': 0,
+                                                                                'removed': 600} for i in range(3)])]
+        base = {'capacity': self.CAP, 'samples': self.samples(), 'admission': admission, 'tap_dispatch': tap,
+                'me_journal': journal, 'order_terminals': 0,
+                'hold': {'swap_me_seq': 500, 'swap_dispatch_seq': 20, 'backlog_at_swap': 1600, 'kill_in_closed_window': True,
+                         'restarted': True},
+                'a03': {'created': 1600, 'rejected_gate': 1400, 'cancelled': 0, 'reopen_acked': 1000, 'closed': True, 'opened': True},
+                'snaps': {'before': scrape(me0={'match_durable_capacity_total': 0.0}),
+                          'after': scrape(me0={'match_durable_capacity_total': 0.0})}}
+        base.update(kw)
+        return base
+
+    def test_capacity_cycle_and_the_cap100k_control(self):
+        """RED 6380b01: no line_capacity_cycle."""
+        self.assertTrue(cd.line_capacity_cycle(self.w())['holds'])
+        cap = self.w(capacity=100_000, samples=self.samples(peak=3000, after=0, reasons=0.0),
+                     admission=self.w()['admission'][:2])
+        line = cd.line_capacity_cycle(cap)
+        self.assertFalse(line['holds'])
+        self.assertIn('no close observed', json.dumps(line['detail']))
+
+    def test_release_once_and_red_a03(self):
+        self.assertTrue(cd.line_release_once(self.w())['holds'])
+        red = cd.line_release_once(self.w(me_journal=[{'type': 'outcome', 'journal_seq': 1}]))
+        self.assertFalse(red['holds'])
+        self.assertIn('no release journaled', red['detail'])
+        twice = self.w(); twice['me_journal'].append(release_event(901, [{'commandIdHigh': 100, 'idLowFloor': 0, 'removed': 1}]))
+        self.assertFalse(cd.line_release_once(twice)['holds'])          # removed twice: applied more than once
+        cap = self.w(snaps={'before': scrape(me0={'match_durable_capacity_total': 0.0}),
+                            'after': scrape(me0={'match_durable_capacity_total': 2.0})})
+        self.assertFalse(cd.line_release_once(cap)['holds'])
+
+    def test_release_resent_and_the_nokill_control(self):
+        self.assertTrue(cd.line_release_resent(self.w())['holds'])
+        live = self.w(me_journal=[release_event(300, [{'commandIdHigh': 100 + i, 'idLowFloor': 0, 'removed': 1}
+                                                      for i in range(3)])])     # a03-nokill: relayed live, inside W
+        self.assertFalse(cd.line_release_resent(live)['holds'])
+        none = cd.line_release_resent(self.w(tap_dispatch=[]))
+        self.assertTrue(none.get('inconclusive'), none)                          # no release in the window
+        noswap = cd.line_release_resent(self.w(hold=None))
+        self.assertTrue(noswap.get('inconclusive'), noswap)
+
+    def test_reopen_admits_and_the_cap100k_control(self):
+        self.assertTrue(cd.line_reopen_admits(self.w())['holds'])
+        cap = self.w(a03=dict(self.w()['a03'], opened=False, closed=False, reopen_acked=1000),
+                     hold=dict(self.w()['hold'], kill_in_closed_window=False))
+        self.assertFalse(cd.line_reopen_admits(cap)['holds'])
+
+
+class A04LinesTest(unittest.TestCase):
+    G1 = 15112027
+
+    def health(self, reason='SOURCE_SCHEMA', status=503, epoch=None):
+        return (status, {'halted': reason != 'NONE', 'haltReason': reason, 'meEpoch': epoch or self.G1})
+
+    def w(self, **kw):
+        base = {'g1': self.G1,
+                'bridge_health': {b: self.health() for b in cd.BRIDGES},
+                'halt_scrape': scrape(bridge0={'bridge_halt_reason': 3.0}, bridge1={'bridge_halt_reason': 3.0},
+                                      ae0=dict(lead('ae'), assets_feed_latch_reason=3.0)),
+                'core': {'feed_halted': True, 'halt_reason': 'SOURCE_SCHEMA', 'bound_me_epoch': self.G1},
+                'settle_rejected': 0,
+                'open_gate': {'meaning': 'REFUSED', 'reply': {'replies': [{'t': 'AdminAck', 'result': 'REJECTED', 'reason': 40}]}},
+                'life2_gate_open': True,
+                'halt_funding': [{'kind': 'deposit', 'outcome': 'ACK', 'gate': 'SUSPENDED'}] * 4
+                                + [{'kind': 'withdraw', 'outcome': 'ACK', 'gate': 'SUSPENDED'}] * 2,
+                'halt_create': {'reply': {'outcome': 'REJECT', 'reason': 'GATE_CLOSED'}},
+                'fence': {f: {'exit_code': 78, 'after_first_me_start_s': 3.7, 'reason': 'F8_EPOCH'} for f in cd.FORWARDERS}}
+        base.update(kw)
+        return base
+
+    def test_halt_local_and_red_a04(self):
+        """RED 6380b01: no line_halt_local."""
+        self.assertTrue(cd.line_halt_local(self.w())['holds'])
+        red = self.w(bridge_health={b: self.health('NONE', 200) for b in cd.BRIDGES},
+                     halt_scrape=scrape(bridge0={'bridge_halt_reason': 0.0}, bridge1={'bridge_halt_reason': 0.0},
+                                        ae0=dict(lead('ae'), assets_feed_latch_reason=0.0)),
+                     core={'feed_halted': False, 'halt_reason': 'NONE', 'bound_me_epoch': self.G1})
+        self.assertFalse(cd.line_halt_local(red)['holds'])
+        mismatch = self.w(halt_scrape=scrape(bridge0={'bridge_halt_reason': 2.0}, bridge1={'bridge_halt_reason': 3.0},
+                                             ae0=dict(lead('ae'), assets_feed_latch_reason=3.0)))
+        self.assertFalse(cd.line_halt_local(mismatch)['holds'])          # EPOCH_MISMATCH is not the declared reason
+
+    def test_open_refused_money_while_halted_fenced_and_the_noregen_control(self):
+        w = self.w()
+        for name in ('open_refused', 'money_while_halted', 'fenced_forwarders'):
+            self.assertTrue(cd.LINES[name](w)['holds'], name)
+        noregen = self.w(open_gate={'meaning': 'ANSWERED', 'reply': {'replies': [{'t': 'AdminAck', 'result': 'APPLIED'}]}},
+                         halt_funding=[dict(r, gate='OPEN') for r in w['halt_funding']],
+                         halt_create={'reply': {'outcome': 'ACK', 'order': 9}},
+                         fence={f: {'exit_code': None, 'after_first_me_start_s': None, 'reason': None} for f in cd.FORWARDERS},
+                         life2_gate_open=None)
+        for name in ('open_refused', 'money_while_halted', 'fenced_forwarders'):
+            self.assertFalse(cd.LINES[name](noregen)['holds'], name)
+        late = self.w(fence=dict(w['fence'], fwd1={'exit_code': 78, 'after_first_me_start_s': 16.0, 'reason': 'F8_EPOCH'}))
+        self.assertFalse(cd.line_fenced_forwarders(late)['holds'])
+
+    def test_second_life_exact(self):
+        g2 = self.G1 + 2
+        good = {'life2': {'money': {'status': 'PASS'}, 'order': {'status': 'PASS'}, 'epochs': [g2], 'g2': g2,
+                          'bound_me_epoch': g2, 'last_applied_trade_id': 40, 'max_epoch2_trade': 40}}
+        self.assertTrue(cd.line_second_life_exact(good)['holds'])
+        self.assertFalse(cd.line_second_life_exact({'life2': dict(good['life2'], bound_me_epoch=self.G1)})['holds'])
+        self.assertTrue(cd.line_second_life_exact({'life2': None}).get('inconclusive'))
+
+    def test_cold_restart_skips_and_the_earlyrestart_control(self):
+        """DR-A04-bridge (answers-14.2 item 11): the cold bridge re-reads from the start and skips to the core cursor."""
+        w = {'cold': {'me_seq_at_kill': 4000, 'peer_cursor_at_restart': 7691, 'skipped_delta': 10161,
+                      'health_after': {'cursor': 10161, 'expected': 10162}, 'restart_after_kill_s': 6.1},
+             'samples': [S(1, bridge0={'bridge_halted': 0.0}, bridge1={'bridge_halted': 0.0})] * 3}
+        self.assertTrue(cd.line_cold_restart_skips(w)['holds'])
+        early = {'cold': dict(w['cold'], peer_cursor_at_restart=4100, restart_after_kill_s=0.8), 'samples': w['samples']}
+        self.assertFalse(cd.line_cold_restart_skips(early)['holds'])    # the peer had not passed the backlog: no line
+        short = {'cold': dict(w['cold'], skipped_delta=2000), 'samples': w['samples']}
+        self.assertFalse(cd.line_cold_restart_skips(short)['holds'])
+        halted = {'samples': w['samples'] + [S(9, bridge0={'bridge_halted': 1.0}, bridge1={'bridge_halted': 0.0})]}
+        self.assertFalse(cd.line_bridge_never_halted(halted)['holds'])
+        self.assertTrue(cd.line_bridge_never_halted({'samples': w['samples']})['holds'])
+
+
+class A05LinesTest(unittest.TestCase):
+    B = 'b' * 40
+
+    def swaps(self, kind='stop', build=None, ready_after_kill=1.1):
+        out = []
+        for n, (a, b) in enumerate(((30.0, 31.6), (50.0, 51.5))):
+            out.append({'slot': f'fwd{n}', 'kind': kind, 'start_s': a, 'ready_s': b, 'pre_build': None,
+                        'replace': {'old': {'sha256': 'a' * 64}, 'new': {'sha256': 'c' * 64}, 'build_health': build or self.B,
+                                    'f7_rejected': 0, 'ready_after_kill_s': ready_after_kill if kind == 'kill' else None}})
+        return out
+
+    def progress(self, stall=None):
+        rows, seq = [], 0
+        for i in range(0, 400):
+            t = 1000.0 + i * 0.25
+            if not (stall and stall[0] <= t - 1000.0 < stall[1]):
+                seq += 25
+            rows.append(S(t, me0=dict(lead('me'), match_engine_next_journal_seq=float(seq),
+                                      match_durable_duplicates_suppressed_total=float(seq // 2))))
+        return rows
+
+    def w(self, **kw):
+        base = {'b_source_sha': self.B, 'swaps': self.swaps(), 't0_ms': 1_000_000, 'samples': self.progress(),
+                'settings': dict(cd.SETTINGS), 'tap_dispatch': [], 'n': 2}
+        base.update(kw)
+        return base
+
+    def test_build_witness_and_a_same_build_swap(self):
+        self.assertTrue(cd.line_build_witness(self.w())['holds'])
+        self.assertFalse(cd.line_build_witness(self.w(swaps=self.swaps(build='d' * 40)))['holds'])
+        pre = self.swaps(); pre[0]['pre_build'] = self.B
+        self.assertFalse(cd.line_build_witness(self.w(swaps=pre))['holds'])     # build A must not report build B
+        self.assertFalse(cd.line_build_witness(self.w(swaps=self.swaps()[:1]))['holds'])
+
+    def test_survivor_delivered_n1_control_and_a_vacuous_window(self):
+        self.assertTrue(cd.line_survivor_delivered(self.w())['holds'])
+        n1 = cd.line_survivor_delivered(self.w(samples=self.progress(stall=(30.0, 31.6))))
+        self.assertFalse(n1['holds'])
+        self.assertFalse(n1.get('inconclusive'))
+        short = self.swaps(); short[0]['ready_s'] = 30.5
+        self.assertTrue(cd.line_survivor_delivered(self.w(swaps=short)).get('inconclusive'))
+
+    def test_dup_outcomes_counts_n_minus_1_per_dispatch_outside_the_windows(self):
+        t0 = 1_000_000
+        # 25 journal seqs per 0.25 s; duplicates half of them; dispatches: one command per 2 journal seqs => 50/s
+        tap = [{'seq': i + 1, 'id_high': i + 1, 'id_low': 0, 'kind': 'CREATE', 'at_ms': t0 + i * 20} for i in range(5000)]
+        w = self.w(tap_dispatch=tap)
+        line = cd.line_dup_outcomes(w)
+        self.assertTrue(line['holds'], line)
+        n1 = self.w(tap_dispatch=tap, samples=[dict(s, roles={'me0': dict(s['roles']['me0'],
+                    match_durable_duplicates_suppressed_total=min(s['roles']['me0']['match_durable_duplicates_suppressed_total'], 3000.0))})
+                    for s in self.progress()])
+        self.assertFalse(cd.line_dup_outcomes(n1)['holds'])          # N = 1 after the stop: no duplicates
+
+    def test_ready_after_kill_bound(self):
+        self.assertTrue(cd.line_ready_after_kill(self.w(swaps=self.swaps('kill')))['holds'])
+        self.assertFalse(cd.line_ready_after_kill(self.w(swaps=self.swaps('kill', ready_after_kill=7.0)))['holds'])
+        self.assertFalse(cd.line_ready_after_kill(self.w(swaps=self.swaps('stop')))['holds'])
+
+    def test_settle_no_gap_and_the_bridge_n1_control(self):
+        def lag_rows(spike):
+            rows = []
+            for i in range(400):
+                t = 1000.0 + i * 0.25
+                lag = 30 if not (30.0 <= t - 1000.0 < 31.6) else spike
+                rows.append(S(t, me0=dict(lead('me'), match_trades_total=float(1000 + i)),
+                              ae0=dict(lead('ae'), assets_last_applied_trade_id=float(1000 + i - lag))))
+            return rows
+        swaps = [dict(s, slot=s['slot'].replace('fwd', 'bridge')) for s in self.swaps()]
+        self.assertTrue(cd.line_settle_no_gap(self.w(swaps=swaps, samples=lag_rows(40)))['holds'])
+        self.assertFalse(cd.line_settle_no_gap(self.w(swaps=swaps, samples=lag_rows(400)))['holds'])
+
+
+class A06LinesTest(unittest.TestCase):
+    def fwd(self, offered, version=3185472, age=0.0, ready=1.0):
+        return {'forwarder_tick_offered_total{market="1",edge="trailing"}': float(offered),
+                'forwarder_tick_last_offered_version{market="1"}': float(version),
+                'forwarder_tick_pending_age_ms{market="1"}': age, 'forwarder_ticks_ready': ready}
+
+    def core(self, applied, stale, version=3185472, leader=True):
+        return dict(lead('ae', 2.0 if leader else 1.0), assets_ticks_applied_total=float(applied),
+                    assets_ticks_stale_total=float(stale), assets_ticks_invalid_total=0.0, assets_ticks_epoch_drop_total=0.0,
+                    assets_ticks_unbound_total=0.0, **{'assets_market_book_version{market="1"}': float(version),
+                                                       'assets_market_best_bid{market="1"}': 8057000000.0,
+                                                       'assets_market_best_ask{market="1"}': 9787000000.0})
+
+    def w(self, **kw):
+        """The DR-A06 counters (a06.log): fwd0 291 at t29, 301 just before the kill, 147 after its restart; fwd1 601."""
+        base = {'snaps': {'before': scrape(ae2=self.core(0, 0), fwd0=self.fwd(0), fwd1=self.fwd(0)),
+                          't29': scrape(ae2=self.core(321, 273), fwd0=self.fwd(291), fwd1=self.fwd(291)),
+                          'prekill': scrape(ae2=self.core(330, 274), fwd0=self.fwd(301), fwd1=self.fwd(300)),
+                          'after': scrape(ae2=self.core(770, 279), fwd0=self.fwd(147), fwd1=self.fwd(601))},
+                'forwarders': ['fwd0', 'fwd1'], 'ae_leaders': ['ae2', 'ae2', 'ae2'],
+                'book': {1: {'version': 3185472, 'bid': 8057000000, 'ask': 9787000000}, 2: None, 3: None, 4: None, 5: None},
+                'kill_window': {'kill_s': 30.0, 'restart_s': 45.0},
+                'samples': [S(1000.0 + t, ae2=self.core(330 + 10 * t, 274)) for t in range(25, 50)], 't0_s': 1000.0}
+        base.update(kw)
+        return base
+
+    def test_tick_conservation_with_the_in_flight_slack(self):
+        """offered 301 + 147 + (601 - 0) = 1049, slack = 301 - 291 = 10 offers in fwd0's last second; core 770 + 279 = 1049."""
+        line = cd.line_tick_conservation(self.w())
+        self.assertTrue(line['holds'], line)
+        moved = self.w(ae_leaders=['ae2', 'ae1', 'ae1'])
+        self.assertFalse(cd.line_tick_conservation(moved)['holds'])      # node-local counters across a leader change
+        over = self.w(); over['snaps']['after']['ae2'] = self.core(900, 279)
+        self.assertFalse(cd.line_tick_conservation(over)['holds'])
+
+    def test_stale_positive_survivor_end_state_invalid_and_the_n1_control(self):
+        w = self.w()
+        for name in ('tick_stale_positive', 'tick_survivor', 'tick_end_state', 'tick_invalid_zero'):
+            self.assertTrue(cd.LINES[name](w)['holds'], (name, cd.LINES[name](w)))
+        n1 = self.w(forwarders=['fwd0'], samples=[S(1000.0 + t, ae2=self.core(330, 274)) for t in range(25, 50)])
+        n1['snaps']['after']['ae2'] = self.core(770, 0)
+        n1['snaps']['before']['ae2'] = self.core(0, 0)
+        self.assertFalse(cd.line_tick_stale_positive(n1)['holds'])
+        self.assertFalse(cd.line_tick_survivor(n1)['holds'])
+        wrong = self.w(book={1: {'version': 3185472, 'bid': 8000000000, 'ask': 9787000000}, 2: None, 3: None, 4: None, 5: None})
+        self.assertFalse(cd.line_tick_end_state(wrong)['holds'])
+
+    def test_book_lines_parse(self):
+        out = 'BOOK market=1 version=3185472 bid=8057000000 ask=9787000000 bids=3 asks=7 blocks=20/20\nBOOK market=2 none\n'
+        self.assertEqual(cd.parse_book(out), {1: {'version': 3185472, 'bid': 8057000000, 'ask': 9787000000}, 2: None})
+
+
+class FwdringLinesTest(unittest.TestCase):
+    def ledger(self, branch='none', reconnect=0.0, last_sent_after=5000, pause=True):
+        ledger = cd.Ledger()
+        for n, (lo, hi) in enumerate(((100, 400), (900, 1300))):
+            witness = {'me_seq_pause': lo, 'me_seq_thaw': hi, 'last_sent_before': 1000 * (n + 1), 'thaw_ms': 2000 + n * 10_000}
+            if not pause:
+                ledger.skip('pause', 'fwd0', 'control fwdring-nopause (8.4)', witness=witness)
+                continue
+            row = ledger.open('pause', 'fwd0', witness)
+            ledger.heal(row, branch, {'reconnect_delta_by_cluster': {'core': reconnect, 'me': reconnect},
+                                      'last_sent_after': last_sent_after + n * 10_000})
+        return ledger
+
+    def w(self, ledger, released=(3, 4)):
+        tap = [{'seq': s, 'at_ms': 1990 + (s % 2) * 10_000, 'kind': 'CREATE'} for s in (900, 4000)]
+        return {'ledger': ledger.rows, 'tap_dispatch': tap, 'released_after_thaw': list(released) if released is not None else None}
+
+    def test_ring_outlived_thaw_and_its_controls(self):
+        """RED 6380b01: no line_ring_outlived_thaw."""
+        self.assertTrue(cd.line_ring_outlived_thaw(self.w(self.ledger()))['holds'])
+        self.assertFalse(cd.line_ring_outlived_thaw(self.w(self.ledger(branch='A')))['holds'])          # fwdring-pause15
+        self.assertFalse(cd.line_ring_outlived_thaw(self.w(self.ledger(reconnect=1.0, branch='B')))['holds'])
+        self.assertFalse(cd.line_ring_outlived_thaw(self.w(self.ledger(pause=False)))['holds'])        # fwdring-nopause
+        self.assertFalse(cd.line_ring_outlived_thaw(self.w(self.ledger(last_sent_after=100)))['holds'])
+
+    def test_released_after_thaw_is_a_line_and_none_is_inconclusive(self):
+        self.assertTrue(cd.line_released_after_thaw(self.w(self.ledger()))['holds'])
+        self.assertFalse(cd.line_released_after_thaw(self.w(self.ledger(), released=(3, 0)))['holds'])
+        self.assertTrue(cd.line_released_after_thaw(self.w(self.ledger(), released=None)).get('inconclusive'))
+
+    def test_released_after_thaw_counts_bracketed_skip_rows(self):
+        """fwdring-nopause records two bracketed rows without a pause: released_after_thaw reads them (it returns counts,
+        never None), so the control FAILs on data rather than on a missing bracket."""
+        ledger = self.ledger(pause=False)
+        model = types.SimpleNamespace(journal=[], released_repeats=[])
+        self.assertEqual(cd.released_after_thaw(model, ledger.rows), [0, 0])
+
+
+class EngineDriverLinesTest(unittest.TestCase):
+    def kills(self, codes=(1, 1, 1), after=(14.2, 13.9, 15.1)):
+        rows = []
+        for n, (target, code, s) in enumerate(zip(('ae1', 'ae1', 'me0'), codes, after)):
+            rows.append({'target': target, 'role': 'me_leader' if target == 'me0' else 'ae_follower', 'kill_s': 15.0 + 25 * n,
+                         'exit_code': code, 'exit_after_s': s, 'identity_before': {'cnc_mtime': str(n)},
+                         'restart': {'driver': {'old': {'cnc_mtime': str(n)}, 'new': {'cnc_mtime': str(n + 1)}}},
+                         'ready_s': 15.0 + 25 * n + s + 13.0, 'ready_during_grace': [200, 503]})
+        return rows
+
+    def test_driver_death_loud_and_exit_zero_is_a_fail(self):
+        """RED 6380b01: no line_driver_death_loud. 20.1 line 5: W9 makes driver death exit 1; DR-0 saw the AE exit 0."""
+        self.assertTrue(cd.line_driver_death_loud({'kills': self.kills()})['holds'])
+        zero = cd.line_driver_death_loud({'kills': self.kills(codes=(0, 1, 1))})
+        self.assertFalse(zero['holds'])
+        self.assertIn('X6', json.dumps(zero['detail']))
+        self.assertFalse(cd.line_driver_death_loud({'kills': self.kills(after=(14.2, 19.0, 15.1))})['holds'])
+        self.assertFalse(cd.line_driver_death_loud({'kills': self.kills()[:2]})['holds'])            # edk-nokill: fewer kills
+        rows = self.kills(); rows[1]['identity_before'] = {'cnc_mtime': 'stale'}
+        self.assertFalse(cd.line_driver_death_loud({'kills': rows})['holds'])       # the second kill missed the new driver
+
+    def test_cluster_served(self):
+        samples = [S(1000.0 + i * 0.5, me1=dict(lead('me'), match_engine_next_journal_seq=float(i * 10))) for i in range(200)]
+        w = {'kills': self.kills(), 'samples': samples, 't0_s': 1000.0,
+             'election': {'killed': 'me0', 'new_leader': 'me1'}, 'story_unresolved': 0}
+        self.assertTrue(cd.line_cluster_served(w)['holds'], cd.line_cluster_served(w))
+        stalled = [S(1000.0 + i * 0.5, me1=dict(lead('me'), match_engine_next_journal_seq=float(min(i, 40) * 10))) for i in range(200)]
+        self.assertFalse(cd.line_cluster_served(dict(w, samples=stalled))['holds'])
+        self.assertFalse(cd.line_cluster_served(dict(w, kills=[]))['holds'])                        # edk-nokill
+
+    def test_cnc_timeout_loud(self):
+        good = {'cnc': {m: {'exit_code': 1, 'exit_after_s': 31.0, 'ready_200_seen': False} for m in ('ae0', 'me0')}}
+        self.assertTrue(cd.line_cnc_timeout_loud(good)['holds'])
+        hang = {'cnc': {m: {'exit_code': None, 'exit_after_s': None, 'ready_200_seen': False} for m in ('ae0', 'me0')}}
+        self.assertFalse(cd.line_cnc_timeout_loud(hang)['holds'])                  # 20.1 line 5: a hang before W9
+
+
+class S16RedVerdictTest(unittest.TestCase):
+    def order(self, detail, status='FAIL'):
+        return {'status': status, 'rules': {'O12': {'status': status, 'detail': detail}}}
+
+    def test_red_a03_needs_the_three_step_text_and_a_full_ledger(self):
+        """RED 6380b01: red_verdict has no red-a03 kind (it falls through to the RED-2 rules)."""
+        money = {'status': 'PASS', 'rules': {}}
+        text = ("gate transitions [['SUSPENDED', 'GENESIS'], ['OPEN', 'ADMIN'], ['SUSPENDED', 'ME_CAPACITY']] != declared "
+                "[['SUSPENDED', 'GENESIS'], ['OPEN', 'ADMIN'], ['SUSPENDED', 'ME_CAPACITY'], ['OPEN', 'ADMIN']]")
+        pre = {'fwd0_running_health_200': True, 'fwd1_running_health_200': True, 'ledger_still_full': True}
+        self.assertEqual(cd.red_verdict('red-a03', money, self.order(text), pre)['red'], 'RED')
+        self.assertEqual(cd.red_verdict('red-a03', money, self.order(text), dict(pre, ledger_still_full=False))['status'],
+                         'INCONCLUSIVE')
+        green = cd.red_verdict('red-a03', money, {'status': 'PASS', 'rules': {'O12': {'status': 'PASS'}}}, pre)
+        self.assertEqual((green['status'], green['red']), ('FAIL', 'GREEN'))
+
+    def test_red_a04_needs_the_two_step_text_skips_and_no_halt(self):
+        money = {'status': 'PASS', 'rules': {}}
+        text = ("gate transitions [['SUSPENDED', 'GENESIS'], ['OPEN', 'ADMIN']] != declared [['SUSPENDED', 'GENESIS'], "
+                "['OPEN', 'ADMIN'], ['SUSPENDED', 'BRIDGE_HALT']]")
+        pre = {'bridge0_running_health': True, 'bridge1_running_health': True, 'bridges_not_halted': True,
+               'bridge0_skipped': True, 'bridge1_skipped': True, 'settle_rejected_0': True, 'order_fault_0': True,
+               'feed_not_halted': True}
+        self.assertEqual(cd.red_verdict('red-a04', money, self.order(text), pre)['red'], 'RED')
+        crash = cd.red_verdict('red-a04', money, self.order(text), dict(pre, bridge0_skipped=False))
+        self.assertEqual(crash['status'], 'INCONCLUSIVE')       # the skip is the mechanism: without it the RED is not shown
+        halted = cd.red_verdict('red-a04', money, self.order(text.replace("['OPEN', 'ADMIN']] !=", "['OPEN', 'ADMIN'], "
+                                                                          "['SUSPENDED', 'BRIDGE_HALT']] !=")), pre)
+        self.assertNotEqual(halted['red'], 'RED')
+
+
+class ObserveLife1Test(unittest.TestCase):
+    """5.4 / R6: life 1's ME evidence comes from the pre-wipe freeze; the fresh ME is never asked."""
+
+    def fixture(self):
+        calls = []
+
+        def me(*a, **k):
+            raise AssertionError('the ME was queried after the wipe')
+        money = {'balances': [], 'holds': [], 'lastAppliedTradeId': 12, 'meEpoch': 15112027, 'lastAppliedJournalSeq': 7505,
+                 'feedHalted': True, 'haltReason': 'SOURCE_SCHEMA'}
+        replies = {'money-dump': money, 'order-dump': {'orders': []}, 'pending-dump': {'count': 0, 'head': 9, 'entries': []}}
+        metrics = {'assets_settle_faults_total': 0.0, 'assets_settle_rejects_total': 0.0, 'assets_cluster_role': 2.0,
+                   **{m: 0.0 for m in core_scenarios.COUNTER_METRICS.values()}}
+        f = types.SimpleNamespace(m={'ports': {'ae_metrics': 9, 'me_metrics': 8, 'forwarder_http': 7, 'bridge_http': 6},
+                                     'me_journal_profile': 'me-journal-4'}, slots={},
+                                  core=lambda verb, principal, **kw: ('ANSWERED', replies[verb]),
+                                  journal_dump=me, me_open_legs=me,
+                                  metrics=lambda role, port: me() if role.startswith('me') else
+                                  dict(metrics, assets_cluster_role=2.0 if role == 'ae0' else 1.0))
+        f.psql = lambda db, sql: '[]'
+        return f, calls
+
+    def test_observe_life1_never_queries_the_me_after_the_wipe(self):
+        """RED 6380b01: observe() has no frozen evidence and calls journal_dump / me_open_legs on the fresh ME."""
+        f, _ = self.fixture()
+        frozen = {'me_journal': [{'type': 'engine_config', 'journal_seq': 1, 'me_epoch': 15112027}], 'me_journal_seq': True,
+                  'me_open_legs': [], 'scrape_me': {'me0': {'match_cluster_role': 2.0}}}
+        obs = core_scenarios.observe(f, frozen=frozen)
+        self.assertEqual(obs['me_journal'], frozen['me_journal'])
+        self.assertEqual(obs['scrape']['me0'], {'match_cluster_role': 2.0})
+
+    def test_observe_maps_the_v7_halt_fields(self):
+        f, _ = self.fixture()
+        obs = core_scenarios.observe(f, frozen={'me_journal': [], 'me_journal_seq': True, 'me_open_legs': [], 'scrape_me': {}})
+        core = obs['core']
+        self.assertEqual((core['bound_me_epoch'], core['feed_cursor'], core['feed_halted'], core['halt_reason']),
+                         (15112027, 7505, True, 'SOURCE_SCHEMA'))
+
+
+class MemberEpochsTest(unittest.TestCase):
+    def test_two_lives_with_overlapping_seqs_stay_apart(self):
+        """5.4: the merge keys on (me_epoch, journal_seq). RED 6380b01: Violation "journalSeq 1 differs between two
+        recordings" (a life-2 seq 1 merged onto life 1's seq 1)."""
+        events = [{'type': 'engine_config', 'journal_seq': 1, 'me_epoch': 11, 'recording': 0},
+                  {'type': 'outcome', 'journal_seq': 2, 'me_epoch': 11, 'recording': 0},
+                  {'type': 'engine_config', 'journal_seq': 1, 'me_epoch': 13, 'recording': 1, 'ledger_capacity': 9},
+                  {'type': 'outcome', 'journal_seq': 2, 'me_epoch': 11, 'recording': 1}]
+        merged = core_scenarios.merge_member_lives(events, True)
+        self.assertEqual([(e['me_epoch'], e['journal_seq']) for e in merged], [(11, 1), (11, 2), (13, 1)])
+
+
+class SamplerTest(unittest.TestCase):
+    def test_sampler_rows_from_one_probe_exec(self):
+        """RED 6380b01: no Sampler. One probe exec per tick reads every target; a target that does not answer is
+        'unavailable' in that row, never a crash, and only the wanted names are kept."""
+        out = json.dumps({'ae0': {'status': 200, 'body': 'assets_cluster_role 2\nassets_release_backlog 4\nother 1\n'},
+                          'me0': {'status': 0, 'error': 'refused'}})
+        row = cd.Sampler.parse(out, {'ae0': ('assets_cluster_role', 'assets_release_backlog'), 'me0': ('match_trades_total',)},
+                               10.0, 10.2)
+        self.assertEqual(row['roles']['ae0'], {'assets_cluster_role': 2.0, 'assets_release_backlog': 4.0})
+        self.assertIn('unavailable', row['roles']['me0'])
+        self.assertEqual(cd.s_value(row, 'ae', 'assets_release_backlog'), 4.0)       # leader resolution inside one row
+
+
+class S16TableTest(unittest.TestCase):
+    S16 = {'a03-lifetime', 'a04-regenesis', 'a04-one-bridge-halt', 'a05-fwd-upgrade', 'a05-fwd-kill', 'a05-bridge-upgrade',
+           'a06-two-forwarders-ticks', 'a01-fwdring', 'c13-enginedriverkill'}
+
+    def test_s16_drills_controls_and_reds_are_tabled(self):
+        self.assertTrue(self.S16 <= set(cd.DRILLS))
+        self.assertEqual({c for c in cd.CONTROLS if cd.CONTROLS[c][0] in self.S16} | {'edk-cnctimeout'},
+                         {'a03-cap100k', 'a03-nokill', 'a04-noregen', 'a04-earlyrestart', 'a05-fwd-upgrade-n1',
+                          'a05-bridge-upgrade-n1', 'a06-n1', 'fwdring-pause15', 'fwdring-nopause', 'edk-nokill',
+                          'edk-cnctimeout'})
+        self.assertEqual((cd.REDS['red-a03']['drill'], cd.REDS['red-a04']['drill']), ('a03-lifetime', 'a04-regenesis'))
+        for name in self.S16:
+            spec = cd.DRILLS[name]
+            self.assertTrue(hasattr(cd.DrillRun, 'faults_' + spec['faults']), name)
+            for line in spec['lines']:
+                self.assertIn(line, cd.LINES, (name, line))
+
+    def test_plans_fit_the_per_user_cap_and_size_the_tap(self):
+        for name in self.S16:
+            spec = cd.DRILLS[name]
+            story = spec['story']
+            if story['script'] == 'a01-mix':
+                requests = (story['rate'] + story['rate'] // 5) * story['seconds']
+                self.assertLessEqual(requests / len(story['users']), 256, name)
+            plan = cd.plan_for(spec, 1)
+            self.assertGreaterEqual(plan['tap_ms'] / 1000, cd.story_seconds(story) + cd.PRE_BARRIER_S + 60, name)
+        self.assertEqual(cd.plan_for(cd.DRILLS['a03-lifetime'], 1)['ledger_capacity'], 2000)
+        self.assertEqual(cd.plan_for(cd.DRILLS['a03-lifetime'], 1, variant={'ledger_capacity': 100_000})['ledger_capacity'], 100_000)
+        life1 = cd.plan_for(cd.DRILLS['a04-regenesis'], 1)['tap_ms'] / 1000
+        self.assertGreaterEqual(life1, 40 + cd.A04_HALT_PHASE_S + cd.PRE_BARRIER_S)     # W1 item 3: life-1 tap ends on its duration
+
+    def test_a03_scenarios_may_stage_the_norelease_build_in_both_slots(self):
+        """W1 open item 1. RED 6380b01: 'GREEN drills run the real binaries only' for core-drill-a03-lifetime on s16-a03."""
+        a03 = StubFixture(slots={'fwd0': 'forwarder_b', 'fwd1': 'forwarder_b', 'bridge0': 'bridge', 'bridge1': 'bridge'},
+                          artifacts={'forwarder_b': {'driver': 'external', 'target': 'ct_forwarder_nc_norelease'},
+                                     'forwarder': {'driver': 'external', 'target': 'ct-forwarder'}, 'bridge_b': None})
+        a03.m['manifest_kind'] = 's16-a03'
+        with mock.patch.object(cd.DrillRun, 'run', lambda self: {'status': 'PASS', 'lines': {}, 'of_rows': {}}):
+            self.assertEqual(cd.scenario(a03, 'core-drill-a03-lifetime', '/nonexistent')['status'], 'PASS')
+            a03.m['manifest_kind'] = 's16'
+            with self.assertRaisesRegex(Inconclusive, 'GREEN drills run the real binaries only'):
+                cd.scenario(a03, 'core-drill-a03-lifetime', '/nonexistent')
+            a03.m['manifest_kind'] = 's16-a03'
+            a03.m['artifacts']['forwarder_b']['target'] = 'ct-forwarder'     # past check_build_b: the slot guard itself
+            with self.assertRaisesRegex(Inconclusive, 'GREEN drills run the real binaries only'):
+                cd.scenario(a03, 'core-drill-a05-fwd-upgrade', '/nonexistent')
+
+    def test_s16_red_scenarios_need_their_negative_builds(self):
+        with self.assertRaisesRegex(Inconclusive, 'needs the negative build bridge_b'):
+            cd.scenario(StubFixture(), 'core-red-a04', '/nonexistent')
+        with self.assertRaisesRegex(Inconclusive, 'needs the negative build forwarder_b'):
+            cd.scenario(StubFixture(), 'core-red-a03', '/nonexistent')
+
+    def test_line_verdict_inconclusive_is_never_pass(self):
+        money = order = {'status': 'PASS', 'rules': {}}
+        lines = {'x': cd._line(False, 'no witness', inconclusive=True)}
+        self.assertEqual(cd.verdict(money, order, lines, {})['status'], 'INCONCLUSIVE')
+        self.assertEqual(cd.control_verdict(money, order, lines, ['x'])['status'], 'INCONCLUSIVE')
+
+
+class S16ScheduleTest(unittest.TestCase):
+    """The section 9 schedules on a stub fixture (no docker): the order of acts and what each records."""
+
+    def run_for(self, drill, variant=None, **f):
+        calls = []
+        fx = types.SimpleNamespace(readiness_override={}, registry={'containers': {}}, slots={}, m={'artifacts': {}},
+                                   stop=lambda slot: calls.append(('stop', slot)) or {'kind': 'stop', 'target': slot, 'exit_code': 0},
+                                   replace_slot=lambda slot, art, after_kill=False: calls.append(('replace', slot, art, after_kill))
+                                   or {'kind': 'replace_slot', 'target': slot, 'old': {'sha256': 'a'}, 'new': {'sha256': 'b'},
+                                       'build_health': 'B'},
+                                   **f)
+        run = cd.DrillRun.__new__(cd.DrillRun)
+        run.f, run.name, run.spec, run.variant = fx, drill, cd.DRILLS[drill], dict(variant or {})
+        run.ledger, run.removed, run.restarted, run.extra = cd.Ledger(), set(), set(), {}
+        run.t0 = time.time_ns() - 100 * 10**9
+        run.at = lambda s: calls.append(('at', s))
+        run.sleep = lambda s: None
+        run.health_of = lambda role: (200, {})
+        run.kill = lambda role: calls.append(('kill', role)) or run.ledger.open('kill', role)
+        return run, calls
+
+    def test_a05_swaps_slot0_at_30_and_slot1_at_50_and_heals_each(self):
+        run, calls = self.run_for('a05-fwd-upgrade')
+        run.faults_a05()
+        self.assertEqual([c for c in calls if c[0] != 'at'][:4],
+                         [('stop', 'fwd0'), ('replace', 'fwd0', 'forwarder_b', False), ('stop', 'fwd1'),
+                          ('replace', 'fwd1', 'forwarder_b', False)])
+        self.assertEqual([c[1] for c in calls if c[0] == 'at'], [30, 50])
+        self.assertFalse(run.ledger.fault_open())
+        self.assertEqual([s['slot'] for s in run.swaps], ['fwd0', 'fwd1'])
+        self.assertTrue(all(s['ready_s'] >= s['start_s'] for s in run.swaps))
+
+    def test_a05_kill_swap_replaces_after_kill(self):
+        run, calls = self.run_for('a05-fwd-kill')
+        run.faults_a05()
+        self.assertIn(('replace', 'fwd0', 'forwarder_b', True), calls)
+        self.assertEqual([r['kind'] for r in run.ledger.faults()], ['kill', 'kill'])
+
+    def test_a05_n1_control_removes_the_survivor_first_and_never_replaces_it(self):
+        run, calls = self.run_for('a05-bridge-upgrade', {'n1': True, 'control': 'a05-bridge-upgrade-n1'})
+        run.faults_a05()
+        self.assertEqual([c for c in calls if c[0] in ('stop', 'replace')],
+                         [('stop', 'bridge1'), ('stop', 'bridge0'), ('replace', 'bridge0', 'bridge_b', False)])
+        self.assertEqual(run.removed, {'bridge1'})
+        skipped = [r for r in run.ledger.rows if 'skipped' in r]
+        self.assertEqual((skipped[0]['target'], skipped[0]['witness']['exit_code']), ('bridge1', 0))
+        self.assertFalse(run.ledger.fault_open())
+
+    def test_fwdring_nopause_records_bracketed_skip_rows(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / 'state' / 'probe').mkdir(parents=True)
+            run, calls = self.run_for('a01-fwdring', {'pause': False}, root=Path(root), leader=lambda e: 'me0')
+            seqs = iter(range(100, 200, 10))
+            run.me_seq = lambda me: next(seqs)
+            run.wait_marker = lambda name, bound, where=None: calls.append(('marker', name)) or {}
+            with mock.patch.object(cd.core_scenarios, 'barrier_scrape', lambda f: {'fwd0': {'forwarder_dispatch_seq{point="last_sent"}': 7.0}}):
+                run.faults_fwdring()
+            rows = [r for r in run.ledger.rows if r['kind'] == 'pause']
+            self.assertEqual(len(rows), 2)
+            self.assertTrue(all('skipped' in r and r['witness']['me_seq_thaw'] > r['witness']['me_seq_pause'] for r in rows))
+            self.assertEqual([c for c in calls if c[0] == 'marker'], [('marker', 'ioc_burst_started')] * 2)
+            self.assertTrue((Path(root) / 'state' / 'probe' / cd.IOC_BURST_FILE).exists())
+
+    def test_gate_watcher_writes_closed_then_open_from_the_tap(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            tap, sig = Path(root) / 'tap.jsonl', Path(root) / 'sig'
+            sig.mkdir()
+            rows = [('OPEN', 'ADMIN'), ('SUSPENDED', 'ME_CAPACITY')]
+            tap.write_text(''.join(json.dumps({'tap': 'admission', 'row': {'market': 0, 'state': s, 'reason': r}}) + '\n'
+                                   for s, r in rows) + '{"tap": "admission", "row": {"mar')        # a row still being written
+            watch = cd.GateWatcher(tap, sig)
+            watch()
+            self.assertTrue((sig / 'capacity_closed').exists())
+            self.assertFalse((sig / 'capacity_open').exists())
+            with tap.open('a') as out:
+                out.write('ket": 1, "state": "OPEN", "reason": "ADMIN"}}\n')
+                out.write(json.dumps({'tap': 'admission', 'row': {'market': 0, 'state': 'OPEN', 'reason': 'ADMIN'}}) + '\n')
+            watch()
+            self.assertTrue((sig / 'capacity_open').exists())
+
+    def test_a03_nokill_swaps_before_the_fill_and_injects_nothing(self):
+        run, calls = self.run_for('a03-lifetime', {'hold': False}, leader=lambda e: 'me0')
+        run.red = None
+        run.gate = types.SimpleNamespace(closed_ns=None, opened_ns=None)
+        run.sampler = types.SimpleNamespace(latest=lambda: S(1, ae0=dict(lead('ae'), assets_release_backlog=0.0)))
+        run.wait_marker = lambda name, bound, where=None: calls.append(('marker', name)) or {}
+        run.tap_rows = lambda: {'dispatch': [{'seq': 5}, {'seq': 9}]}
+        run.me_seq = lambda me: 777
+        run.faults_a03()
+        acts = [c for c in calls if c[0] in ('stop', 'replace', 'marker', 'kill')]
+        self.assertEqual(acts, [('stop', 'fwd0'), ('replace', 'fwd0', 'forwarder', False), ('stop', 'fwd1'),
+                                ('replace', 'fwd1', 'forwarder', False), ('marker', 'fill_ended')])
+        self.assertEqual((run.a03_hold['swap_me_seq'], run.a03_hold['swap_dispatch_seq']), (777, 9))
+        self.assertEqual([r['kind'] for r in run.ledger.rows if 'skipped' in r], ['pause', 'kill', 'stop'])
+
+    def test_iso_ns_reads_docker_times(self):
+        self.assertEqual(cd._iso_ns('1970-01-01T00:00:01.5Z'), 1_500_000_000)
+        self.assertEqual(cd._iso_ns('1970-01-01T00:00:02.123456789Z') - cd._iso_ns('1970-01-01T00:00:02Z'), 123456789)
 
 
 if __name__ == '__main__':

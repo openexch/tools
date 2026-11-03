@@ -197,9 +197,13 @@ def merge_member_lives(events, has_journal_seq):
     plain = [{k: v for k, v in e.items() if k not in {'source', 'recording', 'position'}} for e in events]
     if not has_journal_seq or len({e.get('recording') for e in events}) <= 1:
         return plain
+    # RC2 S16 5.4: keyed on (meEpoch, journalSeq), so two ME lives (a re-genesis restarts journalSeq at 1) never merge;
+    # epochs keep the order of their first appearance
+    order = {epoch: n for n, epoch in enumerate(dict.fromkeys(e.get('me_epoch') for e in plain))}
     by_seq = {}
     for e in plain:
-        seen = by_seq.setdefault(e['journal_seq'], e)
+        key = (order[e.get('me_epoch')], e['journal_seq'])
+        seen = by_seq.setdefault(key, e)
         if seen != e:
             raise Violation(f'journalSeq {e["journal_seq"]} differs between two recordings of one ME member')
     return [by_seq[k] for k in sorted(by_seq)]
@@ -223,20 +227,25 @@ COUNTER_METRICS = {'stale_outcomes': 'assets_order_stale_outcomes_total', 'redun
 SCRAPE_PREFIXES = {
     'ae': ('assets_cluster_role', 'assets_pending_commands', 'assets_order_', 'assets_release_confirm_stale_total', 'assets_market_',
            'assets_released_late_total', 'assets_me_release_early_total', 'assets_late_apply_on_dead_order_total',
-           'assets_release_backlog', 'assets_me_ledger_size'),                  # O-F4 (RUN:372-380)
+           'assets_release_backlog', 'assets_me_ledger_size',                   # O-F4 (RUN:372-380)
+           # RC2 S16 5.4: the capacity gate, the release path, the feed latch, the ticks
+           'assets_release_', 'assets_me_capacity_', 'assets_feed_', 'assets_ticks_', 'assets_last_applied_trade_id'),
     'me': ('match_cluster_role', 'match_engine_next_journal_seq', 'match_durable_', 'match_command_ledger_size',
-           'match_ingress_decode_rejects_total', 'match_ingress_unauthorized_total'),   # O-F1 (RUN:331-338)
+           'match_ingress_decode_rejects_total', 'match_ingress_unauthorized_total',    # O-F1 (RUN:331-338)
+           'match_command_ledger_', 'match_release_', 'match_orders_submitted_total', 'match_trades_total'),   # S16 5.4
     'fwd': ('forwarder_resync_total', 'forwarder_session_reconnect_total', 'forwarder_session_new_leader_total',
-            'forwarder_dispatch_seq', 'forwarder_ready'),
+            'forwarder_dispatch_seq', 'forwarder_ready', 'forwarder_tick_', 'forwarder_ticks_ready'),
     'bridge': ('bridge_ae_connected', 'bridge_ready', 'bridge_not_ready_bits', 'bridge_state', 'bridge_halted',
-               'bridge_client_sessions_opened_total')}
+               'bridge_client_sessions_opened_total', 'bridge_halt_reason', 'bridge_core_halt_reason', 'bridge_skipped_total',
+               'bridge_fences_total')}
 
 
-def barrier_scrape(fixture):
+def barrier_scrape(fixture, skip_me=False):
     """The contract 5.6 scrape set, per role. Names a role does not export are simply absent (the oracle reads
-    sample.counters, this is evidence); a slot that is not STARTED is not scraped."""
+    sample.counters, this is evidence); a slot that is not STARTED is not scraped. ``skip_me``: RC2 S16 5.4, A04 life 1
+    is judged on the ME frozen before the wipe, so the fresh ME is not read."""
     ports = fixture.m['ports']
-    targets = [(f'{e}{i}', e, ports[e + '_metrics']) for e in ('ae', 'me') for i in range(3)]
+    targets = [(f'{e}{i}', e, ports[e + '_metrics']) for e in (('ae',) if skip_me else ('ae', 'me')) for i in range(3)]
     for slot, state in (getattr(fixture, 'slots', None) or {}).items():
         if state.get('state') == 'STARTED':
             targets.append((slot, 'fwd' if slot.startswith('fwd') else 'bridge', ports['forwarder_http' if slot.startswith('fwd') else 'bridge_http']))
@@ -251,11 +260,16 @@ def barrier_scrape(fixture):
     return scrape
 
 
-def observe(fixture):
+def observe(fixture, frozen=None):
+    """One barrier observation. ``frozen`` (RC2 S16 5.4, R6): A04 life 1's ME evidence read BEFORE the wipe
+    ({me_journal, me_journal_seq, me_open_legs, scrape_me}); the fresh ME is then never queried."""
     money, orders = money_dump(fixture), order_dump(fixture)
     pending = _ok(*fixture.core('pending-dump', 'probe-forwarder'), 'pending-dump')
-    journal, has_seq = me_journal(fixture)
-    legs = fixture.me_open_legs()
+    if frozen is None:
+        journal, has_seq = me_journal(fixture)
+        legs = fixture.me_open_legs()
+    else:
+        journal, has_seq, legs = frozen['me_journal'], frozen['me_journal_seq'], frozen['me_open_legs']
     mj, mlegs = money_journal(fixture)
     gauges, leaders = {}, []
     for i in range(3):
@@ -275,9 +289,18 @@ def observe(fixture):
             'holds': sorted(money['holds'], key=lambda h: h['order']),
             'live_orders': orders, 'last_applied_trade_id': money['lastAppliedTradeId'],
             'pending_dispatch': {'count': pending['count'], 'head': pending['head']}}
+    # RC2 S16 3.3 / 5.4: the v7 FeedPositionReport fields money-dump exports since W2 (meEpoch, lastAppliedJournalSeq,
+    # feedHalted, haltReason); absent on an older probe, then M10 keeps its old rule
+    for name, key in (('bound_me_epoch', 'meEpoch'), ('feed_cursor', 'lastAppliedJournalSeq'), ('feed_halted', 'feedHalted'),
+                      ('halt_reason', 'haltReason')):
+        if key in money:
+            core[name] = money[key]
+    scrape = barrier_scrape(fixture, skip_me=frozen is not None)
+    if frozen is not None:
+        scrape.update(frozen.get('scrape_me') or {})
     return {'core': core, 'me_journal': journal, 'me_journal_seq': has_seq, 'me_open_legs': legs,
             'money_journal': mj, 'money_journal_legs': mlegs, 'gauges': gauges, 'pending': pending, 'counters': counters,
-            'scrape': barrier_scrape(fixture)}
+            'scrape': scrape}
 
 
 def core_smoke(fixture):

@@ -71,7 +71,7 @@
     },
     "me-journal-4": {
       "status": "active",
-      "source": "RC2 S1 wire freeze: match-common me-journal-schema.xml (schemaId 4 v1), copied byte-identical from match c53dd20; records 1-5, every record with journalSeq + meEpoch; record 4 carries the flat 'releases' group (RC2 S15 W1, contract 5.4)",
+      "source": "RC2 S1 wire freeze: match-common me-journal-schema.xml (schemaId 4 v1), copied byte-identical from match c53dd20; records 1-5, every record with journalSeq + meEpoch; record 4 carries the flat 'releases' group (RC2 S15 W1, contract 5.4); records 1-3 map the ME cluster timestamp (RC2 S16 W3, contract 5.4 / F-S16-17)",
       "has_journal_seq": true,
       "schemas": [
         {
@@ -97,7 +97,8 @@
             "maker_user": "makerUserId",
             "taker_is_buy": "takerIsBuy",
             "taker_order": "takerOmsOrderId",
-            "maker_order": "makerOmsOrderId"
+            "maker_order": "makerOmsOrderId",
+            "timestamp": "timestamp"
           }
         },
         {
@@ -112,7 +113,8 @@
             "market": "marketId",
             "status": "status",
             "order": "omsOrderId",
-            "reject_reason": "rejectReason"
+            "reject_reason": "rejectReason",
+            "timestamp": "timestamp"
           }
         },
         {
@@ -138,7 +140,8 @@
             "quantity": "quantity",
             "ledger_size": "ledgerSize",
             "ledger_capacity": "ledgerCapacity",
-            "behavior_version": "behaviorVersion"
+            "behavior_version": "behaviorVersion",
+            "timestamp": "timestamp"
           }
         },
         {

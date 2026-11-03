@@ -141,6 +141,39 @@ class CoreOracleTest(unittest.TestCase):
     def test_m10_cursor_behind_the_me(self):
         self.assertRule(variant(clean_sample(), lambda s: s['core'].update(last_applied_trade_id=2)), 'M10')
 
+    def test_m10_bound_epoch_reads_the_cursor_against_the_core_epoch(self):
+        """RC2 S16 5.4 (X2, D-S16-6). Journal: epoch 77 trades 1..k, then epoch 99 trades 1..j with j < k; the core is bound
+        to 77 with its cursor at k. RED 6380b01: M10 FAIL "lastAppliedTradeId k != max ME trade id j" (keys on the last
+        journal epoch). The bound-epoch rule PASSes it and still FAILs a cursor behind the bound epoch's top."""
+        def two_epochs(s, bound, cursor):
+            k = max(t['trade_id'] for t in s['me_journal'] if t['type'] == 'trade')
+            first = next(e for e in s['me_journal'] if e['type'] == 'trade')
+            s['me_journal'].append(dict(first, journal_seq=1, me_epoch=99, trade_id=1))
+            s['core']['last_applied_trade_id'] = k if cursor is None else cursor
+            if bound is not None:
+                s['core']['bound_me_epoch'] = bound
+        import core_oracle as co
+        from oracle_model import Model
+        base = schema4_sample(epoch=77)
+        for bound, cursor, want in ((77, None, 'PASS'), (77, 1, 'FAIL'), (None, None, 'FAIL')):
+            sample = variant(base, lambda s: two_epochs(s, bound, cursor))
+            model = Model(sample)
+            try:
+                co.m10(model)
+                status = 'PASS'
+            except co.Violation:
+                status = 'FAIL'
+            self.assertEqual(status, want, (bound, cursor))
+
+    def test_m10_bound_epoch_without_its_trades_needs_a_zero_cursor(self):
+        import core_oracle as co
+        from oracle_model import Model
+        sample = variant(schema4_sample(epoch=77), lambda s: s['core'].update(bound_me_epoch=99))
+        with self.assertRaisesRegex(co.Violation, 'bound epoch 99'):
+            co.m10(Model(sample))
+        sample = variant(schema4_sample(epoch=77), lambda s: s['core'].update(bound_me_epoch=99, last_applied_trade_id=0))
+        co.m10(Model(sample))
+
     def test_m11_unexplained_settle_fault(self):
         self.assertRule(variant(clean_sample(), lambda s: s['faults'].update(settle_fault=1)), 'M11')
 

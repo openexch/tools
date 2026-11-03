@@ -287,6 +287,17 @@ def m9(m):
 
 
 def m10(m):
+    """The core's trade cursor equals the max ME trade id of the epoch it is bound to (RC2 S16 5.4, D-S16-6: the
+    sample's ``core.bound_me_epoch`` from money-dump v7); with no trade of that epoch the cursor is 0. Samples without
+    the bound epoch (S14/S15) keep the old rule: the last journal epoch."""
+    bound = m.s['core'].get('bound_me_epoch')
+    if bound is not None:
+        ids = [t['trade_id'] for t in m.trades if t['me_epoch'] == bound]
+        top = max(ids) if ids else 0
+        if m.s['core']['last_applied_trade_id'] != top:
+            raise Violation(f'lastAppliedTradeId {m.s["core"]["last_applied_trade_id"]} != max ME trade id {top} of the '
+                            f'bound epoch {bound}')
+        return
     if not m.trades:
         if m.s['core']['last_applied_trade_id'] != 0:
             raise Violation('core applied trades the ME never journaled')

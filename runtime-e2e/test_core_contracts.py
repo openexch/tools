@@ -4,6 +4,7 @@ import copy
 import hashlib
 from pathlib import Path
 import tempfile
+import time
 import types
 import unittest
 
@@ -236,8 +237,10 @@ class EngineDriverManifestTest(unittest.TestCase):
         with self.assertRaisesRegex(Violation, 'negative build ct_forwarder_nc_norelease as forwarder_b'):
             core_drills.scenario(fx, 'core-drill-a05-fwd-upgrade', self.dir)
         fx.m['artifacts']['forwarder_b']['target'] = 'ct-forwarder'
-        with self.assertRaisesRegex(Inconclusive, 'not implemented'):          # the guard passed; W3 adds the drill
-            core_drills.scenario(fx, 'core-drill-a05-fwd-upgrade', self.dir)
+        fx.clock, fx.sleep = time.time, (lambda s: None)
+        from unittest import mock                                              # the guard passed; W3 added the drill
+        with mock.patch.object(core_drills.DrillRun, 'run', lambda run: {'status': 'PASS', 'lines': {}, 'of_rows': {}}):
+            self.assertEqual(core_drills.scenario(fx, 'core-drill-a05-fwd-upgrade', self.dir)['status'], 'PASS')
 
     def test_red_manifest_refuses_a_non_nc_build_b(self):
         m, path = self.b_manifest('s16-red-a03', 'ct_forwarder_nc_norelease'); self.check(m, path)

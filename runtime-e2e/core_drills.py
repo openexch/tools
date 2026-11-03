@@ -14,6 +14,7 @@ oracles answer INCONCLUSIVE (R1), so the drill can never PASS on it (C4: ``test_
 The pure parts (the ledger, the backfill, the lines, the verdicts, the declared block) take recorded witnesses and are
 unit tested on recorded and synthesized samples (``test_core_drills.py``); ``DrillRun`` drives a ``CoreFixture``.
 """
+from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -26,7 +27,8 @@ import core_oracle
 import core_scenarios
 import journal_decode
 import order_oracle
-from oracle_model import BARRIER_COLLECTIONS, RELEASE_KIND, Model, integer, seq_gaps
+from core_fixture import PROBE_AERON_DIR, READY_AFTER_KILL_S
+from oracle_model import BARRIER_COLLECTIONS, RELEASE_KIND, TERMINAL, Model, integer, seq_gaps
 
 A01_USERS = list(range(73001, 73041))         # A7: 256 retained requests per user per 15 min; a01 at 100/s needs >= 29
 A02_USERS = [74001, 74002, 74003, 74004]
@@ -164,9 +166,12 @@ class Ledger:
         row['heal'] = {'branch': branch, 'at_ns': self.clock(), 'witness': witness or {}}
         return row
 
-    def skip(self, kind, target, why):
-        """A control run (8.4) records the fault it did NOT inject; the row is not a fault and never opens."""
+    def skip(self, kind, target, why, witness=None):
+        """A control run (8.4) records the fault it did NOT inject; the row is not a fault and never opens. ``witness``:
+        what the control did instead (S16 fwdring-nopause keeps its bracketed reads, the *-n1 controls their stop)."""
         row = {'row': len(self.rows) + 1, 'kind': kind, 'target': target, 'skipped': why, 'opened_ns': None, 'heal': None}
+        if witness is not None:
+            row['witness'] = witness
         self.rows.append(row)
         return row
 
@@ -180,10 +185,12 @@ class Ledger:
         return bool(self.open_rows())
 
 
-def declared_block(ledger, genesis_id, ordering_exception=None):
-    """Section 7: zero faults, no halt, gate sequence and epochs; ``fault_open`` from the ledger, never assumed (R1)."""
-    return {'settle_fault': 0, 'settle_rejected': 0, 'order_fault': 0, 'quarantined': 0, 'halt': False,
-            'fault_open': ledger.fault_open(), 'forwarder_absent': False, 'gate_sequence': GATE_SEQUENCE,
+def declared_block(ledger, genesis_id, ordering_exception=None, gate_sequence=None, halt=False, order_fault=0):
+    """Section 7: zero faults, no halt, gate sequence and epochs; ``fault_open`` from the ledger, never assumed (R1).
+    RC2 S16 (5.4, F-S16-10): the gate sequence, the halt and the order-fault count per drill and life (declared_for)."""
+    return {'settle_fault': 0, 'settle_rejected': 0, 'order_fault': order_fault, 'quarantined': 0, 'halt': halt,
+            'fault_open': ledger.fault_open(), 'forwarder_absent': False,
+            'gate_sequence': GATE_SEQUENCE if gate_sequence is None else gate_sequence,
             'epochs': [genesis_id], 'ordering_exception': ordering_exception}
 
 
@@ -251,8 +258,13 @@ def backfill(tap_rows, pending_entries, me_journal, known_orders, head):
 # ------------------------------------------------------------------ non-vacuity lines (8.4), each can fail
 
 
-def _line(holds, detail):
-    return {'holds': bool(holds), 'detail': detail}
+def _line(holds, detail, inconclusive=False):
+    """``inconclusive``: the line's witness is missing or vacuous (a gap, a window never bracketed): the run can never
+    PASS on it and it is not a product FAIL either (S16: "a gap or missing witness is INCONCLUSIVE, never PASS")."""
+    line = {'holds': bool(holds) and not inconclusive, 'detail': detail}
+    if inconclusive:
+        line['inconclusive'] = True
+    return line
 
 
 def _rows(w, kind=None, target=None):
@@ -519,10 +531,1365 @@ def window_closures(sample, windows):
     return out
 
 
+
+
+# ================================================================== RC2 S16 (contract 5.4, 7, 8, 9; W0 amendments 20.1)
+#
+# Settings, never acceptance limits tied to one machine (PO 2026-11-03): every one is recorded with every run (SETTINGS).
+
+A03_CAPACITY = 2000                           # 9, Q3 H:577-580; the ME accepts 2000 at FRESH (answers-14.2 item 10)
+A03_PAUSE_S = 2.5                             # 4: fwd1's window pause, below WINDOW_PAUSE_BUDGET_S
+A03_SIGNALS = 'a03-signals'                   # 5.5: the probe /data dir the fixture writes capacity_closed / capacity_open in
+FWDRING_PAUSE_S = 2.5                         # D-S16-10
+IOC_BURST_FILE = 'ioc-burst'                  # 5.5 --ioc-burst-on, enabled for fwdring by 20.1 line 12
+A05_USERS = list(range(75001, 75081))         # 6, F-S16-12: 80 users for 90 s at 100/s
+A04_LIFE2_USERS = list(range(76001, 76041))   # 6: 40 fresh ids in life 2
+EDK_USERS = list(range(77001, 77081))
+A04_HALT_PHASE_S = 420                        # life-1 tap beyond the story: freeze, regenesis('me') (stops 3 x 15 s, 20.1 line 4),
+                                              # fence, halt, halt-time funding (W1 open item 3: the life-1 tap ends on its duration)
+SETTINGS = {
+    'A05_P999_SLACK_MS': 5,                   # PO-2 (a): swap p99.9 <= baseline p99.9 + 5 ms (F:517)
+    'A05_DUP_EDGE_SLACK': 60,                 # [E] the in-flight count at the window edges; DR-A05 did not size it (W5)
+    'A05_SETTLE_LAG_SLACK': 40,               # [E] trades; W0 measured a lag of 10-36 trades (answers-14.2 item 6)
+    'SWAP_WINDOW_MIN_S': 1.0,                 # proposed 20.1: W0 measured swap windows of 1.45-1.49 s (answers item 5)
+    'SURVIVOR_MAX_GAP_S': 1.0,                # proposed 20.1: inside a ~1.5 s window a 2 s gap could never show
+    'SERVED_MAX_GAP_S': 2.0,                  # 8.4 cluster_served
+    'SAMPLER_PERIOD_S': 1.0,                  # 5.4 the 1 s sampler
+    'A05_SAMPLER_PERIOD_S': 0.25,             # proposed 20.1: the swap windows need several rows
+    'READY_AFTER_KILL_S': READY_AFTER_KILL_S,  # 20.1 line 7
+    'DRIVER_DEATH_BOUND_S': 18,               # F-S16-6: Aeron client driver timeout 10 s + 5 s grace + 3 s
+    'CNC_TIMEOUT_BOUND_S': 35,                # 8.4: 30 s cnc wait (TC:73) + 5 s
+    'FENCE_BOUND_S': 15,                      # 8.4 fenced_forwarders (W0: 3.7 s, F8_EPOCH)
+    'BRIDGE_HALT_BOUND_S': 30,                # 9 A04 (W0: 6.7 and 9.7 s)
+    'COLD_RESTART_LEAD': 300,                 # 8.4 cold_restart_skips: the peer passed the ME seq at the kill + 300
+    'COLD_RESTART_BOUND_S': 30,
+    'FWDRING_PAUSE_S': FWDRING_PAUSE_S, 'A03_PAUSE_S': A03_PAUSE_S, 'A03_CAPACITY': A03_CAPACITY,
+}
+PROGRESS = 'match_engine_next_journal_seq'    # ME progress: 20.1 line 10, match_orders_submitted_total does not move
+GATE_REASON_ME_CAPACITY = 16                  # 20.1 line 2: assets_order_entry_gate_reasons is a mask 1 << code (ME_CAPACITY 4)
+SOURCE_SCHEMA = 3                             # BMR:420 bridge_halt_reason 3; assets_feed_latch_reason 3 (answers-14.2 item 2)
+GATE_A03 = GATE_SEQUENCE + [['SUSPENDED', 'ME_CAPACITY'], ['OPEN', 'ADMIN']]
+GATE_A04_HALT = GATE_SEQUENCE + [['SUSPENDED', 'BRIDGE_HALT']]
+RED_A03_TEXT = "gate transitions [['SUSPENDED', 'GENESIS'], ['OPEN', 'ADMIN'], ['SUSPENDED', 'ME_CAPACITY']] != declared"
+RED_A04_TEXT = "gate transitions [['SUSPENDED', 'GENESIS'], ['OPEN', 'ADMIN']] != declared"
+
+
+def _s16_a01(seconds, users, **more):
+    return dict({'script': 'a01-mix', 'seconds': seconds, 'rate': 100, 'users': users}, **more)
+
+
+# Section 9 (with 20.1). ``cycles``: the fault rows each run opens and heals (C4).
+DRILLS.update({
+    'a03-lifetime': {'s16': True, 'faults': 'a03', 'cycles': 3, 'ledger_capacity': A03_CAPACITY,
+                     'story': {'script': 'a03-fill', 'rate': 100, 'fill_s': 30, 'reopen_s': 10, 'marker_timeout_s': 60,
+                               'users': A01_USERS},
+                     'lines': ['capacity_cycle', 'release_once', 'release_resent', 'reopen_admits']},
+    'a04-regenesis': {'s16': True, 'faults': 'a04', 'cycles': 1, 'story': _s16_a01(40, A01_USERS), 'life2_users': A04_LIFE2_USERS,
+                      'tap_extra_s': A04_HALT_PHASE_S,
+                      'lines': ['halt_local', 'open_refused', 'money_while_halted', 'fenced_forwarders']},
+    'a04-one-bridge-halt': {'s16': True, 'faults': 'one_bridge_halt', 'cycles': 1, 'story': _s16_a01(60, A01_USERS),
+                            'lines': ['cold_restart_skips', 'bridge_never_halted']},
+    'a05-fwd-upgrade': {'s16': True, 'faults': 'a05', 'swap': 'fwd', 'how': 'stop', 'cycles': 2, 'story': _s16_a01(90, A05_USERS),
+                        'lines': ['build_witness', 'no_delay', 'survivor_delivered', 'dup_outcomes']},
+    'a05-fwd-kill': {'s16': True, 'faults': 'a05', 'swap': 'fwd', 'how': 'kill', 'cycles': 2, 'story': _s16_a01(90, A05_USERS),
+                     'lines': ['build_witness', 'no_delay', 'survivor_delivered', 'dup_outcomes', 'ready_after_kill']},
+    'a05-bridge-upgrade': {'s16': True, 'faults': 'a05', 'swap': 'bridge', 'how': 'stop', 'cycles': 2,
+                           'story': _s16_a01(90, A05_USERS), 'lines': ['build_witness', 'settle_no_gap', 'bridge_never_halted']},
+    'a06-two-forwarders-ticks': {'s16': True, 'faults': 'a06', 'cycles': 1, 'story': _s16_a01(60, A01_USERS),
+                                 'lines': ['tick_conservation', 'tick_stale_positive', 'tick_end_state', 'tick_invalid_zero',
+                                           'tick_survivor']},
+    'a01-fwdring': {'s16': True, 'faults': 'fwdring', 'cycles': 2,
+                    'story': _s16_a01(75, A01_USERS, ioc_burst_on='/data/' + IOC_BURST_FILE),
+                    'lines': ['ring_outlived_thaw', 'released_after_thaw']},
+    'c13-enginedriverkill': {'s16': True, 'faults': 'edk', 'cycles': 3, 'story': _s16_a01(120, EDK_USERS),
+                             'lines': ['driver_death_loud', 'cluster_served']},
+})
+# 8.4: the ten recorded controls of the drills (edk-cnctimeout has its own boot, run_cnc_timeout; a05-fwd-badproto is
+# dropped by 20.1 line 8)
+CONTROLS.update({
+    'a03-cap100k': ('a03-lifetime', {'ledger_capacity': 100_000}, ['capacity_cycle', 'reopen_admits']),
+    'a03-nokill': ('a03-lifetime', {'hold': False}, ['release_resent']),
+    'a04-noregen': ('a04-regenesis', {'regen': False}, ['open_refused', 'money_while_halted', 'fenced_forwarders']),
+    'a04-earlyrestart': ('a04-one-bridge-halt', {'early': True}, ['cold_restart_skips']),
+    'a05-fwd-upgrade-n1': ('a05-fwd-upgrade', {'n1': True}, ['no_delay', 'survivor_delivered', 'dup_outcomes']),
+    'a05-bridge-upgrade-n1': ('a05-bridge-upgrade', {'n1': True}, ['settle_no_gap']),
+    'a06-n1': ('a06-two-forwarders-ticks', {}, ['tick_stale_positive', 'tick_survivor']),
+    'fwdring-pause15': ('a01-fwdring', {'pause_s': 15}, ['ring_outlived_thaw', 'released_after_thaw']),
+    'fwdring-nopause': ('a01-fwdring', {'pause': False}, ['ring_outlived_thaw', 'released_after_thaw']),
+    'edk-nokill': ('c13-enginedriverkill', {'kill': False}, ['driver_death_loud', 'cluster_served']),
+})
+REDS.update({
+    'red-a03': {'drill': 'a03-lifetime', 'slots': FORWARDERS, 'artifact': 'forwarder_b'},     # 8.1, s16-red-a03.json
+    'red-a04': {'drill': 'a04-regenesis', 'slots': BRIDGES, 'artifact': 'bridge_b'},          # 8.2, s16-red-a04.json, life 1
+})
+
+
+def story_seconds(story):
+    """Nominal wall seconds of a story: a03-fill has phases, not seconds= (5.5)."""
+    if story['script'] == 'a03-fill':
+        return story['fill_s'] + story['marker_timeout_s'] + story['reopen_s']
+    return story['seconds']
+
+
+def funding_script(story):
+    """CoreProbe funding knows a01-mix and a02-lifecycle; a03-fill trades in the a01 bands (CP planA03)."""
+    return 'a01-mix' if story['script'] == 'a03-fill' else story['script']
+
+
+def declared_for(drill, variant, life):
+    """Section 7 per drill and life. The controls that switch the close or the halt off declare the two-step sequence
+    (8.4: "the control declares the two-step sequence so the oracles PASS")."""
+    variant = variant or {}
+    if drill == 'a03-lifetime' and variant.get('hold', True) and variant.get('ledger_capacity', A03_CAPACITY) <= A03_CAPACITY:
+        return {'gate_sequence': GATE_A03, 'halt': False, 'order_fault': 0}
+    if drill == 'a04-regenesis' and life == 1 and variant.get('regen', True):
+        return {'gate_sequence': GATE_A04_HALT, 'halt': True, 'order_fault': 1}
+    return {'gate_sequence': GATE_SEQUENCE, 'halt': False, 'order_fault': 0}
+
+
+# ------------------------------------------------------------------ latency table (5.4, 20.1 line 9)
+
+
+def percentile(values, q):
+    """Nearest rank: the smallest value with at least q of the values at or below it."""
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    rank = max(1, -(-int(round(q * 10000)) * len(ordered) // 10000))
+    return ordered[min(rank, len(ordered)) - 1]
+
+
+def lat_summary(values):
+    return {'count': len(values), 'p50': percentile(values, 0.5), 'p99': percentile(values, 0.99),
+            'p99.9': percentile(values, 0.999), 'max': max(values) if values else None}
+
+
+def latency_table(dispatch_rows, me_journal):
+    """Per command id: the dispatch's cluster ms (the tap row's at_ms is the egress header timestamp, the cluster time of
+    the log entry that minted the dispatch, CP:2183-2191, 2398-2400) to the ME's first record-3 ``timestamp`` (ME cluster
+    ms, one host). RELEASE_ID rows repeat a create's id after its outcome (W0 F-S15-25) and are excluded (they made W0's
+    41 percent negative differences); backfilled rows (seq null) have no dispatch time."""
+    first = {}
+    for e in me_journal:
+        if e['type'] == 'outcome' and e.get('timestamp') is not None:
+            first.setdefault((e['command_id_high'], e['command_id_low']), e['timestamp'])
+    table = []
+    for row in dispatch_rows:
+        if row.get('kind') == RELEASE_KIND or row.get('seq') is None or row.get('at_ms') is None:
+            continue
+        key = (row['id_high'], row['id_low'])
+        if key in first:
+            table.append({'seq': row['seq'], 'id': list(key), 'dispatch_ms': row['at_ms'], 'first_apply_ms': first[key],
+                          'ms': first[key] - row['at_ms']})
+    return table
+
+
+def window_summaries(table, windows):
+    """``windows``: {name: [(lo_ms, hi_ms), ...]} half-open on the dispatch ms; a summary per name over the union."""
+    out = {}
+    for name, spans in windows.items():
+        out[name] = lat_summary([r['ms'] for r in table if any(lo <= r['dispatch_ms'] < hi for lo, hi in spans)])
+    return out
+
+
+# ------------------------------------------------------------------ sampler rows (5.4: the 1 s sampler)
+
+
+def s_value(row, who, name):
+    """A value of one sampler row: ``who`` is a role, or 'ae' / 'me' for that engine's leader in the same row."""
+    roles = (row or {}).get('roles') or {}
+    if who in ('ae', 'me'):
+        who = leader_of(roles, who)
+        if who is None:
+            return None
+    return value(roles, who, name)
+
+
+def series(samples, who, name):
+    """[(t, value)] of the rows that answered; t is the read's midpoint (wall s)."""
+    out = []
+    for row in samples or []:
+        v = s_value(row, who, name)
+        if v is not None:
+            out.append(((row['t0'] + row['t1']) / 2, v))
+    return out
+
+
+def progress(points, lo, hi):
+    """Inside [lo, hi] (wall s): the times the value rose against the row before, and the longest span between lo, those
+    rises and hi. Returns (rises, max_gap_s, rows_in_window)."""
+    rises, prev, n = [], None, 0
+    for t, v in points:
+        if t > hi:
+            break
+        if t >= lo:
+            n += 1
+            if prev is not None and v > prev:
+                rises.append(t)
+        prev = v
+    marks = [lo] + rises + [hi]
+    gap = max(b - a for a, b in zip(marks, marks[1:]))
+    return rises, round(gap, 3), n
+
+
+def at_or_before(points, t):
+    hits = [v for tt, v in points if tt <= t]
+    return hits[-1] if hits else None
+
+
+def release_entries(me_journal):
+    return [(e['journal_seq'], r) for e in me_journal if e['type'] == 'release' for r in e.get('releases') or []]
+
+
+def parse_book(text):
+    """``T1MeDriver book`` lines: ``BOOK market=1 version=V bid=B ask=A ...`` or ``BOOK market=2 none`` (a06.log)."""
+    out = {}
+    for line in (text or '').splitlines():
+        m = re.match(r'BOOK market=(\d+) (.*)$', line.strip())
+        if not m:
+            continue
+        rest = m.group(2)
+        if rest.strip() == 'none':
+            out[int(m.group(1))] = None
+            continue
+        kv = dict(re.findall(r'(\w+)=(-?\d+)', rest))
+        out[int(m.group(1))] = {'version': int(kv['version']), 'bid': int(kv['bid']), 'ask': int(kv['ask'])}
+    return out
+
+
+# ------------------------------------------------------------------ 8.4 lines of the S16 drills
+
+
+def line_capacity_cycle(w):
+    """A03: the AE leader's estimate peaks >= 0.8 c and later reads <= 0.6 c; the tap shows [SUSPENDED, ME_CAPACITY]
+    then [OPEN, ADMIN]; gate reasons bit ME_CAPACITY (16) seen in a sample. The ME ledger gauge is evidence only."""
+    c = w['capacity']
+    est = series(w['samples'], 'ae', 'assets_me_capacity_estimate')
+    values = [v for _, v in est]
+    peak = max(values) if values else None
+    i = values.index(peak) if values else None
+    later = min(values[i:]) if values else None
+    gate = [[a['state'], a['reason']] for a in w['admission'] if a['market'] == 0]
+    compact = [s for n, s in enumerate(gate) if n == 0 or s != gate[n - 1]]
+    closed = ['SUSPENDED', 'ME_CAPACITY'] in compact
+    reopened = closed and ['OPEN', 'ADMIN'] in compact[compact.index(['SUSPENDED', 'ME_CAPACITY']):]
+    bit = any(int(v) & GATE_REASON_ME_CAPACITY for _, v in series(w['samples'], 'ae', 'assets_order_entry_gate_reasons'))
+    ledger = [v for _, v in series(w['samples'], 'me', 'match_command_ledger_size')]
+    holds = peak is not None and peak >= 0.8 * c and later <= 0.6 * c and closed and reopened and bit
+    detail = {'capacity': c, 'estimate_peak': peak, 'estimate_after_peak_min': later, 'tap_closed': closed,
+              'tap_reopened': reopened, 'reasons_bit_seen': bit, 'me_ledger_peak': max(ledger) if ledger else None,
+              'samples': len(values)}
+    if not closed:
+        detail['why'] = 'no close observed'
+    return _line(holds, detail)
+
+
+def line_release_once(w):
+    """A03 (20.1 lines 2, 3: the drain is the forwarder swap, no cancel wave): the record-4 entries free at least what
+    the ME ledger held at its peak (and every ORDER-terminal id), no (command, floor, scope) is removed by two entries,
+    match_durable_capacity_total delta 0. The count of removed == 0 entries is recorded against
+    assets_release_confirm_stale_total (a measurement, [E, DR])."""
+    entries = release_entries(w['me_journal'])
+    removed = Counter((r['commandIdHigh'], r['idLowFloor'], r.get('scope')) for _, r in entries if (r.get('removed') or 0) >= 1)
+    twice = [k for k, n in removed.items() if n > 1]
+    total = sum(r.get('removed') or 0 for _, r in entries)
+    peak = max([v for _, v in series(w['samples'], 'me', 'match_command_ledger_size')] or [0])
+    need = max(int(peak), w.get('order_terminals') or 0)
+    before = max_over(w['snaps']['before'], 'me', 'match_durable_capacity_total') or 0
+    after = max_over(w['snaps']['after'], 'me', 'match_durable_capacity_total')
+    capacity = None if after is None else after - before
+    detail = {'entries': len(entries), 'removed_total': total, 'need': need, 'ledger_peak': peak, 'removed_twice': twice[:5],
+              'noop_entries': sum(1 for _, r in entries if not r.get('removed')), 'capacity_delta': capacity}
+    if not entries or total < need:
+        return _line(False, f'no release journaled for {need - total} of {need} ledger entries: {detail}')
+    return _line(not twice and capacity == 0, detail)
+
+
+def line_release_resent(w):
+    """A03 (H:307 "the interrupted release is re-sent and applied once"): the RELEASE_ID dispatches the core minted while
+    both forwarders held releases back (tap seq <= the dispatch head at the swap) each have exactly one record-4 entry
+    with removed >= 1, journaled after the swap (ME journal seq read just before it). No swap witness or no release in
+    the window: INCONCLUSIVE, never PASS."""
+    hold = w.get('hold')
+    if not hold or hold.get('swap_me_seq') is None or hold.get('swap_dispatch_seq') is None:
+        return _line(False, 'no swap witnessed (hold window not bracketed)', inconclusive=True)
+    held = {(r['id_high'], r['id_low']) for r in w['tap_dispatch']
+            if r.get('kind') == RELEASE_KIND and r.get('seq') is not None and r['seq'] <= hold['swap_dispatch_seq']}
+    if not held:
+        return _line(False, 'no release in the window', inconclusive=True)
+    by_key = {}
+    for seq, r in release_entries(w['me_journal']):
+        by_key.setdefault((r['commandIdHigh'], r['idLowFloor']), []).append((seq, r.get('removed') or 0))
+    bad = []
+    for key in sorted(held):
+        applied = [seq for seq, n in by_key.get(key, []) if n >= 1]
+        if len(applied) != 1 or applied[0] <= hold['swap_me_seq']:
+            bad.append({'id': list(key), 'applied_at': applied})
+    return _line(not bad, {'held': len(held), 'not_applied_once_after_the_swap': bad[:5], 'bad': len(bad),
+                           'swap_me_seq': hold['swap_me_seq'], 'backlog_at_swap': hold.get('backlog_at_swap')})
+
+
+def line_reopen_admits(w):
+    a03 = w.get('a03') or {}
+    hold = w.get('hold') or {}
+    ok = (a03.get('reopen_acked') or 0) > 0 and a03.get('opened') is True and hold.get('kill_in_closed_window') is True \
+        and hold.get('restarted') is True
+    return _line(ok, {'a03': a03, 'kill_in_closed_window': hold.get('kill_in_closed_window'), 'restarted': hold.get('restarted')})
+
+
+def line_halt_local(w):
+    """A04 life 1: both bridges halt SOURCE_SCHEMA (stale epoch prefix, BDM:462-469) bound to g1 with /health 503; the
+    core latched SOURCE_SCHEMA bound to g1; nothing refused."""
+    g1 = w['g1']
+    out = {}
+    for b in BRIDGES:
+        status, body = w['bridge_health'].get(b) or (None, {})
+        reason = value(w['halt_scrape'], b, 'bridge_halt_reason')
+        out[b] = {'metric': reason, 'status': status, 'haltReason': (body or {}).get('haltReason'),
+                  'meEpoch': (body or {}).get('meEpoch')}
+    ae = leader_of(w['halt_scrape'], 'ae')
+    latch = value(w['halt_scrape'], ae, 'assets_feed_latch_reason') if ae else None
+    core = w['core']
+    ok = all(v['metric'] == SOURCE_SCHEMA and v['status'] == 503 and v['haltReason'] == 'SOURCE_SCHEMA' and v['meEpoch'] == g1
+             for v in out.values()) and core.get('feed_halted') is True and core.get('halt_reason') == 'SOURCE_SCHEMA' \
+        and core.get('bound_me_epoch') == g1 and latch == SOURCE_SCHEMA and w.get('settle_rejected') == 0
+    return _line(ok, {'bridges': out, 'core': core, 'latch_reason': latch, 'settle_rejected': w.get('settle_rejected')})
+
+
+def line_open_refused(w):
+    gate = w.get('open_gate') or {}
+    replies = ((gate.get('reply') or {}).get('replies') or [{}])
+    refused = gate.get('meaning') == 'REFUSED' and replies[-1].get('result') == 'REJECTED'
+    life2 = w.get('life2_gate_open')
+    return _line(refused and life2 is not False, {'meaning': gate.get('meaning'), 'reply': replies[-1],
+                                                  'life2_gate_open': life2})
+
+
+def line_money_while_halted(w):
+    rows = w.get('halt_funding') or []
+    ok_rows = [r for r in rows if r.get('outcome') == 'ACK' and r.get('gate') == 'SUSPENDED']
+    deposits = sum(1 for r in ok_rows if r['kind'] == 'deposit')
+    withdraws = sum(1 for r in ok_rows if r['kind'] == 'withdraw')
+    reply = (w.get('halt_create') or {}).get('reply') or {}
+    ok = deposits >= 4 and withdraws >= 2 and reply.get('outcome') == 'REJECT' and reply.get('reason') == 'GATE_CLOSED'
+    return _line(ok, {'deposits_while_closed': deposits, 'withdraws_while_closed': withdraws, 'create': reply})
+
+
+def line_fenced_forwarders(w):
+    bound = SETTINGS['FENCE_BOUND_S']
+    fence = w.get('fence') or {}
+    ok = all((fence.get(f) or {}).get('exit_code') == 78 and (fence[f].get('after_first_me_start_s') is not None)
+             and fence[f]['after_first_me_start_s'] <= bound for f in FORWARDERS)
+    return _line(ok, {'fence': fence, 'bound_s': bound})
+
+
+def line_second_life_exact(w):
+    life2 = w.get('life2')
+    if not life2:
+        return _line(False, 'life 2 was not judged', inconclusive=True)
+    ok = life2['money']['status'] == 'PASS' and life2['order']['status'] == 'PASS' and life2['epochs'] == [life2['g2']] \
+        and life2['bound_me_epoch'] == life2['g2'] and life2['last_applied_trade_id'] == life2['max_epoch2_trade']
+    return _line(ok, {k: (v['status'] if isinstance(v, dict) and 'status' in v else v) for k, v in life2.items()})
+
+
+def line_cold_restart_skips(w):
+    """A04 one-bridge-halt: the peer passed the ME seq at the kill + COLD_RESTART_LEAD before the restart (the backlog
+    exists and the peer delivered it); the cold bridge skipped at least that backlog (W0: it re-reads from the start and
+    skips to the core cursor) and its next expected seq is the core cursor + 1."""
+    c = w.get('cold') or {}
+    if c.get('me_seq_at_kill') is None or c.get('peer_cursor_at_restart') is None:
+        return _line(False, {'why': 'kill or restart not bracketed', **c}, inconclusive=True)
+    backlog = c['peer_cursor_at_restart'] - c['me_seq_at_kill']
+    health = c.get('health_after') or {}
+    ok = backlog >= SETTINGS['COLD_RESTART_LEAD'] and (c.get('skipped_delta') or 0) >= backlog \
+        and health.get('cursor') is not None and health.get('expected') == health['cursor'] + 1
+    return _line(ok, dict(c, backlog=backlog, lead=SETTINGS['COLD_RESTART_LEAD']))
+
+
+def line_bridge_never_halted(w):
+    rows = [(s_value(r, 'bridge0', 'bridge_halted'), s_value(r, 'bridge1', 'bridge_halted')) for r in w.get('samples') or []]
+    seen = [r for r in rows if r != (None, None)]
+    halted = [r for r in seen if any(v not in (None, 0.0) for v in r)]
+    return _line(bool(seen) and not halted, {'rows': len(seen), 'halted_rows': len(halted)})
+
+
+def _t0_s(w):
+    return w['t0_s'] if 't0_s' in w else w['t0_ms'] / 1000
+
+
+def line_build_witness(w):
+    swaps = w.get('swaps') or []
+    out = [{'slot': s['slot'], 'pre_build': s.get('pre_build'), 'build': s['replace'].get('build_health'),
+            'old_sha256': s['replace']['old']['sha256'], 'new_sha256': s['replace']['new']['sha256']} for s in swaps]
+    ok = len(out) == 2 and all(o['pre_build'] is None and o['build'] == w['b_source_sha'] and o['old_sha256'] != o['new_sha256']
+                               for o in out)
+    return _line(ok, {'swaps': out, 'b_source_sha': w.get('b_source_sha')})
+
+
+def _swap_spans_ms(w):
+    t0 = w['t0_ms']
+    return [(t0 + s['start_s'] * 1000, t0 + s['ready_s'] * 1000) for s in w.get('swaps') or []]
+
+
+def line_no_delay(w):
+    """PO-2 (a): p99.9 over the union of both swap windows <= baseline [10 s, 30 s) p99.9 + A05_P999_SLACK_MS; every window's
+    summary recorded. An empty window is a gap: INCONCLUSIVE."""
+    t0 = w['t0_ms']
+    slack = (w.get('settings') or SETTINGS)['A05_P999_SLACK_MS']
+    spans = _swap_spans_ms(w)
+    windows = {'baseline': [(t0 + 10_000, t0 + 30_000)], 'swap': spans, 'after': [(t0 + 60_000, t0 + 90_000)]}
+    for n, span in enumerate(spans, start=1):
+        windows[f'swap{n}'] = [span]
+    out = window_summaries(w['latency'], windows)
+    if not spans or out['baseline']['count'] == 0 or out['swap']['count'] == 0:
+        return _line(False, {'why': 'a latency window has no row', 'windows': out}, inconclusive=True)
+    ok = out['swap']['p99.9'] <= out['baseline']['p99.9'] + slack
+    return _line(ok, {'rule': 'PO-2 (a) p99.9(swap) <= p99.9(baseline) + slack', 'slack_ms': slack, 'windows': out})
+
+
+def line_survivor_delivered(w):
+    """During each swap window the ME progress (journal seq on the ME leader) keeps rising with no gap above
+    SURVIVOR_MAX_GAP_S; a window shorter than SWAP_WINDOW_MIN_S is vacuous: INCONCLUSIVE."""
+    s = w.get('settings') or SETTINGS
+    t0 = _t0_s(w)
+    points = series(w['samples'], 'me', PROGRESS)
+    out, vacuous = [], False
+    for swap in w.get('swaps') or []:
+        lo, hi = t0 + swap['start_s'], t0 + swap['ready_s']
+        rises, gap, n = progress(points, lo, hi)
+        if hi - lo < s['SWAP_WINDOW_MIN_S'] or n == 0:
+            vacuous = True
+        out.append({'slot': swap['slot'], 'window_s': round(hi - lo, 3), 'rows': n, 'rises': len(rises), 'max_gap_s': gap})
+    if not out:
+        return _line(False, 'no swap window', inconclusive=True)
+    if vacuous:
+        return _line(False, {'why': 'a swap window is shorter than SWAP_WINDOW_MIN_S or unsampled', 'windows': out},
+                     inconclusive=True)
+    return _line(all(o['rises'] >= 1 and o['max_gap_s'] <= s['SURVIVOR_MAX_GAP_S'] for o in out), out)
+
+
+def line_dup_outcomes(w):
+    """F7: outside the swap windows (baseline [10, 30) s and after [60, 90) s), the ME leader's duplicate counter delta ==
+    (N - 1) x the tapped command dispatches (RELEASE_ID excluded: releases are not duplicate-suppressed, cost.log), within
+    A05_DUP_EDGE_SLACK. N is the drill's design (2); the N = 1 control must FAIL it."""
+    s = w.get('settings') or SETTINGS
+    t0 = _t0_s(w)
+    points = series(w['samples'], 'me', 'match_durable_duplicates_suppressed_total')
+    out = {}
+    for name, (a, b) in (('baseline', (10, 30)), ('after', (60, 90))):
+        lo, hi = t0 + a, t0 + b
+        first, last = at_or_before(points, lo), at_or_before(points, hi)
+        dispatched = sum(1 for r in w['tap_dispatch'] if r.get('kind') != RELEASE_KIND and r.get('at_ms') is not None
+                         and lo * 1000 <= r['at_ms'] < hi * 1000)
+        dup = None if first is None or last is None else last - first
+        out[name] = {'duplicates': dup, 'dispatches': dispatched, 'expected': (w.get('n', 2) - 1) * dispatched}
+    ok = all(v['duplicates'] is not None and v['dispatches'] > 0 and abs(v['duplicates'] - v['expected']) <= s['A05_DUP_EDGE_SLACK']
+             for v in out.values())
+    return _line(ok, {'windows': out, 'slack': s['A05_DUP_EDGE_SLACK']})
+
+
+def line_ready_after_kill(w):
+    bound = (w.get('settings') or SETTINGS)['READY_AFTER_KILL_S']
+    out = [{'slot': s['slot'], 'kind': s['kind'], 'ready_after_kill_s': s['replace'].get('ready_after_kill_s'),
+            'f7_rejected': s['replace'].get('f7_rejected')} for s in w.get('swaps') or []]
+    ok = len(out) == 2 and all(o['kind'] == 'kill' and o['ready_after_kill_s'] is not None and o['ready_after_kill_s'] <= bound
+                               for o in out)
+    return _line(ok, {'swaps': out, 'bound_s': bound})
+
+
+def line_settle_no_gap(w):
+    """A05 bridges: settle lag = ME leader match_trades_total - core assets_last_applied_trade_id per sample; each swap
+    window's max lag <= the baseline [10, 30) max + A05_SETTLE_LAG_SLACK trades (a count: the projection has no clock)."""
+    s = w.get('settings') or SETTINGS
+    t0 = _t0_s(w)
+    lag = []
+    for row in w.get('samples') or []:
+        me, ae = s_value(row, 'me', 'match_trades_total'), s_value(row, 'ae', 'assets_last_applied_trade_id')
+        if me is not None and ae is not None:
+            lag.append(((row['t0'] + row['t1']) / 2, me - ae))
+
+    def peak(lo, hi, closed=True):
+        values = [v for t, v in lag if lo <= t and (t <= hi if closed else t < hi)]
+        return max(values) if values else None
+    base = peak(t0 + 10, t0 + 30, closed=False)
+    out = [{'slot': sw['slot'], 'max_lag': peak(t0 + sw['start_s'], t0 + sw['ready_s'])} for sw in w.get('swaps') or []]
+    if base is None or not out or any(o['max_lag'] is None for o in out):
+        return _line(False, {'why': 'a lag window has no sample', 'baseline_max': base, 'swaps': out}, inconclusive=True)
+    return _line(all(o['max_lag'] <= base + s['A05_SETTLE_LAG_SLACK'] for o in out),
+                 {'baseline_max': base, 'swaps': out, 'slack': s['A05_SETTLE_LAG_SLACK']})
+
+
+TICK_CORE = ['assets_ticks_applied_total', 'assets_ticks_stale_total', 'assets_ticks_invalid_total',
+             'assets_ticks_epoch_drop_total', 'assets_ticks_unbound_total']
+
+
+def line_tick_conservation(w):
+    """A06 (F-S16-13): the AE leader never changed; offered = fwd0 up to its last pre-kill scrape + its post-restart value
+    + fwd1's delta (summed over every market and edge); core = the five tick counters' deltas on the leader;
+    offered - slack <= core <= offered + slack with slack = fwd0's offers between its t=29 and pre-kill scrapes (the
+    offers of its last second, which SIGKILL may lose or the pre-kill scrape may not hold yet); pending age 0 and ticks
+    ready 1 on every forwarder at the barrier."""
+    snaps, name = w['snaps'], 'forwarder_tick_offered_total'
+    leaders = w['ae_leaders']
+    leader = leaders[0] if leaders and all(l == leaders[0] for l in leaders) and leaders[0] else None
+    offered, slack = 0, 0
+    for fwd in w['forwarders']:
+        if fwd == 'fwd0':
+            pre = value(snaps['prekill'], 'fwd0', name, 0)
+            offered += pre + (value(snaps['after'], 'fwd0', name, 0) or 0)
+            slack = max(0, pre - value(snaps['t29'], 'fwd0', name, 0))
+        else:
+            offered += (value(snaps['after'], fwd, name, 0) or 0) - value(snaps['before'], fwd, name, 0)
+    core = None if leader is None else sum((value(snaps['after'], leader, n, 0) or 0) - value(snaps['before'], leader, n, 0)
+                                           for n in TICK_CORE)
+    quiet = {fwd: (value(snaps['after'], fwd, 'forwarder_tick_pending_age_ms'), value(snaps['after'], fwd, 'forwarder_ticks_ready'))
+             for fwd in w['forwarders']}
+    ok = leader is not None and offered - slack <= core <= offered + slack and all(q == (0.0, 1.0) for q in quiet.values())
+    return _line(ok, {'ae_leaders': leaders, 'offered': offered, 'core': core, 'slack': slack, 'quiet': quiet})
+
+
+def _tick_delta(w, n):
+    leader = (w.get('ae_leaders') or [None])[-1]
+    return None if leader is None else (value(w['snaps']['after'], leader, n, 0) or 0) - value(w['snaps']['before'], leader, n, 0)
+
+
+def line_tick_stale_positive(w):
+    d = _tick_delta(w, 'assets_ticks_stale_total')
+    return _line(d is not None and d > 0, f'assets_ticks_stale_total delta {d}')
+
+
+def line_tick_invalid_zero(w):
+    d = {n: _tick_delta(w, n) for n in ('assets_ticks_invalid_total', 'assets_ticks_epoch_drop_total')}
+    leader = (w.get('ae_leaders') or [None])[-1]
+    unbound = None if leader is None else (value(w['snaps']['after'], leader, 'assets_ticks_unbound_total', 0) or 0) \
+        - value(w['snaps']['t29'], leader, 'assets_ticks_unbound_total', 0)
+    applied29 = value(w['snaps']['t29'], leader, 'assets_ticks_applied_total', 0) if leader else 0
+    return _line(all(v == 0 for v in d.values()) and unbound == 0 and applied29 > 0,
+                 dict(d, unbound_after_first_applied=unbound, applied_at_t29=applied29))
+
+
+def line_tick_end_state(w):
+    """After the quiet: the core's market-1 best bid/ask equal T1MeDriver book; its book version <= the ME's and == the
+    forwarders' max last offered version; markets 2..5 empty at both or equal."""
+    leader = (w.get('ae_leaders') or [None])[-1]
+    after, book = w['snaps']['after'], w.get('book') or {}
+
+    def core(name, m):
+        v = value(after, leader, f'{name}{{market="{m}"}}') if leader else None
+        return None if v is None else int(v)
+    out, ok = {}, bool(book.get(1)) and leader is not None
+    for m in range(1, 6):
+        me = book.get(m)
+        c = {'bid': core('assets_market_best_bid', m), 'ask': core('assets_market_best_ask', m),
+             'version': core('assets_market_book_version', m)}
+        if me is None:
+            ok = ok and c['version'] in (None, 0)
+        else:
+            ok = ok and c['bid'] == me['bid'] and c['ask'] == me['ask'] and c['version'] is not None and c['version'] <= me['version']
+        out[m] = {'core': c, 'me': me}
+    offered = [value(after, f, 'forwarder_tick_last_offered_version{market="1"}') for f in w['forwarders']]
+    offered = [int(v) for v in offered if v is not None]
+    ok = ok and bool(offered) and out[1]['core']['version'] == max(offered)
+    return _line(ok, {'markets': out, 'forwarders_last_offered_1': offered})
+
+
+def line_tick_survivor(w):
+    t0, win = w['t0_s'], w['kill_window']
+    rises, _, n = progress(series(w['samples'], 'ae', 'assets_ticks_applied_total'), t0 + win['kill_s'], t0 + win['restart_s'])
+    after = value(w['snaps']['after'], 'fwd0', 'forwarder_tick_offered_total')
+    return _line(bool(rises) and (after or 0) > 0, {'applied_rises_while_fwd0_down': len(rises), 'rows': n,
+                                                    'fwd0_offered_after_restart': after})
+
+
+def line_ring_outlived_thaw(w):
+    """fwdring, both pauses (C4): the paused fwd0 never exited and reconnected nothing (branch 'none' with the reconnect
+    counters 0 on both clusters by thaw + NO_LOSS_AFTER_S), and its last_sent moved past every dispatch tapped up to the
+    thaw. A bracketed row without a pause (the nopause control) has no heal: FAIL."""
+    rows = [r for r in w['ledger'] if r.get('kind') == 'pause' and r.get('target') == 'fwd0']
+    out = []
+    for r in rows:
+        heal = r.get('heal') or {}
+        hw = heal.get('witness') or {}
+        thaw = (r.get('witness') or {}).get('thaw_ms')
+        tapped = [d['seq'] for d in w['tap_dispatch'] if d.get('seq') is not None and d.get('at_ms') is not None
+                  and thaw is not None and d['at_ms'] <= thaw]
+        reconnect = hw.get('reconnect_delta_by_cluster') or {}
+        after, before = hw.get('last_sent_after'), (r.get('witness') or {}).get('last_sent_before')
+        ok = heal.get('branch') == 'none' and all(reconnect.get(c) == 0 for c in ('core', 'me')) and after is not None \
+            and before is not None and after > before and after >= max(tapped or [0])
+        out.append({'row': r['row'], 'branch': heal.get('branch'), 'reconnect': reconnect, 'last_sent_before': before,
+                    'last_sent_after': after, 'max_tapped_seq_by_thaw': max(tapped or [0]), 'ok': ok})
+    return _line(len(out) == 2 and all(o['ok'] for o in out), out)
+
+
+def line_released_after_thaw(w):
+    counts = w.get('released_after_thaw')
+    if counts is None:
+        return _line(False, 'no bracketed pause row: the RELEASED attribution is unjudgeable', inconclusive=True)
+    return _line(len(counts) == 2 and all(c > 0 for c in counts), {'per_pause': counts})
+
+
+def line_driver_death_loud(w):
+    """C13 engines (20.1 line 5: judged on the W9 build): three kills (AE follower twice, ME leader once); each exit
+    NON-ZERO within DRIVER_DEATH_BOUND_S, the value recorded; exit 0 is a FAIL and an X6 finding (F-S16-15); each restart
+    on a new driver identity; the second kill hit the driver the first restart created."""
+    bound = SETTINGS['DRIVER_DEATH_BOUND_S']
+    kills = w.get('kills') or []
+    out, ok = [], len(kills) == 3
+    for n, k in enumerate(kills):
+        drv = (k.get('restart') or {}).get('driver') or {}
+        new_driver = drv.get('new') is not None and drv.get('new') != drv.get('old')
+        loud = k.get('exit_code') not in (None, 0) and k.get('exit_after_s') is not None and k['exit_after_s'] <= bound
+        hit_new = n != 1 or k.get('identity_before') == ((kills[0].get('restart') or {}).get('driver') or {}).get('new')
+        row = {'target': k['target'], 'exit_code': k.get('exit_code'), 'exit_after_s': k.get('exit_after_s'),
+               'new_driver': new_driver, 'hit_new_driver': hit_new, 'ready_during_grace': k.get('ready_during_grace')}
+        if k.get('exit_code') == 0:
+            row['finding'] = 'exit 0 on driver death: X6 finding (F-S16-15, PO-3 accepts non-zero only)'
+        out.append(row)
+        ok = ok and loud and new_driver and hit_new
+    return _line(ok, {'kills': out, 'bound_s': bound})
+
+
+def line_cluster_served(w):
+    """During each AE follower driver kill (kill to restart /ready) the ME keeps progressing with no gap above
+    SERVED_MAX_GAP_S (no election); the ME leader kill elects a new leader and the story resolves every UNKNOWN."""
+    t0 = _t0_s(w)
+    gap_max = SETTINGS['SERVED_MAX_GAP_S']
+    points = series(w.get('samples'), 'me', PROGRESS)
+    kills = w.get('kills') or []
+    out, ok = [], len(kills) == 3
+    for k in kills:
+        if k['role'] == 'ae_follower':
+            hi = k.get('ready_s')
+            if hi is None:
+                out.append({'target': k['target'], 'why': 'restart not observed'}); ok = False; continue
+            rises, gap, n = progress(points, t0 + k['kill_s'], t0 + hi)
+            out.append({'target': k['target'], 'rises': len(rises), 'max_gap_s': gap, 'rows': n})
+            ok = ok and bool(rises) and n > 0 and gap <= gap_max
+        else:
+            e = w.get('election') or {}
+            elected = e.get('new_leader') not in (None, e.get('killed'))
+            out.append({'target': k['target'], 'election': e, 'story_unresolved': w.get('story_unresolved')})
+            ok = ok and elected and w.get('story_unresolved') == 0
+    return _line(ok, out)
+
+
+def line_cnc_timeout_loud(w):
+    bound = SETTINGS['CNC_TIMEOUT_BOUND_S']
+    cnc = w.get('cnc') or {}
+    ok = bool(cnc) and all(v.get('exit_code') not in (None, 0) and (v.get('exit_after_s') or 1e9) <= bound
+                           and not v.get('ready_200_seen') for v in cnc.values())
+    return _line(ok, {'members': cnc, 'bound_s': bound})
+
+
+LINES = {name[5:]: fn for name, fn in globals().items() if name.startswith('line_')}
+
+
+# ------------------------------------------------------------------ the sampler (5.4)
+
+SAMPLE_NAMES = {
+    'ae': ('assets_cluster_role', 'assets_me_capacity_estimate', 'assets_release_backlog', 'assets_order_entry_gate_reasons',
+           'assets_pending_commands', 'assets_last_applied_trade_id', 'assets_ticks_applied_total',
+           'assets_release_minted_order_total', 'assets_release_minted_up_to_total'),
+    'me': ('match_cluster_role', 'match_command_ledger_size', PROGRESS, 'match_durable_duplicates_suppressed_total',
+           'match_trades_total', 'match_orders_submitted_total', 'match_release_applied_total', 'match_durable_capacity_total'),
+    'bridge': ('bridge_halted', 'bridge_halt_reason'),
+}
+SAMPLER_CODE = '''import json,sys,urllib.request,urllib.error
+out={}
+for role,url in json.loads(sys.stdin.read()).items():
+    try:
+        r=urllib.request.urlopen(url,timeout=1);out[role]={"status":r.status,"body":r.read().decode()}
+    except urllib.error.HTTPError as e:out[role]={"status":e.code,"body":e.read().decode()}
+    except Exception as e:out[role]={"status":0,"error":str(e)}
+print(json.dumps(out))
+'''
+
+
+class Sampler:
+    """5.4: one probe exec per tick reads /metrics of every engine member (and the bridges when asked), keeps the named
+    series, and calls ``on_tick(row)`` (A03's gate watcher). It runs on its own thread and talks to Docker directly, never
+    through the fixture's registry (the drill thread owns that); the probe container's ownership is checked once."""
+
+    def __init__(self, fixture, period_s=None, bridges=False, on_tick=None):
+        self.f, self.period = fixture, period_s or SETTINGS['SAMPLER_PERIOD_S']
+        self.on_tick, self.rows, self.errors = on_tick, [], []
+        ports, nodes = fixture.m['ports'], fixture.m['nodes']
+        self.urls, self.wanted = {}, {}
+        for engine in ('ae', 'me'):
+            for i in range(3):
+                role = f'{engine}{i}'
+                self.urls[role] = f'http://{nodes[role]}:{ports[engine + "_metrics"]}/metrics'
+                self.wanted[role] = SAMPLE_NAMES[engine]
+        if bridges:
+            for b in BRIDGES:
+                self.urls[b] = f'http://{nodes[b]}:{ports["bridge_http"]}/metrics'
+                self.wanted[b] = SAMPLE_NAMES['bridge']
+        self.stopped, self.thread = False, None
+
+    @staticmethod
+    def parse(stdout, wanted, t0, t1):
+        try:
+            answers = json.loads(stdout or '{}')
+        except ValueError:
+            answers = {}
+        roles = {}
+        for role, names in wanted.items():
+            answer = answers.get(role) or {}
+            if answer.get('status') != 200:
+                roles[role] = {'unavailable': answer.get('error') or answer.get('status')}
+                continue
+            values = {}
+            for line in answer['body'].splitlines():
+                if not line or line.startswith('#'):
+                    continue
+                key, _, rest = line.rpartition(' ')
+                base = key.split('{', 1)[0]
+                if base in names:
+                    try:
+                        values[key] = float(rest)
+                    except ValueError:
+                        continue
+            roles[role] = values
+        return {'t0': round(t0, 3), 't1': round(t1, 3), 'roles': roles}
+
+    def tick(self, cid):
+        import subprocess
+        t0 = time.time()
+        try:
+            r = subprocess.run(['docker', 'exec', '-i', cid, 'python3', '-c', SAMPLER_CODE], input=json.dumps(self.urls),
+                               text=True, capture_output=True, timeout=10)
+            out = r.stdout
+        except subprocess.TimeoutExpired:
+            out = ''
+        row = self.parse(out, self.wanted, t0, time.time())
+        self.rows.append(row)
+        if self.on_tick:
+            self.on_tick(row)
+        return row
+
+    def start(self):
+        import threading
+        cid = self.f.registry['containers']['probe']
+        self.f.inspect('container', cid)       # ownership (label + token), once, on the drill thread
+
+        def loop():
+            while not self.stopped:
+                started = time.monotonic()
+                try:
+                    self.tick(cid)
+                except Exception as error:     # recorded; a sampler error leaves a gap the lines see as missing rows
+                    self.errors.append(repr(error))
+                time.sleep(max(0.0, self.period - (time.monotonic() - started)))
+        self.thread = threading.Thread(target=loop, daemon=True)
+        self.thread.start()
+        return self
+
+    def stop(self):
+        self.stopped = True
+        if self.thread:
+            self.thread.join(timeout=15)
+        return self.rows
+
+    def latest(self):
+        return self.rows[-1] if self.rows else None
+
+
+class GateWatcher:
+    """A03 (5.5, D-S16-14): reads the tap incrementally and writes ``capacity_closed`` when the GLOBAL gate shows
+    [SUSPENDED, ME_CAPACITY], then ``capacity_open`` on the next [OPEN, ADMIN]; the story moves its phases on these files."""
+
+    def __init__(self, tap_path, signal_dir):
+        self.tap, self.dir, self.offset = Path(tap_path), Path(signal_dir), 0
+        self.closed_ns = self.opened_ns = None
+
+    def __call__(self, _row=None):
+        if not self.tap.exists():
+            return
+        with self.tap.open() as stream:
+            stream.seek(self.offset)
+            while True:
+                line = stream.readline()
+                if not line.endswith('\n'):
+                    break
+                self.offset = stream.tell()
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                row = entry.get('row') or {}
+                if entry.get('tap') != 'admission' or row.get('market') != 0:
+                    continue
+                if self.closed_ns is None and (row['state'], row['reason']) == ('SUSPENDED', 'ME_CAPACITY'):
+                    self.closed_ns = time.time_ns()
+                    (self.dir / 'capacity_closed').write_text('closed\n')
+                elif self.closed_ns is not None and self.opened_ns is None and (row['state'], row['reason']) == ('OPEN', 'ADMIN'):
+                    self.opened_ns = time.time_ns()
+                    (self.dir / 'capacity_open').write_text('open\n')
+
+
+def _iso_ns(text):
+    """Docker's StartedAt / FinishedAt (RFC 3339 with ns) -> epoch ns."""
+    from datetime import datetime, timezone
+    head, _, frac = text.rstrip('Z').partition('.')
+    base = datetime.strptime(head, '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc)
+    return int(base.timestamp()) * 10**9 + int((frac + '000000000')[:9])
+
+
+class S16Drills:
+    """The S16 schedules of section 9 on the DrillRun machinery (S15 section 9 "Common")."""
+
+    # ---------------------------------------------------------------- helpers
+
+    def active_forwarders(self):
+        return [s for s in FORWARDERS if (self.f.slots.get(s) or {}).get('state') == 'STARTED' and s not in self.removed]
+
+    def life_genesis_id(self):
+        return int(self.f.genesis_id(self.f.life('core')), 16)
+
+    def health_of(self, role):
+        port, _ = self.f.ready_target(role)
+        response = self.f.http(role, port, '/health')
+        try:
+            body = json.loads(response.get('body') or '{}')
+        except ValueError:
+            body = {'unparsed': (response.get('body') or '')[:300]}
+        return response.get('status'), body
+
+    def slot_metrics(self, role):
+        port = self.f.m['ports']['forwarder_http' if role.startswith('fwd') else 'bridge_http']
+        try:
+            return {role: self.f.metrics(role, port)}
+        except Inconclusive as error:
+            return {role: {'unavailable': str(error)}}
+
+    # ---------------------------------------------------------------- A03-T2-lifetime (9; 20.1 lines 2, 3)
+
+    def faults_a03(self):
+        """Phase 1 on the no-release build (the ME ledger fills, the gate closes at 0.8 c); at the story's fill_ended:
+        pause fwd1 2.5 s, kill fwd0 inside the pause, replace fwd0 with build A (after_kill), thaw fwd1, stop fwd1 and
+        replace it with build A: the drain and the reopen run on real code. RED-A03 keeps the no-release build (the kill
+        is healed by a restart of the same container). Control a03-nokill (hold false): both slots are swapped to build A
+        before the fill, so releases relay live; the same swap point is recorded and nothing is killed or paused."""
+        f, red = self.f, self.red == 'red-a03'
+        hold = self.variant.get('hold', True)
+        self.a03_hold = None
+        if not hold:
+            for fwd in FORWARDERS:
+                self.swap(fwd, 'forwarder', how='stop')
+        self.wait_marker('fill_ended', story_seconds(self.spec['story']) + 60)
+        latest = self.sampler.latest()
+        me = f.leader('me')
+        hold_w = {'backlog_at_swap': s_value(latest, 'ae', 'assets_release_backlog'),
+                  'swap_dispatch_seq': max([r['seq'] for r in self.tap_rows()['dispatch'] if r.get('seq') is not None] or [0]),
+                  'swap_me_seq': self.me_seq(me), 'closed_seen': self.gate.closed_ns is not None}
+        if not hold:
+            for kind, target in (('pause', 'fwd1'), ('kill', 'fwd0'), ('stop', 'fwd1')):
+                self.ledger.skip(kind, target, 'control a03-nokill (8.4): releases relayed live')
+            self.a03_hold = dict(hold_w, kill_in_closed_window=False, restarted=False)
+            return
+        thaw_at = time.monotonic() + A03_PAUSE_S
+        before = core_scenarios.barrier_scrape(f)
+        pause = self.pause('fwd1', A03_PAUSE_S)
+        kill = self.kill('fwd0')
+        in_window = self.gate.closed_ns is not None and self.gate.opened_ns is None
+        if red:
+            restart = f.restart('fwd0', readiness='/health')
+            self.ledger.heal(kill, 'restart', dict(restart, ready=True))
+        else:
+            f.readiness_override.pop('fwd0', None)
+            rep = f.replace_slot('fwd0', 'forwarder', after_kill=True)
+            self.ledger.heal(kill, 'replace', rep)
+        self.sleep(max(0.0, thaw_at - time.monotonic()))
+        thawed = time.time_ns()
+        f.unpause('fwd1')
+        self.await_branches({'fwd1': pause}, before, thawed)
+        if not red:
+            self.swap('fwd1', 'forwarder', how='stop')
+        self.a03_hold = dict(hold_w, kill_in_closed_window=in_window, restarted=True,
+                             pause_s=round((thawed - pause['opened_ns']) / 1e9, 3))
+
+    def swap(self, slot, artifact, how='stop', record=None):
+        """stop (polite, exit 0) or kill, then replace_slot (R7); one ledger row healed by the replacement's /ready."""
+        f = self.f
+        start = time.time()
+        if how == 'kill':
+            row = self.kill(slot)
+        else:
+            stop = f.stop(slot)
+            row = self.ledger.open('stop', slot, stop)
+        f.readiness_override.pop(slot, None)
+        rep = f.replace_slot(slot, artifact, after_kill=how == 'kill')
+        ready = time.time()
+        self.ledger.heal(row, 'replace', rep)
+        if record is not None:
+            record.append({'slot': slot, 'kind': how, 'start_s': round(start - self.t0 / 1e9, 3),
+                           'ready_s': round(ready - self.t0 / 1e9, 3), 'replace': rep})
+        return rep
+
+    def faults_a04(self):
+        raise Violation('A04-T2-regenesis runs two lives through run_a04, not a single fault schedule')
+
+    # ---------------------------------------------------------------- A04-T2-one-bridge-halt (9)
+
+    def faults_one_bridge_halt(self):
+        f, early = self.f, self.variant.get('early', False)
+        self.at(20)
+        me = f.leader('me')
+        seq_kill = self.me_seq(me)
+        row = self.kill('bridge0')
+        killed = time.monotonic()
+        cursor = None
+        while time.monotonic() - killed < SETTINGS['COLD_RESTART_BOUND_S']:
+            cursor = self.health_of('bridge1')[1].get('cursor')
+            if early and time.monotonic() - killed >= 0.8:
+                break
+            if not early and seq_kill is not None and cursor is not None and cursor >= seq_kill + SETTINGS['COLD_RESTART_LEAD']:
+                break
+            self.sleep(0.2)
+        after_s = round(time.monotonic() - killed, 3)
+        self.restart(row)
+        deadline = time.monotonic() + SETTINGS['COLD_RESTART_BOUND_S']
+        health = self.health_of('bridge0')[1]
+        while time.monotonic() < deadline and health.get('state') != 'STREAMING':
+            self.sleep(0.5)
+            health = self.health_of('bridge0')[1]
+        skipped = value(self.slot_metrics('bridge0'), 'bridge0', 'bridge_skipped_total')
+        self.cold = {'me_seq_at_kill': seq_kill, 'peer_cursor_at_restart': cursor, 'restart_after_kill_s': after_s,
+                     'skipped_delta': skipped, 'health_after': {k: health.get(k) for k in ('cursor', 'expected', 'last', 'state')},
+                     'early': early}
+
+    # ---------------------------------------------------------------- A05 (9)
+
+    def faults_a05(self):
+        """t=30 slot 0, t=50 slot 1: stop (exit 0) or kill, replace_slot with build B, /ready. Control *-n1: slot 1 is
+        stopped at t=25 and never replaced (the ledger records it as the control's switch, not a fault)."""
+        f = self.f
+        kind, how = self.spec['swap'], self.spec['how']
+        slots, artifact = (FORWARDERS, 'forwarder_b') if kind == 'fwd' else (BRIDGES, 'bridge_b')
+        self.swaps = []
+        if self.variant.get('n1'):
+            self.at(25)
+            witness = f.stop(slots[1])
+            self.ledger.skip('stop', slots[1], f'control {self.variant.get("control")} (8.3): the survivor is removed',
+                             witness=witness)
+            self.removed.add(slots[1])
+        for slot, t in zip(slots, (30, 50)):
+            if slot in self.removed:
+                continue
+            self.at(t)
+            pre = self.health_of(slot)[1].get('build')
+            record = []
+            self.swap(slot, artifact, how=how, record=record)
+            record[0]['pre_build'] = pre
+            self.swaps += record
+
+    # ---------------------------------------------------------------- A06-T2-two-forwarders-ticks (9)
+
+    def faults_a06(self):
+        f = self.f
+        self.ae_leaders = [leader_of(self.snaps['before'], 'ae')]
+        self.at(29)
+        self.snap('t29')
+        self.ae_leaders.append(leader_of(self.snaps['t29'], 'ae'))
+        self.at(30)
+        self.snaps['prekill'] = self.slot_metrics('fwd0')
+        row = self.kill('fwd0')
+        self.kill_window = {'kill_s': round((time.time_ns() - self.t0) / 1e9, 3)}
+        self.at(45)
+        self.restart(row)
+        self.kill_window['restart_s'] = round((time.time_ns() - self.t0) / 1e9, 3)
+
+    def a06_barrier_extra(self):
+        """At the barrier: every forwarder's pending tick age 0 (bounded), a 1 s quiet, then T1MeDriver book."""
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            scrape = core_scenarios.barrier_scrape(self.f)
+            if all(value(scrape, fwd, 'forwarder_tick_pending_age_ms') == 0 for fwd in self.active_forwarders()):
+                break
+            self.sleep(0.5)
+        self.sleep(1)
+        out = self.f._driver('t1_me_driver', 'T1MeDriver', 'book', PROBE_AERON_DIR, self.f._ingress('me'), timeout=60)
+        self.book_text = out.stdout
+        self.book = parse_book(out.stdout)
+
+    # ---------------------------------------------------------------- A01-T2-fwdring (9; 20.1 line 12)
+
+    def faults_fwdring(self):
+        """t=15 and t=45: start an IOC burst (the story crosses every create for 2 s), pause fwd0 2.5 s inside it, read
+        the ME seq before the pause and before the thaw (the bracket), thaw, observe the branch. Controls: pause15 (15 s:
+        branch A expected), nopause (the same bracketed reads 2.5 s apart, no pause: skipped rows with their witness)."""
+        f = self.f
+        pause_s = self.variant.get('pause_s', FWDRING_PAUSE_S)
+        burst = f.root / 'state' / 'probe' / IOC_BURST_FILE
+        for n, t in enumerate((15, 45), start=1):
+            self.at(t)
+            if burst.exists():
+                burst.unlink()        # re-arms the story's burst (W3 CoreProbe change: a deleted file re-arms)
+            # every read that costs a docker exec happens BEFORE the burst: the burst lasts 2 s and the pause must sit in it
+            before = core_scenarios.barrier_scrape(f)
+            me = f.leader('me')
+            witness = {'me_seq_pause': self.me_seq(me), 'burst': n,
+                       'last_sent_before': value(before, 'fwd0', 'forwarder_dispatch_seq{point="last_sent"}')}
+            burst.write_text(f'burst {n}\n')
+            self.wait_marker('ioc_burst_started', 5, where=lambda m, n=n: m.get('n', 1) == n)
+            if self.variant.get('pause', True) is False:
+                self.sleep(pause_s)
+                witness.update(me_seq_thaw=self.me_seq(me), thaw_ms=time.time_ns() // 10**6)
+                self.ledger.skip('pause', 'fwd0', 'control fwdring-nopause (8.4)', witness=witness)
+                continue
+            row = self.pause('fwd0', pause_s)
+            row['witness'].update(witness)
+            self.sleep(pause_s)
+            row['witness']['me_seq_thaw'] = self.me_seq(me)       # read before the unpause (S15 FIX-5)
+            row['witness']['thaw_ms'] = time.time_ns() // 10**6
+            thawed = time.time_ns()
+            f.unpause('fwd0')
+            self.await_branches({'fwd0': row}, before, thawed)
+            if row['heal'] is not None:
+                after = core_scenarios.barrier_scrape(f)
+                row['heal']['witness']['last_sent_after'] = value(after, 'fwd0', 'forwarder_dispatch_seq{point="last_sent"}')
+
+    # ---------------------------------------------------------------- C13-T2-enginedriverkill (9)
+
+    def faults_edk(self):
+        f = self.f
+        if f.engine_driver() != 'external':
+            raise Inconclusive('enginedriverkill needs engine_driver external (s16-ext.json, 5.3)')
+        self.kills, self.election = [], None
+        self.at(15)
+        leader = f.leader('ae')
+        follower = next((f'ae{i}' for i in range(3) if f'ae{i}' != leader), None) if leader else None
+        if follower is None:
+            raise Inconclusive('no single AE leader at t=15 s')
+        if self.variant.get('kill', True) is False:
+            for target in (follower, follower, 'me-leader'):
+                self.ledger.skip('exec_kill', target, 'control edk-nokill (8.4)')
+            return
+        first = self.driver_kill(follower, 'ae_follower')
+        self.sleep(5)                                    # C2: triggered by the restart's witnesses (identity + /ready)
+        if first.get('restart'):
+            self.driver_kill(follower, 'ae_follower')
+            self.sleep(5)
+        me = f.leader('me')
+        if me is None:
+            raise Inconclusive('no single ME leader for the third driver kill')
+        self.driver_kill(me, 'me_leader', restart=False)
+        new, election = self.wait_leader('me', me)
+        self.election = {'killed': me, 'new_leader': new, 'election_s': election}
+
+    def driver_kill(self, role, kind, restart=True):
+        """exec_kill the staged aeronmd, watch the engine's exit (recording /ready answers during the grace), record its
+        code through wait_exit (last_kill: the 12.5 s AE rule), restart on a new driver. A member that does not exit within
+        the bound is killed by the harness so the run heals (the line then FAILs on the missing exit)."""
+        f = self.f
+        bound = SETTINGS['DRIVER_DEATH_BOUND_S']
+        identity = (f.registry.get('driver_identity') or {}).get(role)
+        witness = f.exec_kill(role, f.engine_driver_pidfile(role), 'KILL', heal_bound_s=story_seconds(self.spec['story']) + 300)
+        row = self.ledger.open('exec_kill', role, dict(witness, identity_before=identity))
+        killed = time.time()
+        entry = {'target': role, 'role': kind, 'kill_s': round(killed - self.t0 / 1e9, 3), 'identity_before': identity,
+                 'ready_during_grace': [], 'row': row['row']}
+        self.kills.append(entry)
+        code = None
+        while time.time() - killed < bound + 10:
+            state = self.state(role)
+            if not state['Running']:
+                code = state['ExitCode']
+                break
+            entry['ready_during_grace'].append(f.ready_body(role)[0])
+            self.sleep(0.5)
+        entry['exit_after_s'] = round(time.time() - killed, 3) if code is not None else None
+        if code is None:
+            f.command(['docker', 'kill', '--signal=KILL', self.cid(role)])
+            entry['forced_kill'] = True
+            code_seen = self.state(role)['ExitCode']
+            f.wait_exit(role, code_seen, 5)
+        else:
+            f.wait_exit(role, code, 5)
+        entry['exit_code'] = code
+        if restart:
+            self.restart_driver_row(row, entry)
+        return entry
+
+    def restart_driver_row(self, row, entry):
+        restart = self.f.restart(row['target'])
+        self.restarted.add(row['target'])
+        entry['restart'] = restart
+        entry['ready_s'] = round(time.time() - self.t0 / 1e9, 3)
+        self.ledger.heal(row, 'restart', dict(restart, ready=True))
+
+    # ---------------------------------------------------------------- the generic S16 run (S15 9 "Common" + 5.4)
+
+    def run_s16(self):
+        f, spec = self.f, self.spec
+        if spec['faults'] == 'a04':
+            return self.run_a04()
+        if spec['faults'] == 'a03':
+            # 20.1 line 2: phase 1 runs the no-release build, which may answer /ready 503 STALLED; liveness is /health
+            self.extra['readiness'] = {fwd: '/health' for fwd in FORWARDERS}
+            f.readiness_override = dict(self.extra['readiness'])
+        f.start(plan_for(spec, self.seed, story_extra_s(self.red), variant=self.variant))
+        self.snap('before')
+        self.start_sampler()
+        self.story_paths = f.start_story(self.story_args(), name=self.story_name)
+        self.t0 = self.wait_marker('load_started', 60)['at_ns']
+        getattr(self, 'faults_' + spec['faults'])()
+        self.post_load()
+        story = self.wait_story()
+        pre = self.pre_barrier()
+        self.stop_sampler()
+        if spec['faults'] == 'a06':
+            self.a06_barrier_extra()
+        tap_summary = self.wait_tap_end()
+        tap = self.tap_rows()
+        first, second = self.barrier(story, tap, tap_summary)
+        after = self.snap('after')
+        sample = self.seal(self.build_sample(story, tap, tap_summary, second, pre), first, second)
+        money, order = core_oracle.judge(sample), order_oracle.judge(sample)
+        w = self.witness(sample, after)
+        w.update(self.s16_witness(sample, story))
+        lines = {name: LINES[name](w) for name in spec['lines'] + ['fault_cycles']}
+        rows = of_rows(after, sample)
+        result = self.decide(money, order, lines, rows, sample, after)
+        self.write_evidence(sample, money, order, lines, rows, w, story, tap_summary, result)
+        self.write_s16_evidence(self.out, w)
+        return result
+
+    def start_sampler(self, bridges=None):
+        period = SETTINGS['A05_SAMPLER_PERIOD_S'] if self.spec['faults'] == 'a05' else SETTINGS['SAMPLER_PERIOD_S']
+        bridges = self.spec['faults'] in ('a05', 'one_bridge_halt', 'a04') if bridges is None else bridges
+        on_tick = None
+        if self.spec['faults'] == 'a03':
+            signals = self.f.root / 'state' / 'probe' / A03_SIGNALS
+            signals.mkdir(parents=True, exist_ok=True)
+            self.gate = GateWatcher(self.f.registry['tap']['path'], signals)
+            on_tick = self.gate
+        self.sampler = Sampler(self.f, period, bridges=bridges, on_tick=on_tick).start()
+
+    def stop_sampler(self):
+        if getattr(self, 'sampler', None) is not None:
+            self.sampler.stop()
+            self.samples = (getattr(self, 'samples', None) or []) + self.sampler.rows
+            self.sampler_errors = (getattr(self, 'sampler_errors', None) or []) + self.sampler.errors
+            self.sampler = None
+
+    def s16_witness(self, sample, story):
+        f = self.f
+        terminals = {e['order'] for e in sample['core_events'] if e.get('status') in TERMINAL}
+        b = f.m['artifacts'].get('forwarder_b' if self.spec.get('swap') == 'fwd' else 'bridge_b') or {}
+        t0_ms = self.t0 // 10**6
+        w = {'capacity': (self.variant.get('ledger_capacity') or self.spec.get('ledger_capacity') or 100_000),
+             'samples': getattr(self, 'samples', []), 'admission': sample['admission'], 'tap_dispatch': sample['dispatch_tap'],
+             'me_journal': sample['me_journal'], 'order_terminals': len(terminals), 'hold': getattr(self, 'a03_hold', None),
+             'a03': (story.get('summary') or {}).get('a03'), 'swaps': getattr(self, 'swaps', []), 't0_ms': t0_ms,
+             't0_s': self.t0 / 1e9, 'latency': latency_table(sample['dispatch_tap'], sample['me_journal']),
+             'settings': dict(SETTINGS), 'b_source_sha': b.get('source_sha'), 'n': 2, 'cold': getattr(self, 'cold', None),
+             'forwarders': [s for s in FORWARDERS if (f.slots.get(s) or {}).get('state') == 'STARTED'],
+             'ae_leaders': getattr(self, 'ae_leaders', []) + [leader_of(self.snaps.get('after'), 'ae')],
+             'book': getattr(self, 'book', None), 'kill_window': getattr(self, 'kill_window', None),
+             'kills': getattr(self, 'kills', None), 'election': getattr(self, 'election', None),
+             'story_unresolved': (story.get('summary') or {}).get('unresolved')}
+        return w
+
+    def write_s16_evidence(self, out, w):
+        from credentials import redact as scrub
+        out.mkdir(parents=True, exist_ok=True)
+        redact = getattr(self.f, 'secret_values', [])
+        for name, data in (('samples.json', w.get('samples')), ('latency.json', w.get('latency')),
+                           ('s16-witness.json', {k: v for k, v in w.items() if k not in {'samples', 'latency', 'me_journal',
+                                                                                       'tap_dispatch', 'admission', 'ledger',
+                                                                                       'snaps'}}),
+                           ('settings.json', SETTINGS)):
+            (out / name).write_text(scrub(json.dumps(data, indent=1, default=str) + '\n', redact))
+        if getattr(self, 'book_text', None):
+            (out / 'me-book.txt').write_text(self.book_text)
+
+    # ---------------------------------------------------------------- A04-T2-regenesis (9; R6; 20.1 lines 4, 6)
+
+    def freeze_me(self):
+        """5.4 / R6: life 1's ME evidence, read after the pre-barrier drain and BEFORE regenesis('me'): the three members'
+        journals (merged and equal), the resting legs, and the ME scrape (O-F1 / O-F4 of life 1)."""
+        journal, has_seq = core_scenarios.me_journal(self.f)
+        legs = self.f.me_open_legs()
+        scrape = core_scenarios.barrier_scrape(self.f)
+        return {'me_journal': journal, 'me_journal_seq': has_seq, 'me_open_legs': legs,
+                'scrape_me': {r: v for r, v in scrape.items() if r.startswith('me')}, 'at_ns': time.time_ns()}
+
+    def wait_fenced(self, first_start_ns):
+        """8.4 fenced_forwarders: both forwarders exit 78 (F8_EPOCH, 20.1 line 6); the time from the first ME member's start
+        and the stop reason from the log. Never raises: the line judges what was seen."""
+        out = {}
+        deadline = time.monotonic() + SETTINGS['FENCE_BOUND_S'] + 30
+        while time.monotonic() < deadline and len(out) < len(FORWARDERS):
+            for fwd in FORWARDERS:
+                if fwd in out:
+                    continue
+                state = self.state(fwd)
+                if not state['Running']:
+                    logs = self.f.command(['docker', 'logs', '--tail', '80', self.cid(fwd)], check=False)
+                    text = logs.stdout + logs.stderr
+                    reason = 'F8_EPOCH_ZERO' if 'F8_EPOCH_ZERO' in text else 'F8_EPOCH' if 'F8_EPOCH' in text else None
+                    out[fwd] = {'exit_code': state['ExitCode'], 'reason': reason,
+                                'after_first_me_start_s': round((_iso_ns(state['FinishedAt']) - first_start_ns) / 1e9, 3)}
+            self.sleep(0.5)
+        for fwd in FORWARDERS:
+            out.setdefault(fwd, {'exit_code': None, 'reason': None, 'after_first_me_start_s': None})
+        return out
+
+    def wait_bridges_halted(self):
+        deadline = time.monotonic() + SETTINGS['BRIDGE_HALT_BOUND_S']
+        seen = {}
+        while time.monotonic() < deadline:
+            for b in BRIDGES:
+                status, body = self.health_of(b)
+                if b not in seen and status == 503 and body.get('halted'):
+                    seen[b] = round(SETTINGS['BRIDGE_HALT_BOUND_S'] - (deadline - time.monotonic()), 3)
+            if len(seen) == len(BRIDGES):
+                break
+            self.sleep(0.5)
+        return seen
+
+    def halt_actions(self):
+        """9 A04: 4 deposits and 2 withdrawals through fund_rows (M9, M2/M3), one create (GATE_CLOSED expected), one ADMIN
+        OPEN (refused expected, AE:837-838). The create joins the sample's creates (O1 judges it)."""
+        users = self.spec['story']['users']
+        rows = [{'kind': 'deposit', 'user': u, 'asset': 0, 'amount': 1000 * FP} for u in users[:4]] + \
+               [{'kind': 'withdraw', 'user': u, 'asset': 0, 'amount': 100 * FP} for u in users[:2]]
+        funding = self.f.fund_rows(rows)
+        meaning, reply = self.f.core('create', 'probe-gateway', user=users[4], market=1, side='BUY', type='LIMIT', tif='GTC',
+                                     price=50 * FP, qty=FP // 100, budget=0, stop=0, delta=0, display=0, expires=0,
+                                     rh=9, rl=1, ch=0, cl=900001)
+        row = {'request': [9, 1], 'user': users[4], 'market': 1, 'side': 'BUY', 'type': 'LIMIT', 'tif': 'GTC',
+               'price': 50 * FP, 'quantity': FP // 100, 'budget': 0, 'stop_price': 0, 'display_qty': 0}
+        if meaning == 'UNKNOWN' or not reply or not reply.get('replies'):
+            row['reply'] = {'outcome': 'UNKNOWN'}
+        else:
+            r = reply['replies'][-1]
+            row['reply'] = ({'outcome': 'ACK', 'order': r['order'], 'duplicate': r['duplicate'], 'hold_asset': r['hold_asset'],
+                             'hold_amount': r['hold_amount'], 'status': r['status']} if r['t'] == 'OrderAck'
+                            else {'outcome': 'REJECT', 'reason': r['reason']})
+        self.extra_creates = [row]
+        gate_meaning, gate_reply = self.f.core('gate', 'probe-admin', market=0, state='OPEN', reason='ADMIN')
+        return {'halt_funding': funding, 'halt_create': row, 'open_gate': {'meaning': gate_meaning, 'reply': gate_reply}}
+
+    def judge_life(self, life, story, pre, out):
+        """Tap end, barrier, sample (declared per life), both oracles; evidence under ``out``."""
+        tap_summary = self.wait_tap_end()
+        tap = self.tap_rows()
+        first, second = self.barrier(story, tap, tap_summary)
+        after = self.snap('after' if life == 2 else 'halt', skip_me=self.frozen is not None)    # R6: never the fresh ME
+        sample = self.seal(self.build_sample(story, tap, tap_summary, second, pre), first, second)
+        money, order = core_oracle.judge(sample), order_oracle.judge(sample)
+        w = self.witness(sample, after)
+        w.update(self.s16_witness(sample, story))
+        return {'sample': sample, 'money': money, 'order': order, 'w': w, 'after': after, 'tap_summary': tap_summary,
+                'story': story, 'out': out}
+
+    def run_a04(self):
+        f, spec = self.f, self.spec
+        regen = self.variant.get('regen', True)
+        f.start(plan_for(spec, self.seed, variant=self.variant))
+        self.snap('before')
+        self.start_sampler()
+        self.story_paths = f.start_story(self.story_args(), name=self.story_name)
+        self.t0 = self.wait_marker('load_started', 60)['at_ns']
+        self.post_load()
+        story1 = self.wait_story()
+        pre1 = self.pre_barrier()
+        self.frozen = self.freeze_me() if regen else None
+        pre_regen = self.snap('pre_regen')
+        halt = {'fence': {}, 'bridges_halted_after_s': {}}
+        if regen:
+            row = self.ledger.open('regenesis', 'me', {})
+            witness = f.regenesis(plan_for(spec, self.seed, variant=self.variant), 'me')
+            starts = [_iso_ns(self.state(f'me{i}')['StartedAt']) for i in range(3)]
+            self.ledger.heal(row, 'me_genesis', dict(witness, first_me_start_ns=min(starts)))
+            halt['fence'] = self.wait_fenced(min(starts))
+            halt['bridges_halted_after_s'] = self.wait_bridges_halted()
+            fresh = f.journal_dump('me0')          # evidence only (5.4): never enters the life-1 sample
+            (self.out / 'life-1').mkdir(parents=True, exist_ok=True)
+            (self.out / 'life-1' / 'fresh-me.jsonl').write_text('\n'.join(fresh) + '\n')
+        halt.update(self.halt_actions())
+        halt['bridge_health'] = {b: self.health_of(b) for b in BRIDGES}
+        pre1['forwarders_fenced'] = halt['fence']
+        self.stop_sampler()
+        life1 = self.judge_life(1, story1, pre1, self.out / 'life-1')
+        life1['w'].update(g1=int(f.genesis_id(1), 16), halt_scrape=life1['after'], core=life1['sample']['core'],
+                          settle_rejected=life1['sample']['faults']['settle_rejected'], life2_gate_open=None, **halt)
+        life1['w']['skipped_delta'] = {b: delta(pre_regen, life1['after'], b, 'bridge_skipped_total') for b in BRIDGES}
+        lines1 = {name: LINES[name](life1['w']) for name in spec['lines'] + ['fault_cycles']}
+        rows1 = of_rows(life1['after'], life1['sample'], me_scrape=(self.frozen or {}).get('scrape_me'), halted=regen)
+        self.halt_w = life1['w']
+        if self.red or not regen:
+            result = self.decide(life1['money'], life1['order'], lines1, rows1, life1['sample'], life1['after'])
+            self.finish_life(life1, lines1, rows1, result)
+            return dict(result, lives={'1': {k: result.get(k) for k in ('status', 'oracle_status', 'lines', 'reasons')}})
+        # life 2: the dual genesis (D-S16-2): core wiped and bound to g2 via the bridges, fresh projection, fresh users
+        self.frozen = None
+        ledger1, snaps1 = self.ledger, self.snaps
+        self.ledger, self.snaps, self.extra_creates, self.samples = Ledger(), {}, [], []
+        row = self.ledger.open('regenesis', 'core', {})
+        witness = f.regenesis(plan_for(spec, self.seed, variant=self.variant, life=2), 'core')
+        self.ledger.heal(row, 'core_genesis', witness)
+        gate = f.tap_gate(0)
+        self.life_no, self.story_name, self.resolve_name = 2, 'story-life2', 'resolve-life2.go'
+        self.snap('before')
+        self.start_sampler()
+        self.story_paths = f.start_story(self.story_args(), name=self.story_name)
+        self.t0 = self.wait_marker('load_started', 60)['at_ns']
+        self.post_load()
+        story2 = self.wait_story()
+        pre2 = self.pre_barrier()
+        self.stop_sampler()
+        life2 = self.judge_life(2, story2, pre2, self.out / 'life-2')
+        s2 = life2['sample']
+        g2 = int(f.genesis_id(2), 16)
+        epoch2 = [t['trade_id'] for t in s2['me_journal'] if t['type'] == 'trade' and t.get('me_epoch') == g2]
+        life1['w']['life2_gate_open'] = bool(gate and gate.get('state') == 'OPEN')
+        life1['w']['life2'] = {'money': life2['money'], 'order': life2['order'], 'epochs': s2['declared']['epochs'], 'g2': g2,
+                               'bound_me_epoch': s2['core'].get('bound_me_epoch'),
+                               'last_applied_trade_id': s2['core']['last_applied_trade_id'],
+                               'max_epoch2_trade': max(epoch2) if epoch2 else 0}
+        lines1 = {name: LINES[name](life1['w']) for name in spec['lines'] + ['fault_cycles']}
+        lines2 = {'second_life_exact': LINES['second_life_exact'](life1['w']), 'fault_cycles': LINES['fault_cycles'](life2['w'])}
+        rows2 = of_rows(life2['after'], s2)
+        ledger2, snaps2 = self.ledger, self.snaps
+        self.ledger, self.snaps, self.life_no = ledger1, snaps1, 1
+        v1 = self.decide(life1['money'], life1['order'], lines1, rows1, life1['sample'], life1['after'])
+        self.finish_life(life1, lines1, rows1, v1)
+        self.ledger, self.snaps, self.life_no = ledger2, snaps2, 2
+        v2 = verdict(life2['money'], life2['order'], lines2, rows2, (), s2['declared']['fault_open'])
+        self.finish_life(life2, lines2, rows2, v2)
+        status = 'FAIL' if 'FAIL' in (v1['status'], v2['status']) else 'INCONCLUSIVE' \
+            if 'INCONCLUSIVE' in (v1['status'], v2['status']) else 'PASS'
+        return dict(v1, status=status, reasons=[f'life 1: {r}' for r in v1['reasons']] + [f'life 2: {r}' for r in v2['reasons']],
+                    lines=dict(v1['lines'], **{'life2.' + k: v for k, v in v2.get('lines', {}).items()}),
+                    lives={'1': {k: v1.get(k) for k in ('status', 'oracle_status', 'lines', 'reasons')},
+                           '2': {'status': v2['status'], 'reasons': v2['reasons'],
+                                 'oracle_status': {'money': life2['money']['status'], 'order': life2['order']['status']},
+                                 'lines': {k: v['holds'] for k, v in lines2.items()}}})
+
+    def finish_life(self, life, lines, rows, result):
+        out = life['out']
+        saved = self.out
+        self.out = out
+        try:
+            self.write_evidence(life['sample'], life['money'], life['order'], lines, rows, life['w'], life['story'],
+                                life['tap_summary'], result)
+            self.write_s16_evidence(out, life['w'])
+        finally:
+            self.out = saved
+
+
 # ------------------------------------------------------------------ O-F rows (section 2) and the verdict
 
 
-def of_rows(after, sample):
+def of_rows(after, sample, me_scrape=None, halted=False):
+    """``me_scrape``: A04 life 1's ME rows from the pre-wipe freeze (R6); ``halted``: the declared halt, whose bridges are
+    judged by halt_local, not by bridges_not_halted."""
+    if me_scrape:
+        after = dict(after, **me_scrape)
     of1 = {m: {n: value(after, m, n, 0) for n in ME_REFUSALS} for m in ('me0', 'me1', 'me2')}
     ae = leader_of(after, 'ae')
     me = leader_of(after, 'me')
@@ -533,14 +1900,17 @@ def of_rows(after, sample):
         of5 = {'closed': gap is None, 'open_gap': gap}
     except (Inconclusive, Violation) as error:
         of5 = {'closed': False, 'error': str(error)}
-    halted = {b: value(after, b, 'bridge_halted') for b in BRIDGES}
-    return {
+    halted_bridges = {b: value(after, b, 'bridge_halted') for b in BRIDGES}
+    rows = {
         'O-F1': {'holds': all(v == 0 for row in of1.values() for v in row.values()), 'detail': of1},
         'O-F4': {'holds': ae is not None and me is not None and of4['pending'] == 0 and of4['release_backlog'] == 0
                  and of4['core_ledger'] is not None and of4['core_ledger'] == of4['me_ledger'], 'detail': of4},
         'O-F5': {'holds': of5['closed'], 'detail': of5, 'inconclusive_when_failing': True},
-        'bridges_not_halted': {'holds': all(v == 0 for v in halted.values()), 'detail': halted},
+        'bridges_not_halted': {'holds': all(v == 0 for v in halted_bridges.values()), 'detail': halted_bridges},
     }
+    if halted:
+        del rows['bridges_not_halted']
+    return rows
 
 
 def verdict(money, order, lines, rows, setup_failures=(), fault_open=False):
@@ -555,8 +1925,10 @@ def verdict(money, order, lines, rows, setup_failures=(), fault_open=False):
             reasons.append(('FAIL', f'{name} oracle FAIL {failed}'))
     for name, line in lines.items():
         if not line['holds']:
-            # with a fault still open its effect cannot be judged yet: INCONCLUSIVE, the C4 sibling rule
-            reasons.append(('INCONCLUSIVE' if fault_open else 'FAIL', f'non-vacuity line {name} does not hold'))
+            # with a fault still open its effect cannot be judged yet: INCONCLUSIVE, the C4 sibling rule; a line whose
+            # witness is missing (S16 inconclusive) likewise
+            reasons.append(('INCONCLUSIVE' if fault_open or line.get('inconclusive') else 'FAIL',
+                            f'non-vacuity line {name} does not hold' + (' (witness missing)' if line.get('inconclusive') else '')))
     for name, row in rows.items():
         if not row['holds']:
             reasons.append(('INCONCLUSIVE' if row.get('inconclusive_when_failing') else 'FAIL', f'{name} does not hold'))
@@ -575,6 +1947,9 @@ def control_verdict(money, order, lines, named):
     if money['status'] != 'PASS' or order['status'] != 'PASS':
         return {'status': 'INCONCLUSIVE' if 'FAIL' not in {money['status'], order['status']} else 'FAIL',
                 'reasons': [f'control needs both oracles PASS: money {money["status"]}, order {order["status"]}']}
+    unjudged = [n for n in named if lines[n].get('inconclusive')]
+    if unjudged:
+        return {'status': 'INCONCLUSIVE', 'reasons': [f'control line {n} has no witness: {lines[n]["detail"]}' for n in unjudged]}
     vacuous = [n for n in named if lines[n]['holds']]
     if vacuous:
         return {'status': 'FAIL', 'reasons': [f'control line {n} held without its fault: the line is vacuous' for n in vacuous]}
@@ -586,6 +1961,17 @@ def red_verdict(kind, money, order, preconditions):
     8.2 RED-2: M7/M8 PASS with settle rows present AND one of O4/M5/O5/M4 FAIL with its text; the nc bridges never halted
     and /ready 200 throughout. A RED that is GREEN is a BLOCKER (FAIL); a missing precondition is INCONCLUSIVE."""
     missing = [k for k, v in preconditions.items() if not v]
+    if kind in ('red-a03', 'red-a04'):
+        # S16 8.1 / 8.2: O12 FAIL on the named text; the mechanism witnesses are preconditions (a crash is not a RED)
+        text = RED_A03_TEXT if kind == 'red-a03' else RED_A04_TEXT
+        o12 = order.get('rules', {}).get('O12', {})
+        if o12.get('status') == 'FAIL' and text in o12.get('detail', ''):
+            if missing:
+                return {'status': 'INCONCLUSIVE', 'red': 'NOT_ACCEPTED', 'reasons': [f'{kind} O12 fired but precondition missing: {missing}']}
+            return {'status': 'PASS', 'red': 'RED', 'reasons': [f'O12 FAIL: {o12["detail"][:300]}']}
+        if order['status'] == 'PASS' and money['status'] == 'PASS':
+            return {'status': 'FAIL', 'red': 'GREEN', 'reasons': [f'BLOCKER: {kind} is GREEN']}
+        return {'status': 'INCONCLUSIVE', 'red': 'UNJUDGED', 'reasons': [f'O12 {o12.get("status")}: {o12.get("detail", "")[:200]}']}
     if kind == 'red1':
         o10 = order.get('rules', {}).get('O10', {})
         if o10.get('status') == 'FAIL' and RED1_TEXT in o10.get('detail', ''):
@@ -616,14 +2002,22 @@ def story_extra_s(red):
     return RED2_STORY_EXTRA_S if red and red.startswith('red2') else 0
 
 
-def plan_for(spec, seed, extra_s=0):
+def plan_for(spec, seed, extra_s=0, variant=None, life=1):
+    """The genesis plan of one life. S16: ``ledger_capacity`` (A03, its cap100k control), life 2's fresh users, and the
+    life-1 tap of A04 sized to outlast the halt phase (W1 open item 3: the life-1 tap ends on its duration only)."""
     story = spec['story']
-    tap_s = 60 + story['seconds'] + 30 + 30 + 2 * ELECTION_BOUND_S + PRE_BARRIER_S + 30 + extra_s
-    return {'users': story['users'], 'markets': [1, 2, 3, 4, 5], 'funding_for': story['script'], 'seed': seed,
+    users = spec['life2_users'] if life == 2 else story['users']
+    tap_s = 60 + story_seconds(story) + 30 + 30 + 2 * ELECTION_BOUND_S + PRE_BARRIER_S + 30 + extra_s \
+        + (spec.get('tap_extra_s', 0) if life == 1 else 0)
+    plan = {'users': users, 'markets': [1, 2, 3, 4, 5], 'funding_for': funding_script(story), 'seed': seed,
             'risk': {'per_sec': 1000, 'max_open': 5000, 'slippage_bps': 100, 'collar_bps': 5000}, 'tap_ms': tap_s * 1000}
+    capacity = (variant or {}).get('ledger_capacity', spec.get('ledger_capacity'))
+    if capacity is not None:
+        plan['ledger_capacity'] = capacity
+    return plan
 
 
-class DrillRun:
+class DrillRun(S16Drills):
     def __init__(self, fixture, name, out_dir, variant=None, red=None):
         self.f, self.name, self.out = fixture, name, Path(out_dir)
         self.spec = DRILLS[name]
@@ -636,6 +2030,9 @@ class DrillRun:
         self.bridge_watch = []
         self.seed = fixture.m['seed'] & 0xFFFFFFFF
         self.clock, self.sleep = fixture.clock, fixture.sleep
+        # RC2 S16: slots a control removed, the life being judged, the per-life story and resolution gate names
+        self.removed, self.life_no, self.story_name, self.resolve_name = set(), 1, 'story', 'resolve.go'
+        self.extra_creates, self.frozen = [], None
 
     # ---------------------------------------------------------------- small helpers
 
@@ -645,8 +2042,8 @@ class DrillRun:
     def state(self, role):
         return self.f.inspect('container', self.cid(role))['State']
 
-    def snap(self, label):
-        scrape = core_scenarios.barrier_scrape(self.f)
+    def snap(self, label, skip_me=False):
+        scrape = core_scenarios.barrier_scrape(self.f, skip_me=True) if skip_me else core_scenarios.barrier_scrape(self.f)
         scrape['_at_ns'] = time.time_ns()
         self.snaps[label] = scrape
         return scrape
@@ -694,7 +2091,7 @@ class DrillRun:
 
     def kill(self, role, leader_of_engine=None, wait=True):
         # an engine member is restarted only after the load (C2), so its fault_targets bound covers the whole story
-        bound = self.spec['story']['seconds'] + 4 * 30 + 180 if role[:2] in {'ae', 'me'} else HEAL_BOUND_S
+        bound = story_seconds(self.spec['story']) + 4 * 30 + 180 if role[:2] in {'ae', 'me'} else HEAL_BOUND_S
         witness = dict(self.f.kill(role, heal_bound_s=bound))
         row = self.ledger.open('kill', role, witness)
         if leader_of_engine:
@@ -1132,7 +2529,7 @@ class DrillRun:
     def post_load(self):
         """Engine members killed during the load are restarted after it (C2: late arrivals), then the resolution gate
         opens: the 6.1 re-send pass runs only after every heal was observed."""
-        bound = self.spec['story']['seconds'] + 4 * 30 + 120 + story_extra_s(self.red)
+        bound = story_seconds(self.spec['story']) + 4 * 30 + 120 + story_extra_s(self.red)
         deadline = time.monotonic() + bound
         while time.monotonic() < deadline:
             if self.story_paths['exit'].exists() or any(m.get('marker') == 'resolve_gate_wait' for m in self.markers()):
@@ -1142,7 +2539,10 @@ class DrillRun:
         for row in self.ledger.open_rows():
             if row['kind'] == 'kill' and row['target'][:2] in {'ae', 'me'}:
                 self.restart(row)
-        gate = self.f.root / 'state' / 'probe' / 'resolve.go'
+            elif row['kind'] == 'exec_kill' and row['target'][:2] in {'ae', 'me'}:     # S16 enginedriverkill: the ME leader
+                entry = next(k for k in self.kills if k['row'] == row['row'])
+                self.restart_driver_row(row, entry)
+        gate = self.f.root / 'state' / 'probe' / getattr(self, 'resolve_name', 'resolve.go')
         gate.write_text('go\n')
 
     def wait_story(self):
@@ -1185,25 +2585,34 @@ class DrillRun:
 
     def pre_barrier(self):
         """Section 4: forwarders Running and /health 200, nothing pending at the AE leader, the ME members converged; a
-        60 s bound that falls through and is recorded (only the barrier's own bound gives INCONCLUSIVE)."""
+        60 s bound that falls through and is recorded (only the barrier's own bound gives INCONCLUSIVE). S16: only the
+        forwarders the run still has (a *-n1 control removed one, an N = 1 manifest has none in fwd1); A03 also needs
+        assets_release_backlog 0 (O-F4, section 4)."""
         deadline = time.monotonic() + PRE_BARRIER_S
         status = 'settled'
+        forwarders = self.active_forwarders() if hasattr(self, 'removed') else FORWARDERS
+        a03 = self.spec.get('faults') == 'a03'
         while True:
             scrape = core_scenarios.barrier_scrape(self.f)
             fwd_ok = all(self.state(f)['Running'] and self.f.http(f, self.f.ready_target(f)[0], '/health')['status'] == 200
-                         for f in FORWARDERS)
+                         for f in forwarders)
             ae = leader_of(scrape, 'ae')
             pending = value(scrape, ae, 'assets_pending_commands') if ae else None
+            backlog = value(scrape, ae, 'assets_release_backlog') if ae else None
             seqs = {value(scrape, f'me{i}', 'match_engine_next_journal_seq') for i in range(3)}
-            if fwd_ok and pending == 0 and len(seqs) == 1 and None not in seqs:
+            drained = not a03 or backlog == 0
+            if fwd_ok and pending == 0 and drained and len(seqs) == 1 and None not in seqs:
                 break
             if time.monotonic() > deadline:
-                status = 'pending_not_drained' if pending != 0 else 'me_not_converged' if len(seqs) != 1 or None in seqs \
-                    else 'forwarders_not_healthy'
+                status = 'pending_not_drained' if pending != 0 else 'release_backlog_not_drained' if not drained \
+                    else 'me_not_converged' if len(seqs) != 1 or None in seqs else 'forwarders_not_healthy'
                 break
             self.watch_bridges()
             self.sleep(1)
-        return {'status': status, 'pending': pending, 'me_next_journal_seq': sorted(s for s in seqs if s is not None)}
+        out = {'status': status, 'pending': pending, 'me_next_journal_seq': sorted(s for s in seqs if s is not None)}
+        if a03:
+            out['release_backlog'] = backlog
+        return out
 
     def wait_tap_end(self):
         tap = self.f.registry['tap']
@@ -1226,7 +2635,8 @@ class DrillRun:
                 self.sleep(1)
 
     def observation(self, story, tap, tap_summary):
-        obs = core_scenarios.observe(self.f)
+        frozen = getattr(self, 'frozen', None)
+        obs = core_scenarios.observe(self.f, frozen=frozen) if frozen is not None else core_scenarios.observe(self.f)
         known = set()
         for row in story['lists']['creates']:
             if row['reply'].get('outcome') == 'ACK':
@@ -1257,7 +2667,8 @@ class DrillRun:
         sample = {'version': 'core-sample-v2', 'markets': {str(m): {'base': m, 'quote': 0} for m in range(1, 6)},
                   'risk': f.registry['risk'], 'genesis': f.registry['genesis_snapshot'], 'counters': second['counters'],
                   'funding': [{k: v for k, v in r.items() if k != 'reply'} for r in f.registry['funding']],
-                  'creates': lists['creates'], 'amends': lists['amends'], 'cancels': lists['cancels'],
+                  'creates': lists['creates'] + list(getattr(self, 'extra_creates', [])), 'amends': lists['amends'],
+                  'cancels': lists['cancels'],
                   'core_events': tap['order_event'], 'admission': tap['admission'], 'dispatch_tap': second['dispatch_tap'],
                   **{k: second[k] for k in ['core', 'me_journal', 'me_journal_seq', 'me_open_legs', 'money_journal',
                                             'money_journal_legs']},
@@ -1265,8 +2676,9 @@ class DrillRun:
                              'settle_rejected': max(g['assets_settle_rejects_total'] for g in second['gauges'].values()),
                              'order_fault': len(tap['order_fault']),
                              'quarantined': sum(1 for e in tap['order_event'] if e['kind'] == 'QUARANTINED')},
-                  'declared': declared_block(self.ledger, int(f.genesis_id(), 16),
-                                             self.ordering_exception if self.spec.get('ordering_exception') else None),
+                  'declared': declared_block(self.ledger, int(f.genesis_id(f.life('core') if hasattr(f, 'life') else 1), 16),
+                                             self.ordering_exception if self.spec.get('ordering_exception') else None,
+                                             **declared_for(self.name, self.variant, getattr(self, 'life_no', 1))),
                   'tap_continuity': {'transitions': tap_summary['transitions'], 'summary': tap_summary['summary'],
                                      'line': tap_summary['line'], 'backfill': second['backfill']},
                   'story': {'line': story['line'], 'summary': story['summary'], 'unsent': lists['unsent']},
@@ -1313,8 +2725,16 @@ class DrillRun:
 
     def story_args(self):
         story = self.spec['story']
+        if story['script'] == 'a03-fill':        # S16 5.5: phases moved by the fixture's signal files, no seconds=
+            return {'script': 'a03-fill', 'seed': self.seed, 'users': ','.join(map(str, story['users'])), 'rate': story['rate'],
+                    'fill_s': story['fill_s'], 'reopen_s': story['reopen_s'], 'marker_timeout_s': story['marker_timeout_s'],
+                    'signal_dir': '/data/' + A03_SIGNALS}
+        users = self.spec['life2_users'] if getattr(self, 'life_no', 1) == 2 else story['users']
         kv = {'script': story['script'], 'seed': self.seed, 'seconds': story['seconds'], 'rate': story['rate'],
-              'users': ','.join(map(str, story['users'])), 'resolve_gate': '/data/resolve.go', 'resolve_gate_ms': 180_000}
+              'users': ','.join(map(str, users)), 'resolve_gate': '/data/' + getattr(self, 'resolve_name', 'resolve.go'),
+              'resolve_gate_ms': 180_000}
+        if story.get('ioc_burst_on'):
+            kv['ioc_burst_on'] = story['ioc_burst_on']
         if story.get('hold'):
             kv.update(hold=story['hold'], gate_dir='/data/gates', hold_ms=120_000)
         if self.variant.get('without'):
@@ -1324,6 +2744,8 @@ class DrillRun:
     def run(self):
         f = self.f
         spec = self.spec
+        if spec.get('s16'):
+            return self.run_s16()
         if spec.get('netfilter') and not f.m.get('netfilter_helper'):
             raise Inconclusive('partition needs the hash-pinned netfilter_helper in the manifest (3.1, A14)')
         if self.red == 'red1':
@@ -1360,7 +2782,10 @@ class DrillRun:
                 'driver': {s: (self.f.m['artifacts'].get(self.f.m['slot_artifacts'][s]) or {}).get('driver')
                            for s in FORWARDERS + BRIDGES if self.f.m['slot_artifacts'].get(s)},
                 'o9': order.get('rules', {}).get('O9', {})}
-        if self.red:
+        if self.red in ('red-a03', 'red-a04'):
+            v = red_verdict(self.red, money, order, self.s16_red_preconditions(sample, after))
+            base['preconditions'] = v.get('preconditions')
+        elif self.red:
             pre = {'settle_rows': any(r['kind'] == 'settle' for r in sample['money_journal'])}
             if self.red == 'red1':
                 for fwd in FORWARDERS:
@@ -1382,7 +2807,34 @@ class DrillRun:
             v = control_verdict(money, order, lines, CONTROLS[self.variant['control']][2])
         else:
             v = verdict(money, order, lines, rows, setup, sample['declared']['fault_open'])
+        if self.spec.get('s16'):
+            base['settings'] = dict(SETTINGS)
+            base['slot_override'] = dict(self.f.registry.get('slot_override') or {})
+            if getattr(self, 'sampler_errors', None):
+                base['sampler_errors'] = self.sampler_errors[:10]
         return dict(base, **v)
+
+    def s16_red_preconditions(self, sample, after):
+        """8.1: both nc forwarders Running and /health 200, the ME ledger still >= 60 % of capacity (the drain did not
+        happen). 8.2: both nc bridges Running and /health answering, never halted, skipping (delta >= 1 each), nothing
+        refused, no order fault, the core not halted."""
+        f = self.f
+        if self.red == 'red-a03':
+            pre = {f'{fwd}_running_health_200': self.state(fwd)['Running'] and self.health_of(fwd)[0] == 200 for fwd in FORWARDERS}
+            me = leader_of(after, 'me')
+            ledger = value(after, me, 'match_command_ledger_size') if me else None
+            capacity = self.variant.get('ledger_capacity') or self.spec.get('ledger_capacity')
+            pre['ledger_still_full'] = ledger is not None and ledger >= 0.6 * capacity
+            return pre
+        w = self.halt_w
+        pre = {f'{b}_running_health': self.state(b)['Running'] and self.health_of(b)[0] in (200, 503) for b in BRIDGES}
+        pre['bridges_not_halted'] = all(value(after, b, 'bridge_halt_reason') == 0 for b in BRIDGES)
+        for b in BRIDGES:
+            pre[f'{b}_skipped'] = (w['skipped_delta'].get(b) or 0) >= 1
+        pre['settle_rejected_0'] = sample['faults']['settle_rejected'] == 0
+        pre['order_fault_0'] = sample['faults']['order_fault'] == 0
+        pre['feed_not_halted'] = sample['core'].get('feed_halted') is False
+        return pre
 
     def write_evidence(self, sample, money, order, lines, rows, w, story, tap_summary, result):
         """Section 12: the sealed subset of one run, next to the runner's result.json (secrets never reach these files)."""
@@ -1527,6 +2979,8 @@ def scenario(fixture, scenario_name, out_dir):
     core_contracts.check_build_b(fixture.m, scenario_name)      # RC2 S16 5.2: build B is real, a RED's _b is an nc_ target
     if scenario_name.startswith('core-drill-'):
         name, variant, red = scenario_name[len('core-drill-'):], {}, None
+    elif scenario_name == 'core-control-edk-cnctimeout':
+        return run_cnc_timeout(fixture, Path(out_dir) / 'drill')       # its own boot (W1 open item 5)
     elif scenario_name.startswith('core-control-'):
         control = scenario_name[len('core-control-'):]
         if control not in CONTROLS:
@@ -1535,7 +2989,8 @@ def scenario(fixture, scenario_name, out_dir):
         variant = dict(variant, control=control)
         red = None
     elif scenario_name.startswith('core-red-'):
-        red = 'red' + scenario_name[len('core-red-'):]
+        suffix = scenario_name[len('core-red-'):]
+        red = 'red' + suffix if 'red' + suffix in REDS else 'red-' + suffix      # S15 red1/red2, S16 red-a03/red-a04
         if red not in REDS:
             raise Inconclusive('unknown RED: ' + red)
         spec = REDS[red]
@@ -1548,12 +3003,59 @@ def scenario(fixture, scenario_name, out_dir):
     if name not in DRILLS:
         raise Inconclusive('scenario is not implemented and cannot pass: ' + scenario_name)
     if not red:
+        # 20.1 line 2 (PO): A03 phase 1 runs ct_forwarder_nc_norelease in both forwarder slots, on an s16-a03* manifest only
+        a03 = name == 'a03-lifetime' and str(fixture.m.get('manifest_kind', '')).startswith('s16-a03')
         for slot in FORWARDERS + BRIDGES:
             artifact = fixture.m['slot_artifacts'].get(slot)
-            if artifact in {'forwarder_b', 'bridge_b'}:
+            if artifact in {'forwarder_b', 'bridge_b'} and not (a03 and slot in FORWARDERS and artifact == 'forwarder_b'):
                 raise Inconclusive(f'{slot} stages {artifact}: GREEN drills run the real binaries only (8.3)')
     run = DrillRun(fixture, name, Path(out_dir) / 'drill', variant=variant, red=red)
     result = run.run()
     status = result['status']
     return dict(result, status=status, assertions=len(result['lines']) + len(result['of_rows']) + 2, processed=1, skipped=0,
-                child_exit_codes=[0], scope='RC2 S15 T2 drill on fixture v3; GREEN needs 3/3 (section 11)')
+                child_exit_codes=[0], scope=('RC2 S16 T2 drill on fixture v4; GREEN needs 3/3 (S16 section 12)'
+                                             if DRILLS[name].get('s16') else
+                                             'RC2 S15 T2 drill on fixture v3; GREEN needs 3/3 (section 11)'))
+
+
+def run_cnc_timeout(fixture, out_dir):
+    """Control edk-cnctimeout (8.4 cnc_timeout_loud; 5.2: only on s16-ctl-edk-cnctimeout.json with ENGINE_DRIVER_SKIP=1):
+    its own boot, since start() waits /ready on all six members. ae0 and me0 start java with no driver; each must exit
+    non-zero within CNC_TIMEOUT_BOUND_S with no /ready 200 in between (20.1 line 5: judged on the W9 build)."""
+    f = fixture
+    members = tuple(getattr(f, 'engine_driver_skip', ()) or ())
+    if not members:
+        raise Inconclusive('edk-cnctimeout needs ENGINE_DRIVER_SKIP=1 on its own manifest (5.2)')
+    f.check_image(); f.stage_artifacts(); f.start_network()
+    f.spawn('probe', f.probe_command())
+    spawned = {}
+    for engine in ('ae', 'me'):
+        for i in range(3):
+            f.spawn(f'{engine}{i}', f.engine_command(engine, i), f.engine_env(engine, i))
+            spawned[f'{engine}{i}'] = time.time()
+    bound = SETTINGS['CNC_TIMEOUT_BOUND_S']
+    watch = {m: {'exit_code': None, 'exit_after_s': None, 'ready_200_seen': False, 'ready_answers': []} for m in members}
+    deadline = time.time() + bound + 15
+    while time.time() < deadline and any(v['exit_code'] is None for v in watch.values()):
+        for m, v in watch.items():
+            if v['exit_code'] is not None:
+                continue
+            state = f.inspect('container', f.registry['containers'][m])['State']
+            if not state['Running']:
+                v['exit_code'], v['exit_after_s'] = state['ExitCode'], round(time.time() - spawned[m], 3)
+                continue
+            status, _ = f.ready_body(m)
+            v['ready_answers'].append(status)
+            v['ready_200_seen'] = v['ready_200_seen'] or status == 200
+        f.sleep(0.5)
+    w = {'cnc': {m: {k: v[k] for k in ('exit_code', 'exit_after_s', 'ready_200_seen')} for m, v in watch.items()}}
+    line = line_cnc_timeout_loud(w)
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / 'cnc-timeout.json').write_text(json.dumps({'watch': watch, 'line': line, 'settings': SETTINGS}, indent=1) + '\n')
+    status = 'PASS' if line['holds'] else 'FAIL'
+    return {'status': status, 'drill': 'c13-enginedriverkill', 'variant': {'control': 'edk-cnctimeout'}, 'red': None,
+            'lines': {'cnc_timeout_loud': line['holds']}, 'detail': line['detail'], 'settings': dict(SETTINGS),
+            'reasons': [] if line['holds'] else [f'cnc_timeout_loud does not hold: {line["detail"]}'],
+            'assertions': 1, 'processed': 1, 'skipped': 0, 'child_exit_codes': [0],
+            'scope': 'RC2 S16 control edk-cnctimeout: the measurement of the CnC-timeout exit (W9 build)'}
