@@ -1246,11 +1246,25 @@ class A03LinesTest(unittest.TestCase):
                             'after': scrape(me0={'match_durable_capacity_total': 2.0})})
         self.assertFalse(cd.line_release_once(cap)['holds'])
 
+    def test_empty_sampler_series_is_inconclusive_never_fail(self):
+        """V4. RED f42a1c6: capacity_cycle and release_once FAILed on a sampler that never answered."""
+        dead = [S(100 + i, ae1={'unavailable': 'refused'}, me0={'unavailable': 'refused'}) for i in range(5)]
+        for name in ('capacity_cycle', 'release_once'):
+            line = cd.LINES[name](self.w(samples=dead))
+            self.assertFalse(line['holds'], name)
+            self.assertTrue(line.get('inconclusive'), (name, line))
+        self.assertEqual(cd.verdict({'status': 'PASS', 'rules': {}}, {'status': 'PASS', 'rules': {}},
+                                    {'capacity_cycle': cd.line_capacity_cycle(self.w(samples=[]))}, {})['status'], 'INCONCLUSIVE')
+
     def test_release_resent_and_the_nokill_control(self):
         self.assertTrue(cd.line_release_resent(self.w())['holds'])
         live = self.w(me_journal=[release_event(300, [{'commandIdHigh': 100 + i, 'idLowFloor': 0, 'removed': 1}
                                                       for i in range(3)])])     # a03-nokill: relayed live, inside W
         self.assertFalse(cd.line_release_resent(live)['holds'])
+        first = self.w(me_journal=[release_event(500, [{'commandIdHigh': 100 + i, 'idLowFloor': 0, 'removed': 1} for i in range(3)])])
+        self.assertTrue(cd.line_release_resent(first)['holds'])    # W5: swap_me_seq is the NEXT seq, so the first record after the swap is AT it
+        before = self.w(me_journal=[release_event(499, [{'commandIdHigh': 100 + i, 'idLowFloor': 0, 'removed': 1} for i in range(3)])])
+        self.assertFalse(cd.line_release_resent(before)['holds'])
         none = cd.line_release_resent(self.w(tap_dispatch=[]))
         self.assertTrue(none.get('inconclusive'), none)                          # no release in the window
         noswap = cd.line_release_resent(self.w(hold=None))
@@ -1318,20 +1332,80 @@ class A04LinesTest(unittest.TestCase):
         self.assertTrue(cd.line_second_life_exact(good)['holds'])
         self.assertFalse(cd.line_second_life_exact({'life2': dict(good['life2'], bound_me_epoch=self.G1)})['holds'])
         self.assertTrue(cd.line_second_life_exact({'life2': None}).get('inconclusive'))
+        # V8: the epochs are observed in the life-2 journal; a g1 record in it FAILs, none observed is INCONCLUSIVE
+        self.assertFalse(cd.line_second_life_exact({'life2': dict(good['life2'], epochs=[self.G1, g2])})['holds'])
+        self.assertTrue(cd.line_second_life_exact({'life2': dict(good['life2'], epochs=[])}).get('inconclusive'))
 
-    def test_cold_restart_skips_and_the_earlyrestart_control(self):
-        """DR-A04-bridge (answers-14.2 item 11): the cold bridge re-reads from the start and skips to the core cursor."""
-        w = {'cold': {'me_seq_at_kill': 4000, 'peer_cursor_at_restart': 7691, 'skipped_delta': 10161,
-                      'health_after': {'cursor': 10161, 'expected': 10162}, 'restart_after_kill_s': 6.1},
-             'samples': [S(1, bridge0={'bridge_halted': 0.0}, bridge1={'bridge_halted': 0.0})] * 3}
-        self.assertTrue(cd.line_cold_restart_skips(w)['holds'])
-        early = {'cold': dict(w['cold'], peer_cursor_at_restart=4100, restart_after_kill_s=0.8), 'samples': w['samples']}
-        self.assertFalse(cd.line_cold_restart_skips(early)['holds'])    # the peer had not passed the backlog: no line
-        short = {'cold': dict(w['cold'], skipped_delta=2000), 'samples': w['samples']}
-        self.assertFalse(cd.line_cold_restart_skips(short)['holds'])
-        halted = {'samples': w['samples'] + [S(9, bridge0={'bridge_halted': 1.0}, bridge1={'bridge_halted': 0.0})]}
+    # W5 w5-a04-one-bridge-halt: kill seq 7592, bridge0's sync cursor 9871 = skipped 9871, read at STREAMING last 10152
+    GREEN = {'me_seq_at_kill': 7592.0, 'peer_cursor_at_restart': 9604, 'restart_after_kill_s': 5.492, 'skipped_delta': 9871.0,
+             'health_first': {'cursor': 9871, 'expected': 9890, 'last': 9889, 'state': 'STREAMING'},
+             'health_after': {'cursor': 9871, 'expected': 10153, 'last': 10152, 'state': 'STREAMING'}}
+
+    def test_cold_restart_skips_reads_the_sync_cursor_not_the_live_position(self):
+        """S16 fix round V5. RED f42a1c6: the W5 GREEN run FAILs (expected 10153 != cursor 9871 + 1): the report's C is
+        the sync cursor, the bridge's live position ran on under load. The first forward is judged at the sync."""
+        line = cd.line_cold_restart_skips({'cold': self.GREEN})
+        self.assertTrue(line['holds'], line)
+        self.assertEqual((line['detail']['start_cursor'], line['detail']['backlog']), (9871, 2279.0))
+        # a cold read that forwarded at or below the cursor (skipped short of it) FAILs
+        self.assertFalse(cd.line_cold_restart_skips({'cold': dict(self.GREEN, skipped_delta=9000.0)})['holds'])
+        # not streaming from the cursor: expected != last + 1, or last below the sync cursor
+        bad = dict(self.GREEN, health_first={'cursor': 9871, 'expected': 9870, 'last': 9870, 'state': 'STREAMING'})
+        self.assertFalse(cd.line_cold_restart_skips({'cold': bad})['holds'])
+        missing = cd.line_cold_restart_skips({'cold': dict(self.GREEN, health_first=None)})
+        self.assertTrue(missing.get('inconclusive'))
+
+    def test_earlyrestart_control_fails_clause_a_for_its_named_reason(self):
+        """S16 fix round V2. W5 w5-ctl-a04-earlyrestart (no peer freeze): bridge1 streamed live, so bridge0's sync cursor
+        9530 was 1938 past the kill seq after a 1.08 s restart: the redefined line HOLDS on it (an early restart alone
+        does not show that timing matters). The control now freezes bridge1: the sync cursor sits at about the kill seq,
+        bridge0 forwards the backlog itself, clause (a) FAILs with its reason."""
+        unfrozen = dict(self.GREEN, peer_cursor_at_restart=None, restart_after_kill_s=1.078, skipped_delta=9530.0,
+                        health_first={'cursor': 9530, 'expected': 9550, 'last': 9549, 'state': 'STREAMING'})
+        self.assertTrue(cd.line_cold_restart_skips({'cold': unfrozen})['holds'])
+        frozen = dict(unfrozen, skipped_delta=7580.0, me_seq_at_restart=8700.0, peer_paused_s=2.6, early=True,
+                      health_first={'cursor': 7580, 'expected': 7901, 'last': 7900, 'state': 'STREAMING'})
+        line = cd.line_cold_restart_skips({'cold': frozen})
+        self.assertFalse(line['holds'])
+        self.assertFalse(line.get('inconclusive'))
+        self.assertEqual(line['detail']['clauses'], {'peer_delivered_backlog': False, 'skipped_to_cursor': True,
+                                                     'streaming_from_cursor': True})
+        self.assertIn('the peer had not delivered the backlog', line['detail']['why'])
+        self.assertIn('bridge0 forwarded 320 records from 7581 itself', line['detail']['why'])
+
+    def test_bridge_never_halted(self):
+        rows = [S(1, bridge0={'bridge_halted': 0.0}, bridge1={'bridge_halted': 0.0})] * 3
+        halted = {'samples': rows + [S(9, bridge0={'bridge_halted': 1.0}, bridge1={'bridge_halted': 0.0})]}
         self.assertFalse(cd.line_bridge_never_halted(halted)['holds'])
-        self.assertTrue(cd.line_bridge_never_halted({'samples': w['samples']})['holds'])
+        self.assertTrue(cd.line_bridge_never_halted({'samples': rows})['holds'])
+        empty = cd.line_bridge_never_halted({'samples': [S(1, bridge0={'unavailable': 0})]})
+        self.assertTrue(empty.get('inconclusive'))                      # V4: no row is no witness, never a FAIL
+
+    def test_open_refused_needs_the_life2_open(self):
+        """V7. RED f42a1c6: life2_gate_open None held the line."""
+        self.assertTrue(cd.line_open_refused(self.w())['holds'])
+        pending = cd.line_open_refused(self.w(life2_gate_open=None))
+        self.assertFalse(pending['holds']); self.assertTrue(pending.get('inconclusive'))
+        closed = cd.line_open_refused(self.w(life2_gate_open=False))
+        self.assertFalse(closed['holds']); self.assertFalse(closed.get('inconclusive'))
+        noregen = cd.line_open_refused(self.w(open_gate={'meaning': 'ANSWERED', 'reply': {'replies': [{'result': 'APPLIED'}]}},
+                                              life2_gate_open=None))
+        self.assertFalse(noregen['holds']); self.assertFalse(noregen.get('inconclusive'))   # the control still FAILs
+
+    def test_engine_polite_stop_after_w9(self):
+        """Post-W9 polite stop (20.1 line 4, verifier note). W5: SIGTERM -> 143 in 0.17-0.29 s on all six engines."""
+        stops = [{'kind': 'stop', 'target': f'me{i}', 'exit_code': 143, 'elapsed_s': t} for i, t in enumerate((0.286, 0.212, 0.283))]
+        self.assertTrue(cd.line_engine_polite_stop({'engine_stops': stops})['holds'])
+        hung = stops[:2] + [dict(stops[2], exit_code=137, elapsed_s=15.0)]     # pre-W9: escalated at the 15 s bound
+        self.assertFalse(cd.line_engine_polite_stop({'engine_stops': hung})['holds'])
+        slow = stops[:2] + [dict(stops[2], elapsed_s=cd.SETTINGS['ENGINE_SHUTDOWN_TIMEOUT_S'] + cd.SETTINGS['ENGINE_STOP_SLACK_S'] + 0.1)]
+        self.assertFalse(cd.line_engine_polite_stop({'engine_stops': slow})['holds'])
+        zero = stops[:2] + [dict(stops[2], exit_code=0)]
+        self.assertFalse(cd.line_engine_polite_stop({'engine_stops': zero})['holds'])
+        self.assertTrue(cd.line_engine_polite_stop({'engine_stops': []}).get('inconclusive'))
+        faults = [{'kind': 'stop', 'target': 'bridge0', 'exit_code': 0}, stops[0], {'kind': 'kill', 'target': 'me1'}, stops[1]]
+        self.assertEqual([x['target'] for x in cd.engine_stops(faults, 1)], ['me0', 'me1'])
+        self.assertIn('engine_polite_stop', cd.DRILLS['a04-regenesis']['lines'])
 
 
 class A05LinesTest(unittest.TestCase):
@@ -1388,6 +1462,43 @@ class A05LinesTest(unittest.TestCase):
                     for s in self.progress()])
         self.assertFalse(cd.line_dup_outcomes(n1)['holds'])          # N = 1 after the stop: no duplicates
 
+    def test_dup_outcomes_slack_default_and_an_unsampled_edge(self):
+        """13: W5 measured duplicates - dispatches = -1 (2059 vs 2060, 3129 vs 3130); the default slack is 10, a setting.
+        V4: a window edge with no sampler row is INCONCLUSIVE, never FAIL."""
+        self.assertEqual(cd.SETTINGS['A05_DUP_EDGE_SLACK'], 10)
+        t0 = 1_000_000
+        tap = [{'seq': i + 1, 'id_high': i + 1, 'id_low': 0, 'kind': 'CREATE', 'at_ms': t0 + i * 20} for i in range(5000)]
+        line = cd.line_dup_outcomes(self.w(tap_dispatch=tap, samples=[]))
+        self.assertFalse(line['holds']); self.assertTrue(line.get('inconclusive'))
+        off = [dict(s, roles={'me0': dict(s['roles']['me0'], match_durable_duplicates_suppressed_total=
+                                          s['roles']['me0']['match_durable_duplicates_suppressed_total'] + (15 if s['t0'] >= 1070 else 0))})
+               for s in self.progress()]
+        self.assertFalse(cd.line_dup_outcomes(self.w(tap_dispatch=tap, samples=off))['holds'])   # 15 off > 10
+
+    def test_n1_hold_makes_the_controls_gap_exceed_the_slack(self):
+        """V3 / fix round: W5 n1 windows were 1.08-1.3 s (survivor gap 0.76 s < 1.0 s; settle lag 51 vs 5 + 40). With the
+        single slot held A05_N1_HOLD_S the window is >= 5 s: no progress for 5 s FAILs survivor_delivered and the lag of a
+        5 s settlement stop FAILs settle_no_gap by far more than the slack."""
+        hold = cd.SETTINGS['A05_N1_HOLD_S']
+        self.assertGreaterEqual(hold, 3 * cd.SETTINGS['SURVIVOR_MAX_GAP_S'])
+        swaps = self.swaps()[:1]; swaps[0]['ready_s'] = 30.0 + hold + 1.1
+        line = cd.line_survivor_delivered(self.w(swaps=swaps, samples=self.progress(stall=(30.1, 30.0 + hold + 1.05))))
+        self.assertFalse(line['holds']); self.assertFalse(line.get('inconclusive'))
+        self.assertGreater(line['detail'][0]['max_gap_s'], 3 * cd.SETTINGS['SURVIVOR_MAX_GAP_S'])
+
+        def lag_rows(lo, hi, rate=40):
+            rows = []
+            for i in range(400):
+                t = 1000.0 + i * 0.25
+                lag = 4 if not (lo <= t - 1000.0 < hi) else 4 + int(rate * (t - 1000.0 - lo))
+                rows.append(S(t, me0=dict(lead('me'), match_trades_total=float(1000 + i)),
+                              ae0=dict(lead('ae'), assets_last_applied_trade_id=float(1000 + i - lag))))
+            return rows
+        bswaps = [dict(swaps[0], slot='bridge0')]
+        line = cd.line_settle_no_gap(self.w(swaps=bswaps, samples=lag_rows(30.0, 30.0 + hold + 1.1)))
+        self.assertFalse(line['holds'])
+        self.assertGreater(line['detail']['swaps'][0]['max_lag'], 4 * (4 + cd.SETTINGS['A05_SETTLE_LAG_SLACK']))
+
     def test_ready_after_kill_bound(self):
         self.assertTrue(cd.line_ready_after_kill(self.w(swaps=self.swaps('kill')))['holds'])
         self.assertFalse(cd.line_ready_after_kill(self.w(swaps=self.swaps('kill', ready_after_kill=7.0)))['holds'])
@@ -1425,22 +1536,45 @@ class A06LinesTest(unittest.TestCase):
         base = {'snaps': {'before': scrape(ae2=self.core(0, 0), fwd0=self.fwd(0), fwd1=self.fwd(0)),
                           't29': scrape(ae2=self.core(321, 273), fwd0=self.fwd(291), fwd1=self.fwd(291)),
                           'prekill': scrape(ae2=self.core(330, 274), fwd0=self.fwd(301), fwd1=self.fwd(300)),
+                          'core_prekill': scrape(ae2=self.core(330, 274)), 'core_postkill': scrape(ae2=self.core(340, 276)),
                           'after': scrape(ae2=self.core(770, 279), fwd0=self.fwd(147), fwd1=self.fwd(601))},
                 'forwarders': ['fwd0', 'fwd1'], 'ae_leaders': ['ae2', 'ae2', 'ae2'],
                 'book': {1: {'version': 3185472, 'bid': 8057000000, 'ask': 9787000000}, 2: None, 3: None, 4: None, 5: None},
-                'kill_window': {'kill_s': 30.0, 'restart_s': 45.0},
+                'kill_window': {'kill_s': 30.0, 'restart_begin_s': 45.0, 'restart_s': 46.2}, 'settings': dict(cd.SETTINGS),
                 'samples': [S(1000.0 + t, ae2=self.core(330 + 10 * t, 274)) for t in range(25, 50)], 't0_s': 1000.0}
         base.update(kw)
         return base
 
     def test_tick_conservation_with_the_in_flight_slack(self):
-        """offered 301 + 147 + (601 - 0) = 1049, slack = 301 - 291 = 10 offers in fwd0's last second; core 770 + 279 = 1049."""
+        """offered 301 + 147 + (601 - 0) = 1049, lost slack = 301 - 291 = 10 offers in fwd0's last second; core 770 + 279 =
+        1049; the kill gap's core count (340 + 276) - (330 + 274) = 12 bounds fwd0's unscraped last offers."""
         line = cd.line_tick_conservation(self.w())
         self.assertTrue(line['holds'], line)
+        self.assertEqual((line['detail']['lost_slack'], line['detail']['kill_gap_core_count']), (10, 12))
         moved = self.w(ae_leaders=['ae2', 'ae1', 'ae1'])
         self.assertFalse(cd.line_tick_conservation(moved)['holds'])      # node-local counters across a leader change
         over = self.w(); over['snaps']['after']['ae2'] = self.core(900, 279)
         self.assertFalse(cd.line_tick_conservation(over)['holds'])
+        unscraped = self.w(); del unscraped['snaps']['core_postkill']
+        self.assertTrue(cd.line_tick_conservation(unscraped).get('inconclusive'))
+
+    def test_tick_conservation_bounds_offers_made_between_the_last_scrape_and_the_kill(self):
+        """Fix round, W5 w5-ctl-a06-n1: fwd0 alone; t29 299, prekill 300, after the restart 147: offered 447; the core
+        applied 449 (fwd0 offered 2 more between its pre-kill scrape and the SIGKILL). RED f42a1c6: 449 > 447 + 1 FAIL.
+        The AE leader read 300 just before the pre-kill scrape and 302 a settle after the kill: the bound is 2."""
+        def fwd(n):
+            return {'forwarder_tick_offered_total{market="1",edge="leading"}': 1.0,
+                    'forwarder_tick_offered_total{market="1",edge="trailing"}': float(n - 1),
+                    'forwarder_tick_pending_age_ms{market="1"}': 0.0, 'forwarder_ticks_ready': 1.0}
+        w = self.w(forwarders=['fwd0'])
+        w['snaps'] = {'before': scrape(ae2=self.core(0, 0)), 't29': scrape(ae2=self.core(293, 0), fwd0=fwd(299)),
+                      'prekill': scrape(fwd0=fwd(300)), 'core_prekill': scrape(ae2=self.core(300, 0)),
+                      'core_postkill': scrape(ae2=self.core(302, 0)), 'after': scrape(ae2=self.core(449, 0), fwd0=fwd(147))}
+        line = cd.line_tick_conservation(w)
+        self.assertTrue(line['holds'], line)
+        self.assertEqual((line['detail']['offered'], line['detail']['core'], line['detail']['kill_gap_core_count']), (447.0, 449.0, 2.0))
+        w['snaps']['after']['ae2'] = self.core(452, 0)                      # 3 more than any scrape bounds
+        self.assertFalse(cd.line_tick_conservation(w)['holds'])
 
     def test_stale_positive_survivor_end_state_invalid_and_the_n1_control(self):
         w = self.w()
@@ -1451,8 +1585,27 @@ class A06LinesTest(unittest.TestCase):
         n1['snaps']['before']['ae2'] = self.core(0, 0)
         self.assertFalse(cd.line_tick_stale_positive(n1)['holds'])
         self.assertFalse(cd.line_tick_survivor(n1)['holds'])
+        self.assertFalse(cd.line_tick_survivor(n1).get('inconclusive'))
         wrong = self.w(book={1: {'version': 3185472, 'bid': 8000000000, 'ask': 9787000000}, 2: None, 3: None, 4: None, 5: None})
         self.assertFalse(cd.line_tick_end_state(wrong)['holds'])
+
+    def test_tick_survivor_counts_rises_inside_the_dead_window_only(self):
+        """Fix round, W5 w5-ctl-a06-n1 (applied: 296 at 29.6, 302 at 30.6 then flat, 304 at 45.6 as the restarted fwd0
+        offered before its /ready returned at 46.158): RED f42a1c6 counted 2 rises in [kill, restart_s] with no survivor.
+        The window is [kill + TICK_SETTLE_S, restart issued] and a rise needs two rows inside it."""
+        series = [(25.584, 256), (26.584, 266), (27.592, 276), (28.586, 286), (29.592, 296), (30.585, 302)] + \
+                 [(31.585 + i, 302) for i in range(14)] + [(45.607, 304), (46.586, 314), (47.585, 324)]
+        samples = [S(1000.0 + t, ae2=dict(lead('ae'), assets_ticks_applied_total=float(v))) for t, v in series]
+        n1 = self.w(samples=samples, kill_window={'kill_s': 30.298, 'restart_begin_s': 45.01, 'restart_s': 46.158})
+        line = cd.line_tick_survivor(n1)
+        self.assertFalse(line['holds'], line)
+        self.assertEqual(line['detail']['applied_rises_while_fwd0_down'], 0)
+        old = cd.progress(cd.series(samples, 'ae', 'assets_ticks_applied_total'), 1030.298, 1046.158)[0]
+        self.assertEqual(len(old), 2)                                    # what W5 counted: the pre-kill commit and the restart
+        unbracketed = cd.line_tick_survivor(self.w(kill_window={'kill_s': 30.0, 'restart_s': 45.0}))
+        self.assertTrue(unbracketed.get('inconclusive'))
+        empty = cd.line_tick_survivor(self.w(samples=[]))
+        self.assertTrue(empty.get('inconclusive'))                       # V4
 
     def test_book_lines_parse(self):
         out = 'BOOK market=1 version=3185472 bid=8057000000 ask=9787000000 bids=3 asks=7 blocks=20/20\nBOOK market=2 none\n'
@@ -1526,12 +1679,29 @@ class EngineDriverLinesTest(unittest.TestCase):
         stalled = [S(1000.0 + i * 0.5, me1=dict(lead('me'), match_engine_next_journal_seq=float(min(i, 40) * 10))) for i in range(200)]
         self.assertFalse(cd.line_cluster_served(dict(w, samples=stalled))['holds'])
         self.assertFalse(cd.line_cluster_served(dict(w, kills=[]))['holds'])                        # edk-nokill
+        unsampled = cd.line_cluster_served(dict(w, samples=[]))
+        self.assertFalse(unsampled['holds']); self.assertTrue(unsampled.get('inconclusive'))          # V4
 
     def test_cnc_timeout_loud(self):
         good = {'cnc': {m: {'exit_code': 1, 'exit_after_s': 31.0, 'ready_200_seen': False} for m in ('ae0', 'me0')}}
         self.assertTrue(cd.line_cnc_timeout_loud(good)['holds'])
         hang = {'cnc': {m: {'exit_code': None, 'exit_after_s': None, 'ready_200_seen': False} for m in ('ae0', 'me0')}}
         self.assertFalse(cd.line_cnc_timeout_loud(hang)['holds'])                  # 20.1 line 5: a hang before W9
+        untimed = {'cnc': {'ae0': {'exit_code': 1, 'exit_after_s': None, 'ready_200_seen': False}}}
+        self.assertTrue(cd.line_cnc_timeout_loud(untimed).get('inconclusive'))
+
+    def test_cnc_exit_timing_counts_from_the_engine_driver_wait(self):
+        """V10. RED f42a1c6: W5 measured from the harness's spawn loop (35.9 s and 34.8 s against 35): the container
+        create, the JVM start and the 0.5 s polling were inside the bound. Now FinishedAt minus the docker timestamp of
+        the engine's own 'Driver mode EXTERNAL: connecting' line; the process start if the line is absent."""
+        logs = ('2026-11-03T11:00:00.100000000Z starting\n'
+                '2026-11-03T11:00:01.900000000Z INFO Driver mode EXTERNAL: connecting to media driver at /dev/shm/aeron-ae0\n')
+        f = types.SimpleNamespace(command=lambda argv, check=True: types.SimpleNamespace(stdout=logs, stderr=''))
+        state = {'StartedAt': '2026-11-03T11:00:00.000000000Z', 'FinishedAt': '2026-11-03T11:00:32.050000000Z'}
+        self.assertEqual(cd.cnc_exit_timing(f, 'c-ae0', state), {'exit_after_s': 30.15, 'measured_from': 'driver_wait_log'})
+        bare = types.SimpleNamespace(command=lambda argv, check=True: types.SimpleNamespace(stdout='', stderr='boom\n'))
+        self.assertEqual(cd.cnc_exit_timing(bare, 'c-ae0', state), {'exit_after_s': 32.05, 'measured_from': 'process_start'})
+        self.assertEqual(cd.SETTINGS['CNC_TIMEOUT_BOUND_S'], 35)
 
 
 class S16RedVerdictTest(unittest.TestCase):
@@ -1629,6 +1799,91 @@ class SamplerTest(unittest.TestCase):
         self.assertEqual(cd.s_value(row, 'ae', 'assets_release_backlog'), 4.0)       # leader resolution inside one row
 
 
+class RunA04OrderTest(unittest.TestCase):
+    """V1: life 1's evidence is written when life 1 ends (before regenesis('core')), then overwritten by the final verdict.
+    RED f42a1c6: the only life-1 write came after life 2 (finish_life(life1) after judge_life(2))."""
+
+    def test_life1_evidence_is_on_disk_before_the_core_is_wiped(self):
+        events = []
+        g1, g2 = 0x11, 0x13
+        faults = []
+
+        def regenesis(plan, scope):
+            events.append(('regenesis', scope))
+            target = 'me' if scope == 'me' else 'ae'
+            faults.extend({'kind': 'stop', 'target': f'{target}{i}', 'exit_code': 143, 'elapsed_s': 0.2} for i in range(3))
+            return {'kind': 'regenesis', 'scope': scope}
+        fx = types.SimpleNamespace(registry={'faults': faults, 'containers': {}}, start=lambda plan: None,
+                                   start_story=lambda args, name=None: {}, regenesis=regenesis,
+                                   genesis_id=lambda life: hex(g1 if life == 1 else g2), tap_gate=lambda m: {'state': 'OPEN'},
+                                   journal_dump=lambda m: ['{}'])
+        run = cd.DrillRun.__new__(cd.DrillRun)
+        run.f, run.name, run.spec, run.variant, run.red, run.seed = fx, 'a04-regenesis', cd.DRILLS['a04-regenesis'], {}, None, 1
+        run.ledger, run.snaps, run.removed, run.restarted, run.extra = cd.Ledger(), {}, set(), set(), {}
+        import tempfile
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        run.out = Path(tmp.name)
+        run.snap = lambda label, skip_me=False: run.snaps.setdefault(label, {})
+        run.start_sampler = run.stop_sampler = run.post_load = lambda *a: None
+        run.story_args = lambda: {}
+        run.story_name = 'story'
+        run.wait_marker = lambda name, bound: {'at_ns': 0}
+        run.wait_story = lambda: {'line': {}, 'summary': {}}
+        run.pre_barrier = lambda: {}
+        run.freeze_me = lambda: {'scrape_me': {}}
+        run.state = lambda role: {'StartedAt': '1970-01-01T00:00:01Z'}
+        run.wait_fenced = lambda ns: {}
+        run.wait_bridges_halted = lambda: {}
+        run.halt_actions = lambda: {'open_gate': {'meaning': 'REFUSED', 'reply': {'replies': [{'result': 'REJECTED'}]}}}
+        run.health_of = lambda role: (503, {})
+        ok = {'status': 'PASS', 'rules': {}}
+
+        def judge_life(life, story, pre, out):
+            events.append(('judge', life))
+            journal = [{'type': 'engine_config', 'journal_seq': 1, 'me_epoch': g1 if life == 1 else g2}]
+            sample = {'core': {'bound_me_epoch': g2, 'last_applied_trade_id': 0}, 'faults': {'settle_rejected': 0},
+                      'me_journal': journal, 'declared': {'epochs': [g2], 'fault_open': False}}
+            return {'sample': sample, 'money': ok, 'order': ok, 'w': {}, 'after': {}, 'tap_summary': {}, 'story': story, 'out': out}
+        run.judge_life = judge_life
+        run.decide = lambda money, order, lines, rows, sample, after: {'status': 'PASS', 'reasons': [], 'oracle_status': {},
+                                                                      'lines': {k: v['holds'] for k, v in lines.items()}}
+        run.finish_life = lambda life, lines, rows, result: events.append(('write', str(life['out'].name), bool(result.get('provisional')),
+                                                                         lines.get('open_refused', {}).get('inconclusive')))
+        line = lambda w: cd._line(True, '')
+        with mock.patch.dict(cd.LINES, {n: line for n in ('halt_local', 'money_while_halted', 'fenced_forwarders', 'fault_cycles')}), \
+                mock.patch.object(cd, 'of_rows', lambda *a, **k: {}), \
+                mock.patch.object(cd, 'verdict', lambda *a, **k: {'status': 'PASS', 'reasons': []}):
+            result = run.run_a04()
+        core = events.index(('regenesis', 'core'))
+        first_write = events.index(('write', 'life-1', True, True))       # provisional, open_refused pending life 2
+        self.assertLess(first_write, core)
+        self.assertGreater(events.index(('write', 'life-1', False, None)), core)    # the final life-1 write
+        self.assertEqual(result['status'], 'PASS')
+        self.assertTrue(result['lines']['open_refused'])                 # life 2's OPEN observed: no longer pending
+        self.assertTrue(result['lines']['engine_polite_stop'])
+        self.assertTrue(result['lives']['2']['lines']['engine_polite_stop'])
+        self.assertTrue(result['lines']['life2.engine_polite_stop'])       # verdict() returns no 'lines': merged from lines2
+
+
+class SamplerWatcherTest(unittest.TestCase):
+    def test_a_watcher_exception_is_recorded_and_makes_a_pass_inconclusive(self):
+        """V13. RED f42a1c6: the GateWatcher's exception went to the sampler's generic errors and the run PASSed."""
+        def boom(row):
+            raise KeyError('state')
+        sampler = cd.Sampler.__new__(cd.Sampler)
+        sampler.on_tick, sampler.rows, sampler.errors, sampler.watcher_errors = boom, [], [], []
+        sampler.urls, sampler.wanted = {}, {}
+        with mock.patch('subprocess.run', lambda *a, **k: types.SimpleNamespace(stdout='{}')):
+            row = sampler.tick('c-probe')
+        self.assertEqual(sampler.rows, [row])                          # the row is kept
+        self.assertEqual(sampler.watcher_errors, ["KeyError('state')"])
+        v = cd.with_watcher_errors({'status': 'PASS', 'reasons': []}, sampler.watcher_errors)
+        self.assertEqual(v['status'], 'INCONCLUSIVE')
+        self.assertIn('sampler watcher raised', v['reasons'][-1])
+        self.assertEqual(cd.with_watcher_errors({'status': 'FAIL', 'reasons': ['x']}, ['e'])['status'], 'FAIL')
+        self.assertEqual(cd.with_watcher_errors({'status': 'PASS', 'reasons': []}, []), {'status': 'PASS', 'reasons': []})
+
+
 class S16TableTest(unittest.TestCase):
     S16 = {'a03-lifetime', 'a04-regenesis', 'a04-one-bridge-halt', 'a05-fwd-upgrade', 'a05-fwd-kill', 'a05-bridge-upgrade',
            'a06-two-forwarders-ticks', 'a01-fwdring', 'c13-enginedriverkill'}
@@ -1659,6 +1914,12 @@ class S16TableTest(unittest.TestCase):
         self.assertEqual(cd.plan_for(cd.DRILLS['a03-lifetime'], 1, variant={'ledger_capacity': 100_000})['ledger_capacity'], 100_000)
         life1 = cd.plan_for(cd.DRILLS['a04-regenesis'], 1)['tap_ms'] / 1000
         self.assertGreaterEqual(life1, 40 + cd.A04_HALT_PHASE_S + cd.PRE_BARRIER_S)     # W1 item 3: life-1 tap ends on its duration
+        # V9: the halt phase is a setting, default 60 s (W5: halt ~5 s, funding done ~12 s after the ME restart)
+        self.assertEqual(cd.SETTINGS['A04_HALT_PHASE_S'], 60)
+        life2 = cd.plan_for(cd.DRILLS['a04-regenesis'], 1, life=2)['tap_ms'] / 1000
+        self.assertEqual(life1 - life2, 60)
+        with mock.patch.dict(cd.SETTINGS, {'A04_HALT_PHASE_S': 200}):
+            self.assertEqual(cd.plan_for(cd.DRILLS['a04-regenesis'], 1)['tap_ms'] / 1000 - life2, 200)
 
     def test_a03_scenarios_may_stage_the_norelease_build_in_both_slots(self):
         """W1 open item 1. RED 6380b01: 'GREEN drills run the real binaries only' for core-drill-a03-lifetime on s16-a03."""
@@ -1785,6 +2046,76 @@ class S16ScheduleTest(unittest.TestCase):
                                 ('replace', 'fwd1', 'forwarder', False), ('marker', 'fill_ended')])
         self.assertEqual((run.a03_hold['swap_me_seq'], run.a03_hold['swap_dispatch_seq']), (777, 9))
         self.assertEqual([r['kind'] for r in run.ledger.rows if 'skipped' in r], ['pause', 'kill', 'stop'])
+
+    def one_bridge_halt(self, early):
+        run, calls = self.run_for('a04-one-bridge-halt', {'early': True} if early else {}, leader=lambda e: 'me0',
+                                  unpause=lambda role: calls.append(('unpause', role)))
+        seqs = iter([7592, 8700])
+        run.me_seq = lambda me: next(seqs)
+        health = {'bridge1': {'cursor': 9604}, 'bridge0': {'cursor': 9871, 'expected': 9890, 'last': 9889, 'state': 'STREAMING'}}
+        run.health_of = lambda role: calls.append(('health', role)) or (200, health[role])
+        run.slot_metrics = lambda role: calls.append(('metrics', role)) or {role: {'bridge_skipped_total{kind="trade"}': 9871.0}}
+        run.restart = lambda row: calls.append(('restart', row['target'])) or run.ledger.heal(row, 'restart', {'ready': True})
+        run.pause = lambda role, s: calls.append(('pause', role, s)) or run.ledger.open('pause', role)
+        run.await_branches = lambda rows, before, thawed: calls.append(('branches', sorted(rows))) or \
+            [run.ledger.heal(r, 'none', {}) for r in rows.values()]
+        with mock.patch.object(cd.core_scenarios, 'barrier_scrape', lambda f: {}), \
+                mock.patch.dict(cd.SETTINGS, {'EARLY_RESTART_AFTER_S': 0.0}):
+            run.faults_one_bridge_halt()
+        return run, [c for c in calls if c[0] != 'at']
+
+    def test_one_bridge_halt_reads_the_sync_witness_right_after_the_restart(self):
+        run, calls = self.one_bridge_halt(early=False)
+        self.assertEqual(calls[:5], [('kill', 'bridge0'), ('health', 'bridge1'), ('restart', 'bridge0'), ('health', 'bridge0'),
+                                     ('metrics', 'bridge0')])
+        self.assertNotIn('pause', [c[0] for c in calls])
+        self.assertEqual(run.cold['health_first']['cursor'], 9871)
+        self.assertTrue(cd.line_cold_restart_skips({'cold': run.cold})['holds'])
+        self.assertFalse(run.ledger.fault_open())
+
+    def test_earlyrestart_control_freezes_the_peer_across_the_restart(self):
+        """V2: bridge1 paused before the kill, thawed after bridge0's sync witness, its branch observed."""
+        run, calls = self.one_bridge_halt(early=True)
+        names = [c[:2] for c in calls]
+        self.assertEqual(names[:6], [('pause', 'bridge1'), ('kill', 'bridge0'), ('restart', 'bridge0'), ('health', 'bridge0'),
+                                     ('metrics', 'bridge0'), ('unpause', 'bridge1')])
+        self.assertEqual(calls[0][2], cd.SETTINGS['EARLY_PEER_PAUSE_BUDGET_S'])
+        self.assertIn(('branches', ['bridge1']), calls)
+        self.assertNotIn(('health', 'bridge1'), names)                   # a frozen peer is never polled
+        self.assertTrue(run.cold['early'])
+        self.assertIsNotNone(run.cold['peer_paused_s'])
+        self.assertFalse(run.ledger.fault_open())
+
+    def test_a05_n1_control_holds_the_single_slot_down(self):
+        """Items 6, 7: the n1 controls hold the swapped slot down A05_N1_HOLD_S before the replacement; GREEN does not."""
+        for drill in ('a05-fwd-upgrade', 'a05-bridge-upgrade'):
+            run, calls = self.run_for(drill, {'n1': True, 'control': drill + '-n1'})
+            slept = []
+            run.sleep = slept.append
+            run.faults_a05()
+            self.assertEqual(slept, [cd.SETTINGS['A05_N1_HOLD_S']], drill)
+            self.assertEqual(run.ledger.faults()[0]['witness']['held_s'], cd.SETTINGS['A05_N1_HOLD_S'])
+            run, calls = self.run_for(drill)
+            slept = []
+            run.sleep = slept.append
+            run.faults_a05()
+            self.assertEqual(slept, [], drill)
+
+    def test_a06_scrapes_the_core_around_the_kill_and_brackets_the_restart(self):
+        run, calls = self.run_for('a06-two-forwarders-ticks', ports={'ae_metrics': 9})
+        run.f.m['ports'] = {'ae_metrics': 9, 'forwarder_http': 7}
+        run.f.metrics = lambda role, port: calls.append(('metrics', role)) or {'assets_ticks_applied_total': 1.0}
+        run.snaps = {'before': scrape(ae2=dict(lead('ae')))}
+        run.snap = lambda label: run.snaps.__setitem__(label, scrape(ae2=dict(lead('ae')))) or run.snaps[label]
+        run.restart = lambda row: calls.append(('restart', row['target'])) or run.ledger.heal(row, 'restart', {'ready': True})
+        slept = []
+        run.sleep = slept.append
+        run.faults_a06()
+        acts = [c for c in calls if c[0] in ('metrics', 'kill', 'restart')]
+        self.assertEqual(acts, [('metrics', 'ae2'), ('metrics', 'fwd0'), ('kill', 'fwd0'), ('metrics', 'ae2'), ('restart', 'fwd0')])
+        self.assertEqual(slept, [cd.SETTINGS['TICK_SETTLE_S']])
+        self.assertLessEqual(run.kill_window['restart_begin_s'], run.kill_window['restart_s'])
+        self.assertIn('ae2', run.snaps['core_prekill']); self.assertIn('ae2', run.snaps['core_postkill'])
 
     def test_iso_ns_reads_docker_times(self):
         self.assertEqual(cd._iso_ns('1970-01-01T00:00:01.5Z'), 1_500_000_000)

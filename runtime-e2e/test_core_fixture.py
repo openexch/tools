@@ -1169,6 +1169,31 @@ class WipeEngineTest(V4Base):
         with self.assertRaises(Violation):
             f.wipe_engine('fwd0')
 
+    def test_wipe_engine_refuses_an_ae_member_without_its_life_projection_dump(self):
+        """S16 fix round V6: the AE is the life's money source; its wipe needs that life's PG dump (precondition).
+        RED f42a1c6: wipe_engine('ae0') wiped with no dump."""
+        f = self.fx()
+        state = f.root / 'state' / 'ae0'
+        (state / 'snap.dat').write_bytes(b'y' * 10)
+        self.docker.state['c-ae0'].update(Running=False, ExitCode=143)
+        with self.assertRaisesRegex(Violation, r'wipe_engine refuses ae0: no projection dump of core life 1 \(reset_projection first\)'):
+            f.wipe_engine('ae0')
+        self.assertTrue((state / 'snap.dat').exists())
+        dump = f.root / 'lives' / 'life-1' / 'money_journal.pg.jsonl'
+        dump.parent.mkdir(parents=True); dump.write_text('{"table": "t", "row": {}}\n')
+        f.registry['projection_dumps'] = {'1': {'dump': str(dump), 'sha256': hashlib.sha256(dump.read_bytes()).hexdigest()}}
+        dump.write_text('changed\n')
+        with self.assertRaisesRegex(Violation, 'projection dump is missing or changed'):
+            f.wipe_engine('ae0')
+        f.registry['projection_dumps']['1']['sha256'] = hashlib.sha256(dump.read_bytes()).hexdigest()
+        self.assertEqual(f.wipe_engine('ae0')['bytes_removed'], 10)
+        self.assertEqual(list(state.iterdir()), [])
+        # a dump of another life does not count
+        f.registry['lives'] = {'1': {'core': {}}, '2': {'core': {}}}
+        (state / 'x').write_text('z')
+        with self.assertRaisesRegex(Violation, 'no projection dump of core life 2'):
+            f.wipe_engine('ae0')
+
 
 class ResetProjectionTest(V4Base):
     def test_reset_projection_dumps_before_drop(self):
@@ -1203,6 +1228,8 @@ class ResetProjectionTest(V4Base):
         self.assertIn('CREATE TABLE money_journal', sqls[-1])               # packaged migrations re-applied
         self.assertEqual((w['kind'], w['life'], w['tables']), ('reset_projection', 1, {'money_journal': 2, 'money_journal_leg': 1}))
         self.assertEqual(json.loads(dump.read_text().splitlines()[0]), {'table': 'money_journal', 'row': {'journal_seq': 1}})
+        self.assertEqual(f.registry['projection_dumps']['1'],                    # V6: the wipe precondition's record
+                         {'dump': str(dump), 'sha256': hashlib.sha256(dump.read_bytes()).hexdigest()})
         stop = [c for c in self.docker.calls if c[:3] == ['docker', 'stop', '-t']][-1]
         self.assertEqual(stop[-1], 'c-projector')
 
@@ -1268,8 +1295,9 @@ class RegenesisTest(V4Base):
         calls = self.recorded(f, ['stop', 'wipe_engine', 'reset_projection', 'start_members'] + self.CORE_STEPS)
         w = f.regenesis({'users': [1]}, 'core')
         names = [c[:2] if c[0] in ('stop', 'wipe_engine', 'start_members') else c[:1] for c in calls]
+        # V6: the projection is dumped before the AE is wiped (RED f42a1c6: the three wipes came first)
         self.assertEqual(names, [('stop', 'bridge0'), ('stop', 'bridge1'), ('stop', 'ae0'), ('stop', 'ae1'), ('stop', 'ae2'),
-                                 ('wipe_engine', 'ae0'), ('wipe_engine', 'ae1'), ('wipe_engine', 'ae2'), ('reset_projection',),
+                                 ('reset_projection',), ('wipe_engine', 'ae0'), ('wipe_engine', 'ae1'), ('wipe_engine', 'ae2'),
                                  ('start_members', 'ae')] + [(s,) for s in self.CORE_STEPS])
         phases = f.registry['boot']['lives']['2']['phases']
         core_fixture.check_genesis_order(phases, expected=core_fixture.LIFE2_CORE_PHASES)
