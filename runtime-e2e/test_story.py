@@ -28,6 +28,10 @@ CASES = ['a01_request_log_is_a_function_of_the_seed', 'a02_request_log_is_a_func
          'unknown_replies_are_resolved_by_resend_with_the_same_request_id', 'unanswered_resend_leaves_the_row_unresolved',
          'unoffered_rows_are_unsent_not_unknown', 'hold_waits_for_the_gate_file', 'hold_without_gate_file_expires_loudly',
          'story_refuses_ambiguous_arguments', 'funding_plan_covers_every_user_and_asset',
+         'a03_fill_runs_the_three_phases_with_markers', 'a03_open_timeout_starts_phase_three_with_opened_false',
+         'a03_summary_counts_gate_rejects_and_reopen_acks', 'a03_request_log_is_a_function_of_the_seed',
+         'a03_refuses_ambiguous_arguments', 'a01_ioc_burst_follows_the_marker_for_two_seconds',
+         'a01_takes_120_users_and_funding_covers_them', 'money_dump_exports_the_v7_halt_fields',
          'listener_routes_story_replies_by_correlation', 'tap_reports_dispatch_gaps_and_new_leader',
          'tap_dense_run_reports_no_gap', 'order_dump_keeps_every_page']
 # the sample's request rows (oracle_model docstring; core_scenarios._create writes the same create keys)
@@ -82,7 +86,7 @@ class StoryTest(unittest.TestCase):
         self.assertEqual(self.java_run.returncode, 0, self.java_run.stdout + self.java_run.stderr)
 
     def test_rows_carry_the_sample_key_set(self):
-        for name in ['a01-mix.jsonl', 'a02-lifecycle.jsonl', 'a01-resolved.jsonl']:
+        for name in ['a01-mix.jsonl', 'a02-lifecycle.jsonl', 'a01-resolved.jsonl', 'a03-fill.jsonl']:
             lists = load(self.out / name)
             self.assertTrue(lists['creates'], name)
             for row in lists['creates']:
@@ -108,6 +112,13 @@ class StoryTest(unittest.TestCase):
         acked = [r for r in lists['creates'] if r['reply']['outcome'] == 'ACK']
         self.assertEqual(len(model.orders), len(acked))
         order_oracle.o1(model)   # every requestId minted one order, no replay
+
+    def test_model_reads_the_a03_rows(self):
+        lists = load(self.out / 'a03-fill.jsonl')
+        self.assertEqual(lists['cancels'], [])
+        self.assertEqual({r['moment'] for r in lists['creates']}, {'fill', 'reopen'})
+        model = oracle_model.Model(model_sample(lists))
+        order_oracle.o1(model)
 
     def test_resolved_log_is_judged_after_w3(self):
         """6.1 rule 2 (W3): the story's resolved UNKNOWN originals are judged as their re-send's verdict. W2 pinned the
