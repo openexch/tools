@@ -49,6 +49,7 @@ public final class CoreProbeTest {
         run("a03_request_log_is_a_function_of_the_seed", CoreProbeTest::a03Deterministic);
         run("a03_refuses_ambiguous_arguments", CoreProbeTest::a03Refusals);
         run("a01_ioc_burst_follows_the_marker_for_two_seconds", CoreProbeTest::iocBurst);
+        run("a01_ioc_burst_rearms_when_the_marker_is_deleted", CoreProbeTest::iocBurstRearm);
         run("a01_takes_120_users_and_funding_covers_them", CoreProbeTest::users120);
         run("money_dump_exports_the_v7_halt_fields", CoreProbeTest::moneyDumpV7);
         run("listener_routes_story_replies_by_correlation", CoreProbeTest::listenerRoutes);
@@ -94,7 +95,19 @@ public final class CoreProbeTest {
             now += 1_000_000L;
         }
 
+        /** S16 W3: a file present in [from, to) spans (a deleted and re-created marker). */
+        final Map<String, long[]> fileSpans = new HashMap<>();
+
         public boolean exists(final String path) {
+            final long[] spans = fileSpans.get(path);
+            if (spans != null) {
+                for (int i = 0; i + 1 < spans.length; i += 2) {
+                    if (now >= spans[i] && now < spans[i + 1]) {
+                        return true;
+                    }
+                }
+                return false;
+            }
             final Long at = filesAt.get(path);
             return at != null && now >= at;
         }
@@ -805,6 +818,31 @@ public final class CoreProbeTest {
         }
         final Result never = story(cfg(concat(kv, "ioc_burst_on=/m/never")), StubPort.Mode.ACK_ALL);
         check(never.log.equals(plain.log) && markersNamed(never, "ioc_burst_started").isEmpty(), "a burst marker that never appears changed the story");
+    }
+
+    /** S16 W3: fwdring pauses twice; the drill deletes the marker after the first burst and writes it again. A marker
+     *  that stays only ever gives one burst (iocBurst above); a deleted and re-created one gives a second, numbered n=2. */
+    private static void iocBurstRearm() {
+        final String[] kv = {"script=a01-mix", "seed=5", "seconds=10", "rate=20", "users=1,2,3,4"};
+        final FakeClock clock = new FakeClock();
+        final long t0 = clock.now;
+        clock.fileSpans.put("/m/burst", new long[] {t0 + 2_000_000_000L, t0 + 5_000_000_000L, t0 + 6_000_000_000L, Long.MAX_VALUE});
+        final Result r = story(cfg(concat(kv, "ioc_burst_on=/m/burst")), StubPort.Mode.ACK_ALL, p -> p, clock);
+        final List<Map<String, Object>> started = markersNamed(r, "ioc_burst_started");
+        check(started.size() == 2, "expected two bursts, got " + started.size());
+        check(Integer.valueOf(1).equals(started.get(0).get("n")) && Integer.valueOf(2).equals(started.get(1).get("n")),
+                "bursts not numbered 1, 2: " + started);
+        final long second = ((Number) started.get(1).get("at_ns")).longValue();
+        check(second >= t0 + 6_000_000_000L && second < t0 + 6_100_000_000L, "second burst started at +" + (second - t0));
+        int burst = 0;
+        for (final CoreProbe.StoryRow c : list(r, "creates")) {
+            burst += c.moment.equals("ioc_burst") ? 1 : 0;
+        }
+        check(burst >= 76 && burst <= 84, "two bursts carried " + burst + " creates for 2 x 2 s at 20/s");
+        final FakeClock stays = new FakeClock();
+        stays.filesAt.put("/m/burst", stays.now + 2_000_000_000L);
+        final Result once = story(cfg(concat(kv, "ioc_burst_on=/m/burst")), StubPort.Mode.ACK_ALL, p -> p, stays);
+        check(markersNamed(once, "ioc_burst_started").size() == 1, "a marker that stays re-armed the burst");
     }
 
     private static void users120() {

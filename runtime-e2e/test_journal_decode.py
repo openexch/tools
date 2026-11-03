@@ -47,7 +47,7 @@ SCHEMA4 = '''<?xml version="1.0" encoding="UTF-8"?>
     <field name="makerOrderId" id="7" type="int64"/><field name="makerUserId" id="8" type="int64"/>
     <field name="price" id="9" type="int64"/><field name="quantity" id="10" type="int64"/>
     <field name="takerIsBuy" id="11" type="BooleanType"/><field name="takerOmsOrderId" id="12" type="int64"/>
-    <field name="makerOmsOrderId" id="13" type="int64"/>
+    <field name="makerOmsOrderId" id="13" type="int64"/><field name="timestamp" id="14" type="int64"/>
   </sbe:message>
 </sbe:messageSchema>
 '''
@@ -289,6 +289,25 @@ class Profile4Test(unittest.TestCase):
                                                       'max_wire_version', 'decision']},
                          {'egress_seq': 11, 'config_version': 1, 'behavior_version': 2, 'ledger_capacity': 100000,
                           'max_wire_version': 12, 'decision': 'FRESH'})
+
+
+class TimestampMappingTest(unittest.TestCase):
+    """RC2 S16 5.4 / F-S16-17: records 1-3 of the active profile carry the ME cluster ``timestamp`` (the A05 latency
+    table's first-apply clock). RED 6380b01: KeyError 'timestamp' (the profile maps no timestamp)."""
+
+    def test_records_1_to_3_decode_their_timestamp(self):
+        profile = journal_decode.load_profile('me-journal-4')
+        schema = sbe_layout.load(SCHEMAS / 'me-journal-schema-4.xml')
+        frames = [encode(schema, 1, {'journalSeq': 1, 'meEpoch': 2, 'takerIsBuy': 'TRUE', 'timestamp': 1793697000101}),
+                  encode(schema, 2, {'journalSeq': 2, 'meEpoch': 2, 'status': 'FILLED', 'rejectReason': 0, 'timestamp': 1793697000102}),
+                  encode(schema, 3, {'journalSeq': 3, 'meEpoch': 2, 'timestamp': 1793697000103})]
+        events = journal_decode.decode_dump([row(f, 64 * i) for i, f in enumerate(frames)], profile)
+        self.assertEqual([e['timestamp'] for e in events], [1793697000101, 1793697000102, 1793697000103])
+
+    def test_release_and_engine_config_stay_without_timestamp(self):
+        spec = json.loads((SCHEMAS / 'journal-profiles.json').read_text())['profiles']['me-journal-4']
+        mapped = {r['template_id']: r['fields'].get('timestamp') for r in spec['records']}
+        self.assertEqual(mapped, {1: 'timestamp', 2: 'timestamp', 3: 'timestamp', 4: None, 5: None})
 
 
 if __name__ == '__main__':

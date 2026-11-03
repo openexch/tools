@@ -1248,6 +1248,7 @@ public final class CoreProbe {
         static final long IOC_BURST_NS = 2 * SECOND;
         private long burstStartNs = -1;
         private boolean burstEnded;
+        private int bursts;
         int iocBurstRows;
 
         /**
@@ -1300,13 +1301,19 @@ public final class CoreProbe {
                 return;
             }
             final boolean beat = signalPoll(now);
+            if (cfg.iocBurstOn != null && burstEnded && beat && !clock.exists(cfg.iocBurstOn)) {
+                // S16 W3 (fwdring pauses twice, 20.1 line 12): a marker file deleted after its burst re-arms the next one
+                burstEnded = false;
+                burstStartNs = -1;
+            }
             if (cfg.iocBurstOn != null && !burstEnded) {
                 if (burstStartNs < 0 && beat && clock.exists(cfg.iocBurstOn)) {
                     burstStartNs = now;
-                    marker("ioc_burst_started", map("marker_file", cfg.iocBurstOn));
+                    bursts++;
+                    marker("ioc_burst_started", map("marker_file", cfg.iocBurstOn, "n", bursts));
                 } else if (burstStartNs >= 0 && now >= burstStartNs + IOC_BURST_NS) {
                     burstEnded = true;
-                    marker("ioc_burst_ended", map("rows", iocBurstRows));
+                    marker("ioc_burst_ended", map("rows", iocBurstRows, "n", bursts));
                 }
             }
             if (phase == PHASE_NONE || phase == PHASE_DONE) {
