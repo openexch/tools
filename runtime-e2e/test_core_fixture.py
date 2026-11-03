@@ -788,8 +788,8 @@ class TapRegistrationAndFundingGateTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.f = fixture_for(slot_manifest(self.temp.name), self.temp.name)
         self.probe = self.f.root / 'state' / 'probe'; self.probe.mkdir(parents=True)
-        self.tap = self.probe / 'tap.jsonl'
-        self.sessions = self.probe / 'tap.jsonl.sessions.jsonl'
+        self.tap = self.probe / 'tap-life1.jsonl'                 # S16 5.1: per-life tap files
+        self.sessions = self.probe / 'tap-life1.sessions.jsonl'
 
     def tearDown(self):
         self.temp.cleanup()
@@ -811,7 +811,7 @@ class TapRegistrationAndFundingGateTest(unittest.TestCase):
             if len(sleeps) == 3:
                 self.note('registered', started // 1_000_000 + 10)
         self.f.sleep = sleep
-        self.f.start_tap = lambda duration: self.tap
+        self.f.start_tap = lambda duration, life=1: self.tap
         self.f.start_tap_witness({'tap_ms': 1000})
         self.assertEqual(len(sleeps), 3)                  # it waited for the note, no fixed 3 s
         self.assertNotIn(3, sleeps)
@@ -925,6 +925,608 @@ class BuildProbesCtDirTest(unittest.TestCase):
             self.assertEqual(sources['t1_me_driver']['main_class'], 'T1MeDriver')
             self.assertEqual(sources['t1_core_driver']['classpath_arg'], '--ae-jar')
             self.assertEqual(sources['t1_me_driver']['classpath_arg'], '--me-jar')
+
+
+# ======================================================================================================
+# RC2 S16 W1 (contract 5.1, 5.2, 5.3 and the 20.1 amendments): fixture v4. Each test was RED on a693555 first.
+# ======================================================================================================
+
+import zipfile
+
+# the pinned production keys of me/deploy/media-driver/driver.properties at c53dd20 (contract 5.3)
+DP_TEXT = '''# external driver tuning (test copy of the pinned keys)
+aeron.dir.delete.on.start=true
+aeron.dir.delete.on.shutdown=true
+aeron.term.buffer.sparse.file=false
+aeron.term.buffer.length=16m
+aeron.ipc.term.buffer.length=16m
+aeron.mtu.length=8192
+aeron.socket.so_sndbuf=4m
+aeron.socket.so_rcvbuf=4m
+aeron.rcv.initial.window.length=4m
+aeron.timer.interval=500us
+aeron.client.liveness.timeout=5s
+aeron.publication.unblock.timeout=10s
+aeron.untethered.window.limit.timeout=100ms
+aeron.untethered.resting.timeout=100ms
+'''
+DEV_TEXT = '''aeron.threading.mode=SHARED
+aeron.conductor.idle.strategy=backoff
+aeron.sender.idle.strategy=backoff
+aeron.receiver.idle.strategy=backoff
+aeron.shared.idle.strategy=backoff
+'''
+
+
+def plain(entry):
+    return {k: v for k, v in entry.items() if k != 'source_sha'}
+
+
+def engine_libs(directory, props=DP_TEXT, overlay=DEV_TEXT):
+    return {'aeronmd': dict(plain(write(directory, 'e-aeronmd', b'emd')), exec=True),
+            'libaeron_driver.so': plain(write(directory, 'e-libaeron_driver.so', b'esod')),
+            'libaeron.so': plain(write(directory, 'e-libaeron.so', b'eso')),
+            'driver.properties': plain(write(directory, 'e-driver.properties', props.encode())),
+            'driver-dev.properties': plain(write(directory, 'e-driver-dev.properties', overlay.encode()))}
+
+
+def ext_manifest(directory, engines='external'):
+    m = slot_manifest(directory)
+    m['artifacts']['forwarder_b'] = dict(write(directory, 'fwd-b.bin', b'elf-forwarder-b'), driver='external',
+                                         libs=m['artifacts']['forwarder']['libs'], target='ct-forwarder')
+    m['artifacts']['forwarder']['target'] = 'ct-forwarder'
+    m['artifacts']['bridge']['target'] = 'ct-bridge'
+    m['engine_driver'] = engines
+    if engines == 'external':
+        m['engine_libs'] = engine_libs(directory)
+    return m
+
+
+class Clock:
+    def __init__(self):
+        self.now, self.sleeps = 1_000_000.0, []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds); self.now += seconds
+
+
+OK = types.SimpleNamespace(stdout='', stderr='', returncode=0)
+
+
+class Docker4(Docker):
+    """Docker plus SIGTERM stops (``docker kill --signal=TERM`` then ``docker stop -t N``), rm, logs, scripted exits on start
+    and a cnc.dat mtime that changes with every container start (the driver identity)."""
+
+    def __init__(self, fixture, roles, clock):
+        super().__init__(fixture, roles)
+        self.clock, self.polite, self.start_exits, self.removed, self.stale_driver = clock, {}, {}, [], False
+
+    def command(self, argv, **kw):
+        argv = [str(a) for a in argv]
+        if argv[:3] == ['docker', 'kill', '--signal=TERM']:
+            self.calls.append(argv); return OK
+        if argv[:3] == ['docker', 'stop', '-t']:
+            self.calls.append(argv)
+            bound, state = int(argv[3]), self.state[argv[4]]
+            code, seconds = self.polite.get(argv[4][2:], (137, None))
+            if seconds is None or seconds > bound:
+                code, seconds = 137, bound
+            self.clock.now += seconds
+            state.update(Running=False, ExitCode=code, FinishedAt='F%d' % len(self.calls))
+            return OK
+        if argv[:2] == ['docker', 'rm']:
+            self.calls.append(argv); self.removed.append(argv[-1]); self.state.pop(argv[-1]); return OK
+        if argv[:2] == ['docker', 'logs']:
+            self.calls.append(argv); return types.SimpleNamespace(stdout='log of ' + argv[-1] + '\n', stderr='', returncode=0)
+        result = super().command(argv, **kw)
+        if argv[:2] == ['docker', 'start']:
+            queue = self.start_exits.get(argv[2][2:])
+            if queue:
+                code = queue.pop(0)
+                if code is not None:
+                    self.state[argv[2]].update(Running=False, ExitCode=code)
+        return result
+
+    def execute(self, name, argv, **kw):
+        if 'stat -c' in ' '.join(argv):
+            self.exec_calls.append((name, argv, kw))
+            mtime = '7.5' if self.stale_driver else self.state['c-' + name]['StartedAt'][1:] + '.5'
+            return types.SimpleNamespace(stdout=mtime + '\n', stderr='', returncode=0)
+        return super().execute(name, argv, **kw)
+
+
+class V4Base(unittest.TestCase):
+    ROLES = ('probe', 'fwd0', 'fwd1', 'bridge0', 'bridge1', 'projector', 'ae0', 'ae1', 'ae2', 'me0', 'me1', 'me2')
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.dir = self.temp.name
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def fx(self, m=None, roles=ROLES):
+        f = fixture_for(m or ext_manifest(self.dir), self.dir)
+        self.clock = Clock(); f.clock = self.clock; f.sleep = self.clock.sleep
+        self.docker = Docker4(f, roles, self.clock)
+        f.registry.update(fault_targets={}, faults=[])
+        self.health = {'aeConnected': True}
+        f.http = lambda name, port, path, **kw: {'status': 200, 'body': json.dumps(self.health)}
+        f.wait_http = lambda *a, **k: {'status': 200, 'body': '{}'}
+        for role in roles:
+            (f.root / 'state' / role).mkdir(parents=True, exist_ok=True)
+        return f
+
+
+class StopTest(V4Base):
+    def test_stop_bounds_and_exit_codes_per_role(self):
+        f = self.fx()
+        self.docker.polite.update(fwd0=(0, 0.2), fwd1=(143, 0.1), bridge0=(0, 0.15), ae0=(0, 2.0))
+        w = f.stop('fwd0')
+        self.assertEqual((w['kind'], w['target'], w['exit_code'], w['bound_s'], w['elapsed_s'], w['within_contract']),
+                         ('stop', 'fwd0', 0, 3, 0.2, True))
+        self.assertEqual(self.docker.calls[-2][:3], ['docker', 'kill', '--signal=TERM'])
+        self.assertEqual(self.docker.calls[-1][:4], ['docker', 'stop', '-t', '3'])
+        self.assertIn('fwd0', f.registry['fault_targets'])
+        with self.assertRaisesRegex(Inconclusive, 'polite stop exited 143'):
+            f.stop('fwd1')
+        self.assertEqual(f.registry['faults'][-1]['exit_code'], 143)        # the witness is recorded before the verdict
+        self.assertEqual(f.stop('bridge0')['bound_s'], 10)
+        with self.assertRaisesRegex(Inconclusive, 'polite stop exited 137'):
+            f.stop('bridge1')                                                # never exits on SIGTERM: killed at 10 s
+        self.assertEqual(f.registry['faults'][-1]['elapsed_s'], 10)
+        w = f.stop('me0')                                                    # 20.1 line 4: 15 s bound, then kill, 137 kept
+        self.assertEqual((w['exit_code'], w['bound_s'], w['escalated_to_kill']), (137, 15, True))
+        self.assertIn('me0', f.registry['last_kill'])                        # the 12.5 s AE rule sees an escalated stop
+        self.assertEqual(f.stop('ae0')['exit_code'], 0)
+        self.assertNotIn('ae0', f.registry.get('last_kill', {}))
+        with self.assertRaisesRegex(Inconclusive, 'not running'):
+            f.stop('fwd0')
+        for bad in (('probe',), ('fwd1', 'KILL'), ('fwd1', 'STOP')):
+            with self.subTest(bad=bad), self.assertRaises(Violation):
+                f.stop(*bad)
+
+
+class ReplaceSlotTest(V4Base):
+    def test_replace_slot_records_both_shas_refuses_same_binary_and_closes_the_fault_row(self):
+        f = self.fx()
+        f.slots['fwd0'] = {'state': 'STARTED', 'artifact': 'forwarder'}
+        self.docker.polite.update(fwd0=(0, 0.1))
+        with self.assertRaisesRegex(Violation, 'replace_slot needs the slot stopped'):
+            f.replace_slot('fwd0', 'forwarder_b')
+        (f.root / 'state' / 'fwd0' / 'old.txt').write_text('gen0')
+        f.stop('fwd0')
+        self.health = {'aeConnected': True, 'build': 'b' * 40}
+        w = f.replace_slot('fwd0', 'forwarder_b')
+        a, b = f.m['artifacts']['forwarder'], f.m['artifacts']['forwarder_b']
+        self.assertEqual(w['old'], {'artifact': 'forwarder', 'sha256': a['sha256'], 'source_sha': a['source_sha']})
+        self.assertEqual(w['new'], {'artifact': 'forwarder_b', 'sha256': b['sha256'], 'source_sha': b['source_sha']})
+        self.assertEqual((w['kind'], w['build_health'], w['f7_rejected']), ('replace_slot', 'b' * 40, 0))
+        self.assertIn('ready_after_s', w)
+        self.assertEqual((f.root / 'state' / 'fwd0.gen1' / 'old.txt').read_text(), 'gen0')   # evidence kept
+        self.assertTrue((f.root / 'state' / 'fwd0').is_dir())
+        self.assertIn('c-fwd0', self.docker.removed)
+        self.assertTrue((f.root / 'logs' / 'fwd0.gen1.log').read_text().startswith('log of c-fwd0'))
+        self.assertEqual(f.registry['slot_override']['fwd0'], 'forwarder_b')
+        self.assertEqual(f.slots['fwd0']['artifact'], 'forwarder_b')
+        self.assertEqual(f.registry['slots']['fwd0']['artifact'], 'forwarder_b')
+        create = [c for c in self.docker.calls if c[:2] == ['docker', 'create']][-1]
+        self.assertIn('exec /artifacts/forwarder_b/bin', create[-1])
+        self.assertNotIn('fwd0', f.registry['fault_targets'])                # closed on /ready 200
+        f.stop('fwd0')
+        with self.assertRaisesRegex(Violation, 'replace_slot with the same binary is not a swap'):
+            f.replace_slot('fwd0', 'forwarder_b')
+        w = f.replace_slot('fwd0', 'forwarder')                              # back to A: gen2
+        self.assertTrue((f.root / 'state' / 'fwd0.gen2').is_dir())
+        self.assertEqual(w['old']['artifact'], 'forwarder_b')
+        self.docker.polite.update(fwd1=(0, 0.1)); f.stop('fwd1')
+        for artifact, text in (('bridge_b', 'absent from the manifest'), ('bridge', 'cannot run'), ('nope', 'absent from the manifest')):
+            with self.subTest(artifact=artifact), self.assertRaisesRegex(Violation, text):
+                f.replace_slot('fwd1', artifact)
+
+    def test_replace_slot_after_kill_restarts_once_after_the_session_window(self):
+        f = self.fx()
+        f.kill('fwd1'); killed_at = self.clock.now
+        self.docker.start_exits['fwd1'] = [78, None]                        # F-S16-11: REJECTED registration, exit 78
+        w = f.replace_slot('fwd1', 'forwarder_b', after_kill=True)
+        self.assertEqual(w['f7_rejected'], 1)
+        starts = [c for c in self.docker.calls if c[:2] == ['docker', 'start'] and c[2] == 'c-fwd1']
+        self.assertEqual(len(starts), 2)
+        self.assertGreaterEqual(self.clock.now - killed_at, core_fixture.SESSION_WINDOW_S)
+        self.assertTrue(any(p.name.startswith('fwd1.gen1-f7') for p in (f.root / 'logs').iterdir()))
+        self.assertNotIn('fwd1', f.registry['fault_targets'])
+        self.assertEqual(w['ready_after_kill_bound_s'], core_fixture.READY_AFTER_KILL_S)
+        # a polite stop leaves no kill witness: after_kill is refused (the kill witness belonged to the replaced container)
+        self.docker.polite.update(fwd1=(0, 0.1)); f.stop('fwd1')
+        with self.assertRaisesRegex(Violation, 'after_kill needs a kill witness'):
+            f.replace_slot('fwd1', 'forwarder', after_kill=True)
+
+    def test_replace_slot_refuses_a_replacement_that_exits(self):
+        f = self.fx()
+        self.docker.polite.update(fwd0=(0, 0.1)); f.stop('fwd0')
+        self.docker.start_exits['fwd0'] = [1]
+        with self.assertRaisesRegex(Inconclusive, 'replacement fwd0 exited 1'):
+            f.replace_slot('fwd0', 'forwarder_b')
+
+
+class WipeEngineTest(V4Base):
+    def test_wipe_engine_refuses_a_running_member(self):
+        f = self.fx()
+        state = f.root / 'state' / 'me0'
+        (state / 'state' / 'archive').mkdir(parents=True)
+        (state / 'state' / 'archive' / 'rec.dat').write_bytes(b'x' * 100); (state / 'aeronmd.pid').write_text('9\n')
+        with self.assertRaisesRegex(Violation, 'wipe_engine refuses a running member'):
+            f.wipe_engine('me0')
+        self.assertTrue((state / 'aeronmd.pid').exists())
+        f.stop('me0')
+        w = f.wipe_engine('me0')
+        self.assertEqual((w['kind'], w['target'], w['bytes_removed'], w['files_removed']), ('wipe_engine', 'me0', 102, 2))
+        self.assertIn('state/archive/rec.dat', w['listing_before'])
+        self.assertTrue(state.is_dir()); self.assertEqual(list(state.iterdir()), [])
+        self.assertIn('me0', f.registry['fault_targets'])
+        with self.assertRaises(Violation):
+            f.wipe_engine('fwd0')
+
+
+class ResetProjectionTest(V4Base):
+    def test_reset_projection_dumps_before_drop(self):
+        m = ext_manifest(self.dir)
+        jar = Path(self.dir) / 'projector-mig.jar'
+        with zipfile.ZipFile(jar, 'w') as z:
+            z.writestr('db/migration/V1__money.sql', 'CREATE TABLE money_journal (journal_seq bigint);')
+        m['artifacts']['projector']['path'] = str(jar)
+        f = self.fx(m)
+        f.registry.update(lives={'1': {'core': {'genesis_id': '0x1'}}})
+        self.docker.polite.update(projector=(0, 0.3))
+        calls = []
+        dump = f.root / 'lives' / 'life-1' / 'money_journal.pg.jsonl'
+
+        def psql(db, sql):
+            calls.append((db, sql))
+            if sql.startswith('DROP DATABASE'):
+                self.assertTrue(dump.exists() and dump.read_text().count('\n') == 3, 'dump written before the drop')
+            if 'information_schema.tables' in sql:
+                return '["money_journal", "money_journal_leg"]'
+            if 'FROM "money_journal" t' in sql:
+                return '[{"journal_seq": 1}, {"journal_seq": 2}]'
+            if 'FROM "money_journal_leg" t' in sql:
+                return '[{"journal_seq": 1, "leg_no": 0}]'
+            return ''
+        f.psql = psql
+        w = f.reset_projection()
+        sqls = [s for _, s in calls]
+        drop = next(i for i, s in enumerate(sqls) if s.startswith('DROP DATABASE r01_money'))
+        self.assertLess(max(i for i, s in enumerate(sqls) if ' t' in s and 'json_agg' in s), drop)
+        self.assertEqual(sqls[drop + 1], 'CREATE DATABASE r01_money')
+        self.assertIn('CREATE TABLE money_journal', sqls[-1])               # packaged migrations re-applied
+        self.assertEqual((w['kind'], w['life'], w['tables']), ('reset_projection', 1, {'money_journal': 2, 'money_journal_leg': 1}))
+        self.assertEqual(json.loads(dump.read_text().splitlines()[0]), {'table': 'money_journal', 'row': {'journal_seq': 1}})
+        stop = [c for c in self.docker.calls if c[:3] == ['docker', 'stop', '-t']][-1]
+        self.assertEqual(stop[-1], 'c-projector')
+
+
+G1 = hex(1 | 1)
+
+
+def life1(f):
+    """The registry after a life-1 genesis (fixture.genesis on a plan)."""
+    g1 = f.genesis_id(1)
+    f.registry.update(lives={'1': {'me': {'genesis_id': g1}, 'core': {'genesis_id': g1}}},
+                      boot={'started_ns': 0, 'phases': {}}, tap={'path': str(f.root / 'state/probe/tap-life1.jsonl')},
+                      funding=[{'kind': 'deposit', 'user': 1}], genesis={'genesis_id': g1}, genesis_snapshot={'verified': True},
+                      risk={'1': {}})
+    return g1
+
+
+class RegenesisTest(V4Base):
+    CORE_STEPS = ['snapshot_genesis', 'start_tap_witness', 'arm_money_journal', 'start_projector', 'start_bridges',
+                  'core_genesis', 'configure_risk', 'fund', 'verify_funded', 'start_forwarders']
+
+    def recorded(self, f, names):
+        calls = []
+        for name in names:
+            setattr(f, name, lambda *a, name=name, **k: calls.append((name,) + a) or {'kind': name})
+        return calls
+
+    def test_genesis_id_per_life_is_odd_and_distinct(self):
+        f = self.fx()
+        ids = [f.genesis_id(n) for n in (1, 2, 3, 4)]
+        self.assertEqual(ids[0], hex(f.m['seed'] | 1)); self.assertEqual(f.genesis_id(), ids[0])
+        self.assertEqual(ids[1], hex((f.m['seed'] | 1) + 2))
+        self.assertTrue(all(int(i, 16) % 2 == 1 for i in ids)); self.assertEqual(len(set(ids)), 4)
+        with self.assertRaises(Violation):
+            f.genesis_id(0)
+
+    def test_regenesis_me_uses_a_new_odd_genesis_id(self):
+        f = self.fx(); g1 = life1(f)
+        calls = self.recorded(f, ['stop', 'wipe_engine', 'start_members'])
+        driven = []
+        f._driver = lambda key, main, *args, **kw: driven.append((key, main) + args)
+        w = f.regenesis({'ledger_capacity': 2000}, 'me')
+        g2 = hex(int(g1, 16) + 2)
+        self.assertEqual([c[:2] for c in calls], [('stop', 'me0'), ('stop', 'me1'), ('stop', 'me2'), ('wipe_engine', 'me0'),
+                                                  ('wipe_engine', 'me1'), ('wipe_engine', 'me2'), ('start_members', 'me')])
+        self.assertEqual(driven[0][2], 'genesis'); self.assertEqual(driven[0][5], g2); self.assertEqual(driven[0][6], 2000)
+        self.assertEqual(f.registry['lives']['2']['me']['genesis_id'], g2)
+        self.assertEqual(f.life('me'), 2); self.assertEqual(f.life('core'), 1)       # the core is still bound to g1
+        self.assertEqual((w['kind'], w['scope'], w['life'], w['genesis_id']), ('regenesis', 'me', 2, g2))
+        for fwd in ('fwd0', 'fwd1'):         # they exit 78 (F8_EPOCH) during the ME start: registered, not unexpected
+            self.assertIn(fwd, f.registry['fault_targets'])
+        self.assertIn('me_genesis_ns', f.registry['boot']['lives']['2']['me_phases'])
+        with self.assertRaisesRegex(Violation, 'scope'):
+            f.regenesis({}, 'both')
+
+    def test_regenesis_core_runs_every_phase_on_a_new_life(self):
+        f = self.fx(); g1 = life1(f)
+        g2 = hex(int(g1, 16) + 2)
+        f.registry['lives']['2'] = {'me': {'genesis_id': g2}}
+        f.registry['boot']['lives'] = {'2': {'me_phases': {}}}
+        self.docker.state['c-fwd0'].update(Running=False, ExitCode=78)
+        self.docker.state['c-fwd1'].update(Running=False, ExitCode=78)
+        calls = self.recorded(f, ['stop', 'wipe_engine', 'reset_projection', 'start_members'] + self.CORE_STEPS)
+        w = f.regenesis({'users': [1]}, 'core')
+        names = [c[:2] if c[0] in ('stop', 'wipe_engine', 'start_members') else c[:1] for c in calls]
+        self.assertEqual(names, [('stop', 'bridge0'), ('stop', 'bridge1'), ('stop', 'ae0'), ('stop', 'ae1'), ('stop', 'ae2'),
+                                 ('wipe_engine', 'ae0'), ('wipe_engine', 'ae1'), ('wipe_engine', 'ae2'), ('reset_projection',),
+                                 ('start_members', 'ae')] + [(s,) for s in self.CORE_STEPS])
+        phases = f.registry['boot']['lives']['2']['phases']
+        core_fixture.check_genesis_order(phases, expected=core_fixture.LIFE2_CORE_PHASES)
+        self.assertNotIn('me_genesis_ns', phases)
+        self.assertEqual(f.registry['lives']['2']['core']['genesis_id'], g2); self.assertEqual(f.life('core'), 2)
+        self.assertEqual(f.registry['genesis']['genesis_id'], g2)
+        self.assertEqual(f.registry['lives']['1']['records']['funding'], [{'kind': 'deposit', 'user': 1}])  # life 1 kept
+        self.assertEqual(w['forwarders_exited'], {'fwd0': 78, 'fwd1': 78})
+        # the forwarders already exited (A04): recorded, not stopped; a Running forwarder is stopped
+        f2 = self.fx(); life1(f2); f2.registry['lives']['2'] = {'me': {'genesis_id': g2}}
+        calls = self.recorded(f2, ['stop', 'wipe_engine', 'reset_projection', 'start_members'] + self.CORE_STEPS)
+        f2.regenesis({}, 'core')
+        self.assertEqual([c[1] for c in calls if c[0] == 'stop'][:2], ['fwd0', 'fwd1'])
+
+    def test_regenesis_core_needs_an_me_regenesis_first(self):
+        f = self.fx(); life1(f)
+        with self.assertRaisesRegex(Violation, 'regenesis core needs the ME re-genesis of life 2 first'):
+            f.regenesis({}, 'core')
+
+    def test_regenesis_never_respawns_an_existing_container(self):
+        f = self.fx(); life1(f)
+        for role in ('projector', 'bridge0', 'bridge1', 'fwd0', 'fwd1'):
+            self.docker.state['c-' + role].update(Running=False, ExitCode=0)
+        f.spawn = lambda *a, **k: self.fail('spawn of an existing container: ' + a[0])
+        restarted = []
+        f.restart = lambda name, **kw: restarted.append(name) or {'kind': 'restart', 'target': name}
+        f.registry['slots'] = {}
+        for step in ('start_projector', 'start_bridges', 'start_forwarders'):
+            getattr(f, step)({})
+        self.assertEqual(restarted, ['projector', 'bridge0', 'bridge1', 'fwd0', 'fwd1'])
+        self.assertEqual(f.slots['bridge0']['state'], 'STARTED'); self.assertEqual(f.slots['fwd1']['artifact'], 'forwarder')
+        self.assertEqual(f.slots['shadow0']['state'], 'RESERVED')
+
+    def test_check_genesis_order_accepts_life2_without_me_genesis(self):
+        life2 = {'genesis_snapshot_ns': 1, 'tap_started_ns': 2, 'bridges_ready_ns': 4, 'core_bound_ns': 5,
+                 'first_deposit_ns': 6, 'funded_ns': 7, 'forwarders_ready_ns': 8}
+        core_fixture.check_genesis_order(life2, expected=core_fixture.LIFE2_CORE_PHASES)
+        with self.assertRaisesRegex(Violation, 'genesis phase missing: me_genesis_ns'):
+            core_fixture.check_genesis_order(life2)
+        with self.assertRaisesRegex(Violation, 'genesis snapshot after money moved'):
+            core_fixture.check_genesis_order(dict(life2, first_deposit_ns=0), expected=core_fixture.LIFE2_CORE_PHASES)
+
+
+class PerLifeTapTest(V4Base):
+    def test_tap_files_are_per_life(self):
+        f = self.fx()
+        path = f.start_tap(1000, life=2)
+        script = self.docker.calls[-1][-1]
+        for text in ('out=/data/tap-life2.jsonl', 'sessions=/data/tap-life2.sessions.jsonl', '> /data/tap-life2.out',
+                     '2> /data/tap-life2.err', 'duration_ms=1000'):
+            self.assertIn(text, script)
+        self.assertEqual(path, f.root / 'state' / 'probe' / 'tap-life2.jsonl')
+        probe = f.root / 'state' / 'probe'
+        (probe / 'tap-life2.out').write_text('TAP first=1 last=3 rows=3 gaps=[]\n'
+                                             '{"verb": "tap", "rows": 3, "sessions_file": "/data/tap-life2.sessions.jsonl"}\n')
+        (probe / 'tap-life2.sessions.jsonl').write_text('{"event": "registered", "at_ms": 1}\n')
+        summary = f.read_tap_summary(2)
+        self.assertEqual((summary['line'][:11], summary['transitions'][0]['event']), ('TAP first=1', 'registered'))
+        with self.assertRaisesRegex(Inconclusive, 'no TAP density line'):
+            f.read_tap_summary(1)
+        # start_tap_witness on life 2: the record lives under lives[2]; registry['tap'] is the current life's
+        f.registry['lives'] = {'1': {'core': {}}, '2': {'core': {}}}
+        f.wait_tap_registered = lambda path, started_ns, **kw: {'at_ms': 5, 'leader': 1, 'sessions': kw.get('sessions')}
+        f.start_tap_witness({'tap_ms': 2000})
+        self.assertEqual(f.registry['tap']['path'], str(probe / 'tap-life2.jsonl'))
+        self.assertIs(f.registry['lives']['2']['tap'], f.registry['tap'])
+        self.assertEqual(f.registry['tap']['life'], 2)
+
+    def test_wait_tap_registered_reads_the_life_sessions_file(self):
+        f = self.fx(); f.sleep = lambda s: None
+        probe = f.root / 'state' / 'probe'
+        started = time.time_ns()
+        (probe / 'tap-life2.sessions.jsonl').write_text(json.dumps({'event': 'registered', 'at_ms': started // 1_000_000,
+                                                                    'leader': 2}) + '\n')
+        note = f.wait_tap_registered(probe / 'tap-life2.jsonl', started, bound_s=0, sessions=probe / 'tap-life2.sessions.jsonl')
+        self.assertEqual(note['leader'], 2)
+
+
+class FundRowsTest(V4Base):
+    def test_fund_rows_records_gate_state_for_m9(self):
+        f = self.fx()
+        tap = f.root / 'state' / 'probe' / 'tap-life1.jsonl'
+        tap.write_text(json.dumps({'tap': 'admission', 'row': {'market': 0, 'state': 'SUSPENDED', 'reason': 'BRIDGE_HALT'}}) + '\n')
+        f.registry.update(tap={'path': str(tap)}, funding=[{'kind': 'deposit', 'request': [2, 1], 'user': 1, 'asset': 0,
+                                                            'amount': 5, 'outcome': 'ACK', 'gate': 'OPEN'}])
+        answers = iter([('ANSWERED', {'replies': [{'t': 'DepositAck'}]}), ('REFUSED', {'replies': [{'t': 'WithdrawReject'}]}),
+                        ('UNKNOWN', None)])
+        seen = []
+
+        def core(verb, principal, **kw):
+            seen.append((verb, principal, kw)); return next(answers)
+        f.core = core
+        rows = f.fund_rows([{'kind': 'deposit', 'user': 7, 'asset': 0, 'amount': 10},
+                            {'kind': 'withdraw', 'user': 7, 'asset': 0, 'amount': 3},
+                            {'kind': 'withdraw', 'user': 8, 'asset': 1, 'amount': 4}])
+        self.assertEqual([r['outcome'] for r in rows], ['ACK', 'REJECT', 'UNKNOWN'])
+        self.assertEqual([s[:2] for s in seen], [('deposit', 'probe-tool'), ('withdraw', 'probe-tool'), ('withdraw', 'probe-tool')])
+        self.assertEqual(len(f.registry['funding']), 4)                  # appended to the genesis rows
+        self.assertEqual({r['gate'] for r in rows}, {'SUSPENDED'})
+        self.assertEqual(rows[0]['gate_witness'], {'source': 'tap', 'row': {'market': 0, 'state': 'SUSPENDED', 'reason': 'BRIDGE_HALT'}})
+        requests = [tuple(r['request']) for r in f.registry['funding']]
+        self.assertEqual(len(set(requests)), 4)                          # never reuses a request id
+        self.assertTrue(all(r['phase'] == 'drill' for r in rows))
+        with self.assertRaises(Violation):
+            f.fund_rows([{'kind': 'transfer', 'user': 1, 'asset': 0, 'amount': 1}])
+
+
+class EngineRestartRuleTest(V4Base):
+    def test_ae_restart_waits_after_driver_death_exit(self):
+        f = self.fx()
+        self.docker.state['c-ae0'].update(Running=False, ExitCode=1)
+        f.wait_exit('ae0', 1, 18)
+        self.assertIn('ae0', f.registry['last_kill'])
+        self.clock.now += 3.0
+        w = f.restart('ae0')
+        self.assertAlmostEqual(sum(self.clock.sleeps), 9.5, places=2)
+        self.assertGreaterEqual(w['waited_after_kill_s'], core_fixture.AE_RESTART_MIN_AFTER_KILL_S)
+
+    def test_wait_exit_accepts_nonzero(self):
+        f = self.fx()
+        self.docker.state['c-me0'].update(Running=False, ExitCode=139)
+        self.assertEqual(f.wait_exit('me0', 'nonzero', 18)['exit_code'], 139)
+        self.docker.state['c-ae1'].update(Running=False, ExitCode=0)
+        with self.assertRaisesRegex(Inconclusive, 'ae1 exited 0, expected nonzero'):
+            f.wait_exit('ae1', 'nonzero', 18)
+
+    def boot(self, m):
+        f = self.fx(m, roles=())
+        f.registry['network_id'] = 'net'
+        for name in ('check_image', 'stage_artifacts', 'start_network', 'start_database', 'arm_money_journal', 'start_projector'):
+            setattr(f, name, lambda *a, **k: None)
+        f.start_slot = lambda slot: {'state': 'SKIPPED_ABSENT'}
+        self.docker.stale_driver = getattr(self, 'stale_boot', False)     # every cnc.dat mtime the same: a driver that never changes
+        f.start()
+        return f
+
+    def test_engine_restart_requires_new_driver_identity(self):
+        self.stale_boot = True
+        f = self.boot(ext_manifest(self.dir))
+        self.assertEqual(sorted(f.registry['driver_identity']), sorted(core_contracts.ENGINES))
+        self.docker.state['c-ae1'].update(Running=False, ExitCode=1)
+        with self.assertRaisesRegex(Inconclusive, 'ae1 driver identity did not change'):
+            f.restart('ae1')
+        self.docker.stale_driver = False
+        self.docker.state['c-me2'].update(Running=False, ExitCode=1)
+        self.assertIn('driver', f.restart('me2'))
+        embedded = self.boot(ext_manifest(self.dir, engines='embedded'))
+        self.assertFalse(set(embedded.registry.get('driver_identity', {})) & set(core_contracts.ENGINES))
+
+    def test_engine_driver_pidfile(self):
+        f = self.fx()
+        self.assertEqual(f.engine_driver_pidfile('ae1'), '/data/aeronmd.pid')
+        with self.assertRaises(Violation):
+            self.fx(ext_manifest(self.dir, engines='embedded')).engine_driver_pidfile('ae1')
+
+
+class EngineExternalProfileTest(V4Base):
+    def test_engine_wrapper_in_external_mode_starts_aeronmd_with_the_pinned_properties_before_java(self):
+        f = self.fx(roles=())
+        f.registry['network_id'] = 'net'
+        for name in ('check_image', 'stage_artifacts', 'start_network', 'start_database', 'arm_money_journal', 'start_projector'):
+            setattr(f, name, lambda *a, **k: None)
+        f.start_slot = lambda slot: {'state': 'SKIPPED_ABSENT'}
+        f.start()
+        create = {c[c.index('--name') + 1].rsplit('-', 1)[-1]: c for c in self.docker.calls if c[:2] == ['docker', 'create']}
+        for role in core_contracts.ENGINES:
+            argv = create[role]
+            entry = argv[argv.index('--entrypoint') + 1]
+            with self.subTest(role=role):
+                self.assertEqual((entry, argv[-2]), ('sh', '-c'))      # a693555: --entrypoint java ... -jar
+                script = argv[-1]
+                d = '/dev/shm/aeron-' + role
+                order = ['rm -rf ' + d, 'mkdir -p ' + d,
+                         'LD_LIBRARY_PATH=/artifacts/engine_libs /artifacts/engine_libs/aeronmd '
+                         '/artifacts/engine_libs/driver.properties /artifacts/engine_libs/driver-dev.properties',
+                         'echo $! > /data/aeronmd.pid', d + '/cnc.dat', 'exec java']
+                positions = [script.index(t) for t in order]
+                self.assertEqual(positions, sorted(positions))
+                self.assertIn('AERON_DIR=%s AERON_DIR_DELETE_ON_SHUTDOWN=1 AERON_DIR_DELETE_ON_START=1' % d, script)
+                self.assertIn('-jar /artifacts/%s.jar' % role[:2], script)
+                env = {a.split('=', 1)[0]: a.split('=', 1)[1] for a, p in zip(argv[1:], argv) if p == '--env'}
+                self.assertEqual((env['TRANSPORT_DRIVER_MODE'], env['AERON_DIR']), ('external', d))
+        # the dev profile keeps the plain embedded engines (D-S15-4)
+        f2 = self.fx(ext_manifest(self.dir, engines='embedded'), roles=())
+        self.assertEqual(f2.engine_command('me', 1), core_fixture.JAVA + ['-jar', '/artifacts/me.jar'])
+        self.assertEqual(f2.engine_env('me', 1)['TRANSPORT_DRIVER_MODE'], 'embedded')
+        self.assertNotIn('AERON_DIR', f2.engine_env('me', 1))
+        assert_production_timeouts(f.engine_env('ae', 2), f.allowed_env())
+
+    def run_engine_wrapper(self, fake_driver, ticks=300, skip=()):
+        import subprocess
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for d in ('artifacts/engine_libs', 'data', 'shm', 'bin'):
+                (root / d).mkdir(parents=True)
+            (root / 'artifacts/engine_libs/aeronmd').write_text(fake_driver)
+            (root / 'bin/java').write_text('#!/bin/sh\necho "JAVA $* cnc=$([ -f "$AERON_DIR/cnc.dat" ] && echo yes)"\n')
+            for p in ((root / 'artifacts/engine_libs/aeronmd'), (root / 'bin/java')):
+                p.chmod(0o755)
+            f = self.fx(roles=()); f.engine_driver_skip = tuple(skip)
+            script = f.engine_command('ae', 0)[2]
+            script = (script.replace('/artifacts/', str(root / 'artifacts') + '/').replace('/data/', str(root / 'data') + '/')
+                      .replace('/dev/shm/', str(root / 'shm') + '/').replace('-lt 300', '-lt %d' % ticks))
+            env = dict(os.environ, PATH=str(root / 'bin') + ':' + os.environ['PATH'], AERON_DIR=str(root / 'shm/aeron-ae0'))
+            run = subprocess.run(['sh', '-c', script], capture_output=True, text=True, timeout=20, env=env)
+            args = (root / 'data' / 'driver-args').read_text() if (root / 'data' / 'driver-args').exists() else ''
+            return run, args
+
+    def test_engine_wrapper_runs_the_driver_then_execs_java(self):
+        fake = ('#!/bin/sh\necho "$*" > "$(dirname "$0")/../../data/driver-args"\n'
+                'touch "$AERON_DIR/cnc.dat"; sleep 1\n')
+        run, args = self.run_engine_wrapper(fake)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn('JAVA', run.stdout); self.assertIn('-jar', run.stdout); self.assertIn('cnc=yes', run.stdout)
+        self.assertTrue(args.strip().endswith('engine_libs/driver.properties ' + args.split()[-1]))
+        self.assertTrue(args.split()[-1].endswith('engine_libs/driver-dev.properties'))
+        run, _ = self.run_engine_wrapper('#!/bin/sh\nexit 3\n', ticks=3)
+        self.assertEqual(run.returncode, 1); self.assertIn('aeronmd did not come up', run.stderr); self.assertNotIn('JAVA', run.stdout)
+
+    def test_engine_driver_skip_starts_java_without_a_driver(self):
+        run, args = self.run_engine_wrapper('#!/bin/sh\necho ran > "$(dirname "$0")/../../data/driver-args"\n', skip=('ae0',))
+        self.assertEqual((run.returncode, args), (0, ''))
+        self.assertIn('JAVA', run.stdout); self.assertIn('cnc=', run.stdout)
+        f = self.fx(roles=()); f.engine_driver_skip = ('ae0', 'me0')
+        self.assertNotIn('aeronmd', f.engine_command('ae', 0)[2]); self.assertIn('aeronmd', f.engine_command('ae', 1)[2])
+
+    def test_engine_libs_are_staged_with_their_modes(self):
+        m = ext_manifest(self.dir)
+        f = fixture_for(m, self.dir)
+        f.stage_artifacts()
+        mode = lambda name: os.stat(f.root / 'artifacts' / 'engine_libs' / name).st_mode & 0o777
+        self.assertEqual(mode('aeronmd'), 0o755)
+        for name in ('libaeron.so', 'libaeron_driver.so', 'driver.properties', 'driver-dev.properties'):
+            self.assertEqual(mode(name) & 0o111, 0, name)
+        self.assertEqual((f.root / 'artifacts' / 'engine_libs' / 'driver.properties').read_text(), DP_TEXT)
+
+
+class FaultTargetsV4Test(V4Base):
+    def test_stopped_wiped_and_replaced_roles_do_not_abort_other_waits(self):
+        f = self.fx()
+        f.wait_http = types.MethodType(fixture_module.Fixture.wait_http, f)
+        with mock.patch.object(fixture_module.time, 'sleep', lambda s: None):
+            self.docker.polite.update(fwd0=(0, 0.1)); f.stop('fwd0')
+            f.stop('me0'); f.wipe_engine('me0')
+            self.assertEqual(f.wait_http('fwd1', 9700, '/ready')['status'], 200)
+            # regenesis('me'): the forwarders exit 78 on their own while the fresh ME starts
+            life1(f)
+            for name in ('stop', 'wipe_engine'):
+                setattr(f, name, lambda *a, **k: None)
+            f._driver = lambda *a, **k: None
+            def members(engine):
+                for role in ('fwd1',):
+                    self.docker.state['c-' + role].update(Running=False, ExitCode=78)
+                return f.wait_http('me1', 19500, '/ready')
+            f.start_members = members
+            f.regenesis({}, 'me')
+        self.assertEqual(f.registry['fault_targets']['fwd1']['reason'], 'regenesis me: F8 epoch fence expected')
 
 
 if __name__ == '__main__':

@@ -4,6 +4,7 @@ import copy
 import hashlib
 from pathlib import Path
 import tempfile
+import types
 import unittest
 
 from contracts import Inconclusive, Violation
@@ -141,6 +142,156 @@ class ManifestV3Test(unittest.TestCase):
         for never in ('T1_BRIDGE_KEY', 'T1_TAP_KEY', 'T1_ME_FORWARDER_KEY'):
             self.assertNotIn(never, core_contracts.PROBE_ENV)
         self.assertFalse(core_contracts.PROBE_ENV & core_contracts.PROCESS_ENV)
+
+
+
+# ======================================================================================================
+# RC2 S16 W1 (contract 5.2, 5.3; 20.1 lines 2 and 11): engine driver profile, build B and the control guards.
+# ======================================================================================================
+
+import json
+import os
+from unittest import mock
+
+import core_drills
+from test_core_fixture import DEV_TEXT, DP_TEXT, engine_libs, ext_manifest, slot_manifest
+
+REAL_DP = Path(__file__).resolve().parents[2] / 'match-s13wt' / 'deploy' / 'media-driver' / 'driver.properties'
+
+
+class EngineDriverManifestTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.dir = self.temp.name
+        self.path = Path(self.dir) / 'manifest.json'
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def check(self, m, path=None):
+        validate_core_manifest(m, path or self.path, cpu_count=24)
+
+    def bad(self, m, text, error=Violation, path=None):
+        with self.assertRaises(error) as caught:
+            self.check(m, path)
+        self.assertIn(text, str(caught.exception))
+
+    def test_engine_driver_values_and_complete_engine_libs(self):
+        self.check(ext_manifest(self.dir))
+        self.check(ext_manifest(self.dir, engines='embedded'))
+        m = slot_manifest(self.dir); self.check(m)                       # absent = embedded (dev default)
+        self.bad(dict(ext_manifest(self.dir), engine_driver='java'), 'engine_driver must be embedded or external')
+        m = ext_manifest(self.dir); m.pop('engine_libs')
+        self.bad(m, 'engine_driver external needs engine_libs')
+        for name in ('aeronmd', 'driver.properties', 'driver-dev.properties', 'libaeron.so'):
+            m = ext_manifest(self.dir); m['engine_libs'].pop(name)
+            with self.subTest(missing=name):
+                self.bad(m, 'engine_libs must be exactly')
+        m = ext_manifest(self.dir); m['engine_libs']['aeronmd'].pop('exec')
+        self.bad(m, 'engine_libs aeronmd must be exec')
+        m = ext_manifest(self.dir, engines='embedded'); m['engine_libs'] = engine_libs(self.dir)
+        self.bad(m, 'engine_libs without engine_driver external')
+        m = ext_manifest(self.dir); Path(m['engine_libs']['libaeron.so']['path']).write_bytes(b'tampered')
+        self.bad(m, 'engine_libs changed: libaeron.so')
+
+    def test_engine_libs_properties_match_the_embedded_overrides(self):
+        core_contracts.check_driver_properties(DP_TEXT, DEV_TEXT)
+        drifts = [('aeron.mtu.length=8192', 'aeron.mtu.length=1408'), ('aeron.term.buffer.length=16m', 'aeron.term.buffer.length=64m'),
+                  ('aeron.term.buffer.sparse.file=false', 'aeron.term.buffer.sparse.file=true'),
+                  ('aeron.client.liveness.timeout=5s', 'aeron.client.liveness.timeout=10s'),
+                  ('aeron.publication.unblock.timeout=10s', 'aeron.publication.unblock.timeout=15s'),
+                  ('aeron.ipc.term.buffer.length=16m\n', '')]
+        for old, new in drifts:
+            with self.subTest(drift=new or 'missing ' + old), self.assertRaisesRegex(Violation, 'driver.properties drifts from the embedded'):
+                core_contracts.check_driver_properties(DP_TEXT.replace(old, new), DEV_TEXT)
+        # units are normalised: 16777216 is 16m, 5000ms is 5s
+        core_contracts.check_driver_properties(DP_TEXT.replace('=16m', '=16777216').replace('liveness.timeout=5s', 'liveness.timeout=5000ms'), DEV_TEXT)
+        with self.assertRaisesRegex(Violation, 'driver-dev.properties may set only'):
+            core_contracts.check_driver_properties(DP_TEXT, DEV_TEXT + 'aeron.mtu.length=1408\n')
+        with self.assertRaisesRegex(Violation, 'aeron.threading.mode=SHARED'):
+            core_contracts.check_driver_properties(DP_TEXT, DEV_TEXT.replace('SHARED', 'DEDICATED'))
+        m = ext_manifest(self.dir)
+        Path(m['engine_libs']['driver.properties']['path']).write_text(DP_TEXT.replace('8192', '1408'))
+        m['engine_libs']['driver.properties']['sha256'] = hashlib.sha256(DP_TEXT.replace('8192', '1408').encode()).hexdigest()
+        self.bad(m, 'driver.properties drifts from the embedded overrides: aeron.mtu.length')
+
+    @unittest.skipUnless(REAL_DP.is_file(), 'the me tree is not checked out beside tools')
+    def test_the_real_driver_properties_pass(self):
+        core_contracts.check_driver_properties(REAL_DP.read_text(), DEV_TEXT)
+
+    def b_manifest(self, kind, target):
+        m = ext_manifest(self.dir)
+        m['artifacts']['forwarder_b']['target'] = target
+        m['manifest_kind'] = kind
+        return m, Path(self.dir) / (kind + '--r1.json')
+
+    def test_a05_manifest_refuses_a_negative_build_as_build_b(self):
+        m, path = self.b_manifest('s16-a05', 'ct-forwarder'); self.check(m, path)
+        m, path = self.b_manifest('s16-a05', 'ct_forwarder_nc_norelease')
+        self.bad(m, 'an A05 manifest stages the negative build ct_forwarder_nc_norelease as forwarder_b', path=path)
+        m, path = self.b_manifest('s16-a05', 'ct-forwarder'); m['artifacts']['forwarder_b'].pop('target')
+        self.bad(m, 'forwarder_b needs a pinned CMake target', path=path)
+        # scenario-level: core-drill-a05-* refuses it whatever the kind says
+        fx = types.SimpleNamespace(m=self.b_manifest('s16-a05', 'ct_forwarder_nc_norelease')[0])
+        fx.m['slot_artifacts'].update(fwd0='forwarder', fwd1='forwarder')
+        with self.assertRaisesRegex(Violation, 'negative build ct_forwarder_nc_norelease as forwarder_b'):
+            core_drills.scenario(fx, 'core-drill-a05-fwd-upgrade', self.dir)
+        fx.m['artifacts']['forwarder_b']['target'] = 'ct-forwarder'
+        with self.assertRaisesRegex(Inconclusive, 'not implemented'):          # the guard passed; W3 adds the drill
+            core_drills.scenario(fx, 'core-drill-a05-fwd-upgrade', self.dir)
+
+    def test_red_manifest_refuses_a_non_nc_build_b(self):
+        m, path = self.b_manifest('s16-red-a03', 'ct_forwarder_nc_norelease'); self.check(m, path)
+        m, path = self.b_manifest('s16-red-a03', 'ct-forwarder')
+        self.bad(m, 'a RED manifest stages the real build ct-forwarder as forwarder_b', path=path)
+        fx = types.SimpleNamespace(m=self.b_manifest('s16-red-a03', 'ct-forwarder')[0])
+        with self.assertRaisesRegex(Violation, 'real build ct-forwarder as forwarder_b'):
+            core_drills.scenario(fx, 'core-red-a03', self.dir)
+
+    def test_a03_manifest_pins_the_norelease_phase_and_build_a(self):
+        """20.1 line 2 (PO): A03 phase 1 runs ct_forwarder_nc_norelease, then replace_slot swaps to build A."""
+        m, path = self.b_manifest('s16-a03', 'ct_forwarder_nc_norelease'); self.check(m, path)
+        m, path = self.b_manifest('s16-a03', 'ct_forwarder_nc_noresync')
+        self.bad(m, 'an A03 manifest stages ct_forwarder_nc_norelease as forwarder_b', path=path)
+        m, path = self.b_manifest('s16-a03', 'ct_forwarder_nc_norelease'); m['artifacts']['forwarder']['target'] = 'ct_forwarder_nc_noresync'
+        self.bad(m, 'build A forwarder must be a real build', path=path)
+
+    def test_green_kinds_stage_no_build_b(self):
+        m, path = self.b_manifest('s16', 'ct-forwarder')
+        self.bad(m, 'manifest kind s16 stages no build B', path=path)
+
+    def test_manifest_kind_matches_file_name(self):
+        m, _ = self.b_manifest('s16-a05', 'ct-forwarder')
+        self.bad(m, 'manifest kind s16-a05 does not match the file name x.json', path=Path(self.dir) / 'x.json')
+        m['manifest_kind'] = 's16-nope'
+        self.bad(m, 'unknown manifest kind s16-nope', path=Path(self.dir) / 's16-nope--r1.json')
+
+    def test_b_artifact_needs_a_40_hex_source_sha(self):
+        m, path = self.b_manifest('s16-a05', 'ct-forwarder')
+        m['artifacts']['forwarder_b']['source_sha'] = 'abc'
+        self.bad(m, 'missing artifact source commit: forwarder_b', Inconclusive, path=path)
+
+    def test_engine_driver_skip_is_refused_outside_its_control(self):
+        m = ext_manifest(self.dir); m['manifest_kind'] = 's16-ctl-edk-cnctimeout'
+        ok = Path(self.dir) / 's16-ctl-edk-cnctimeout--r1.json'
+        self.assertEqual(core_contracts.check_engine_driver_skip(m, ok, '1'), ('ae0', 'me0'))
+        self.assertEqual(core_contracts.check_engine_driver_skip(m, ok, None), ())
+        for kind in ('s16-ext', 's16'):
+            other = dict(m, manifest_kind=kind)
+            with self.subTest(kind=kind), self.assertRaisesRegex(Violation, 'ENGINE_DRIVER_SKIP is refused outside s16-ctl-edk-cnctimeout'):
+                core_contracts.check_engine_driver_skip(other, Path(self.dir) / (kind + '--r1.json'), '1')
+        with self.assertRaisesRegex(Violation, 'ENGINE_DRIVER_SKIP is refused outside'):
+            core_contracts.check_engine_driver_skip(ext_manifest(self.dir), self.path, '1')
+        with self.assertRaisesRegex(Violation, 'ENGINE_DRIVER_SKIP=1 only'):
+            core_contracts.check_engine_driver_skip(m, ok, 'ae1')
+        embedded = dict(m, engine_driver='embedded')
+        with self.assertRaisesRegex(Violation, 'needs engine_driver external'):
+            core_contracts.check_engine_driver_skip(embedded, ok, '1')
+        # the constructor reads it from the harness environment before touching the box
+        m2 = ext_manifest(self.dir); path = Path(self.dir) / 'm.json'; path.write_text(json.dumps(m2))
+        with mock.patch.dict(os.environ, {'ENGINE_DRIVER_SKIP': '1'}), self.assertRaisesRegex(Violation, 'ENGINE_DRIVER_SKIP'):
+            import core_fixture
+            core_fixture.CoreFixture(path)
+        self.assertFalse(Path(m2['state_root']).exists())
 
 
 if __name__ == '__main__':

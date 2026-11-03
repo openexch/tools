@@ -21,6 +21,7 @@ import re
 import time
 
 from contracts import FP, Inconclusive, Violation, fingerprint
+import core_contracts
 import core_oracle
 import core_scenarios
 import journal_decode
@@ -1523,6 +1524,7 @@ def iceberg_slice_journaled(events, parent):
 
 def scenario(fixture, scenario_name, out_dir):
     """runner.py entry: ``core-drill-<drill>``, ``core-control-<control>``, ``core-red-<1|2|2-negctl>``."""
+    core_contracts.check_build_b(fixture.m, scenario_name)      # RC2 S16 5.2: build B is real, a RED's _b is an nc_ target
     if scenario_name.startswith('core-drill-'):
         name, variant, red = scenario_name[len('core-drill-'):], {}, None
     elif scenario_name.startswith('core-control-'):
