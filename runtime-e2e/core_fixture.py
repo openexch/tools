@@ -54,7 +54,8 @@ GENESIS_ORDER = [('snapshot_genesis', 'genesis_snapshot_ns'), ('start_tap_witnes
                  ('fund', 'funded_ns'), ('verify_funded', 'verified_ns'), ('start_forwarders', 'forwarders_ready_ns')]
 LIFE2_CORE_ORDER = [step for step in GENESIS_ORDER if step[0] != 'me_genesis']
 # RC2 S16 5.1 stop(): the polite-stop bound per role (docker stop -t). Forwarder: exit 0, contract <= 1 s (RUN:465-472);
-# bridge: exit 0 within 10 s (RUN:1768-1770); engines: no exit-code contract until W9, 15 s then kill (20.1 line 4).
+# bridge: exit 0 within 10 s (RUN:1768-1770); engines: 15 s then kill (20.1 line 4) is the escalation bound only; on the W9
+# jars the code and time are judged by the drills' engine_polite_stop line (143 within ENGINE_SHUTDOWN_TIMEOUT_S + slack).
 STOP_BOUND_S = {'forwarder': 3, 'bridge': 10, 'engine': 15, 'projector': 10}
 FORWARDER_STOP_CONTRACT_S = 1.0
 SESSION_WINDOW_S = 10.0          # the core's session timeout a killed forwarder's session outlives it by (F-S16-11)
@@ -1091,7 +1092,8 @@ class CoreFixture(Fixture):
     def stop(self, name, signal='TERM', heal_bound_s=KILL_HEAL_BOUND_S):
         """A polite stop: ``docker kill --signal=TERM`` then ``docker stop -t <bound>`` (which kills at the bound). Forwarder
         and bridge must exit 0 (else INCONCLUSIVE "polite stop exited N", the witness recorded first); an engine's code is
-        recorded (20.1 line 4: no clean SIGTERM until W9, so 137 at 15 s). An escalated stop is a kill and sets last_kill.
+        recorded (20.1 line 4: 137 at 15 s before W9; on the W9 jars 143 in 0.17-0.29 s, judged by the drills'
+        engine_polite_stop line). An escalated stop is a kill and sets last_kill.
         Opens a fault row: the stopped role is a deliberate target until it is restarted or replaced."""
         if signal not in {'TERM', 'INT'}:
             raise Violation('stop sends TERM or INT only (a kill is kill(), a pause is pause())')
@@ -1206,12 +1208,22 @@ class CoreFixture(Fixture):
 
     def wipe_engine(self, role):
         """Empty the member's bind-mounted state dir on the host (CF:243, 261), keeping the directory. The member must not be
-        Running; the witness carries the byte count removed and the listing before."""
+        Running; the witness carries the byte count removed and the listing before. S16 fix round V6: an AE member is the
+        source of the life's money state, so its wipe needs that core life's projection dump on disk with the digest
+        reset_projection recorded (a precondition, never a fallback: no dump, no wipe)."""
         if role not in ENGINES:
             raise Violation('wipe_engine wipes an engine member only: ' + role)
         cid = self._fault_target(role)
         if self.inspect('container', cid)['State']['Running']:
             raise Violation('wipe_engine refuses a running member: ' + role)
+        if role.startswith('ae'):
+            life = self.life('core')
+            dump = (self.registry.get('projection_dumps') or {}).get(str(life))
+            if not dump:
+                raise Violation(f'wipe_engine refuses {role}: no projection dump of core life {life} (reset_projection first)')
+            path = Path(dump['dump'])
+            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != dump['sha256']:
+                raise Violation(f'wipe_engine refuses {role}: the core life {life} projection dump is missing or changed: {path}')
         state = self.root / 'state' / role
         listing, total = {}, 0
         for path in sorted(state.rglob('*')):
@@ -1256,6 +1268,8 @@ class CoreFixture(Fixture):
                 for row in rows:
                     out.write(json.dumps({'table': table, 'row': row}) + '\n')
         digest = hashlib.sha256(dump.read_bytes()).hexdigest()
+        self.registry.setdefault('projection_dumps', {})[str(life)] = {'dump': str(dump), 'sha256': digest}
+        self.save()
         self.psql('postgres', 'DROP DATABASE r01_money WITH (FORCE)')
         self.create_money_database()
         return self.record_fault({'kind': 'reset_projection', 'life': life, 'dump': str(dump), 'dump_sha256': digest,
@@ -1293,7 +1307,8 @@ class CoreFixture(Fixture):
         """S16 5.1 (F-REGEN, H:266). ``me``: stop me0-2, wipe their state, start a fresh ME, ME genesis with the next life's
         genesis id; the core stays bound to the old epoch (A04 life 1 is judged on it). ``core``: stop the forwarders (if
         still Running; in A04 they fenced themselves), the bridges and ae0-2, wipe the AE, reset the projection, start a
-        fresh AE and run the life-2 genesis phases; projector, bridges and forwarders come back through restart()."""
+        fresh AE and run the life-2 genesis phases; projector, bridges and forwarders come back through restart(). The
+        projection is dumped before the AE wipe (V6; wipe_engine refuses an AE member without that dump)."""
         if scope not in ('me', 'core'):
             raise Violation('regenesis scope is me or core, got ' + repr(scope))
         lives = self.registry.setdefault('lives', {})
@@ -1339,8 +1354,8 @@ class CoreFixture(Fixture):
         for role in ('bridge0', 'bridge1', 'ae0', 'ae1', 'ae2'):
             if role in containers and self.inspect('container', containers[role])['State']['Running']:
                 stops.append(self.stop(role, heal_bound_s=REGENESIS_HEAL_BOUND_S))
+        self.reset_projection()        # V6: the life's projection is dumped BEFORE the AE (its source) is wiped
         wipes = [self.wipe_engine(f'ae{i}') for i in range(3)]
-        self.reset_projection()
         self.start_members('ae')
         lives[str(life)]['core'] = {'genesis_id': gid}
         self.registry['funding'] = []
