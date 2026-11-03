@@ -37,7 +37,9 @@ MANIFEST_KEYS = {'schema_version', 'topology', 'run_id', 'timeouts', 'image', 's
 OPTIONAL_MANIFEST_KEYS = {'netfilter_helper', 'host_loss_acceptance', 'profile_note', 'measurement_purpose',
                           'harness_commit', 'harness_dirty',
                           # RC2 S15 (contract 3.2, 3.3): the probe's own aeronmd and the two T1 drivers, hash-pinned
-                          'probe_libs', 't1_me_driver', 't1_core_driver'}
+                          'probe_libs', 't1_me_driver', 't1_core_driver',
+                          # RC2 S16 (contract 5.2, 5.3): the engines' driver profile and its staged driver; the builder's kind
+                          'engine_driver', 'engine_libs', 'manifest_kind'}
 DRIVER_MODES = {'embedded', 'external'}
 LIB_KEYS = {'path', 'sha256', 'exec'}
 # Pinned single-file helper programs, checked like core_probe / journal_probe (path + source_path hashes).
@@ -77,6 +79,31 @@ IMAGE_ENV = {'PATH', 'JAVA_HOME', 'JAVA_VERSION', 'LANG', 'LANGUAGE', 'LC_ALL', 
 TIMEOUT_WORDS = re.compile(r'TIMEOUT|HEARTBEAT|ELECTION|LIVENESS', re.IGNORECASE)
 JVM_TIMEOUT = re.compile(r'-D\S*(timeout|heartbeat|election|liveness)', re.IGNORECASE)
 
+# RC2 S16 5.3: the engine container's staged driver. driver.properties is a byte copy of me/deploy/media-driver/driver.properties
+# (c53dd20) and driver-dev.properties the overlay the launch-driver.sh dev profile applies (LD:19-20, SHARED threading and
+# backoff idles: the engine member has one CPU, 3.4). Nothing else, nothing missing.
+ENGINE_LIBS = {'aeronmd', 'libaeron_driver.so', 'libaeron.so', 'driver.properties', 'driver-dev.properties'}
+# The embedded driver overrides the external driver must equal (MEC:221-236, ME AeronCluster.launchWithEmbeddedDriver; the AE
+# context AEC:205-214 sets the same values except the two untethered timeouts, which only the ME codes). driverTimeoutMs(500)
+# is a client setting and has no driver counterpart. sparse.file=false is DP's own pin (the contract 5.3 list).
+ENGINE_DRIVER_PROPERTIES = {
+    'aeron.mtu.length': '8192', 'aeron.term.buffer.length': '16m', 'aeron.ipc.term.buffer.length': '16m',
+    'aeron.term.buffer.sparse.file': 'false', 'aeron.socket.so_sndbuf': '4m', 'aeron.socket.so_rcvbuf': '4m',
+    'aeron.rcv.initial.window.length': '4m', 'aeron.timer.interval': '500us', 'aeron.client.liveness.timeout': '5s',
+    'aeron.publication.unblock.timeout': '10s', 'aeron.untethered.window.limit.timeout': '100ms',
+    'aeron.untethered.resting.timeout': '100ms'}
+DEV_OVERLAY_KEYS = {'aeron.threading.mode', 'aeron.conductor.idle.strategy', 'aeron.sender.idle.strategy',
+                    'aeron.receiver.idle.strategy', 'aeron.shared.idle.strategy', 'aeron.sharednetwork.idle.strategy'}
+# The eleven S16 manifests (mk_manifests.py). The kind is pinned in the manifest and is the file name's prefix
+# ("<kind>--<tag>.json"), so a guard keyed on it cannot be satisfied by renaming a file.
+S16_KINDS = {'s16', 's16-ext', 's16-embedded', 's16-n1', 's16-a03', 's16-a03-embedded', 's16-a05', 's16-a05-embedded',
+             's16-red-a03', 's16-red-a04', 's16-ctl-edk-cnctimeout'}
+EDK_CNCTIMEOUT_KIND = 's16-ctl-edk-cnctimeout'
+ENGINE_DRIVER_SKIP_MEMBERS = ('ae0', 'me0')          # 8.4 cnc_timeout_loud: one AE member and one ME member
+NC_TARGET = re.compile(r'ct_(forwarder|bridge)_nc_[a-z0-9_]+')
+CMAKE_TARGET = re.compile(r'[A-Za-z0-9_.-]{1,64}')
+A03_NC_TARGET = 'ct_forwarder_nc_norelease'           # 20.1 line 2 (PO): A03 phase 1 only
+
 
 def _file(entry, what, keys=('path', 'sha256')):
     file = Path(entry['path'])
@@ -105,6 +132,149 @@ def _lib(entry, what, changed=None):
 def _source(entry, what):
     if not re.fullmatch(r'[0-9a-f]{40}', entry.get('source_sha') or ''):
         raise Inconclusive('missing artifact source commit: ' + what)
+
+
+
+_UNITS = {'k': 1024, 'm': 1024 ** 2, 'g': 1024 ** 3}
+_TIME = {'ns': 1, 'us': 1000, 'ms': 1000 ** 2, 's': 1000 ** 3}
+
+
+def aeron_value(text):
+    """A property value as the Aeron drivers read it: sizes k/m/g (binary), durations ns/us/ms/s (to ns), else the text."""
+    value = text.strip().lower()
+    match = re.fullmatch(r'(\d+)(ns|us|ms|s)', value)
+    if match:
+        return ('ns', int(match.group(1)) * _TIME[match.group(2)])
+    match = re.fullmatch(r'(\d+)([kmg]?)', value)
+    if match:
+        return ('n', int(match.group(1)) * _UNITS.get(match.group(2), 1))
+    return ('text', value)
+
+
+def parse_properties(text, what):
+    values = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '=' not in line:
+            raise Violation(f'{what}: not a key=value line: {line[:80]}')
+        key, value = (part.strip() for part in line.split('=', 1))
+        if key in values:
+            raise Violation(f'{what}: {key} is set twice')
+        values[key] = value
+    return values
+
+
+def check_driver_properties(properties_text, overlay_text):
+    """5.2 / 5.3: the pinned external driver properties equal the embedded overrides (a drift is a Violation), and the dev
+    overlay sets only threading and idle keys, SHARED threading, never a pinned value."""
+    props = parse_properties(properties_text, 'driver.properties')
+    drift = sorted(k for k, v in ENGINE_DRIVER_PROPERTIES.items() if k not in props or aeron_value(props[k]) != aeron_value(v))
+    if drift:
+        raise Violation('driver.properties drifts from the embedded overrides: ' + ', '.join(
+            f'{k} {props.get(k, "<missing>")} != {ENGINE_DRIVER_PROPERTIES[k]}' for k in drift))
+    overlay = parse_properties(overlay_text, 'driver-dev.properties')
+    extra = sorted(set(overlay) - DEV_OVERLAY_KEYS)
+    if extra:
+        raise Violation('driver-dev.properties may set only threading and idle keys; refused ' + ', '.join(extra))
+    if overlay.get('aeron.threading.mode') != 'SHARED':
+        raise Violation('driver-dev.properties must set aeron.threading.mode=SHARED (the member has one CPU, 3.4)')
+    return props, overlay
+
+
+def validate_engine_driver(manifest):
+    mode = manifest.get('engine_driver', 'embedded')
+    if mode not in DRIVER_MODES:
+        raise Violation('engine_driver must be embedded or external, got ' + str(mode))
+    libs = manifest.get('engine_libs')
+    if mode == 'embedded':
+        if libs is not None:
+            raise Violation('engine_libs without engine_driver external: the embedded engines stage no driver')
+        return
+    if not libs:
+        raise Violation('engine_driver external needs engine_libs (aeronmd, its two .so, driver.properties, the dev overlay)')
+    if set(libs) != ENGINE_LIBS:
+        raise Violation('engine_libs must be exactly ' + ', '.join(sorted(ENGINE_LIBS)) + '; got ' + ', '.join(sorted(libs)))
+    for name, lib in libs.items():
+        _lib(lib, 'engine_libs ' + name, changed='engine_libs changed: ' + name)
+        if (name == 'aeronmd') != (lib.get('exec') is True):
+            raise Violation('engine_libs aeronmd must be exec and nothing else may be: ' + name)
+    check_driver_properties(Path(libs['driver.properties']['path']).read_text(),
+                            Path(libs['driver-dev.properties']['path']).read_text())
+
+
+def _target(manifest, name):
+    entry = manifest['artifacts'].get(name)
+    return None if entry is None else entry.get('target')
+
+
+def validate_build_b(manifest, path):
+    """5.2 by manifest kind (S16 manifests carry ``manifest_kind``; older manifests have none and keep the S15 rules)."""
+    for name in OPTIONAL_BINARIES:
+        entry = manifest['artifacts'].get(name)
+        if entry is not None and 'target' in entry and not CMAKE_TARGET.fullmatch(str(entry['target'])):
+            raise Violation(f'{name}: target must be a CMake target name')
+    kind = manifest.get('manifest_kind')
+    if kind is None:
+        return
+    if kind not in S16_KINDS:
+        raise Violation('unknown manifest kind ' + str(kind))
+    if Path(path).name.split('--')[0].removesuffix('.json') != kind:
+        raise Violation(f'manifest kind {kind} does not match the file name {Path(path).name}')
+    staged = [n for n in ('forwarder_b', 'bridge_b') if manifest['artifacts'].get(n) is not None]
+    for name in staged + [n for n in ('forwarder', 'bridge') if manifest['artifacts'].get(n) is not None]:
+        if _target(manifest, name) is None:
+            raise Violation(f'{name} needs a pinned CMake target (artifacts.{name}.target, set by mk_manifests.py)')
+    for name in ('forwarder', 'bridge'):
+        if manifest['artifacts'].get(name) is not None and NC_TARGET.fullmatch(_target(manifest, name)):
+            raise Violation(f'build A {name} must be a real build, got {_target(manifest, name)}')
+    if kind.startswith('s16-a05'):
+        for name in staged:
+            if NC_TARGET.fullmatch(_target(manifest, name)):
+                raise Violation(f'an A05 manifest stages the negative build {_target(manifest, name)} as {name}: build B is a '
+                                'real ct build (3.2)')
+    elif kind.startswith('s16-red-'):
+        for name in staged:
+            if not NC_TARGET.fullmatch(_target(manifest, name)):
+                raise Violation(f'a RED manifest stages the real build {_target(manifest, name)} as {name} (8.1, 8.2)')
+    elif kind.startswith('s16-a03'):
+        if staged != ['forwarder_b'] or _target(manifest, 'forwarder_b') != A03_NC_TARGET or manifest['artifacts'].get('forwarder') is None:
+            raise Violation(f'an A03 manifest stages {A03_NC_TARGET} as forwarder_b and build A as forwarder, nothing else '
+                            '(20.1 line 2)')
+    elif staged:
+        raise Violation(f'manifest kind {kind} stages no build B: ' + ', '.join(staged))
+
+
+def check_build_b(manifest, scenario_name):
+    """5.2 at the scenario: core-drill-a05-* refuses an nc_ target as build B, core-red-* refuses a real build as ``*_b``."""
+    for name in ('forwarder_b', 'bridge_b'):
+        entry = manifest['artifacts'].get(name)
+        if entry is None:
+            continue
+        target = entry.get('target')
+        if scenario_name.startswith('core-drill-a05-'):
+            if target is None:
+                raise Violation(f'{name} needs a pinned CMake target for an A05 drill (5.2)')
+            if NC_TARGET.fullmatch(target):
+                raise Violation(f'an A05 drill refuses the negative build {target} as {name} (5.2)')
+        elif scenario_name.startswith('core-red-') and target is not None and not NC_TARGET.fullmatch(target):
+            raise Violation(f'a RED runs a negative build; refused the real build {target} as {name} (5.2)')
+
+
+def check_engine_driver_skip(manifest, path, value):
+    """5.2: ENGINE_DRIVER_SKIP=1 (the harness environment; the wrapper of the two members then starts no aeronmd) only on the
+    edk-cnctimeout control manifest. Returns the members whose driver is skipped (empty when unset)."""
+    if value is None or value == '':
+        return ()
+    kind = manifest.get('manifest_kind')
+    if kind != EDK_CNCTIMEOUT_KIND or Path(path).name.split('--')[0].removesuffix('.json') != kind:
+        raise Violation(f'ENGINE_DRIVER_SKIP is refused outside {EDK_CNCTIMEOUT_KIND}.json (5.2); manifest {Path(path).name}')
+    if manifest.get('engine_driver') != 'external':
+        raise Violation('ENGINE_DRIVER_SKIP needs engine_driver external')
+    if value != '1':
+        raise Violation('ENGINE_DRIVER_SKIP=1 only (it skips ' + ' and '.join(ENGINE_DRIVER_SKIP_MEMBERS) + ')')
+    return ENGINE_DRIVER_SKIP_MEMBERS
 
 
 def validate_cpus(manifest, cpu_count):
@@ -262,6 +432,8 @@ def validate_core_manifest(manifest, manifest_path, cpu_count=None, profiles=jou
                 raise Violation('ME credential environment name collides with a fixture variable: ' + me[key])
         if me['keys_env'] == me['credential_env']:
             raise Violation('ME key table and credential need distinct environment names')
+        validate_engine_driver(manifest)
+        validate_build_b(manifest, path)
         profile = manifest['me_journal_profile']
         if profile not in journal_decode.profiles_spec(profiles):
             raise Violation('unknown ME journal profile ' + str(profile))
