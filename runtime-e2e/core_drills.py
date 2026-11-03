@@ -550,7 +550,7 @@ A04_HALT_PHASE_S = 60                         # life-1 tap beyond the story: fre
                                               # the halt ~5 s and the funding done ~12 s after the ME restart (W9 stops 0.2-0.3 s),
                                               # then 640 s idle on 420; the default is 60 s, a setting (SETTINGS)
 SETTINGS = {
-    'A05_P999_SLACK_MS': 5,                   # PO-2 (a): swap p99.9 <= baseline p99.9 + 5 ms (F:517)
+    'A05_P999_SLACK_MS': 10,                  # PO-2 (a): swap p99.9 <= baseline p99.9 + slack; default 10 ms (W6: ~150-sample windows, 5 ms flaked; PO 2026-11-03)
     'A05_DUP_EDGE_SLACK': 10,                 # the in-flight count at the window edges; W5 measured duplicates - dispatches = -1
     'A05_SETTLE_LAG_SLACK': 40,               # [E] trades; W0 measured a lag of 10-36 trades (answers-14.2 item 6)
     'SWAP_WINDOW_MIN_S': 1.0,                 # proposed 20.1: W0 measured swap windows of 1.45-1.49 s (answers item 5)
