@@ -6,6 +6,12 @@ freezes journal schema 4 its XML drops into ``schemas/`` and this module compute
 what a journal record may contain is supported (primitives, fixed char arrays, enums, sets and
 composites of those). A group or var-data field is refused loudly: a journal record is one
 unfragmented fixed-length frame.
+
+RC2 S15 (contract 5.4): one flat repeating group per message is supported, because the ME journal's
+CommandRelease (template 4) carries the ``releases`` group. A group is the dimension header
+(``groupSizeEncoding``: blockLength uint16 + numInGroup uint16) and ``numInGroup`` fixed entries of
+``blockLength`` bytes; the total frame length must equal ``HEADER + block + 4 + n * entryBlock`` exactly.
+A nested group, a second group, a ``<data>`` part or a group that carries ``<data>`` is still refused.
 """
 import struct
 import xml.etree.ElementTree as ET
@@ -14,6 +20,7 @@ PRIMITIVES = {'char': ('c', 1), 'int8': ('b', 1), 'uint8': ('B', 1), 'int16': ('
               'int32': ('i', 4), 'uint32': ('I', 4), 'int64': ('q', 8), 'uint64': ('Q', 8),
               'float': ('f', 4), 'double': ('d', 8)}
 HEADER_LENGTH = 8
+GROUP_HEADER_LENGTH = 4
 
 
 class SchemaError(ValueError):
@@ -43,9 +50,21 @@ class Field:
         return value
 
 
+class Group:
+    """One flat repeating group: entry fields at offsets inside an entry of ``block_length`` bytes."""
+
+    def __init__(self, name, block_length, fields):
+        self.name, self.block_length, self.fields = name, block_length, fields
+
+    def field_names(self):
+        return [f.name for f in self.fields]
+
+
 class Message:
-    def __init__(self, name, template_id, block_length, fields):
+    def __init__(self, name, template_id, block_length, fields, group=None):
         self.name, self.template_id, self.block_length, self.fields = name, template_id, block_length, fields
+        self.group = group
+        self.variable = False
 
     def field_names(self):
         return [f.name for f in self.fields]
@@ -70,10 +89,30 @@ class Schema:
             raise SchemaError(f'unknown template {template} in schema {schema_id} v{version}')
         if message.variable:
             raise SchemaError(f'template {template} carries a group/var-data part; not a fixed journal record')
-        if block != message.block_length or length != HEADER_LENGTH + block:
-            raise SchemaError(f'template {template} block {block}/frame {length} != declared {message.block_length}')
+        group = message.group
+        if group is None:
+            if block != message.block_length or length != HEADER_LENGTH + block:
+                raise SchemaError(f'template {template} block {block}/frame {length} != declared {message.block_length}')
+        elif block != message.block_length or length < HEADER_LENGTH + block + GROUP_HEADER_LENGTH:
+            raise SchemaError(f'template {template} block {block}/frame {length} != declared {message.block_length} '
+                              f'plus a {group.name} group header')
         body = offset + HEADER_LENGTH
-        return message, {f.name: f.decode(data, body, self.order) for f in message.fields}
+        values = {f.name: f.decode(data, body, self.order) for f in message.fields}
+        if group is not None:
+            values[group.name] = self._group(data, body + block, offset + length, template, group)
+        return message, values
+
+    def _group(self, data, start, end, template, group):
+        entry_block, count = struct.unpack_from(self.order + 'HH', data, start)
+        if entry_block != group.block_length:
+            raise SchemaError(f'template {template} group entry block {entry_block} != declared {group.block_length}')
+        first = start + GROUP_HEADER_LENGTH
+        if first + count * entry_block > end:
+            raise SchemaError(f'template {template} group overruns the frame')
+        if first + count * entry_block != end:
+            raise SchemaError(f'template {template} frame carries {end - first - count * entry_block} bytes after its '
+                              f'{count} {group.name} entries')
+        return [{f.name: f.decode(data, first + i * entry_block, self.order) for f in group.fields} for i in range(count)]
 
 
 def _type_table(types):
@@ -123,6 +162,28 @@ def _resolve(type_name, table, name, offset):
     return Field(name, offset, 'composite', inner, values=parts)
 
 
+def _group(node, table, path, template):
+    """A flat repeating group, or None when it is not one (a nested group, var-data, another dimension header)."""
+    dimension = table.get(node.get('dimensionType') or 'groupSizeEncoding')
+    parts = [(c.get('name'), c.get('primitiveType')) for c in dimension[1]] if dimension and dimension[0] == 'composite' else None
+    if parts != [('blockLength', 'uint16'), ('numInGroup', 'uint16')]:
+        return None
+    fields, offset = [], 0
+    for child in node:
+        kind = _local(child.tag)
+        if kind in ('group', 'data'):
+            return None
+        if kind != 'field':
+            continue
+        if child.get('offset') is not None:
+            offset = int(child.get('offset'))
+        field = _resolve(child.get('type'), table, child.get('name'), offset)
+        field.since = int(child.get('sinceVersion', '0'))
+        fields.append(field); offset += field.size
+    declared = node.get('blockLength')
+    return Group(node.get('name'), int(declared) if declared is not None else offset, fields)
+
+
 def load(path):
     """Parse a schema XML into fixed-block layouts. Raises SchemaError on anything a journal cannot carry."""
     root = ET.parse(path).getroot()
@@ -141,10 +202,19 @@ def load(path):
         template = int(node.get('id'))
         fields, offset = [], 0
         has_variable = False
+        group = None
         for child in node:
             kind = _local(child.tag)
-            if kind in ('group', 'data'):
+            if kind == 'data':
                 has_variable = True
+                continue
+            if kind == 'group':
+                # Anything beyond one flat fixed group stays "variable": loaded, but refused at decode as today.
+                flat = None if group is not None or has_variable else _group(child, table, path, template)
+                if flat is None:
+                    has_variable = True
+                else:
+                    group = flat
                 continue
             if kind != 'field':
                 continue
@@ -158,7 +228,7 @@ def load(path):
         block = int(declared) if declared is not None else offset
         if template in messages:
             raise SchemaError(f'{path}: duplicate template id {template}')
-        message = Message(node.get('name'), template, block, fields)
+        message = Message(node.get('name'), template, block, fields, group)
         message.variable = has_variable
         messages[template] = message
     return Schema(schema_id, version, order, messages)

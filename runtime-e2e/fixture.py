@@ -8,10 +8,12 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 import zipfile
 
+REGISTRY_LOCK = threading.RLock()
 from contracts import Inconclusive, Violation, validate_manifest
 
 LABEL = 'org.openexchange.runtime-fixture'
@@ -71,12 +73,30 @@ class Fixture:
         (self.root / 'logs').mkdir(exist_ok=True)
 
     def save(self):
-        temp = self.root / 'owner.json.tmp'
-        temp.write_text(json.dumps(self.registry, indent=2) + '\n')
-        temp.replace(self.root / 'owner.json')
+        # S15 fix round (FIX-4): the partition sampler reads from the main thread while a helper call runs on another
+        # thread, so the registry is saved under one lock; a dict resized by the other thread mid-dump is retried.
+        with REGISTRY_LOCK:
+            for _ in range(20):
+                try:
+                    text = json.dumps(self.registry, indent=2) + '\n'
+                    break
+                except RuntimeError:
+                    time.sleep(0.01)
+            else:
+                text = json.dumps(self.registry, indent=2) + '\n'
+            temp = self.root / 'owner.json.tmp'
+            temp.write_text(text)
+            temp.replace(self.root / 'owner.json')
+
+    def next_command_seq(self):
+        with REGISTRY_LOCK:
+            sequence = self.registry['command_seq']
+            self.registry['command_seq'] += 1
+        self.save()
+        return sequence
 
     def command(self, argv, *, input=None, timeout=60, check=True, env=None):
-        sequence = self.registry['command_seq']; self.registry['command_seq'] += 1; self.save()
+        sequence = self.next_command_seq()
         started = time.monotonic_ns()
         try:
             r = subprocess.run([str(arg) for arg in argv], input=input, text=True,
@@ -229,9 +249,15 @@ except Exception as e:print(json.dumps({'status':0,'error':str(e)}))
             response = self.http(name,port,path)
             if response['status'] == 200 and (predicate is None or predicate(response)):
                 return response
+            targets = self.registry.get('fault_targets') or {}
             for role, cid in self.registry['containers'].items():
                 state = self.inspect('container', cid)['State']
                 if not state['Running']:
+                    # RC2 S15 (F-S15-17): a container that a fault helper deliberately took down is not an unexpected
+                    # exit while its fault row is open and inside its declared bound; anything else still aborts.
+                    row = targets.get(role)
+                    if row and time.time_ns() <= row['until_ns']:
+                        continue
                     raise Inconclusive(f'fixture process {role} exited {state["ExitCode"]} before readiness')
             time.sleep(.5)
         raise Inconclusive('startup deadline exceeded: ' + name + path)

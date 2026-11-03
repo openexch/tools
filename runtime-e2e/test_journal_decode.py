@@ -113,9 +113,14 @@ class JournalDecodeTest(unittest.TestCase):
             with self.assertRaises(journal_decode.JournalSchemaError):
                 journal_decode.decode_dump(lines, self.profile, require_end=True)
 
-    def test_pending_schema4_profile_refuses_to_load(self):
-        with self.assertRaisesRegex(journal_decode.JournalSchemaError, 'pending'):
-            journal_decode.load_profile('me-journal-4')
+    def test_pending_profile_refuses_to_load(self):
+        with tempfile.TemporaryDirectory() as temp:
+            spec = json.loads((SCHEMAS / 'journal-profiles.json').read_text())
+            spec['profiles']['me-journal-4']['status'] = 'pending'
+            spec['profiles']['me-journal-4']['schemas'][0]['sha256'] = None
+            path = Path(temp) / 'profiles.json'; path.write_text(json.dumps(spec))
+            with self.assertRaisesRegex(journal_decode.JournalSchemaError, 'pending'):
+                journal_decode.load_profile('me-journal-4', path)
 
     def _dropped(self, temp, xml, pin=True):
         directory = Path(temp)
@@ -154,6 +159,136 @@ class JournalDecodeTest(unittest.TestCase):
             self.orders.decode(encode(self.orders, 27, {}) if not self.orders.messages[27].variable else
                                struct.pack('<HHHH', self.orders.messages[27].block_length, 27, 1, 11)
                                + bytes(self.orders.messages[27].block_length))
+
+
+# ---------------------------------------------------------------- RC2 S15 W1, contract 5.4: profile 4 and group support
+
+PINNED_SCHEMA4 = 'a7c58d87e4f1cfaa642014e4c92f46492c5fe20d36bd6b1d127dd7fa05a3541a'
+
+
+def pack_fields(order, fields, values, size):
+    body = bytearray(size)
+    for field in fields:
+        value = values.get(field.name, 0)
+        if field.kind == 'enum' and isinstance(value, str):
+            value = next(code for code, name in field.values.items() if name == value)
+        struct.pack_into(order + field.fmt, body, field.offset, value)
+    return bytes(body)
+
+
+# The release entry layout, written out by hand from the XML comment (22 bytes), so the test does not
+# take its group layout from the code under test.
+ENTRY_FIELDS = [sbe_layout.Field('commandIdHigh', 0, 'prim', 8, 'q'), sbe_layout.Field('idLowFloor', 8, 'prim', 8, 'q'),
+                sbe_layout.Field('scope', 16, 'enum', 1, 'B', values={0: 'UP_TO', 1: 'ORDER'}),
+                sbe_layout.Field('result', 17, 'enum', 1, 'B', values={0: 'APPLIED', 1: 'NOOP', 2: 'LEG_LIVE'}),
+                sbe_layout.Field('removed', 18, 'prim', 4, 'i')]
+ENTRY_BLOCK = 22
+
+
+def encode_release(schema, root, entries, declared_count=None, entry_block=None):
+    message = schema.messages[4]
+    frame = bytearray(struct.pack(schema.order + 'HHHH', message.block_length, 4, schema.schema_id, schema.version))
+    frame += pack_fields(schema.order, message.fields, root, message.block_length)
+    frame += struct.pack(schema.order + 'HH', ENTRY_BLOCK if entry_block is None else entry_block,
+                         len(entries) if declared_count is None else declared_count)
+    for entry in entries:
+        frame += pack_fields(schema.order, ENTRY_FIELDS, entry, ENTRY_BLOCK)
+    return bytes(frame)
+
+
+class Profile4Test(unittest.TestCase):
+    def setUp(self):
+        self.profile = journal_decode.load_profile('me-journal-4')
+        self.schema = sbe_layout.load(SCHEMAS / 'me-journal-schema-4.xml')
+
+    def test_profile4_is_active_and_pinned_to_the_s1_file(self):
+        self.assertEqual(hashlib.sha256((SCHEMAS / 'me-journal-schema-4.xml').read_bytes()).hexdigest(), PINNED_SCHEMA4)
+        spec = json.loads((SCHEMAS / 'journal-profiles.json').read_text())['profiles']['me-journal-4']
+        self.assertEqual((spec['status'], spec['schemas'][0]['sha256']), ('active', PINNED_SCHEMA4))
+        self.assertEqual([self.schema.messages[t].block_length for t in (1, 2, 3, 4, 5)], [109, 62, 153, 44, 39])
+        self.assertEqual((self.schema.messages[4].group.name, self.schema.messages[4].group.block_length), ('releases', 22))
+
+    def test_profile4_decodes_a_release_with_two_entries(self):
+        frame = encode_release(self.schema, {'journalSeq': 9, 'meEpoch': 3, 'egressSeq': 70, 'releaseSeq': 4, 'ledgerSize': 12,
+                                              'ledgerCapacity': 100000, 'tombstoneRanges': 1},
+                               [{'commandIdHigh': 1002, 'idLowFloor': 0, 'scope': 'ORDER', 'result': 'APPLIED', 'removed': 2},
+                                {'commandIdHigh': 1003, 'idLowFloor': 7, 'scope': 'UP_TO', 'result': 'NOOP', 'removed': 0}])
+        self.assertEqual(len(frame), 8 + 44 + 4 + 2 * 22)
+        event = journal_decode.decode_dump([row(frame, 0)], self.profile)[0]
+        self.assertEqual(event['type'], 'release')
+        self.assertEqual((event['journal_seq'], event['me_epoch'], event['egress_seq'], event['release_seq'], event['ledger_size'],
+                          event['ledger_capacity'], event['tombstone_ranges']), (9, 3, 70, 4, 12, 100000, 1))
+        self.assertEqual(event['releases'], [
+            {'commandIdHigh': 1002, 'idLowFloor': 0, 'scope': 'ORDER', 'result': 'APPLIED', 'removed': 2},
+            {'commandIdHigh': 1003, 'idLowFloor': 7, 'scope': 'UP_TO', 'result': 'NOOP', 'removed': 0}])
+
+    def test_empty_and_full_release_groups_decode(self):
+        for count in (0, 48):
+            frame = encode_release(self.schema, {'journalSeq': 1, 'meEpoch': 1}, [{'commandIdHigh': i} for i in range(count)])
+            event = journal_decode.decode_dump([row(frame, 0)], self.profile)[0]
+            self.assertEqual(len(event['releases']), count)
+        self.assertEqual(len(frame), 1112)
+
+    def test_group_overrun_is_refused(self):
+        frame = encode_release(self.schema, {'journalSeq': 1, 'meEpoch': 1}, [{'commandIdHigh': 1}], declared_count=48)
+        with self.assertRaisesRegex(journal_decode.JournalSchemaError, 'template 4 group overruns the frame'):
+            journal_decode.decode_dump([row(frame, 0)], self.profile)
+
+    def test_group_trailing_bytes_and_wrong_entry_block_are_refused(self):
+        frame = encode_release(self.schema, {'journalSeq': 1, 'meEpoch': 1}, [{'commandIdHigh': 1}])
+        with self.assertRaisesRegex(journal_decode.JournalSchemaError, 'template 4'):
+            journal_decode.decode_dump([row(frame + b'\0', 0)], self.profile)
+        wrong = encode_release(self.schema, {'journalSeq': 1, 'meEpoch': 1}, [{'commandIdHigh': 1}], entry_block=24)
+        with self.assertRaisesRegex(journal_decode.JournalSchemaError, 'template 4 group entry block 24'):
+            journal_decode.decode_dump([row(wrong, 0)], self.profile)
+        with self.assertRaisesRegex(journal_decode.JournalSchemaError, 'template 4'):
+            journal_decode.decode_dump([row(frame[:8 + 44 + 2], 0)], self.profile)   # cut inside the group header
+
+    def test_nested_group_and_data_and_two_groups_are_still_refused(self):
+        header = ('<?xml version="1.0"?><sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="x" id="9" version="1" '
+                  'byteOrder="littleEndian"><types><composite name="messageHeader"><type name="blockLength" primitiveType="uint16"/>'
+                  '<type name="templateId" primitiveType="uint16"/><type name="schemaId" primitiveType="uint16"/>'
+                  '<type name="version" primitiveType="uint16"/></composite><composite name="groupSizeEncoding">'
+                  '<type name="blockLength" primitiveType="uint16"/><type name="numInGroup" primitiveType="uint16"/></composite>'
+                  '</types><sbe:message name="M" id="1"><field name="a" id="1" type="int64"/>')
+        cases = {
+            'nested': '<group name="g" id="10" dimensionType="groupSizeEncoding"><field name="x" id="1" type="int64"/>'
+                      '<group name="h" id="11" dimensionType="groupSizeEncoding"><field name="y" id="1" type="int64"/></group></group>',
+            'two': '<group name="g" id="10" dimensionType="groupSizeEncoding"><field name="x" id="1" type="int64"/></group>'
+                   '<group name="h" id="11" dimensionType="groupSizeEncoding"><field name="y" id="1" type="int64"/></group>',
+            'data_in_group': '<group name="g" id="10" dimensionType="groupSizeEncoding"><field name="x" id="1" type="int64"/>'
+                             '<data name="d" id="2" type="varDataEncoding"/></group>'}
+        with tempfile.TemporaryDirectory() as temp:
+            for name, body in cases.items():
+                path = Path(temp) / (name + '.xml'); path.write_text(header + body + '</sbe:message></sbe:messageSchema>')
+                schema = sbe_layout.load(path)
+                frame = struct.pack('<HHHH', 8, 1, 9, 1) + bytes(8)
+                with self.subTest(case=name), self.assertRaisesRegex(sbe_layout.SchemaError, 'carries a group/var-data part'):
+                    schema.decode(frame)
+            path = Path(temp) / 'data.xml'
+            path.write_text(header + '<data name="d" id="2" type="varDataEncoding"/></sbe:message></sbe:messageSchema>')
+            schema = sbe_layout.load(path)
+            frame = struct.pack('<HHHH', 8, 1, 9, 1) + bytes(8)
+            with self.assertRaisesRegex(sbe_layout.SchemaError, 'carries a group/var-data part'):
+                schema.decode(frame)
+
+    def test_every_record_decodes_with_require_end(self):
+        trade = encode(self.schema, 1, {'journalSeq': 1, 'meEpoch': 2, 'tradeId': 7, 'takerIsBuy': 'TRUE', 'price': 5, 'quantity': 2})
+        terminal = encode(self.schema, 2, {'journalSeq': 2, 'meEpoch': 2, 'orderId': 9, 'status': 'FILLED', 'rejectReason': 0})
+        outcome = encode(self.schema, 3, {'journalSeq': 3, 'meEpoch': 2, 'commandIdHigh': 4, 'result': 0, 'ledgerSize': 3})
+        release = encode_release(self.schema, {'journalSeq': 4, 'meEpoch': 2}, [{'commandIdHigh': 4, 'scope': 'ORDER'}])
+        config = encode(self.schema, 5, {'journalSeq': 5, 'meEpoch': 2, 'egressSeq': 11, 'configVersion': 1, 'behaviorVersion': 2,
+                                         'ledgerCapacity': 100000, 'maxWireVersion': 12, 'decision': 'FRESH'})
+        recording = json.dumps({'kind': 'recording', 'source': 'me0', 'recording': 0, 'start': 0, 'stop': 1, 'active': True})
+        end = json.dumps({'kind': 'end', 'source': 'me0', 'recordings': 1, 'frames': 5})
+        lines = [recording] + [row(f, 64 * i) for i, f in enumerate([trade, terminal, outcome, release, config])] + [end]
+        events = journal_decode.decode_dump(lines, self.profile, require_end=True)
+        self.assertEqual([e['type'] for e in events], ['trade', 'terminal', 'outcome', 'release', 'engine_config'])
+        self.assertEqual([e['journal_seq'] for e in events], [1, 2, 3, 4, 5])
+        self.assertEqual({k: events[4][k] for k in ['egress_seq', 'config_version', 'behavior_version', 'ledger_capacity',
+                                                      'max_wire_version', 'decision']},
+                         {'egress_seq': 11, 'config_version': 1, 'behavior_version': 2, 'ledger_capacity': 100000,
+                          'max_wire_version': 12, 'decision': 'FRESH'})
 
 
 if __name__ == '__main__':
