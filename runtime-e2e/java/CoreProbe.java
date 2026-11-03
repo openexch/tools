@@ -537,13 +537,27 @@ public final class CoreProbe {
         offer(HEADER + new RequestHoldSnapshotEncoder().wrapAndApplyHeader(buffer, 0, headerEncoder).correlationId(listener.holdCorr).encodedLength());
         offer(HEADER + new QueryFeedPositionEncoder().wrapAndApplyHeader(buffer, 0, headerEncoder).correlationId(listener.expectCorrelation).encodedLength());
         await(t -> listener.balancesEnd && listener.holdsEnd && listener.positionSeen);
+        System.out.println(moneyDumpLine());
+        return 0;
+    }
+
+    /**
+     * The money-dump answer. S16 W2 (contract 3.3): the four v7 FeedPositionReport fields the decoder already reads past
+     * are exported as {@code meEpoch} (the ME epoch the core is bound to), {@code lastAppliedJournalSeq} (the feed
+     * cursor), {@code feedHalted} and {@code haltReason} (the FeedHaltReason name); the fixture maps them to
+     * {@code core.bound_me_epoch / feed_cursor / feed_halted / halt_reason}.
+     */
+    String moneyDumpLine() {
         final StringBuilder sb = new StringBuilder("{\"verb\":\"money-dump\",\"balances\":[");
         sb.append(String.join(",", listener.balances.values())).append("],\"holds\":[");
         sb.append(String.join(",", listener.holds.values())).append("],\"consumePosition\":").append(listener.consumePosition)
                 .append(",\"lastAppliedTradeId\":").append(listener.lastAppliedTradeId)
-                .append(",\"journalEnabled\":").append(listener.journalEnabled).append('}');
-        System.out.println(sb);
-        return 0;
+                .append(",\"journalEnabled\":").append(listener.journalEnabled)
+                .append(",\"meEpoch\":").append(listener.meEpoch)
+                .append(",\"lastAppliedJournalSeq\":").append(listener.lastAppliedJournalSeq)
+                .append(",\"feedHalted\":").append(listener.feedHalted)
+                .append(",\"haltReason\":\"").append(listener.haltReason).append("\"}");
+        return sb.toString();
     }
 
     private int pendingDump() {
@@ -633,6 +647,9 @@ public final class CoreProbe {
             final Story.Summary summary = s.run();
             writeAtomically(cfg.out, s.requestLog());
             System.out.println(summary.storyLine());
+            if (cfg.script.equals("a03-fill")) {
+                System.out.println(s.a03Line());
+            }
             final Map<String, Object> report = summary.json();
             report.put("sessions", continuity.summary());
             System.out.println(json(report));
@@ -728,11 +745,18 @@ public final class CoreProbe {
 
     /** Arguments of {@code story}, refused when ambiguous (contract C7: unknown script, non-integer seed). */
     static final class StoryConfig {
-        static final List<String> SCRIPTS = List.of("a01-mix", "a02-lifecycle", "funding");
+        static final List<String> SCRIPTS = List.of("a01-mix", "a02-lifecycle", "funding", "a03-fill");
         static final List<String> MOMENTS = List.of("iceberg", "replace", "maker_replace", "stop", "ioc_fok", "gtd", "markets");
         static final List<String> HOLDS = List.of("slice1_exhausting_fill", "replace_open:1", "replace_open:2", "replace_open:3");
         static final Set<String> STORY_KEYS = Set.of("script", "seed", "seconds", "rate", "users", "out", "markers", "without",
-                "hold", "gate_dir", "hold_ms", "resolve_gate", "resolve_gate_ms");
+                "hold", "gate_dir", "hold_ms", "resolve_gate", "resolve_gate_ms", "ioc_burst_on");
+        /** S16 W2 (contract 5.5, 20.1 lines 2, 3): a03-fill is a rate / fill_s / reopen_s story with no cancels and no seconds=. */
+        static final Set<String> A03_KEYS = Set.of("script", "seed", "users", "out", "markers", "rate", "fill_s", "reopen_s",
+                "marker_timeout_s", "signal_dir");
+        static final int A03_DEFAULT_RATE = 100;
+        static final int A03_DEFAULT_FILL_S = 30;
+        static final int A03_DEFAULT_REOPEN_S = 10;
+        static final int A03_DEFAULT_MARKER_TIMEOUT_S = 60;
         static final Set<String> FUNDING_KEYS = Set.of("script", "seed", "users", "out", "for");
         /** Section 0: a functional story stays at or under 200 commands/s; a02 at or under 50/s (section 4). */
         static final int A01_MAX_COMMANDS_PER_S = 200;
@@ -753,6 +777,13 @@ public final class CoreProbe {
         long holdMs;
         String resolveGate;
         long resolveGateMs;
+        /** a01-mix: a file the fixture creates; for 2 s after it appears every create is IOC crossing (fwdring). */
+        String iocBurstOn;
+        /** a03-fill: seconds of phase 1, seconds of phase 3, the wait bound of phase 2, the directory the fixture signals in. */
+        int fillS;
+        int reopenS;
+        int markerTimeoutS;
+        String signalDir;
 
         static StoryConfig parse(final Map<String, String> a) {
             final StoryConfig c = new StoryConfig();
@@ -760,7 +791,7 @@ public final class CoreProbe {
             if (!SCRIPTS.contains(c.script)) {
                 throw new IllegalArgumentException("unknown story script " + c.script + " (scripts: " + SCRIPTS + ")");
             }
-            final Set<String> allowed = c.script.equals("funding") ? FUNDING_KEYS : STORY_KEYS;
+            final Set<String> allowed = c.script.equals("funding") ? FUNDING_KEYS : c.script.equals("a03-fill") ? A03_KEYS : STORY_KEYS;
             for (final String k : new TreeSet<>(a.keySet())) {
                 if (!allowed.contains(k)) {
                     throw new IllegalArgumentException("story " + c.script + " does not take " + k + "=");
@@ -784,8 +815,27 @@ public final class CoreProbe {
                 return c;
             }
             c.markers = required(a, "markers");
+            if (c.script.equals("a03-fill")) {
+                c.rate = a.containsKey("rate") ? positiveInt(a, "rate", false) : A03_DEFAULT_RATE;
+                c.fillS = a.containsKey("fill_s") ? positiveInt(a, "fill_s", false) : A03_DEFAULT_FILL_S;
+                c.reopenS = a.containsKey("reopen_s") ? positiveInt(a, "reopen_s", false) : A03_DEFAULT_REOPEN_S;
+                c.markerTimeoutS = a.containsKey("marker_timeout_s") ? positiveInt(a, "marker_timeout_s", false)
+                        : A03_DEFAULT_MARKER_TIMEOUT_S;
+                c.signalDir = required(a, "signal_dir");
+                if (c.rate > A01_MAX_COMMANDS_PER_S) {
+                    throw new IllegalArgumentException("a03-fill rate " + c.rate + " is above the functional bound " + A01_MAX_COMMANDS_PER_S);
+                }
+                if (c.users.length < 2) {
+                    throw new IllegalArgumentException("a03-fill needs at least two users");
+                }
+                return c;
+            }
             c.seconds = positiveInt(a, "seconds", true);
             c.rate = positiveInt(a, "rate", false);
+            if (a.containsKey("ioc_burst_on") && !c.script.equals("a01-mix")) {
+                throw new IllegalArgumentException("story " + c.script + " does not take ioc_burst_on=");
+            }
+            c.iocBurstOn = a.get("ioc_burst_on");
             if (c.script.equals("a01-mix")) {
                 if (c.seconds == 0) {
                     throw new IllegalArgumentException("a01-mix needs seconds > 0");
@@ -1082,6 +1132,8 @@ public final class CoreProbe {
             this.foregroundSpacingNs = 2 * SECOND / cfg.rate;
             if (cfg.script.equals("a01-mix")) {
                 planA01();
+            } else if (cfg.script.equals("a03-fill")) {
+                planA03();
             } else {
                 planA02();
             }
@@ -1175,6 +1227,141 @@ public final class CoreProbe {
                     timeline.add(b.get(j++));
                 }
             }
+        }
+
+        // ---------------------------------------------------------- a03-fill (S16 W2, contract 5.5 and 20.1 lines 2, 3)
+
+        static final int PHASE_NONE = 0;      // not an a03 story: nothing waits
+        static final int PHASE_FILL = 1;      // phase 1: non-crossing creates, both forwarders on the no-release build
+        static final int PHASE_WAIT = 2;      // phase 2: nothing is sent; the drill swaps the forwarders, the gate drains and reopens
+        static final int PHASE_REOPEN = 3;    // phase 3: creates again, so the reopen is proved by admits
+        static final int PHASE_DONE = 4;
+        static final long SIGNAL_POLL_NS = 50_000_000L;   // the signal files are looked at every 50 ms, not on every spin
+
+        private int phase = PHASE_NONE;
+        private final List<Timed> reopenPlan = new ArrayList<>();
+        private long waitStartNs;
+        private long lastSignalPollNs;
+        boolean capacityClosed;
+        boolean capacityOpened;
+        // a01-mix --ioc-burst-on: the burst window starts when the marker file is first seen and lasts 2 s
+        static final long IOC_BURST_NS = 2 * SECOND;
+        private long burstStartNs = -1;
+        private boolean burstEnded;
+        int iocBurstRows;
+
+        /**
+         * a03-fill: phase 1 is rate x fill_s non-crossing LIMIT GTC creates on market 1 (users at even positions BUY
+         * 80.00..84.99, odd positions SELL 95.00..99.99: the a01 resting bands, never crossing), no cancels. Phase 3
+         * (rate x reopen_s creates of the same shape) is planned now, so the per-user cap sees it, and released at run
+         * time. The fixture signals through files in {@code signal_dir}: {@code capacity_closed} when the tap shows
+         * [SUSPENDED, ME_CAPACITY], {@code capacity_open} when it shows [OPEN, ADMIN] after the swap.
+         */
+        private void planA03() {
+            final SplittableRandom rng = new SplittableRandom(cfg.seed);
+            phase = PHASE_FILL;
+            for (int i = 0; i < cfg.rate * cfg.fillS; i++) {
+                final Timed t = new Timed();
+                t.atNs = i * SECOND / cfg.rate;
+                t.create = a03Create("fill", i, rng);
+                timeline.add(t);
+            }
+            for (int i = 0; i < cfg.rate * cfg.reopenS; i++) {
+                final Timed t = new Timed();
+                t.atNs = i * SECOND / cfg.rate;   // relative to the start of phase 3
+                t.create = a03Create("reopen", i, rng);
+                reopenPlan.add(t);
+            }
+        }
+
+        private StoryRow a03Create(final String moment, final int i, final SplittableRandom rng) {
+            final long user = cfg.users[i % cfg.users.length];
+            final boolean buy = (i % cfg.users.length) % 2 == 0;
+            final long qty = (1 + rng.nextInt(3)) * ONE;
+            final long cents = buy ? 8000 + rng.nextInt(500) : 9500 + rng.nextInt(500);
+            return create(moment, user, 1, buy ? "BUY" : "SELL", "LIMIT", "GTC", cents * CENT, qty);
+        }
+
+        private boolean polledOnce;
+
+        /** True at most every 50 ms of story time: the signal files are looked at on that beat, not on every spin. */
+        private boolean signalPoll(final long now) {
+            if (polledOnce && now - lastSignalPollNs < SIGNAL_POLL_NS) {
+                return false;
+            }
+            polledOnce = true;
+            lastSignalPollNs = now;
+            return true;
+        }
+
+        /** Phase transitions of a03-fill and the window of --ioc-burst-on; called on every pass of the run loop. */
+        private void signals(final long now, final int nextIndex) {
+            if (cfg.iocBurstOn == null && phase == PHASE_NONE) {
+                return;
+            }
+            final boolean beat = signalPoll(now);
+            if (cfg.iocBurstOn != null && !burstEnded) {
+                if (burstStartNs < 0 && beat && clock.exists(cfg.iocBurstOn)) {
+                    burstStartNs = now;
+                    marker("ioc_burst_started", map("marker_file", cfg.iocBurstOn));
+                } else if (burstStartNs >= 0 && now >= burstStartNs + IOC_BURST_NS) {
+                    burstEnded = true;
+                    marker("ioc_burst_ended", map("rows", iocBurstRows));
+                }
+            }
+            if (phase == PHASE_NONE || phase == PHASE_DONE) {
+                return;
+            }
+            if (!capacityClosed && beat && clock.exists(cfg.signalDir + "/capacity_closed")) {
+                capacityClosed = true;
+                marker("capacity_closed_seen", map());
+            }
+            if (phase == PHASE_FILL && nextIndex >= timeline.size()) {
+                phase = PHASE_WAIT;
+                waitStartNs = now;
+                marker("fill_ended", map("rows", rows.size()));
+            }
+            if (phase == PHASE_WAIT) {
+                final boolean opened = beat && clock.exists(cfg.signalDir + "/capacity_open");
+                if (opened || now - waitStartNs >= cfg.markerTimeoutS * SECOND) {
+                    capacityOpened = opened;
+                    marker(opened ? "capacity_open_seen" : "capacity_open_timeout", map("waited_ns", now - waitStartNs));
+                    for (final Timed r : reopenPlan) {
+                        r.atNs = (now - t0) + r.atNs;
+                        timeline.add(r);
+                    }
+                    phase = PHASE_REOPEN;
+                    marker("reopen_started", map("rows", reopenPlan.size()));
+                }
+            } else if (phase == PHASE_REOPEN && nextIndex >= timeline.size()) {
+                phase = PHASE_DONE;
+            }
+        }
+
+        private boolean phasesPending() {
+            return phase != PHASE_NONE && phase != PHASE_DONE;
+        }
+
+        Map<String, Object> a03() {
+            int created = 0;
+            int gate = 0;
+            int reopenAcked = 0;
+            for (final StoryRow r : rows) {
+                if (r.resolves != null || !r.list.equals("creates")) {
+                    continue;
+                }
+                created += r.moment.equals("fill") && "ACK".equals(r.outcome()) ? 1 : 0;
+                gate += "REJECT".equals(r.outcome()) && "GATE_CLOSED".equals(r.reply.get("reason")) ? 1 : 0;
+                reopenAcked += r.moment.equals("reopen") && "ACK".equals(r.outcome()) ? 1 : 0;
+            }
+            return map("created", created, "rejected_gate", gate, "cancelled", 0, "reopen_acked", reopenAcked,
+                    "closed", capacityClosed, "opened", capacityOpened);
+        }
+
+        String a03Line() {
+            final Map<String, Object> a = a03();
+            return "A03 created=" + a.get("created") + " rejected_gate=" + a.get("rejected_gate") + " cancelled=" + a.get("cancelled")
+                    + " reopen_acked=" + a.get("reopen_acked") + " closed=" + a.get("closed") + " opened=" + a.get("opened");
         }
 
         private Step step(final String op, final String moment) {
@@ -1369,6 +1556,9 @@ public final class CoreProbe {
                 final long user = t.create != null ? t.create.user : cfg.users[t.cancelIndex % cfg.users.length];
                 perUser.merge(user, 1, Integer::sum);
             }
+            for (final Timed t : reopenPlan) {
+                perUser.merge(t.create.user, 1, Integer::sum);
+            }
             for (final Step s : steps) {
                 if (s.op.equals("create")) {
                     perUser.merge(s.spec.user, 1, Integer::sum);
@@ -1410,15 +1600,17 @@ public final class CoreProbe {
             int ti = 0;
             while (true) {
                 final long now = clock.nowNs();
+                signals(now, ti);
                 while (ti < timeline.size() && t0 + timeline.get(ti).atNs <= now) {
                     due(timeline.get(ti), t0 + timeline.get(ti).atNs);
                     ti++;
                 }
+                signals(now, ti);
                 foreground(now);
                 int work = flush(now);
                 work += port.poll();
                 expire(clock.nowNs());
-                if (ti >= timeline.size() && pc >= steps.size()) {
+                if (ti >= timeline.size() && pc >= steps.size() && !phasesPending()) {
                     break;   // what is still queued is offered (or found UNSENT) by drain()
                 }
                 clock.idle(work);
@@ -1432,7 +1624,15 @@ public final class CoreProbe {
 
         private void due(final Timed t, final long scheduledNs) {
             if (t.create != null) {
-                enqueue(t.create.copy(), scheduledNs);
+                final StoryRow c = t.create.copy();
+                if (burstStartNs >= 0 && scheduledNs >= burstStartNs && scheduledNs < burstStartNs + IOC_BURST_NS) {
+                    // --ioc-burst-on: the whole band is crossed with IOC, so the ids minted during the pause are ME-terminal
+                    c.moment = "ioc_burst";
+                    c.tif = "IOC";
+                    c.price = (c.side.equals("BUY") ? 9999 : 8000) * CENT;
+                    iocBurstRows++;
+                }
+                enqueue(c, scheduledNs);
                 return;
             }
             final long user = cfg.users[t.cancelIndex % cfg.users.length];
@@ -1799,12 +1999,13 @@ public final class CoreProbe {
         }
 
         record Summary(String script, int sent, int acked, int unknown, int rejected, int resolved, int unsent, int resent,
-                       int skippedCancels, int awaitExpired, int holdsExpired, int skippedSteps) {
+                       int skippedCancels, int awaitExpired, int holdsExpired, int skippedSteps, int iocBurstRows,
+                       Map<String, Object> a03) {
             Summary(final Story s) {
                 this(s.cfg.script, count(s, r -> r.sentNs >= 0), count(s, r -> "ACK".equals(r.outcome())),
                         count(s, r -> "UNKNOWN".equals(r.outcome())), count(s, r -> "REJECT".equals(r.outcome())),
                         count(s, r -> r.resolvedBy != null), s.unsent.size(), countResent(s), s.skippedCancels, s.awaitExpired,
-                        s.holdsExpired, s.skippedSteps);
+                        s.holdsExpired, s.skippedSteps, s.iocBurstRows, s.cfg.script.equals("a03-fill") ? s.a03() : null);
             }
 
             private static int count(final Story s, final Predicate<StoryRow> p) {
@@ -1838,10 +2039,15 @@ public final class CoreProbe {
             }
 
             Map<String, Object> json() {
-                return map("verb", "story", "script", script, "sent", sent, "acked", acked, "unknown", unknown,
+                final Map<String, Object> m = map("verb", "story", "script", script, "sent", sent, "acked", acked, "unknown", unknown,
                         "rejected", rejected, "resolved", resolved, "unresolved", unknown - resolved, "unsent", unsent,
                         "resent", resent, "skipped_cancels", skippedCancels, "await_expired", awaitExpired,
-                        "holds_expired", holdsExpired, "skipped_steps", skippedSteps, "setup_failure", setupFailure());
+                        "holds_expired", holdsExpired, "skipped_steps", skippedSteps, "ioc_burst_rows", iocBurstRows,
+                        "setup_failure", setupFailure());
+                if (a03 != null) {
+                    m.put("a03", a03);
+                }
+                return m;
             }
         }
     }
@@ -1929,6 +2135,10 @@ public final class CoreProbe {
         long balanceCorr, holdCorr;
         boolean balancesEnd, holdsEnd, positionSeen, journalEnabled;
         long consumePosition, lastAppliedTradeId;
+        /** v7 FeedPositionReport (S16 W2): the bound ME epoch, the feed cursor and the halt latch. */
+        long meEpoch, lastAppliedJournalSeq;
+        boolean feedHalted;
+        String haltReason = "NONE";
         int pendingCount;
         long pendingHead;
         PrintWriter tap;
@@ -2043,9 +2253,15 @@ public final class CoreProbe {
                     consumePosition = d.consumePosition();
                     lastAppliedTradeId = d.lastAppliedTradeId();
                     journalEnabled = d.journalEnabled() == BoolFlag.TRUE;
+                    meEpoch = d.meEpoch();
+                    lastAppliedJournalSeq = d.lastAppliedJournalSeq();
+                    feedHalted = d.feedHalted() == BoolFlag.TRUE;
+                    haltReason = d.haltReason().name();
                     positionSeen = true;
                     rows.add("{\"t\":\"FeedPositionReport\",\"consumePosition\":" + consumePosition + ",\"lastAppliedTradeId\":"
-                            + lastAppliedTradeId + ",\"journalEnabled\":" + journalEnabled + "}");
+                            + lastAppliedTradeId + ",\"journalEnabled\":" + journalEnabled + ",\"meEpoch\":" + meEpoch
+                            + ",\"lastAppliedJournalSeq\":" + lastAppliedJournalSeq + ",\"feedHalted\":" + feedHalted
+                            + ",\"haltReason\":" + q(haltReason) + "}");
                     finish(t);
                 }
                 case OrderSnapshotBatchDecoder.TEMPLATE_ID -> {

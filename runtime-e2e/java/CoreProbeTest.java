@@ -43,6 +43,14 @@ public final class CoreProbeTest {
         run("hold_without_gate_file_expires_loudly", CoreProbeTest::holdExpired);
         run("story_refuses_ambiguous_arguments", CoreProbeTest::refusals);
         run("funding_plan_covers_every_user_and_asset", CoreProbeTest::fundingPlan);
+        run("a03_fill_runs_the_three_phases_with_markers", CoreProbeTest::a03Phases);
+        run("a03_open_timeout_starts_phase_three_with_opened_false", CoreProbeTest::a03Timeout);
+        run("a03_summary_counts_gate_rejects_and_reopen_acks", CoreProbeTest::a03Summary);
+        run("a03_request_log_is_a_function_of_the_seed", CoreProbeTest::a03Deterministic);
+        run("a03_refuses_ambiguous_arguments", CoreProbeTest::a03Refusals);
+        run("a01_ioc_burst_follows_the_marker_for_two_seconds", CoreProbeTest::iocBurst);
+        run("a01_takes_120_users_and_funding_covers_them", CoreProbeTest::users120);
+        run("money_dump_exports_the_v7_halt_fields", CoreProbeTest::moneyDumpV7);
         run("listener_routes_story_replies_by_correlation", CoreProbeTest::listenerRoutes);
         run("tap_reports_dispatch_gaps_and_new_leader", CoreProbeTest::tapGaps);
         run("tap_dense_run_reports_no_gap", CoreProbeTest::tapDense);
@@ -110,6 +118,9 @@ public final class CoreProbeTest {
         final List<Runnable> actions = new ArrayList<>();
         long nextOrder = 1000;
         int creates;
+        /** creates offered inside [gateFrom, gateTo) (epoch ns) are rejected GATE_CLOSED, as the core does while the gate is shut. */
+        long gateFrom = Long.MAX_VALUE;
+        long gateTo = Long.MAX_VALUE;
 
         StubPort(final FakeClock clock, final Mode mode) {
             this.clock = clock;
@@ -153,6 +164,10 @@ public final class CoreProbeTest {
         private void reply(final CoreProbe.StoryRow row, final long correlationId, final String key) {
             switch (row.list) {
                 case "creates" -> {
+                    if (row.sentNs >= gateFrom && row.sentNs < gateTo) {
+                        sink.onReject(correlationId, "GATE_CLOSED", 0, 0, 0);
+                        return;
+                    }
                     final boolean duplicate = committed.containsKey(key);
                     final long order = committed.computeIfAbsent(key, k -> nextOrder++);
                     final String status = row.tif.equals("GTC") || row.tif.equals("GTD") ? "NEW" : "EXPIRED";
@@ -607,6 +622,234 @@ public final class CoreProbeTest {
         check(p.rows.size() == 3, "order-dump kept " + p.rows.size() + " of 3 orders over two pages");
         p.listener.reset();
         check(p.rows.isEmpty(), "reset() must still clear the rows of a new verb");
+    }
+
+    // ------------------------------------------------------------------ S16 W2 cases
+
+    private static final String SIG = "/sig";
+
+    private static List<Map<String, Object>> markersNamed(final Result r, final String name) {
+        final List<Map<String, Object>> out = new ArrayList<>();
+        for (final Map<String, Object> m : r.markers) {
+            if (name.equals(m.get("marker"))) {
+                out.add(m);
+            }
+        }
+        return out;
+    }
+
+    private static long markerAt(final Result r, final String name) {
+        final List<Map<String, Object>> m = markersNamed(r, name);
+        check(m.size() == 1, "marker " + name + " written " + m.size() + " times, expected once: " + r.markers);
+        return (Long) m.get(0).get("at_ns");
+    }
+
+    private static void a03Phases() {
+        final FakeClock clock = new FakeClock();
+        final long t0 = clock.now;
+        clock.filesAt.put(SIG + "/capacity_closed", t0 + 1_000_000_000L);
+        clock.filesAt.put(SIG + "/capacity_open", t0 + 4_000_000_000L);
+        final Result r = story(cfg("script=a03-fill", "seed=3", "rate=20", "fill_s=2", "reopen_s=1", "marker_timeout_s=10",
+                "users=1,2,3,4", "signal_dir=" + SIG), StubPort.Mode.ACK_ALL, p -> p, clock);
+        check(list(r, "cancels").isEmpty() && list(r, "amends").isEmpty(), "a03-fill sent a cancel or an amend (20.1 line 3: no cancel wave)");
+        int fill = 0;
+        int reopen = 0;
+        for (final CoreProbe.StoryRow c : list(r, "creates")) {
+            check(c.market == 1 && c.type.equals("LIMIT") && c.tif.equals("GTC"), "a03 create is not a LIMIT GTC on market 1: " + c.toJson());
+            check(c.side.equals(c.user % 2 == 1 ? "BUY" : "SELL"), "a03 side does not follow the user position: " + c.toJson());
+            check(c.side.equals("BUY") ? c.price < 8500 * CoreProbe.Story.CENT : c.price >= 9500 * CoreProbe.Story.CENT,
+                    "a03 create crosses the other side's band: " + c.toJson());
+            if (c.moment.equals("fill")) {
+                fill++;
+                check(c.sentNs < t0 + 2_100_000_000L, "a fill create was sent after the fill window: " + c.toJson());
+            } else if (c.moment.equals("reopen")) {
+                reopen++;
+                check(c.sentNs >= t0 + 4_000_000_000L, "a reopen create was sent before capacity_open: " + c.toJson());
+            } else {
+                throw new AssertionError("unknown a03 moment " + c.moment);
+            }
+        }
+        check(fill == 40 && reopen == 20, "a03 planned fill " + fill + " reopen " + reopen + ", expected 40 and 20");
+        check(markerAt(r, "capacity_closed_seen") >= t0 + 1_000_000_000L, "capacity_closed_seen before the file existed");
+        final long ended = markerAt(r, "fill_ended");
+        final long open = markerAt(r, "capacity_open_seen");
+        final long started = markerAt(r, "reopen_started");
+        check(ended <= open && open <= started, "marker order fill_ended " + ended + " capacity_open_seen " + open + " reopen_started " + started);
+        check(markersNamed(r, "capacity_open_timeout").isEmpty(), "a seen capacity_open also wrote a timeout marker");
+        check(Boolean.TRUE.equals(r.story.a03().get("closed")) && Boolean.TRUE.equals(r.story.a03().get("opened")),
+                "a03 closed/opened " + r.story.a03());
+    }
+
+    private static void a03Timeout() {
+        final FakeClock clock = new FakeClock();
+        final Result r = story(cfg("script=a03-fill", "seed=3", "rate=20", "fill_s=2", "reopen_s=1", "marker_timeout_s=3",
+                "users=1,2,3,4", "signal_dir=" + SIG), StubPort.Mode.ACK_ALL, p -> p, clock);
+        final long ended = markerAt(r, "fill_ended");
+        final long timeout = markerAt(r, "capacity_open_timeout");
+        check(timeout - ended >= 3_000_000_000L && timeout - ended < 3_100_000_000L, "timeout after " + (timeout - ended) + " ns, expected 3 s");
+        check(markersNamed(r, "capacity_open_seen").isEmpty(), "a timeout also wrote capacity_open_seen");
+        check(markersNamed(r, "capacity_closed_seen").isEmpty(), "capacity_closed_seen without the file");
+        check(list(r, "creates").stream().filter(c -> c.moment.equals("reopen")).count() == 20, "phase 3 did not run after the timeout");
+        check(Boolean.FALSE.equals(r.story.a03().get("closed")) && Boolean.FALSE.equals(r.story.a03().get("opened")),
+                "a03 closed/opened " + r.story.a03());
+    }
+
+    private static void a03Summary() {
+        final FakeClock clock = new FakeClock();
+        final long t0 = clock.now;
+        clock.filesAt.put(SIG + "/capacity_open", t0 + 4_000_000_000L);
+        final Result r = story(cfg("script=a03-fill", "seed=3", "rate=20", "fill_s=2", "reopen_s=1", "marker_timeout_s=10",
+                "users=1,2,3,4", "signal_dir=" + SIG), StubPort.Mode.ACK_ALL, p -> {
+            p.gateFrom = t0 + 1_000_000_000L;   // the gate shuts 1 s into the fill and stays shut until phase 3
+            p.gateTo = t0 + 3_900_000_000L;
+            return p;
+        }, clock);
+        final Map<String, Object> a = r.story.a03();
+        final int gate = (Integer) a.get("rejected_gate");
+        check(gate > 0 && gate < 40, "rejected_gate " + gate + " (expected the fill rows sent after the gate shut)");
+        check((Integer) a.get("created") == 40 - gate, "created " + a.get("created") + " with " + gate + " gate rejects of 40");
+        check((Integer) a.get("cancelled") == 0, "a03 reports cancelled " + a.get("cancelled"));
+        check((Integer) a.get("reopen_acked") == 20, "reopen_acked " + a.get("reopen_acked") + ", expected 20");
+        final String line = r.story.a03Line();
+        check(line.equals("A03 created=" + (40 - gate) + " rejected_gate=" + gate + " cancelled=0 reopen_acked=20 closed=false opened=true"),
+                "A03 line " + line);
+        check(r.summary.json().get("a03") != null, "the JSON summary has no a03 block");
+    }
+
+    private static void a03Deterministic() throws Exception {
+        final String[] kv = {"script=a03-fill", "seed=11", "rate=10", "fill_s=3", "reopen_s=2", "marker_timeout_s=1", "users=1,2,3,4,5,6",
+                "signal_dir=" + SIG};
+        final Result one = story(cfg(kv), StubPort.Mode.ACK_ALL);
+        final Result two = story(cfg(kv), StubPort.Mode.ACK_ALL);
+        check(one.log.equals(two.log), "two a03 runs with seed 11 wrote different request logs");
+        final String[] other = kv.clone();
+        other[1] = "seed=12";
+        check(!one.log.equals(story(cfg(other), StubPort.Mode.ACK_ALL).log), "seed 12 wrote the same a03 log as seed 11");
+        final Result a01 = story(cfg("script=a01-mix", "seed=11", "seconds=3", "rate=10", "users=1,2,3,4,5,6"), StubPort.Mode.ACK_ALL);
+        check(one.story.requestHigh != a01.story.requestHigh, "a03 and a01 share a request id space");
+        Files.writeString(outDir.resolve("a03-fill.jsonl"), one.log, StandardCharsets.UTF_8);
+    }
+
+    private static void a03Refusals() {
+        final String[] base = {"script=a03-fill", "seed=1", "users=1,2", "signal_dir=" + SIG};
+        refusal("signal_dir", () -> cfg("script=a03-fill", "seed=1", "users=1,2"));
+        refusal("does not take seconds=", () -> cfg(concat(base, "seconds=5")));
+        refusal("does not take without=", () -> cfg(concat(base, "without=gtd")));
+        refusal("above the functional bound", () -> cfg(concat(base, "rate=201")));
+        refusal("marker_timeout_s", () -> cfg(concat(base, "marker_timeout_s=0")));
+        refusal("fill_s", () -> cfg(concat(base, "fill_s=0")));
+        refusal("fill_s", () -> cfg(concat(base, "fill_s=x")));
+        refusal("at least two users", () -> cfg("script=a03-fill", "seed=1", "users=1", "signal_dir=" + SIG));
+        refusal("pass more users", () -> {   // 4000 creates / 2 users
+            final CoreProbe.StoryConfig big = cfg(concat(base, "rate=100", "fill_s=30", "reopen_s=10"));
+            new CoreProbe.Story(big, new FakeClock(), null, m -> { });
+        });
+        refusal("does not take fill_s=", () -> cfg("script=a01-mix", "seed=1", "seconds=1", "rate=1", "users=1,2", "fill_s=3"));
+        refusal("does not take signal_dir=", () -> cfg("script=a01-mix", "seed=1", "seconds=1", "rate=1", "users=1,2", "signal_dir=/x"));
+        refusal("does not take ioc_burst_on=", () -> cfg(concat(base, "ioc_burst_on=/m")));
+        refusal("does not take ioc_burst_on=", () -> cfg("script=a02-lifecycle", "seed=1", "seconds=0", "rate=1", "users=1,2", "ioc_burst_on=/m"));
+        // defaults of contract 5.5: 100/s, fill_s 30, reopen_s 10, marker_timeout_s 60
+        final CoreProbe.StoryConfig d = cfg("script=a03-fill", "seed=1", "users=" + users(40), "signal_dir=" + SIG);
+        check(d.rate == 100 && d.fillS == 30 && d.reopenS == 10 && d.markerTimeoutS == 60,
+                "a03 defaults " + d.rate + "/" + d.fillS + "/" + d.reopenS + "/" + d.markerTimeoutS);
+    }
+
+    private static String[] concat(final String[] a, final String... b) {
+        final String[] out = java.util.Arrays.copyOf(a, a.length + b.length);
+        System.arraycopy(b, 0, out, a.length, b.length);
+        return out;
+    }
+
+    private static String users(final int n) {
+        final StringBuilder sb = new StringBuilder();
+        for (int i = 1; i <= n; i++) {
+            sb.append(i == 1 ? "" : ",").append(i);
+        }
+        return sb.toString();
+    }
+
+    private static void iocBurst() {
+        final String[] kv = {"script=a01-mix", "seed=5", "seconds=6", "rate=20", "users=1,2,3,4"};
+        final Result plain = story(cfg(kv), StubPort.Mode.ACK_ALL);
+        final FakeClock clock = new FakeClock();
+        final long t0 = clock.now;
+        clock.filesAt.put("/m/burst", t0 + 2_000_000_000L);
+        final Result r = story(cfg(concat(kv, "ioc_burst_on=/m/burst")), StubPort.Mode.ACK_ALL, p -> p, clock);
+        final long start = markerAt(r, "ioc_burst_started");
+        final long end = markerAt(r, "ioc_burst_ended");
+        check(start >= t0 + 2_000_000_000L && start < t0 + 2_100_000_000L, "burst started at +" + (start - t0));
+        check(end - start >= 2_000_000_000L && end - start < 2_100_000_000L, "burst lasted " + (end - start) + " ns, expected 2 s");
+        int burst = 0;
+        for (final CoreProbe.StoryRow c : list(r, "creates")) {
+            final boolean inside = c.scheduledNs >= start && c.scheduledNs < start + 2_000_000_000L;
+            if (inside) {
+                burst++;
+                check(c.moment.equals("ioc_burst") && c.tif.equals("IOC") && c.type.equals("LIMIT"), "create inside the burst is not IOC: " + c.toJson());
+                check(c.side.equals("BUY") ? c.price == 9999 * CoreProbe.Story.CENT : c.price == 8000 * CoreProbe.Story.CENT,
+                        "burst create does not cross the whole band: " + c.toJson());
+            } else {
+                check(!c.moment.equals("ioc_burst"), "create outside the burst is marked ioc_burst: " + c.toJson());
+            }
+        }
+        check(burst >= 38 && burst <= 42, "burst carried " + burst + " creates for 2 s at 20/s");
+        check(((Integer) r.summary.json().get("ioc_burst_rows")) == burst, "ioc_burst_rows " + r.summary.json().get("ioc_burst_rows"));
+        // rows before the marker are the plain story's rows: the burst changes nothing it was not asked to
+        final List<CoreProbe.StoryRow> a = list(plain, "creates");
+        final List<CoreProbe.StoryRow> b = list(r, "creates");
+        check(a.size() == b.size(), "burst changed the number of creates");
+        for (int i = 0; i < a.size(); i++) {
+            if (b.get(i).scheduledNs - t0 < 2_000_000_000L) {
+                check(a.get(i).toJson().get("price").equals(b.get(i).toJson().get("price")) && a.get(i).tif.equals(b.get(i).tif),
+                        "a pre-burst row differs from the plain story at " + i);
+            }
+        }
+        final Result never = story(cfg(concat(kv, "ioc_burst_on=/m/never")), StubPort.Mode.ACK_ALL);
+        check(never.log.equals(plain.log) && markersNamed(never, "ioc_burst_started").isEmpty(), "a burst marker that never appears changed the story");
+    }
+
+    private static void users120() {
+        final String u = users(120);
+        final CoreProbe.StoryConfig c = cfg("script=a01-mix", "seed=2", "seconds=20", "rate=160", "users=" + u);
+        final Result r = story(c, StubPort.Mode.ACK_ALL);
+        check(list(r, "creates").size() == 3200, "a01 160/s 20 s with 120 users planned " + list(r, "creates").size() + " creates");
+        check(c.users.length == 120, "users parsed " + c.users.length);
+        final Set<Long> seen = new HashSet<>();
+        for (final CoreProbe.StoryRow row : list(r, "creates")) {
+            seen.add(row.user);
+        }
+        check(seen.size() == 120, "the story used " + seen.size() + " of 120 users");
+        final CoreProbe.StoryConfig f = CoreProbe.StoryConfig.parse(Map.of("script", "funding", "seed", "2", "users", u,
+                "out", "/x", "for", "a01-mix"));
+        check(CoreProbe.Story.fundingPlan(f).size() == 240, "funding 120 users planned " + CoreProbe.Story.fundingPlan(f).size() + " rows, expected 240");
+        // A05: 80 users, 90 s at 100/s
+        final CoreProbe.StoryConfig a05 = cfg("script=a01-mix", "seed=2", "seconds=90", "rate=100", "users=" + users(80));
+        check(a05.users.length == 80, "80 users");
+        new CoreProbe.Story(a05, new FakeClock(), new StubPort(new FakeClock(), StubPort.Mode.ACK_ALL), m -> { });
+    }
+
+    private static void moneyDumpV7() {
+        final CoreProbe p = new CoreProbe();
+        p.listener = p.new Listener();
+        p.listener.expectCorrelation = 5;
+        p.listener.balancesEnd = true;
+        p.listener.holdsEnd = true;
+        int n = MessageHeaderEncoder.ENCODED_LENGTH + new FeedPositionReportEncoder().wrapAndApplyHeader(BUF, 0, HDR).correlationId(5)
+                .consumePosition(4096).lastAppliedTradeId(77).journalEnabled(BoolFlag.TRUE).meEpoch(7506L).lastAppliedJournalSeq(321)
+                .feedHalted(BoolFlag.TRUE).haltReason(FeedHaltReason.SOURCE_SCHEMA).encodedLength();
+        p.listener.onMessage(1, 1, BUF, 0, n, null);
+        String line = p.moneyDumpLine();
+        check(line.contains("\"meEpoch\":7506") && line.contains("\"lastAppliedJournalSeq\":321") && line.contains("\"feedHalted\":true")
+                && line.contains("\"haltReason\":\"SOURCE_SCHEMA\""), "money-dump halt fields missing: " + line);
+        check(line.contains("\"consumePosition\":4096") && line.contains("\"lastAppliedTradeId\":77") && line.contains("\"journalEnabled\":true"),
+                "money-dump lost a v6 field: " + line);
+        n = MessageHeaderEncoder.ENCODED_LENGTH + new FeedPositionReportEncoder().wrapAndApplyHeader(BUF, 0, HDR).correlationId(5)
+                .consumePosition(9).lastAppliedTradeId(3).journalEnabled(BoolFlag.FALSE).meEpoch(8L).lastAppliedJournalSeq(2)
+                .feedHalted(BoolFlag.FALSE).haltReason(FeedHaltReason.NONE).encodedLength();
+        p.listener.onMessage(1, 1, BUF, 0, n, null);
+        line = p.moneyDumpLine();
+        check(line.contains("\"meEpoch\":8") && line.contains("\"feedHalted\":false") && line.contains("\"haltReason\":\"NONE\""),
+                "a running feed does not export feedHalted false / NONE: " + line);
+        check(!line.contains("SOURCE_SCHEMA"), "the later report did not replace the earlier one");
     }
 
     private static void listenerRoutes() {
