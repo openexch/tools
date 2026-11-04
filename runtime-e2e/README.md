@@ -154,3 +154,27 @@ fwdrestart, partition, fwdpause, driverkill, lifecycle, lifecycle-faults), `core
 * Pitfalls seen in real runs: restarting an AE member within about 12 s of a kill hangs the JVM ("active mark file");
   the in-container aeronmd pid is always 9, so driver identity is the `cnc.dat` mtime plus the container `StartedAt`;
   `/dev/shm` peaks were 1040 to 1047 MB per ME member and 927 to 948 MB per AE member (limit 1536 MB each), bridges 60 MB, forwarders 56 MB.
+
+## Docker drills A03 + A04 + A05 + A06 (RC2 S16, 2026-11-04)
+
+Contract: `notebook/reports/runtime-handoff-execution/RC2-me-link/S16/contract.md`. Scenario names follow S15 (`core-drill-<name>`, `core-control-<line>`, RED scenarios).
+
+* Lifecycle helpers (`core_fixture.py`): `stop`, `replace_slot` (the only way a slot changes binaries; both shas in the witness),
+  `wipe_engine` (refuses a running member; for an AE member it needs the core life's projection dump with the digest
+  `reset_projection` recorded, no dump no wipe), `reset_projection` (dumps the life's money tables, then recreates the database),
+  `regenesis`, `start_members`.
+* Two-life runs: A04 judges one sample per life; the projection database is reset between lives; life-1 ME evidence is read
+  before the wipe.
+* Engine external profile: manifest kind `s16-ext` runs the Java engines with `TRANSPORT_DRIVER_MODE=external` on a staged
+  aeronmd, the pinned production `driver.properties` plus a dev threading overlay (both pinned by sha256 in `engine_libs`).
+  Every other drill keeps the engines embedded.
+* `mk_manifests.py <kind> <tag>`: `s16`, `s16-ext`, `s16-embedded`, `s16-n1`, `s16-a03`, `s16-a03-embedded`, `s16-a05`,
+  `s16-a05-embedded`, `s16-red-a03`, `s16-red-a04`, `s16-ctl-edk-cnctimeout`.
+* Latency table: per command id, the dispatch's cluster ms to the ME's first record-3 `timestamp` (the mint ms; the tap's receive
+  time is not used), RELEASE_ID rows excluded. Baseline and swap-window summaries (p50, p99, p99.9, max) are recorded per run.
+* Cost matrix: N in {1, 2} x rate in {100, 160} commands/s x 60 s (`CoreProbe story` caps at about 166/s); counts only, no
+  throughput or latency claim (G20 is RCS S9's).
+* Settings (`core_drills.py` SETTINGS, recorded with every run, never acceptance limits): `A05_P999_SLACK_MS` 10,
+  `A05_N1_HOLD_S` 5, `A04_HALT_PHASE_S` 60, `CNC_TIMEOUT_BOUND_S` 35 (measured from the engine's own driver-wait log line, not the
+  container spawn), `A05_DUP_EDGE_SLACK` 10, `ENGINE_SHUTDOWN_TIMEOUT_S` 4 plus `ENGINE_STOP_SLACK_S` 1.
+
