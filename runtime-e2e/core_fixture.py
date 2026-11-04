@@ -97,6 +97,18 @@ def check_genesis_order(phases, expected=GENESIS_PHASES):
             raise Violation(f'genesis phase out of order: {later} before {earlier}')
 
 
+T1_ROW = re.compile(r'\.tickSize\(([0-9_]+)L?\)\.minPrice\(([0-9_]+)L?\)\.maxPrice\(([0-9_]+)L?\)\.lotSize\(([0-9_]+)L?\)')
+
+
+def t1_market_rows(source):
+    """tick, min, max, lot of the market rows the T1CoreDriver genesis encodes (one literal row for every market)."""
+    rows = {tuple(int(v.replace('_', '')) for v in hit) for hit in T1_ROW.findall(source)}
+    if len(rows) != 1:
+        raise Violation(f'T1CoreDriver: expected one literal market rows encoding, found {sorted(rows)}')
+    tick, low, high, lot = rows.pop()
+    return {'tick': tick, 'min': low, 'max': high, 'lot': lot}
+
+
 def role_kind(name):
     """forwarder | bridge | engine | projector, or None for a role the fixture never stops politely."""
     if name in ENGINES:
@@ -822,14 +834,18 @@ class CoreFixture(Fixture):
         self._driver('t1_core_driver', 'T1CoreDriver', 'genesis', PROBE_AERON_DIR, self._ingress('ae'),
                      self.genesis_id(self.life('core')), plan.get('ledger_capacity', 100_000), 0, 'via-bridge')
 
-    T1_MARKET = {'tick': 1, 'min': 1, 'max': 10**18, 'lot': 0}      # the market rows T1CoreDriver genesis sends (T1C:214-219)
+    def t1_market(self):
+        """W5 item 3: the market rows of the pinned T1CoreDriver genesis, read from its source (the W3 constant had maxPrice
+        10^18, the driver sends 1_000_000_000_000_000L = 10^15: the tables differed, so the driver's re-run met STALE at
+        CoreConfig 1, CoreConfigStateMachine.java:94-98 at eb559a7)."""
+        return t1_market_rows(Path(self.m['t1_core_driver']['source_path']).read_text())
 
     def core_config(self, version, genesis_id=None):
         """RC2 S17 W3 (5.2 (iii)): one CoreConfig through ``CoreProbe core-config`` on the ADMIN principal, with the values the
         genesis driver sends (configVersion = behaviorVersion = version, the genesisId, its market rows), so a later driver run
         meets an equal record (DUPLICATE). Returns [version, AdminAck result name]."""
         gid = genesis_id or self.genesis_id(self.life('core'))
-        meaning, reply = self.core('core-config', 'probe-admin', version=version, behavior=version, genesis=gid, **self.T1_MARKET)
+        meaning, reply = self.core('core-config', 'probe-admin', version=version, behavior=version, genesis=gid, **self.t1_market())
         acks = [r for r in (reply or {}).get('replies') or [] if r.get('t') == 'AdminAck']
         if not acks:
             raise Inconclusive(f'CoreConfig {version}: no AdminAck ({meaning})')

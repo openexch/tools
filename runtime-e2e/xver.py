@@ -34,7 +34,7 @@ DEFAULTS = {'XVER_BOUND_S': 150, 'XVER_STAGGER_S': 5, 'XVER_TAIL_MIN': 8, 'ENGIN
             'XVER_FATAL_GRACE_S': 5, 'XVER_LEGACY_OCTET': 187,
             # review V5, V17: every timing size of the X harness is a setting with its W3 value as the default
             'XVER_PROBE_MIN': 1, 'XVER_SERVE_HOLD_S': 15, 'XVER_PROBE_ATTEMPT_S': 20, 'XVER_PROBE_EXEC_S': 40,
-            'XVER_PROBE_DRAIN_S': 45, 'XVER_RECOVERY_READY_S': 150, 'XVER_AE_QUIESCE_S': 30, 'XVER_FINISH_BIND_S': 60,
+            'XVER_PROBE_DRAIN_S': 45, 'XVER_RECOVERY_READY_S': 150, 'XVER_AE_QUIESCE_S': 120, 'XVER_FINISH_BIND_S': 60,
             'XVER_BIND_WAIT_S': 60, 'XVER_ENGINE_READY_S': 120, 'XVER_DRIVER_S': 150, 'XVER_ME_DRIVER_S': 120,
             'XVER_EPOCH_WAITS_MIN': 2, 'XVER_RESTART_READY_S': 120, 'XVER_FWD_READY_S': 90}
 _S = dict(DEFAULTS)                        # the run's settings (scenario() fills it), read by the helpers below
@@ -87,8 +87,10 @@ SNAP3 = {'replay-halted': 3, 'quorum-exited': 0, 'other': 0}
 LOG21 = {'replay-halted': 2, 'quorum-exited': 1, 'other': 0}
 CASES = {}
 for _mode in ('emb', 'ext'):
+    # W5 item 1 (coordinator): with the W12 always-envelope reader the tag snapshot is refused at the envelope check before
+    # any session restore; that is the X-1a refusal (6.1 (a) amended); the R0 restored-session text stays accepted
     CASES[f'X-1a-{_mode}'] = _state_case('01', 'me', 'A', 'snapshot-tail', 'core-xver-me-new-on-old-snaptail', SNAP3,
-                                         ['me-r0-restored'])
+                                         ['me-envelope', 'me-r0-restored'])
     CASES[f'X-1b-{_mode}'] = _state_case('01', 'me', 'B', 'snapshot-quiet', 'core-xver-me-new-on-old-snapquiet', SNAP3,
                                          ['me-envelope'])
     CASES[f'X-1c-{_mode}'] = _state_case('01', 'me', 'C', 'log', 'core-xver-me-new-on-old-log', LOG21,
@@ -112,8 +114,11 @@ CONTROLS = {
     **{f'core-xver-ctl-ae-old-same-{shape.lower()}': {'engine': 'ae', 'under_test': 'tag-seed-validity', 'kinds': XVER_KINDS,
                                                        'of': 'X-3', 'seed': shape} for shape in ('A', 'C')},
     'core-xver-ctl-x7-wiped': {'under_test': 'rc2', 'kinds': XVER_KINDS, 'of': 'X-7'},
-    'core-rollback-ctl-omit-journal': {'under_test': 'rollback-restore', 'kinds': ('s17-rollback',), 'of': 'X-R',
-                                       'omit': 'ae-money-journal'},
+    # W5 item 5: the tag AE's money journal archive (1-0.rec) is regenerated from the replayed cluster log (the writer re-emits
+    # journalSeq 1..16 into a new recording; the projector skips them against the restored rows), so omitting it cannot bite;
+    # the control omits the AE cluster state the restore needs
+    'core-rollback-ctl-omit-aestate': {'under_test': 'rollback-restore', 'kinds': ('s17-rollback',), 'of': 'X-R',
+                                       'omit': 'ae-state'},
     'core-rollback-ctl-omit-pgdump': {'under_test': 'rollback-restore', 'kinds': ('s17-rollback',), 'of': 'X-R', 'omit': 'pg-dump'},
 }
 SCENARIO_NAMES = sorted({n for c in CASES.values() for n in c.get('scenarios', (c['scenario'],))} | set(CONTROLS))
@@ -601,9 +606,13 @@ def judge_a4(obs):
             for k in sorted(set(ref) | set(r5[m])):
                 if k not in LOCAL_FIELDS and ref.get(k) != r5[m].get(k):
                     reasons.append(f'{m} record 5 differs from me0 in {k}')
-    pos = obs['ae_log_positions']
-    if len(pos) != 3 or len(set(pos.values())) != 1:
-        reasons.append(f'AE logPositions differ at quiescence: {pos}')
+    if 'ae_catch_up' in obs:
+        if not obs['ae_catch_up'].get('caught_up'):
+            reasons.append(f'the AE late joiner did not catch up in the leader\'s view within the bound: {obs["ae_catch_up"]}')
+    else:
+        pos = obs['ae_log_positions']
+        if len(pos) != 3 or len(set(pos.values())) != 1:
+            reasons.append(f'AE logPositions differ at quiescence: {pos}')
     for m, ready in sorted(obs['late_ready'].items()):
         if not ready:
             reasons.append(f'the late member {m} did not become ready')
@@ -642,7 +651,8 @@ def judge_a5(obs):
 
 # ------------------------------------------------------------------ the X-R judge (6.9)
 
-OMIT_PART = {'ae-money-journal': ('ae', re.compile(r'\bae[0-2]\b')), 'pg-dump': ('r01_money', re.compile(r'r01_money|projector'))}
+OMIT_PART = {'ae-money-journal': ('ae', re.compile(r'\bae[0-2]\b')), 'ae-state': ('ae', re.compile(r'\bae[0-2]\b')),
+             'pg-dump': ('r01_money', re.compile(r'r01_money|projector'))}
 
 
 def judge_rollback(d0, d1, post, omitted=None, error=None, smoke=None, error_phase=None):
@@ -773,6 +783,16 @@ class ActiveProbe(threading.Thread):
             return list(self.rows)
 
 
+def not_started_by_steps(done):
+    """W5 item 2: the slots a genesis stopped after ``done`` has not started yet (the audit names them, never a finding)."""
+    out = []
+    if 'start_bridges' not in done:
+        out += ['bridge0', 'bridge1']
+    if 'start_forwarders' not in done:
+        out += ['fwd0', 'fwd1']
+    return tuple(out)
+
+
 def require_probe_genesis(m):
     """Review V2: X-A2's partial genesis sends ``CoreProbe core-config genesis=``; a staged CoreProbe without that argument
     leaves CoreConfig.genesisId unset. Refused before the box is touched."""
@@ -821,10 +841,11 @@ def _cut_aeron():
         return None
 
 
-def _audit(f, out, name, started_only=False):
+def _audit(f, out, name, started_only=False, not_started=()):
     import r10_cut
     try:
-        return r10_cut.audit_fixture(f, Path(out) / name, aeron_version=_cut_aeron(), started_only=started_only)
+        return r10_cut.audit_fixture(f, Path(out) / name, aeron_version=_cut_aeron(), started_only=started_only,
+                                     not_started=not_started)
     except Exception as error:
         report = {'status': 'ERROR', 'error': str(error)[:500], 'findings': [str(error)[:300]], 'stopped': [], 'members_up': {}}
         (Path(out) / name).write_text(json.dumps(report, indent=1) + '\n')
@@ -929,6 +950,8 @@ def _seed_members(f, shape, roles, tail_min, parts=None):
 
 def _result(verdict, extra, fixtures, assertions):
     status = verdict_status(verdict['verdict'])
+    if fixtures and 'state_root' not in extra:          # W5 item 6: the activation-record CLI reads the run's state root
+        extra = dict(extra, state_root=str(fixtures[0].root))
     return dict(extra, status=status, xver_verdict=verdict['verdict'], verdict=verdict, assertions=assertions, processed=1,
                 skipped=0, child_exit_codes=_child_exits(fixtures))
 
@@ -1346,7 +1369,8 @@ def run_act(manifest, name, out, s):
             partial = f.core_genesis_partial(plan, k)
             time.sleep(3)
             gate_partial = _gate_now(f)
-            audit = _audit(f, out, 'audit.json')
+            _journal_records(f, ['me0', 'me1', 'me2'])      # W5 item 2: record 5 dumped before the record (evidence)
+            audit = _audit(f, out, 'audit.json', not_started=not_started_by_steps(order[:order.index('core_genesis')]))
             before = _record(f, out, audit, 'rc2-activation-record.before-recovery.json')
             # review V15 (a): 6.8 order: (a) the same genesisId on the untouched partial state, then (b) a new one
             same = _core_driver(f)
@@ -1373,7 +1397,7 @@ def run_act(manifest, name, out, s):
                 time.sleep(3)
                 obs['recovery'] = {'finish': finish['results'], 'bound': bound, 'gate_after_finish': gate_after_finish,
                                    'open': {'meaning': meaning, 'reply': reply}, 'gate_after_open': _gate_now(f)}
-            obs['record_after'] = _record(f, out, _audit(f, out, 'audit-end.json'))
+            obs['record_after'] = _record(f, out, _audit(f, out, 'audit-end.json', not_started=('fwd0', 'fwd1')))
             verdict = judge_a2(obs)
         elif name == 'core-act-nobridge':
             _boot_engines(f)
@@ -1382,7 +1406,9 @@ def run_act(manifest, name, out, s):
             gate0 = _gate_now(f)
             meaning, reply = f.core('gate', 'probe-admin', market=0, state='OPEN', reason='ADMIN')
             ack = next((r for r in (reply or {}).get('replies') or [] if r.get('t') == 'AdminAck'), {})
-            before = _record(f, out, _audit(f, out, 'audit.json'), 'rc2-activation-record.before-recovery.json')
+            _journal_records(f, ['me0', 'me1', 'me2'])      # W5 item 2
+            before = _record(f, out, _audit(f, out, 'audit.json', not_started=not_started_by_steps(order[:order.index('start_bridges')])),
+                             'rc2-activation-record.before-recovery.json')
             t = time.time()
             f.start_bridges(plan)
             f.registry['boot']['phases']['bridges_ready_ns'] = time.time_ns()
@@ -1400,7 +1426,7 @@ def run_act(manifest, name, out, s):
             obs = {'driver': driver, 'gate_no_bridge': gate0, 'probe_open_no_bridge': {'meaning': meaning, 'reason': ack.get('reason')},
                    'before': before, 'bound_after_s': bound_after, 'gate_after_bind': gate1,
                    'probe_open_after_bind': {'meaning': m2, 'result': ack2.get('result')}, 'gate_final': _gate_now(f)}
-            obs['record_after'] = _record(f, out, _audit(f, out, 'audit-end.json'))
+            obs['record_after'] = _record(f, out, _audit(f, out, 'audit-end.json', not_started=('fwd0', 'fwd1')))
             verdict = judge_a3(obs)
         elif name == 'core-act-latemember':
             late = ('me2', 'ae2')
@@ -1422,8 +1448,8 @@ def run_act(manifest, name, out, s):
                     _note(out, ev='late member not ready', role=m, error=str(error))
             time.sleep(5)
             r5, _ = _journal_records(f, ['me0', 'me1', 'me2'])
-            positions = _ae_log_positions(f, out)
-            obs = {'record5': r5, 'ae_log_positions': positions, 'late_ready': ready, 'record': record}
+            catch = _ae_catch_up(f, out)
+            obs = {'record5': r5, 'ae_catch_up': catch, 'late_ready': ready, 'record': record}
             verdict = judge_a4(obs)
         elif name == 'core-act-fwdfirst':
             _boot_engines(f)
@@ -1486,7 +1512,7 @@ def _ae_log_positions(f, out, bound_s=None):
                            '-cp', '/artifacts/ae.jar', 'io.aeron.cluster.ClusterTool', '/data/state/cluster', 'list-members']
             r = f.execute(role, argv, timeout=60, check=False, accepted=tuple(range(256)))
             text = (r.stdout or '') + (r.stderr or '')
-            _note(out, ev='list-members', role=role, out=text[-800:])
+            _note(out, ev='list-members', role=role, text=text[-800:])
             own = re.search(r'memberId=(\d+)', text)
             members = dict(re.findall(r'ClusterMember\{id=(\d+).*?logPosition=(-?\d+)', text))
             if own and own.group(1) in members:
@@ -1495,6 +1521,51 @@ def _ae_log_positions(f, out, bound_s=None):
             break
         time.sleep(3)
     return positions
+
+
+MEMBER_ROW = re.compile(r'ClusterMember\{id=(\d+), [^{}]*?isLeader=(true|false), [^{}]*?logPosition=(-?\d+)')
+
+
+def leader_view(text):
+    """(leader id, {member id: logPosition}) from one ``list-members`` output when it is the leader's own (its memberId row
+    says isLeader=true), else None: a follower's view of its peers is stale (W5 X-A4: -1 or its election-time position)."""
+    own = re.search(r'memberId=(\d+)', text)
+    rows = {int(i): (lead == 'true', int(p)) for i, lead, p in MEMBER_ROW.findall(text)}
+    if not own or int(own.group(1)) not in rows or not rows[int(own.group(1))][0]:
+        return None
+    return int(own.group(1)), {i: p for i, (_, p) in rows.items()}
+
+
+def caught_up(samples, late):
+    """W5 X-A4: the AE log advances under the engines' own timers, so exact equality "at quiescence" is never seen; the late
+    member has caught up when, in the leader's view, its logPosition reaches the leader's position of an EARLIER sample."""
+    for earlier, later in zip(samples, samples[1:]):
+        if later['positions'].get(late, -1) >= earlier['positions'][earlier['leader']]:
+            return {'caught_up': True, 'leader_position_before': earlier['positions'][earlier['leader']],
+                    'late_position_after': later['positions'][late]}
+    return {'caught_up': False}
+
+
+def _ae_catch_up(f, out, late=2, bound_s=None):
+    from core_fixture import JAVA
+    bound_s = _S['XVER_AE_QUIESCE_S'] if bound_s is None else bound_s
+    samples, t = [], time.time()
+    while time.time() - t < bound_s:
+        for i in range(3):
+            role = f'ae{i}'
+            argv = JAVA + [f'-Daeron.dir=/dev/shm/aeron-{role}' if f.engine_driver() == 'external' else '-Daeron.dir=/dev/shm/aeron',
+                           '-cp', '/artifacts/ae.jar', 'io.aeron.cluster.ClusterTool', '/data/state/cluster', 'list-members']
+            r = f.execute(role, argv, timeout=60, check=False, accepted=tuple(range(256)))
+            view = leader_view((r.stdout or '') + (r.stderr or ''))
+            if view:
+                samples.append({'at_ns': time.time_ns(), 'leader': view[0], 'positions': view[1]})
+                _note(out, ev='leader view', leader=view[0], positions=view[1])
+                break
+        result = caught_up(samples, late)
+        if result['caught_up']:
+            return dict(result, samples=samples)
+        time.sleep(3)
+    return dict(caught_up(samples, late), samples=samples)
 
 
 # ------------------------------------------------------------------ X-R (6.9)
@@ -1586,6 +1657,8 @@ def run_rollback(manifest, out, s, omit=None):
         shutil.copytree(archive / 'state' / m, roots / m, symlinks=True, dirs_exist_ok=True)
         if omit == 'ae-money-journal' and m.startswith('ae'):
             omitted_items[m] = _omit_money_journal(roots / m)
+        if omit == 'ae-state' and m.startswith('ae'):
+            omitted_items[m] = _empty_dir(roots / m)
     result['omitted_items'] = omitted_items
     # 5: the tag line on the same roots (a new legacy fixture, the same addresses), D1, a post-restore scenario
     l2_path, _ = legacy_tag.legacy_manifest(f'xr-{tag}-l2', s['XVER_LEGACY_OCTET'], B0 / 'local-runs/s17/legacy-xr')
