@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """RC2 S17 W2/W4 (contract 5.4, 20.1 line 20): child manifests are written under the names mk_manifests.py produces,
 ``<kind>--<tag>.json``, so the S16 kind rule (``validate_build_b``) accepts a child of a kinded manifest. No Docker."""
+import fcntl
+import hashlib
 import json
+import os
 from pathlib import Path
+import re
+import subprocess
 import tempfile
 import types
 import unittest
@@ -10,6 +15,7 @@ from unittest import mock
 
 import core_contracts
 import core_scenarios
+from contracts import Violation
 import nightly
 
 
@@ -63,6 +69,283 @@ class ChildManifestNameTest(unittest.TestCase):
         for path in seen:
             self.assertTrue(path.name.startswith('s16--'), path.name)
             self.accepted(path)
+
+
+# ------------------------------------------------------------------ RC2 S17 W4 (contract 5.4, 8.3): the plan nightly
+
+class FakeHost(nightly.Host):
+    """No docker, no runner, no clock: records what the night would have done."""
+    def __init__(self, containers=(), fixture=(), load=0.5, results=None, durations=None):
+        self.containers, self.fixture, self.load, self.removed, self.started = list(containers), list(fixture), load, [], []
+        self.results, self.durations, self.clock = results or {}, durations or {}, 0.0
+
+    def fixture_containers(self): return list(self.fixture)
+    def running_containers(self): return list(self.containers)
+    def remove_container(self, cid): self.removed.append(cid); self.fixture = [c for c in self.fixture if c != cid]
+    def load5(self): return self.load
+    def monotonic(self): return self.clock
+    def make_manifest(self, entry, index, work, settings):
+        path = work / f'{entry["kind"]}--night-{index}.json'; work.mkdir(parents=True, exist_ok=True); path.write_text('{}\n')
+        return path
+
+    def run_entry(self, entry, manifest, output, log, timeout):
+        key = entry['scenario']; self.started.append(key)
+        duration = self.durations.get(key, 10.0)
+        if timeout is not None and duration > timeout:
+            self.clock += timeout
+            return 'TIMEOUT', None
+        self.clock += duration
+        output.mkdir(parents=True)
+        status = self.results.get(key, 'PASS')
+        (output / 'result.json').write_text(json.dumps({'status': status, 'error': None if status == 'PASS' else 'x'}))
+        log.write('ran ' + key + '\n')
+        return 'DONE', 0 if status == 'PASS' else 1
+
+
+def plan2():
+    return [{'kind': 's17', 'scenario': 'core-boots-1'}, {'kind': 's17-ext', 'scenario': 'core-drill-a04-regenesis'}]
+
+
+class PlanTest(unittest.TestCase):
+    def test_plan_refuses_unknown_kind_and_scenario(self):
+        with self.assertRaisesRegex(Violation, 'unknown kind'):
+            nightly.parse_plan([{'kind': 's99', 'scenario': 'core-smoke'}])
+        with self.assertRaisesRegex(Violation, 'unknown scenario'):
+            nightly.parse_plan([{'kind': 's17', 'scenario': 'core-drill-nonesuch'}])
+        with self.assertRaisesRegex(Violation, 'unknown scenario'):
+            nightly.parse_plan([{'kind': 's17', 'scenario': 'core-boots-0'}])
+        with self.assertRaisesRegex(Violation, 'entry'):
+            nightly.parse_plan([{'kind': 's17'}])
+        with self.assertRaisesRegex(Violation, 'entry'):
+            nightly.parse_plan([{'kind': 's17', 'scenario': 'core-smoke', 'extra': 1}])
+        with self.assertRaisesRegex(Violation, 'empty'):
+            nightly.parse_plan([])
+
+    def test_plan_accepts_the_known_names(self):
+        plan = nightly.parse_plan({'entries': plan2() + [{'kind': 's17-red-a04', 'scenario': 'core-red-a04'},
+                                                         {'kind': 's17', 'scenario': 'core-control-a06-n1'}]})
+        self.assertEqual(len(plan), 4)
+
+    def test_default_plan_is_valid_and_ends_with_boots(self):
+        plan = nightly.parse_plan(json.loads((Path(__file__).with_name('nightly-cut.json')).read_text()))
+        self.assertEqual(plan[-1], {'kind': 's17', 'scenario': 'core-boots-10'})
+        self.assertGreaterEqual(len(plan), 18 + 4)           # contract 7.1: 18 drills and the embedded repeats at least
+        self.assertEqual(len({(e['kind'], e['scenario']) for e in plan}), len(plan))
+
+
+class NightBase(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.dir = Path(self.temp.name)
+        self.ev = self.dir / 'evidence'; self.ev.mkdir(); self.work = self.dir / 'work'
+        self.lock = self.dir / 'heavy.lock'
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def settings(self, **kw):
+        base = dict(lock=str(self.lock), bound_s=18000.0, after_interrupt='run', load_max=6.0, harness_commit='a' * 40)
+        base.update(kw)
+        return nightly.Settings(**base)
+
+    def night(self, host, plan=None, **kw):
+        host.clock_start = host.monotonic()
+        return nightly.run_night(plan or nightly.parse_plan(plan2()), self.ev, self.work, self.settings(**kw), host)
+
+    def summary(self, night):
+        return json.loads((self.ev / night / 'summary.json').read_text())
+
+
+class LockTest(NightBase):
+    def test_held_lock_is_skipped_busy_and_runs_nothing(self):          # nightly-busy
+        host = FakeHost()
+        holder = open(self.lock, 'a'); fcntl.flock(holder, fcntl.LOCK_EX)
+        code, summary = self.night(host)
+        self.assertEqual((code, summary['status']), (75, 'SKIPPED_BUSY'))
+        self.assertEqual(host.started, []); self.assertEqual(host.removed, [])
+        self.assertEqual(summary['lock'], str(self.lock))
+        self.assertEqual(summary['entries'], [])
+        # the lock is per night and released on exit: the same test then runs a normal night (C4)
+        fcntl.flock(holder, fcntl.LOCK_UN); holder.close()
+        code, summary = self.night(host)
+        self.assertEqual((code, summary['status']), (0, 'PASS'))
+        self.assertEqual(host.started, ['core-boots-1', 'core-drill-a04-regenesis'])
+        code, summary = self.night(host)            # released again by the night just finished
+        self.assertEqual(code, 0)
+
+    def test_busy_night_is_sealed(self):
+        holder = open(self.lock, 'a'); fcntl.flock(holder, fcntl.LOCK_EX)
+        _, summary = self.night(FakeHost())
+        self.assertTrue(nightly.verify_seal(self.ev / summary['night']))
+        holder.close()
+
+
+class PreflightTest(NightBase):
+    def test_unfinished_night_dir_is_interrupted_then_runs(self):       # nightly-stale (dir half)
+        (self.ev / '20200101T000000Z').mkdir(); (self.ev / '20200102T000000Z').mkdir()
+        (self.ev / '20200102T000000Z' / 'half.log').write_text('x')
+        host = FakeHost()
+        code, summary = self.night(host)
+        self.assertEqual(summary['status'], 'PASS')
+        self.assertEqual(sorted(summary['interrupted']['unfinished_night_dirs']), ['20200101T000000Z', '20200102T000000Z'])
+        for name in ('20200101T000000Z', '20200102T000000Z'):
+            old = self.summary(name)
+            self.assertEqual(old['status'], 'INTERRUPTED')
+        code, second = self.night(host)                  # recorded once: the second night finds nothing unfinished (C4)
+        self.assertNotIn('interrupted', second)
+
+    def test_stale_fixture_container_is_removed_and_after_interrupt_skip(self):   # nightly-stale (container half)
+        host = FakeHost(containers=['c1'], fixture=['c1'])
+        code, summary = self.night(host, after_interrupt='skip')
+        self.assertEqual((code, summary['status']), (0, 'INTERRUPTED'))
+        self.assertEqual(host.removed, ['c1']); self.assertEqual(host.started, [])
+        self.assertEqual(summary['interrupted']['stale_fixture_containers'], ['c1'])
+
+    def test_stale_container_removed_then_night_runs_by_default(self):
+        host = FakeHost(containers=['c1'], fixture=['c1'])
+        code, summary = self.night(host)
+        self.assertEqual(host.removed, ['c1'])
+        self.assertEqual(summary['status'], 'PASS'); self.assertEqual(summary['previous_night'], 'INTERRUPTED')
+        self.assertEqual(len(host.started), 2)
+
+    def test_foreign_container_is_skipped_busy(self):                   # nightly-foreign-load
+        host = FakeHost(containers=['f1', 'c1'], fixture=['c1'])
+        code, summary = self.night(host)
+        self.assertEqual((code, summary['status']), (75, 'SKIPPED_BUSY'))
+        self.assertEqual(summary['preflight']['foreign_running'], ['f1'])
+        self.assertEqual(host.started, [])
+
+    def test_load_average_is_skipped_busy(self):
+        code, summary = self.night(FakeHost(load=7.5))
+        self.assertEqual((code, summary['status']), (75, 'SKIPPED_BUSY'))
+        self.assertEqual(summary['preflight']['load5'], 7.5)
+        code, summary = self.night(FakeHost(load=7.5), load_max=8.0)
+        self.assertEqual(code, 0)
+
+
+class BoundTest(NightBase):
+    def test_bound_marks_the_remaining_entries_inconclusive(self):
+        plan = nightly.parse_plan(plan2() + [{'kind': 's17', 'scenario': 'core-smoke'}])
+        host = FakeHost(durations={'core-boots-1': 600.0, 'core-drill-a04-regenesis': 600.0})
+        code, summary = self.night(host, plan, bound_s=900.0)
+        by = {e['scenario']: e['status'] for e in summary['entries']}
+        self.assertEqual(by, {'core-boots-1': 'PASS', 'core-drill-a04-regenesis': 'INCONCLUSIVE', 'core-smoke': 'INCONCLUSIVE'})
+        self.assertEqual(summary['status'], 'INCONCLUSIVE'); self.assertEqual(code, 2)
+        self.assertIn('night bound', summary['entries'][2]['error'])
+        self.assertEqual(host.started, ['core-boots-1', 'core-drill-a04-regenesis'])
+
+    def test_bound_already_spent_starts_nothing(self):
+        host = FakeHost()
+        code, summary = self.night(host, bound_s=0.0)
+        self.assertEqual(host.started, []); self.assertEqual(summary['status'], 'INCONCLUSIVE')
+
+    def test_fail_outranks_inconclusive(self):
+        host = FakeHost(results={'core-boots-1': 'FAIL'}, durations={'core-boots-1': 400.0, 'core-drill-a04-regenesis': 1000.0})
+        code, summary = self.night(host, bound_s=500.0)
+        self.assertEqual((code, summary['status']), (1, 'FAIL'))
+
+    def test_bound_default_is_five_hours_and_a_setting(self):
+        self.assertEqual(nightly.settings_from_env({}).bound_s, 18000.0)
+        self.assertEqual(nightly.settings_from_env({'NIGHTLY_BOUND_S': '900'}).bound_s, 900.0)
+        with self.assertRaises(Violation): nightly.settings_from_env({'NIGHTLY_BOUND_S': 'soon'})
+        with self.assertRaises(Violation): nightly.settings_from_env({'NIGHTLY_AFTER_INTERRUPT': 'maybe'})
+        s = nightly.settings_from_env({})
+        self.assertEqual((s.after_interrupt, s.load_max), ('run', 6.0))
+        self.assertTrue(s.lock.endswith('/scratchpad/heavy.lock'))
+
+
+class SealTest(NightBase):
+    def test_night_is_sealed_over_every_file(self):
+        code, summary = self.night(FakeHost())
+        night = self.ev / summary['night']
+        files = sorted(str(p.relative_to(night)) for p in night.rglob('*') if p.is_file() and p.name != 'SHA256SUMS')
+        lines = (night / 'SHA256SUMS').read_text().splitlines()
+        self.assertEqual([l.split('  ', 1)[1] for l in lines], files)
+        self.assertIn('summary.json', files); self.assertTrue(any(f.endswith('.log') for f in files))
+        log = next(night / f for f in files if f.endswith('-core-boots-1.log'))
+        for line in lines:
+            digest, name = line.split('  ', 1)
+            self.assertEqual(digest, hashlib.sha256((night / name).read_bytes()).hexdigest())
+        self.assertTrue(nightly.verify_seal(night))
+        original = log.read_text(); log.write_text('edited')
+        self.assertFalse(nightly.verify_seal(night))
+        log.write_text(original)
+        (night / 'late.txt').write_text('x')
+        self.assertFalse(nightly.verify_seal(night))        # a file the seal does not list
+
+
+class HarnessTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.dir = Path(self.temp.name)
+        self.repo = self.dir / 'repo'; (self.repo / 'runtime-e2e').mkdir(parents=True)
+        (self.repo / 'runtime-e2e' / 'a.py').write_text('print(1)\n'); (self.repo / 'runtime-e2e' / 'b.txt').write_text('b\n')
+        self.git('init', '-q'); self.git('add', '-A'); self.git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'one')
+        self.sha = self.git('rev-parse', 'HEAD').strip(); self.root = self.dir / 'nightly'
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def git(self, *args):
+        return subprocess.run(['git', '-C', str(self.repo)] + list(args), capture_output=True, text=True, check=True).stdout
+
+    def test_harness_is_the_archive_of_the_commit_not_the_working_tree(self):
+        (self.repo / 'runtime-e2e' / 'a.py').write_text('print(2)\n')          # a dirty checkout
+        (self.repo / 'runtime-e2e' / 'new.py').write_text('x\n')
+        harness = nightly.prepare_harness(self.repo, self.sha, self.root)
+        self.assertEqual(harness, self.root / ('harness-' + self.sha))
+        self.assertEqual((harness / 'runtime-e2e' / 'a.py').read_text(), 'print(1)\n')
+        self.assertFalse((harness / 'runtime-e2e' / 'new.py').exists())
+        again = nightly.prepare_harness(self.repo, self.sha, self.root)          # unpacked once
+        self.assertEqual(again, harness)
+
+    def test_dirty_harness_is_refused(self):                                  # nightly-dirty
+        harness = nightly.prepare_harness(self.repo, self.sha, self.root)
+        (harness / 'runtime-e2e' / 'b.txt').write_text('edited\n')
+        with self.assertRaisesRegex(Violation, 'dirty.*b.txt'):
+            nightly.prepare_harness(self.repo, self.sha, self.root)
+        (harness / 'runtime-e2e' / 'b.txt').write_text('b\n'); (harness / 'runtime-e2e' / 'extra.py').write_text('x')
+        with self.assertRaisesRegex(Violation, 'dirty.*extra.py'):
+            nightly.prepare_harness(self.repo, self.sha, self.root)
+        (harness / 'runtime-e2e' / 'extra.py').unlink(); (harness / 'runtime-e2e' / 'a.py').unlink()
+        with self.assertRaisesRegex(Violation, 'dirty.*a.py'):
+            nightly.prepare_harness(self.repo, self.sha, self.root)
+
+    def test_unknown_commit_and_short_sha_are_refused(self):
+        with self.assertRaisesRegex(Violation, '40-hex'):
+            nightly.prepare_harness(self.repo, self.sha[:7], self.root)
+        with self.assertRaisesRegex(Violation, 'not in'):
+            nightly.prepare_harness(self.repo, '0' * 40, self.root)
+
+    def test_dirty_harness_runs_nothing(self):
+        harness = nightly.prepare_harness(self.repo, self.sha, self.root)
+        (harness / 'runtime-e2e' / 'b.txt').write_text('edited\n')
+        host = FakeHost()
+        with tempfile.TemporaryDirectory() as ev:
+            with self.assertRaises(Violation):
+                nightly.main_with(['--plan', str(self.dir / 'p.json'), '--evidence-root', ev, '--tools-repo', str(self.repo),
+                                   '--harness-commit', self.sha, '--harness-root', str(self.root)], host=host)
+        self.assertEqual(host.started, [])
+
+
+class UnitFilesTest(unittest.TestCase):
+    D = Path(__file__).with_name('systemd')
+
+    def test_service_reads_the_bound_from_environment_and_keeps_its_shape(self):
+        text = (self.D / 'runtime-e2e-nightly.service').read_text()
+        self.assertRegex(text, r'(?m)^Environment=NIGHTLY_BOUND_S=18000$')
+        self.assertRegex(text, r'(?m)^Nice=5$'); self.assertRegex(text, r'(?m)^After=docker.service$')
+        self.assertIn('--plan', text); self.assertIn('--harness-commit', text)
+        self.assertNotRegex(text, r'(?m)^TimeoutStartSec=.*\$')       # systemd does not expand Environment= there
+
+    def test_outer_guard_is_in_the_drop_in_and_larger_than_the_bound(self):
+        text = (self.D / 'runtime-e2e-nightly.service.d' / 'timeout.conf').read_text()
+        guard = int(re.search(r'(?m)^TimeoutStartSec=(\d+)$', text).group(1))
+        self.assertEqual(guard, 21600)
+        self.assertGreater(guard, nightly.settings_from_env({}).bound_s)
+        self.assertNotRegex((self.D / 'runtime-e2e-nightly.service').read_text(), r'(?m)^TimeoutStartSec=')
+
+    def test_timer_keeps_its_calendar_and_persistence(self):
+        text = (self.D / 'runtime-e2e-nightly.timer').read_text()
+        self.assertIn('OnCalendar=*-*-* 03:17:00', text); self.assertIn('Persistent=true', text)
 
 
 if __name__ == '__main__':
