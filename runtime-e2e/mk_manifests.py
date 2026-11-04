@@ -112,6 +112,7 @@ class Config:
     seed: int = SEED
     cut_nc_dir: Path = B0 / 'local-runs/s17/cut17/ct2t'       # RC2 S17: the test-config build of the cut's ct commit (nc targets)
     shm_mb: dict = field(default_factory=dict)                 # per-role overrides of SHM_MB (settings)
+    harness_drift: str = None                                  # RC2 S17 review V2: a named waiver (rig kinds only), recorded
     memory_mb: dict = field(default_factory=dict)
 
 
@@ -363,6 +364,9 @@ def build_from_cut(kind, tag, cut_path, cfg=None, old_pins=None):
                          f'projector {engine_driver}; shm/memory sizes are settings, not acceptance limits'),
         'projector_driver': engine_driver,
     }
+    if cfg.harness_drift:
+        m['harness_drift'] = {'reason': cfg.harness_drift, 'cut_harness_commit': cut.get('harness_commit'),
+                              'harness_commit': commit, 'harness_dirty': dirty}
     if kind in LEGACY_LAYOUT_KINDS:
         m['nodes'] = legacy_nodes(roles, cfg.octet)
         m['node_layout'] = 'legacy'
@@ -401,9 +405,11 @@ def main(argv=None):
     parser.add_argument('--b-source-sha'); parser.add_argument('--build-b', type=Path)
     parser.add_argument('--octet', type=int); parser.add_argument('--pg-port', type=int)
     parser.add_argument('--shm', action='append'); parser.add_argument('--memory', action='append')
+    parser.add_argument('--harness-drift', metavar='REASON', help='RC2 S17 review V2: run a rig kind on a harness other than the '
+                        'cut\'s (recorded with this reason; never a product or nightly manifest)')
     parser.add_argument('--runs', type=Path, help='the runs root (default local-runs/s16; the s17 kinds default to local-runs/s17)')
     args = parser.parse_args(argv)
-    cfg = Config(shm_mb=_sizes(args.shm), memory_mb=_sizes(args.memory))
+    cfg = Config(shm_mb=_sizes(args.shm), memory_mb=_sizes(args.memory), harness_drift=args.harness_drift)
     if args.kind in KINDS17 and args.runs is None:
         args.runs = B0 / 'local-runs/s17'
     for key, value in (('b_source_sha', args.b_source_sha), ('build_b', args.build_b), ('octet', args.octet),

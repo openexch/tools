@@ -31,7 +31,14 @@ PREFIXES = ('core-xver-', 'core-act-', 'core-rollback-')
 DEFAULTS = {'XVER_BOUND_S': 150, 'XVER_STAGGER_S': 5, 'XVER_TAIL_MIN': 8, 'ENGINE_QUORUM_WAIT_MS': 120000,
             'XVER_SAMPLE_S': 60, 'XVER_LATE_JOIN_S': 30, 'XVER_FWD_WAIT_S': 30, 'XVER_PROBE_INFLIGHT': 2,
             'XVER_PROBE_INTERVAL_S': 1,
-            'XVER_FATAL_GRACE_S': 5, 'XVER_LEGACY_OCTET': 187}
+            'XVER_FATAL_GRACE_S': 5, 'XVER_LEGACY_OCTET': 187,
+            # review V5, V17: every timing size of the X harness is a setting with its W3 value as the default
+            'XVER_PROBE_MIN': 1, 'XVER_SERVE_HOLD_S': 15, 'XVER_PROBE_ATTEMPT_S': 20, 'XVER_PROBE_EXEC_S': 40,
+            'XVER_PROBE_DRAIN_S': 45, 'XVER_RECOVERY_READY_S': 150, 'XVER_AE_QUIESCE_S': 30, 'XVER_FINISH_BIND_S': 60,
+            'XVER_BIND_WAIT_S': 60, 'XVER_ENGINE_READY_S': 120, 'XVER_DRIVER_S': 150, 'XVER_ME_DRIVER_S': 120,
+            'XVER_EPOCH_WAITS_MIN': 2, 'XVER_RESTART_READY_S': 120, 'XVER_FWD_READY_S': 90}
+_S = dict(DEFAULTS)                        # the run's settings (scenario() fills it), read by the helpers below
+X7_SAMPLE_MIN_S = 60                       # the 6.7 pass line (">= 60 s after the last FeedHalt ack"); XVER_SAMPLE_S may only raise it
 SEEDS = Path(os.environ.get('XVER_SEEDS', str(B0 / 'local-runs/s17/seeds-w1')))
 CUT = Path(os.environ.get('XVER_CUT', str(B0 / 'workspace/notebook/reports/runtime-handoff-execution/R10/rc2-cut-manifest.json')))
 XVER_KINDS = ('s17-xver', 's17-xver-ext')
@@ -55,6 +62,8 @@ def settings(env=None):
         if value <= 0:
             raise Violation(f'{key} must be a positive number, got {raw!r}')
         out[key] = int(value) if value == int(value) else value
+    if out['XVER_SAMPLE_S'] < X7_SAMPLE_MIN_S:
+        raise Violation(f'XVER_SAMPLE_S may only be raised: the X-7 pass line samples >= {X7_SAMPLE_MIN_S} s (got {out["XVER_SAMPLE_S"]})')
     need = out['ENGINE_QUORUM_WAIT_MS'] / 1000 + out['XVER_FATAL_GRACE_S'] + 2 * out['XVER_STAGGER_S']
     if out['XVER_BOUND_S'] < need:
         raise Violation(f'XVER_BOUND_S {out["XVER_BOUND_S"]} s cannot hold ENGINE_QUORUM_WAIT_MS + fatal grace + stagger ({need} s)')
@@ -97,8 +106,11 @@ CASES['X-R'] = {'row': '49', 'scenario': 'core-rollback-old-line', 'seed': 'R', 
 CONTROLS = {
     'core-xver-ctl-me-same': {'engine': 'me', 'under_test': 'rc2', 'kinds': XVER_KINDS, 'of': 'X-1'},
     'core-xver-ctl-ae-same': {'engine': 'ae', 'under_test': 'rc2', 'kinds': XVER_KINDS, 'of': 'X-3'},
-    'core-xver-ctl-me-old-same': {'engine': 'me', 'under_test': 'tag-seed-validity', 'kinds': XVER_KINDS, 'of': 'X-1', 'seed': 'A'},
-    'core-xver-ctl-ae-old-same': {'engine': 'ae', 'under_test': 'tag-seed-validity', 'kinds': XVER_KINDS, 'of': 'X-3', 'seed': 'A'},
+    # review V14: one seed-validity control per seed an X case uses (X-1a/b/c: A, B, C; X-3a/b: A, C; X-7: the C journal)
+    **{f'core-xver-ctl-me-old-same-{shape.lower()}': {'engine': 'me', 'under_test': 'tag-seed-validity', 'kinds': XVER_KINDS,
+                                                       'of': 'X-1', 'seed': shape} for shape in ('A', 'B', 'C')},
+    **{f'core-xver-ctl-ae-old-same-{shape.lower()}': {'engine': 'ae', 'under_test': 'tag-seed-validity', 'kinds': XVER_KINDS,
+                                                       'of': 'X-3', 'seed': shape} for shape in ('A', 'C')},
     'core-xver-ctl-x7-wiped': {'under_test': 'rc2', 'kinds': XVER_KINDS, 'of': 'X-7'},
     'core-rollback-ctl-omit-journal': {'under_test': 'rollback-restore', 'kinds': ('s17-rollback',), 'of': 'X-R',
                                        'omit': 'ae-money-journal'},
@@ -133,6 +145,13 @@ _R0 = (r'CRITICAL: principal-less session in log: pre-S6 history, clean genesis 
 ACS_ME = 'match-cluster/src/main/java/com/match/infrastructure/persistence/AppClusteredService.java'
 ACS_AE = 'assets-cluster/src/main/java/com/openexchange/assets/infrastructure/persistence/AssetsClusteredService.java'
 KIT_GATE = 'cluster-kit src/main/java/com/openexchange/cluster/auth/PrincipalGate.java:15,40-42'
+def check_sites(cut):
+    """Review V18: the refusal-site table was read at COMMITS; a cut on other commits makes every site citation stale."""
+    repos = (cut or {}).get('repos') or {}
+    return [f'{repo}: the refusal-site table was read at {commit}, the cut is at {repos.get(repo)}'
+            for repo, commit in sorted(COMMITS.items()) if repos.get(repo) != commit]
+
+
 SITES = {
     'me-r0-restored': {'engine': 'me', 're': _R0.format('restored session'), 'layer': 'application (kit PrincipalGate)',
                        'reads': f'match {ACS_ME}:1452 (the restored session principal, onStart)', 'prints': f'{ACS_ME}:231-237',
@@ -240,14 +259,22 @@ def classify_member(m, allowed):
     return dict(out, **{'class': 'other', 'reason': 'exit 1 with no refusal text'})
 
 
+BANNER = re.compile(r'(Assets|Match) Engine node \d+ starting')       # AeronCluster's start line (both engines)
+DROP = 'INGRESS DROP'      # AssetsSbeDemuxer at eb559a7: (schema) :388, (unknown template) :402, (frame bounds) :1489,
+                           # (decode) :1496, (unhandled template) :1504
+
+
 def capture_witness(m):
-    """X-3(b): the member's log from its start banner to its CRITICAL line in one file, and no INGRESS DROP (schema) between."""
+    """X-3(b) (review V6): the member's one log holds the engine's start banner, then its CRITICAL line, with no restart of the
+    container (RestartCount 0) and no INGRESS DROP of any kind between them."""
     lines = (m.get('log') or '').splitlines()
     idx = next((i for i, l in enumerate(lines) if 'CRITICAL: principal-less session' in l), None)
+    banner = next((i for i, l in enumerate(lines) if BANNER.search(l)), None)
+    out = {'role': m['role'], 'restart_count': m.get('restart_count'), 'banner_line': banner}
     if idx is None:
-        return {'role': m['role'], 'critical': None}
-    return {'role': m['role'], 'banner': lines[0][:200] if lines else None, 'critical': lines[idx][:300], 'lines_between': idx,
-            'ingress_drops': sum(1 for l in lines[:idx] if 'INGRESS DROP (schema)' in l)}
+        return dict(out, critical=None)
+    return dict(out, banner=lines[banner][:200] if banner is not None and banner < idx else None, critical=lines[idx][:300],
+                lines_between=idx - (banner or 0), ingress_drops=sum(1 for l in lines[:idx] if DROP in l))
 
 
 VERDICT_STATUS = {'REFUSED': 'PASS', 'GUARDED-silent': 'FAIL', 'FAIL': 'FAIL', 'INCONCLUSIVE': 'INCONCLUSIVE', 'PASS': 'PASS',
@@ -258,7 +285,13 @@ def verdict_status(verdict):
     return VERDICT_STATUS[verdict]
 
 
-def judge_state(case, members, probes, bound_s, quorum_wait_ms):
+def _covered(member, probes):
+    """Probe attempts in flight while ``member`` was Running (started before its exit, ended after its start)."""
+    lo, hi = member['started_ns'], member.get('finished_ns') or float('inf')
+    return sum(1 for p in probes if p.get('started_ns', 0) <= hi and (p.get('ended_ns') or float('inf')) >= lo)
+
+
+def judge_state(case, members, probes, bound_s, quorum_wait_ms, probe_min=1):
     """The REFUSED (state kind) pass line of 6.10 for X-1 and X-3; GUARDED-silent when anything served."""
     spec = CASES[case]
     reasons = []
@@ -276,6 +309,17 @@ def judge_state(case, members, probes, bound_s, quorum_wait_ms):
             reasons.append(f'{c["role"]} other: {c["reason"]}')
     if counts != spec['classes']:
         reasons.append(f'class counts {counts} != the stagger\'s prediction {spec["classes"]}')
+    # review V7: in a log-only case the quorum-exited member is the one started after its peers halted
+    if spec['classes'].get('quorum-exited'):
+        last = max(members, key=lambda m: m['started_ns'])['role']
+        exited = [c['role'] for c in classes if c['class'] == 'quorum-exited']
+        if exited and exited != [last]:
+            reasons.append(f'the quorum-exited member is {exited}, not the last-started {last} (the stagger\'s prediction)')
+    # review V5 (a): "no probe attempt answered" needs attempts; each member's life is probed at least probe_min times
+    for m in members:
+        n = _covered(m, probes)
+        if n < probe_min:
+            reasons.append(f'{m["role"]}: {n} probe attempt(s) in flight while it ran, the line needs >= {probe_min}')
     for m, c in zip(members, classes):
         if m.get('finished_ns') is not None:
             after = round((m['finished_ns'] - last_start) / 1e9, 1)
@@ -292,9 +336,12 @@ def judge_state(case, members, probes, bound_s, quorum_wait_ms):
         for cap in caps:
             if cap['critical'] is None:
                 reasons.append(f'{cap["role"]} log has no CRITICAL line from its start banner (capture witness)')
+            elif cap['banner'] is None:
+                reasons.append(f'{cap["role"]} log has no engine start banner before its CRITICAL line (capture witness)')
+            elif cap['restart_count'] != 0:
+                reasons.append(f'{cap["role"]} container RestartCount {cap["restart_count"]}: the log is not one life')
             elif cap['ingress_drops']:
-                reasons.append(f'{cap["role"]} dropped {cap["ingress_drops"]} frame(s) (INGRESS DROP (schema)) before its '
-                               'CRITICAL line')
+                reasons.append(f'{cap["role"]} dropped {cap["ingress_drops"]} frame(s) (INGRESS DROP) before its CRITICAL line')
                 verdict = 'FAIL'
         if len(positions) > 1:
             reasons.append(f'the two replaying members name different logPositions {positions}')
@@ -344,7 +391,13 @@ def _dedupe(rows):
     return out
 
 
+UNREACHABLE = re.compile(r'verdict source (\d+) e \S+ UNREACHABLE')
+
+
 def judge_x7(obs):
+    """The 6.7 pass line. Review V8: INCONCLUSIVE needs positive unreachability evidence (an ME member down in a sample, or an
+    UNREACHABLE source verdict in the bridge log); relistsSinceHalt must be present and 0; the window starts after the last
+    FeedHalt AdminAck and lasts >= 60 s after it; the tap is alive at the end of the window."""
     reasons, fail = [], False
     down = sorted({m for s in obs['samples'] for m, up in s['me_running'].items() if not up})
     if down:
@@ -352,11 +405,29 @@ def judge_x7(obs):
                                                        f'({", ".join(down)})']}
     for b in ('bridge0', 'bridge1'):
         details = {s['bridges'][b]['health'].get('haltDetail') for s in obs['samples']}
-        warns = obs['bridge_logs'].get(b, '').count('foreign journal at the chain head')
-        if details == {'NONE'} and not warns:
-            return {'verdict': 'INCONCLUSIVE', 'reasons': [f'{b} haltDetail NONE and no WARN: a source was UNREACHABLE (C8)']}
-    if obs.get('sample_s', 0) < 60:
-        reasons.append(f'sampling {obs.get("sample_s")} s < 60 s')
+        text = obs['bridge_logs'].get(b, '')
+        if details == {'NONE'} and not text.count('foreign journal at the chain head'):
+            sources = sorted(set(UNREACHABLE.findall(text)))
+            if sources:
+                return {'verdict': 'INCONCLUSIVE', 'reasons': [f'{b} haltDetail NONE and no WARN with source(s) {sources} '
+                                                               'UNREACHABLE in its log (C8)']}
+            reasons.append(f'{b} haltDetail NONE and no foreign-head WARN with every source reachable: B1 did not classify '
+                           'the foreign head')
+            fail = True
+    if obs.get('sample_s', 0) < X7_SAMPLE_MIN_S:
+        reasons.append(f'sampling {obs.get("sample_s")} s < {X7_SAMPLE_MIN_S} s')
+    acks = obs.get('last_feedhalt_ack_ns') or {}
+    first, last = obs['samples'][0]['at_ns'], obs['samples'][-1]['at_ns']
+    for b in ('bridge0', 'bridge1'):
+        ack = acks.get(b)
+        if ack is None:
+            reasons.append(f'{b} logged no FeedHalt AdminAck: the window has no anchor (6.7)')
+        elif first < ack or last - ack < X7_SAMPLE_MIN_S * 1_000_000_000:
+            reasons.append(f'{b}: the sampling must start after the last FeedHalt ack and last >= {X7_SAMPLE_MIN_S} s after it '
+                           f'(ack {round((ack - first) / 1e9, 1)} s after the window start, '
+                           f'{round((last - ack) / 1e9, 1)} s before its end)')
+    if obs.get('tap_alive_after_sampling') is not True:
+        reasons.append('the tap was not alive at the end of the sampling (an OPEN row after its death is unseen)')
     for b in ('bridge0', 'bridge1'):
         for s in obs['samples']:
             row = s['bridges'][b]
@@ -367,16 +438,19 @@ def judge_x7(obs):
                                f'{row.get("status")} {h.get("haltReason")} {h.get("haltDetail")}')
                 break
         for s in obs['samples']:
-            n = (s['bridges'][b].get('health') or {}).get('relistsSinceHalt')
-            if n:
-                reasons.append(f'{b} relistsSinceHalt {n} in a sample')
+            h = s['bridges'][b].get('health') or {}
+            if 'relistsSinceHalt' not in h:
+                reasons.append(f'{b} relistsSinceHalt missing in a sample')
+                break
+            if h['relistsSinceHalt'] != 0:
+                reasons.append(f'{b} relistsSinceHalt {h["relistsSinceHalt"]} in a sample')
                 break
         text = obs['bridge_logs'].get(b, '')
         if 'halt left' in text:
             reasons.append(f'{b} logged "halt left"')
             fail = True
         warns = text.count('foreign journal at the chain head')
-        if warns != 1:
+        if warns != 1 and not (warns == 0 and fail):
             reasons.append(f'{b} logged the foreign-head WARN {warns} time(s), want once')
     for money in obs['money']:
         if money.get('meEpoch') or money.get('lastAppliedJournalSeq'):
@@ -386,6 +460,8 @@ def judge_x7(obs):
         if money.get('feedHalted') is not True or money.get('haltReason') != 'SOURCE_SCHEMA':
             reasons.append(f'core feedHalted {money.get("feedHalted")} haltReason {money.get("haltReason")}, want true SOURCE_SCHEMA')
             break
+    # the per-OPEN acks (41 before the latch, 40 after) are judged through the admission rows and the unbound core: the driver
+    # prints its last reason only (review V8 (d)); a 45 would need a holder, which the never-bound core and these rows exclude
     gate = _dedupe(obs['gate_rows'])
     if gate != [['SUSPENDED', 'GENESIS'], ['SUSPENDED', 'BRIDGE_HALT']]:
         reasons.append(f'GLOBAL admission rows {gate}, want [SUSPENDED, GENESIS] then [SUSPENDED, BRIDGE_HALT]')
@@ -395,13 +471,13 @@ def judge_x7(obs):
     if driver.get('exit') == 0 or 'GLOBAL OPEN' in driver.get('out', '').replace('never accepted', ''):
         reasons.append('an OPEN(GLOBAL, ADMIN) was ACCEPTED or DUPLICATE: the genesis driver opened the gate')
         fail = True
-    elif match_site(driver.get('out', ''), 'driver', ) is None or match_site(driver['out'], 'driver')['key'] != 'admin-ack-40':
+    elif match_site(driver.get('out', ''), 'driver') is None or match_site(driver['out'], 'driver')['key'] != 'admin-ack-40':
         reasons.append('the driver did not end with "ADMIN OPEN GLOBAL never accepted: last reason 40 FEED_HALTED"')
     order = obs['probe_order']
-    last = ((order.get('reply') or {}).get('replies') or [{}])[-1]
-    if order.get('meaning') != 'REFUSED' or last.get('reason') != 'GATE_CLOSED' or not order.get('after_bridge_halt'):
+    last_reply = ((order.get('reply') or {}).get('replies') or [{}])[-1]
+    if order.get('meaning') != 'REFUSED' or last_reply.get('reason') != 'GATE_CLOSED' or not order.get('after_bridge_halt'):
         reasons.append(f'the probe order was not refused GATE_CLOSED after the first BRIDGE_HALT row: {order.get("meaning")} '
-                       f'{last}')
+                       f'{last_reply}')
         if order.get('meaning') == 'ANSWERED':
             fail = True
     if obs['probe_deposit'].get('meaning') != 'ANSWERED':
@@ -452,15 +528,24 @@ def judge_a1(obs):
 
 
 def judge_a2(obs):
+    """6.8 X-A2 (review V15): the partial CoreConfig acks are ACCEPTED/ADOPTED; (a) the same-id re-run runs on the untouched
+    partial state BEFORE (b) the new-id run; (b) the core REJECTED (2) at CoreConfig 1 and the T1MeDriver FRESH with the new id
+    did not answer its epoch; k = 2 records the gate after the finish and after the explicit OPEN separately."""
     reasons, out = [], {}
     if obs['before'].get('status') not in ('INCOMPLETE', 'ABORTED'):
         reasons.append(f'the record before the recovery reads {obs["before"].get("status")}, want INCOMPLETE or ABORTED')
+    partial = (obs.get('partial') or {}).get('results') or []
+    if [v for v, _ in partial] != list(range(1, obs['stop_after'] + 1)) or any(r not in ('ACCEPTED', 'ADOPTED') for _, r in partial):
+        reasons.append(f'the partial genesis acks are {partial}, want CoreConfig 1..{obs["stop_after"]} ACCEPTED or ADOPTED')
+    if obs.get('order') != ['same-id', 'new-id']:
+        reasons.append(f'run order {obs.get("order")}: 6.8 runs (a) the same genesisId first, then (b) a new one')
     if obs['gate_after_partial'] != 'GENESIS':
         reasons.append(f'the gate after the partial genesis is {obs["gate_after_partial"]}, want [SUSPENDED, GENESIS]')
     if _results(obs['new_id_core'].get('out')).get(1) != 2 or obs['new_id_core'].get('exit') == 0:
         reasons.append('the new genesisId was not REJECTED at CoreConfig 1')
-    if not obs.get('new_id_me_rejected'):
-        reasons.append('the ME FRESH with a new genesisId was not REJECTED_GENESIS')
+    me = obs.get('new_id_me') or {}
+    if me.get('exit') == 0 or f'EPOCH {obs.get("new_id")}' in me.get('out', ''):
+        reasons.append(f'the ME FRESH with a new genesisId was not refused (T1MeDriver exit {me.get("exit")}): REJECTED_GENESIS expected')
     same = obs['same_id']
     if obs['stop_after'] == 1:
         if same.get('exit') != 0 or obs.get('gate_final') != 'OPEN':
@@ -473,8 +558,10 @@ def judge_a2(obs):
             reasons.append(f'after the refused re-run the gate is {obs.get("gate_final")} and meEpoch '
                            f'{obs.get("bound_after_same_id")}, want GENESIS and 0')
         rec = obs.get('recovery') or {}
-        out['recovery'] = ('finish opened: [OPEN, ADMIN]' if rec.get('opened') else
-                           'finish did not open: a wipe of both clusters and a new genesisId')
+        bound = 'finish bound the epoch' if rec.get('bound') else 'finish did not bind the epoch'
+        opened = (f'the explicit OPEN then opened [OPEN, ADMIN]' if rec.get('gate_after_open') == 'OPEN' else
+                  'the explicit OPEN did not open: a wipe of both clusters and a new genesisId')
+        out['recovery'] = f'{bound} (gate {rec.get("gate_after_finish")}); {opened}'
     return dict(out, verdict='FAIL' if reasons else 'PASS', reasons=reasons)
 
 
@@ -523,6 +610,13 @@ def judge_a4(obs):
     return {'verdict': 'FAIL' if reasons else 'PASS', 'reasons': reasons}
 
 
+def resync_after_bound(text):
+    """Review V16: RESYNC(0) lines after the forwarder's "ME epoch bound" line (ForwarderAgent.h:740, :595)."""
+    lines = (text or '').splitlines()
+    bound = next((i for i, l in enumerate(lines) if 'ME epoch bound' in l), None)
+    return 0 if bound is None else sum(1 for l in lines[bound + 1:] if 'RESYNC(0)' in l)
+
+
 def judge_a5(obs):
     reasons = []
     for row in obs['wait_rows']:
@@ -533,7 +627,9 @@ def judge_a5(obs):
                 reasons.append(f'{fwd} answered /ready 200 while the epoch was 0')
     reasons = sorted(set(reasons))
     for fwd in ('fwd0', 'fwd1'):
-        if obs['epoch_waits'].get(fwd, 0) < 2:
+        if not (obs.get('resync_after_bound') or {}).get(fwd):
+            reasons.append(f'{fwd} logged no RESYNC(0) after "ME epoch bound"')
+        if obs['epoch_waits'].get(fwd, 0) < obs.get('epoch_waits_min', 2):
             reasons.append(f'{fwd} logged {obs["epoch_waits"].get(fwd, 0)} epoch wait(s); a reconnect every about 5 s expected')
         if not obs['bound_lines'].get(fwd):
             reasons.append(f'{fwd} never logged "ME epoch bound"')
@@ -546,26 +642,52 @@ def judge_a5(obs):
 
 # ------------------------------------------------------------------ the X-R judge (6.9)
 
-def judge_rollback(d0, d1, post, omitted=None, error=None):
-    """Pass: D1 == D0 and the post-restore scenario passes. ``omitted`` (control xr-omit): the restore omitted one item and must
-    FAIL the equality or the post-restore scenario (an error in the restore counts as that failure)."""
-    reasons = []
-    if error:
-        reasons.append(f'the restore failed: {error}')
-    if d1 is not None:
-        for key in sorted(k for k in d0 if k != 'combined'):
-            if (d1.get(key) or {}).get('sha256') != d0[key]['sha256']:
-                reasons.append(f'D1 != D0 in {key}')
-    elif not error:
-        reasons.append('D1 was not taken')
-    if post is not None:
-        if not (all(post.get('deposits') or [False]) and all(post.get('orders') or [False]) and post.get('changed')):
-            reasons.append(f'the post-restore scenario did not pass: {post}')
-    elif not error:
-        reasons.append('the post-restore scenario did not run')
+OMIT_PART = {'ae-money-journal': ('ae', re.compile(r'\bae[0-2]\b')), 'pg-dump': ('r01_money', re.compile(r'r01_money|projector'))}
+
+
+def judge_rollback(d0, d1, post, omitted=None, error=None, smoke=None, error_phase=None):
+    """6.9 (review V9). Pass: the legacy smoke passed, D0 holds a real line (OMS and money rows, AE balances, applied trades),
+    D1 == D0 and the post-restore scenario passes. ``omitted`` (xr-omit): the control bites only on its own part (that part of
+    D1 differs, the post-restore scenario fails, or the restored member of that part does not start); any other error or
+    difference is INCONCLUSIVE, never a bite."""
+    if smoke != 'PASS':
+        return {'verdict': 'INCONCLUSIVE', 'reasons': [f'the legacy critical-path-smoke did not pass ({smoke}): no line to roll back']}
+    empty = [k for k, ok in (('r01_oms rows', d0['r01_oms']['rows'] > 0), ('r01_money rows', d0['r01_money']['rows'] > 0),
+                             ('AE balances', d0['ae'].get('balances', 0) > 0),
+                             ('AE lastAppliedTradeId', (d0['ae'].get('lastAppliedTradeId') or 0) > 0)) if not ok]
+    if empty:
+        return {'verdict': 'INCONCLUSIVE', 'reasons': ['D0 is empty: ' + ', '.join(empty)]}
+    diffs = sorted(k for k in d0 if k != 'combined' and d1 is not None and (d1.get(k) or {}).get('sha256') != d0[k]['sha256'])
+    post_ok = post is not None and all(post.get('deposits') or [False]) and all(post.get('orders') or [False]) and post.get('changed')
     if omitted:
-        return {'verdict': 'PASS' if reasons else 'FAIL', 'omitted': omitted,
-                'reasons': reasons or [f'the restore without {omitted} still passed: the control did not bite']}
+        part, pattern = OMIT_PART[omitted]
+        bites = []
+        if part in diffs:
+            bites.append(f'D1 != D0 in {part}')
+        if d1 is not None and post is not None and not post_ok:
+            bites.append(f'the post-restore scenario failed: {post}')
+        if error and error_phase == 'restore-start' and pattern.search(error):
+            bites.append(f'the restored {part} did not start: {error}')
+        others = [k for k in diffs if k != part]
+        if bites and not others:
+            return {'verdict': 'PASS', 'omitted': omitted, 'reasons': bites}
+        if others or (error and not bites):
+            return {'verdict': 'INCONCLUSIVE', 'omitted': omitted,
+                    'reasons': [f'not the omitted part: differs in {others}' if others else f'error not attributable to {part}: '
+                                f'{error} ({error_phase})']}
+        return {'verdict': 'FAIL', 'omitted': omitted, 'reasons': [f'the restore without {omitted} still passed: the control did not bite']}
+    reasons = [f'D1 != D0 in {k}' for k in diffs]
+    if error:
+        if error_phase in ('restore-start', 'post'):
+            reasons.append(f'the restore failed: {error}')
+        else:
+            return {'verdict': 'INCONCLUSIVE', 'reasons': [f'harness error before the restore was judged: {error} ({error_phase})']}
+    if d1 is None and not error:
+        reasons.append('D1 was not taken')
+    if post is not None and not post_ok:
+        reasons.append(f'the post-restore scenario did not pass: {post}')
+    elif post is None and not error:
+        reasons.append('the post-restore scenario did not run')
     return {'verdict': 'FAIL' if reasons else 'PASS', 'reasons': reasons}
 
 
@@ -574,7 +696,7 @@ def judge_rollback(d0, d1, post, omitted=None, error=None):
 def probe_answered(engine, code, stdout, meaning):
     """ME: JournalProbe open-legs (a session plus one request) answered; AE: a CoreProbe deposit answered (ACK or REJECT)."""
     if engine == 'me':
-        return code == 0 and '"verb":"open-legs"' in (stdout or '')
+        return code == 0          # review V5 (b): open-legs exits 0 only after a complete OpenOrdersSnapshot
     return meaning in ('ANSWERED', 'REFUSED')
 
 
@@ -605,14 +727,15 @@ class ActiveProbe(threading.Thread):
                 f = self.f
                 ingress = ','.join(f'{i}={f.m["nodes"][f"me{i}"]}:{f.m["ports"]["me_base"] + i * f.m["ports"]["stride"] + 2}'
                                    for i in range(3))
-                argv = ['timeout', '-k', '5', '20'] + JAVA + ['-cp', '/artifacts/journal-probe.jar:/artifacts/me.jar',
+                argv = ['timeout', '-k', '5', str(_S['XVER_PROBE_ATTEMPT_S'])] + JAVA + ['-cp', '/artifacts/journal-probe.jar:/artifacts/me.jar',
                                                               'JournalProbe', 'open-legs', f'ingress={ingress}',
                                                               f'local={f.m["nodes"]["probe"]}']
                 env = {'ME_AUTH_CREDENTIAL': f.keys.credential('probe-admin', 'me')}
-                r = f.execute('probe', argv, environment=env, timeout=40, check=False, accepted=tuple(range(256)))
-                row = {'code': r.returncode, 'out': (r.stdout or '')[-300:], 'meaning': None}
+                r = f.execute('probe', argv, environment=env, timeout=_S['XVER_PROBE_EXEC_S'], check=False,
+                              accepted=tuple(range(256)))
+                row = {'code': r.returncode, 'out': r.stdout or '', 'meaning': None}
             else:
-                meaning, reply = self.f.core('deposit', 'probe-tool', timeout=40, user=990001, asset=0, amount=1, rh=9, rl=n)
+                meaning, reply = self.f.core('deposit', 'probe-tool', timeout=_S['XVER_PROBE_EXEC_S'], user=990001, asset=0, amount=1, rh=9, rl=n)
                 row = {'code': None, 'meaning': meaning, 'out': json.dumps(reply)[-300:] if reply else ''}
         except Exception as error:                      # a refused attempt is evidence, never a crash of the run
             row = {'code': None, 'meaning': 'ERROR', 'out': str(error)[-300:]}
@@ -637,7 +760,8 @@ class ActiveProbe(threading.Thread):
                 threading.Thread(target=self.attempt, args=(n,), daemon=True).start()
             self.stop_event.wait(self.interval)
 
-    def stop(self, drain_s=45):
+    def stop(self, drain_s=None):
+        drain_s = _S['XVER_PROBE_DRAIN_S'] if drain_s is None else drain_s
         self.stop_event.set()
         deadline = time.time() + drain_s
         while time.time() < deadline:
@@ -647,6 +771,23 @@ class ActiveProbe(threading.Thread):
             time.sleep(0.5)
         with self.lock:
             return list(self.rows)
+
+
+def require_probe_genesis(m):
+    """Review V2: X-A2's partial genesis sends ``CoreProbe core-config genesis=``; a staged CoreProbe without that argument
+    leaves CoreConfig.genesisId unset. Refused before the box is touched."""
+    src = Path(str((m.get('core_probe') or {}).get('source_path', '')))
+    text = src.read_text() if src.is_file() else ''
+    if 'arg("genesis")' not in text:
+        raise Inconclusive(f'stale CoreProbe: {src} has no core-config genesis= argument (X-A2 needs the W3 probe; regenerate the cut)')
+
+
+def forward_precheck(f, roots):
+    """Review V1: runbook step 1 on the roots the forward order runs on, with the projection rows READ from the database the
+    cut will use (never assumed empty)."""
+    import r10_cut
+    rows = r10_cut.projection_rows(f)
+    return dict(r10_cut.precheck(roots, pg_rows=rows), pg_rows=rows)
 
 
 # ------------------------------------------------------------------ scenario plumbing
@@ -725,8 +866,9 @@ def _state(f, role):
     return f.inspect('container', f.registry['containers'][role])['State']
 
 
-def _watch_members(f, roles, out, bound_s, last_start_ns, serve_hold_s=15):
+def _watch_members(f, roles, out, bound_s, last_start_ns, serve_hold_s=None):
     """Poll every second until every member exited, or every member served for ``serve_hold_s``, or the bound passed."""
+    serve_hold_s = _S['XVER_SERVE_HOLD_S'] if serve_hold_s is None else serve_hold_s
     port = f.m['ports'][roles[0][:2] + '_metrics']
     ready, served_since = {r: False for r in roles}, None
     while time.time_ns() < last_start_ns + bound_s * 1_000_000_000:
@@ -757,7 +899,8 @@ def _members(f, roles, starts, ready):
         (f.root / 'logs' / f'{r}.xver.log').write_text(log)
         out.append({'role': r, 'running': st['Running'], 'exit_code': None if st['Running'] else st['ExitCode'],
                     'started_ns': starts[r], 'finished_ns': None if st['Running'] else _iso_ns(st['FinishedAt']),
-                    'log': _strip_stamps(log), 'ready_200': ready[r]})
+                    'log': _strip_stamps(log), 'ready_200': ready[r],
+                    'restart_count': f.inspect('container', f.registry['containers'][r]).get('RestartCount')})
     return out
 
 
@@ -769,7 +912,7 @@ def _recovery_line(f, engine, out):
             f.command(['docker', 'kill', '--signal=KILL', f.registry['containers'][r]])
         f.wipe_engine(r, projection_dump_required=False, reason='the X run seeded a foreign state; no money moved in this fixture')
     try:
-        w = f.start_members(engine, ready_timeout=150)
+        w = f.start_members(engine, ready_timeout=_S['XVER_RECOVERY_READY_S'])
         return {'ready': True, 'witness': w}
     except Inconclusive as error:
         return {'ready': False, 'error': str(error)}
@@ -831,7 +974,7 @@ def run_state_case(manifest, case, out, s, seed_override=None, control=None):
                        'ready': ready}
             return _result(verdict, {'case': 'control:' + control, 'seeds': seeds, 'audit': audit['status']}, fixtures,
                            len(roles) + 1)
-        verdict = judge_state(case, members, probes, s['XVER_BOUND_S'], s['ENGINE_QUORUM_WAIT_MS'])
+        verdict = judge_state(case, members, probes, s['XVER_BOUND_S'], s['ENGINE_QUORUM_WAIT_MS'], probe_min=s['XVER_PROBE_MIN'])
         verdict['probe_attempts'] = len(probes)
         verdict['probe_cadence'] = probe_cadence(probes, s)
         verdict['probe_answered'] = sum(p['answered'] for p in probes)
@@ -875,7 +1018,7 @@ def run_same_control(manifest, control, out, s):
         for r in roles:
             _spawn_engine(f0, r)
         for r in roles:
-            f0.wait_http(r, f0.m['ports'][engine + '_metrics'], '/ready', timeout=120)
+            f0.wait_http(r, f0.m['ports'][engine + '_metrics'], '/ready', timeout=_S['XVER_ENGINE_READY_S'])
         if engine == 'me':
             f0.registry['lives'] = {'1': {'me': {'genesis_id': f0.genesis_id(1)}}}
             f0.me_genesis({'ledger_capacity': 100_000})
@@ -1020,7 +1163,7 @@ def _boot_engines(f, stop_before=(), seed=None, s=None):
     for engine in ('ae', 'me'):
         for i in range(3):
             if f'{engine}{i}' not in stop_before:
-                f.wait_http(f'{engine}{i}', f.m['ports'][engine + '_metrics'], '/ready', timeout=120)
+                f.wait_http(f'{engine}{i}', f.m['ports'][engine + '_metrics'], '/ready', timeout=_S['XVER_ENGINE_READY_S'])
     if f.engine_driver() == 'external':
         for role in ENGINES:
             if role not in stop_before:
@@ -1046,15 +1189,17 @@ def _steps(f, plan, steps):
         f.save()
 
 
-def _core_driver(f, genesis_id=None, timeout=150):
+def _core_driver(f, genesis_id=None, timeout=None):
     from core_fixture import PROBE_AERON_DIR
+    timeout = _S['XVER_DRIVER_S'] if timeout is None else timeout
     r = f._driver('t1_core_driver', 'T1CoreDriver', 'genesis', PROBE_AERON_DIR, f._ingress('ae'),
                   genesis_id or f.genesis_id(1), 100_000, 0, 'via-bridge', timeout=timeout, check=False, accepted=(0, 1))
     return {'exit': r.returncode, 'out': (r.stdout or '') + (r.stderr or '')}
 
 
-def _me_driver(f, genesis_id, timeout=150):
+def _me_driver(f, genesis_id, timeout=None):
     from core_fixture import PROBE_AERON_DIR
+    timeout = _S['XVER_ME_DRIVER_S'] if timeout is None else timeout
     r = f._driver('t1_me_driver', 'T1MeDriver', 'genesis', PROBE_AERON_DIR, f._ingress('me'), genesis_id, 100_000,
                   timeout=timeout, check=False, accepted=(0, 1, 78))
     return {'exit': r.returncode, 'out': (r.stdout or '') + (r.stderr or '')}
@@ -1085,10 +1230,10 @@ def run_x7(manifest, out, s, wiped=False):
         gate_rows = _gate_rows(f)
         halt_at = next((g[2] for g in gate_rows if g[1] == 'BRIDGE_HALT'), None)
         money = [_money(f)]
+        sent_ms = time.time_ns() // 1_000_000        # review V23: the send time, taken before the send
         order_meaning, order_reply = f.core('create', 'probe-gateway', user=990002, market=1, side='BUY', type='LIMIT', tif='GTC',
                                             price=100, qty=1, budget=0, stop=0, delta=0, display=0, expires=0, rh=1, rl=1, ch=0,
                                             cl=1)
-        sent_ms = time.time_ns() // 1_000_000
         deposit_meaning, _ = f.core('deposit', 'probe-tool', user=990002, asset=0, amount=1, rh=2, rl=1)
         samples = []
         started = time.time()
@@ -1106,12 +1251,19 @@ def run_x7(manifest, out, s, wiped=False):
             samples.append(row)
             time.sleep(2)
         sample_s = round(time.time() - started, 1)
+        tap_out = f.tap_paths(1)['out']
+        tap_alive = not (tap_out.exists() and 'TAP first=' in tap_out.read_text())
         money.append(_money(f))
+        acks = {}
+        for b in ('bridge0', 'bridge1'):          # review V8 (c): the window's anchor, from the timestamped bridge log
+            stamps = [l.split(' ', 1)[0] for l in _docker_logs(f, b).splitlines() if 'FeedHalt AdminAck' in l]
+            acks[b] = _iso_ns(stamps[-1]) if stamps else None
         obs = {'samples': samples, 'sample_s': sample_s, 'money': money, 'gate_rows': [g[:2] for g in _gate_rows(f)],
                'bridge_logs': {b: _strip_stamps(_docker_logs(f, b)) for b in ('bridge0', 'bridge1')}, 'driver': driver,
                'probe_order': {'meaning': order_meaning, 'reply': order_reply,
                                'after_bridge_halt': halt_at is not None and sent_ms > halt_at},
-               'probe_deposit': {'meaning': deposit_meaning}}
+               'probe_deposit': {'meaning': deposit_meaning}, 'last_feedhalt_ack_ns': acks,
+               'tap_alive_after_sampling': tap_alive}
         (Path(out) / 'x7-observations.json').write_text(json.dumps(obs, indent=1, default=str) + '\n')
         verdict = judge_x7_wiped(obs) if wiped else judge_x7(obs)
         audit = _audit(f, out, 'audit-end.json', started_only=True)
@@ -1179,7 +1331,7 @@ def run_act(manifest, name, out, s):
             up = [m for m in ('me0', 'me1', 'me2') if m != lead]
             _, counts = _journal_records(f, up)
             try:
-                f.restart(lead, ready_timeout=120)
+                f.restart(lead, ready_timeout=_S['XVER_RESTART_READY_S'])
                 restarted = True
             except Inconclusive as error:
                 restarted = str(error)
@@ -1196,27 +1348,31 @@ def run_act(manifest, name, out, s):
             gate_partial = _gate_now(f)
             audit = _audit(f, out, 'audit.json')
             before = _record(f, out, audit, 'rc2-activation-record.before-recovery.json')
-            new_core = _core_driver(f, genesis_id=f.genesis_id(2))
-            new_me = _me_driver(f, f.genesis_id(2), timeout=120)
-            me_logs = ''.join(_docker_logs(f, m) for m in ('me0', 'me1', 'me2'))
+            # review V15 (a): 6.8 order: (a) the same genesisId on the untouched partial state, then (b) a new one
             same = _core_driver(f)
             time.sleep(3)
+            gate_final = _gate_now(f)
+            bound_after_same = _money(f).get('meEpoch')
+            new_core = _core_driver(f, genesis_id=f.genesis_id(2))
+            new_me = _me_driver(f, f.genesis_id(2))
+            me_logs = ''.join(_docker_logs(f, m) for m in ('me0', 'me1', 'me2'))
             obs = {'stop_after': k, 'partial': partial, 'before': before, 'gate_after_partial': gate_partial,
-                   'new_id_core': new_core, 'new_id_me': new_me, 'new_id_me_rejected': 'REJECTED_GENESIS' in me_logs,
-                   'same_id': same, 'gate_final': _gate_now(f)}
+                   'order': ['same-id', 'new-id'], 'same_id': same, 'gate_final': gate_final,
+                   'bound_after_same_id': bound_after_same, 'new_id_core': new_core, 'new_id_me': new_me,
+                   'new_id': int(f.genesis_id(2), 16), 'me_logs_rejected_genesis': 'REJECTED_GENESIS' in me_logs}
             if k == 2:
-                obs['bound_after_same_id'] = _money(f).get('meEpoch')
                 finish = f.core_genesis_finish(plan)
-                bound = None
-                for _ in range(20):
+                bound, t = None, time.time()
+                while time.time() - t < _S['XVER_FINISH_BIND_S']:
                     bound = _money(f).get('meEpoch')
                     if bound:
                         break
                     time.sleep(3)
+                gate_after_finish = _gate_now(f)          # review V15 (d): the finish and the explicit OPEN, separately
                 meaning, reply = f.core('gate', 'probe-admin', market=0, state='OPEN', reason='ADMIN')
                 time.sleep(3)
-                obs['recovery'] = {'finish': finish['results'], 'bound': bound, 'open': {'meaning': meaning, 'reply': reply},
-                                   'opened': _gate_now(f) == 'OPEN'}
+                obs['recovery'] = {'finish': finish['results'], 'bound': bound, 'gate_after_finish': gate_after_finish,
+                                   'open': {'meaning': meaning, 'reply': reply}, 'gate_after_open': _gate_now(f)}
             obs['record_after'] = _record(f, out, _audit(f, out, 'audit-end.json'))
             verdict = judge_a2(obs)
         elif name == 'core-act-nobridge':
@@ -1231,7 +1387,7 @@ def run_act(manifest, name, out, s):
             f.start_bridges(plan)
             f.registry['boot']['phases']['bridges_ready_ns'] = time.time_ns()
             bound_after = None
-            while time.time() - t < 60:
+            while time.time() - t < _S['XVER_BIND_WAIT_S']:
                 if _money(f).get('meEpoch'):
                     bound_after = round(time.time() - t, 1)
                     f.registry['boot']['phases']['core_bound_ns'] = time.time_ns()
@@ -1259,7 +1415,7 @@ def run_act(manifest, name, out, s):
             ready = {}
             for m in late:
                 try:
-                    f.restart(m, ready_timeout=120)
+                    f.restart(m, ready_timeout=_S['XVER_RESTART_READY_S'])
                     ready[m] = True
                 except Inconclusive as error:
                     ready[m] = False
@@ -1290,7 +1446,7 @@ def run_act(manifest, name, out, s):
             ready = True
             for slot in ('fwd0', 'fwd1'):
                 try:
-                    f.wait_http(slot, f.m['ports']['forwarder_http'], '/ready', timeout=90)
+                    f.wait_http(slot, f.m['ports']['forwarder_http'], '/ready', timeout=_S['XVER_FWD_READY_S'])
                     f.slots[slot] = f.slot_row(slot, f.slot_artifact(slot))
                 except Inconclusive:
                     ready = False
@@ -1302,6 +1458,8 @@ def run_act(manifest, name, out, s):
                    'epoch_waits': {k: v.count('waiting for the epoch') for k, v in logs.items()},
                    'bound_lines': {k: v.count('ME epoch bound') for k, v in logs.items()},
                    'resync': {k: v.count('RESYNC') for k, v in logs.items()}, 'restarts': restarts,
+                   'resync_after_bound': {k: resync_after_bound(v) for k, v in logs.items()},
+                   'epoch_waits_min': _S['XVER_EPOCH_WAITS_MIN'],
                    'ready_after_genesis': ready}
             obs['record'] = _record(f, out, _audit(f, out, 'audit.json'))
             verdict = judge_a5(obs)
@@ -1313,11 +1471,12 @@ def run_act(manifest, name, out, s):
         f.close()
 
 
-def _ae_log_positions(f, out, bound_s=30):
+def _ae_log_positions(f, out, bound_s=None):
     """X-A4: ``ClusterTool list-members`` on each AE member until the members' logPositions are equal (quiescence) or the
     bound passes; the outputs are evidence."""
     from core_fixture import JAVA
     positions = {}
+    bound_s = _S['XVER_AE_QUIESCE_S'] if bound_s is None else bound_s
     t = time.time()
     while time.time() - t < bound_s:
         positions = {}
@@ -1340,10 +1499,38 @@ def _ae_log_positions(f, out, bound_s=30):
 
 # ------------------------------------------------------------------ X-R (6.9)
 
-def run_rollback(manifest, out, s, omit=None):
-    import legacy_tag
+def _empty_dir(path):
+    """Remove the contents of ``path`` (kept); returns (files, bytes) removed: the evidence of what was there."""
+    path = Path(path)
+    files = [p for p in path.rglob('*') if p.is_file() or p.is_symlink()]
+    total = sum(p.lstat().st_size for p in files)
+    for child in list(path.iterdir()):
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+    return {'files': len(files), 'bytes': total}
+
+
+def _omit_money_journal(member_dir):
+    """xr-omit run 1: drop the AE archive recordings other than the cluster log (the tag AE's money journal)."""
     import r10_cut
-    from core_fixture import CoreFixture
+    log = Path(member_dir) / 'state' / 'cluster' / 'recording.log'
+    keep = {e['recording_id'] for e in r10_cut.recording_log(log) if e['type'] == 'TERM'}
+    dropped = []
+    for rec in sorted((Path(member_dir) / 'state' / 'archive').glob('*.rec')):
+        if int(rec.name.split('-')[0]) not in keep:
+            rec.unlink()
+            dropped.append(rec.name)
+    return dropped
+
+
+def run_rollback(manifest, out, s, omit=None):
+    """6.9 on ONE set of state roots (review V1): the tag line's member dirs are archived, wiped per the precheck list, the cut
+    runs ON THEM (its members' /data bound to those dirs; the precheck reads the cut's projection database), the cut is
+    stopped, what it wrote is wiped, the archive is restored over the same dirs and the tag line starts on them again."""
+    import legacy_tag
+    from core_fixture import CoreFixture, ENGINES
     import core_scenarios
     from scenarios import critical_path_smoke, request, money
     from contracts import FP
@@ -1351,8 +1538,7 @@ def run_rollback(manifest, out, s, omit=None):
     archive = out / 'archive'
     tag = re.sub(r'[^a-z0-9-]', '', out.name.lower())[-10:] or 'x'
     l1, _ = legacy_tag.legacy_manifest(f'xr-{tag}-l1', s['XVER_LEGACY_OCTET'], B0 / 'local-runs/s17/legacy-xr')
-    l2_path = None
-    result = {'case': 'control:' + (omit or '') if omit else 'X-R', 'row': '49', 'omit': omit}
+    result = {'case': 'control:' + omit if omit else 'X-R', 'row': '49', 'omit': omit}
     fixtures = []
     # 1, 2: the tag line, D0, the archive
     f1 = legacy_tag.LegacyTagFixture(l1)
@@ -1371,33 +1557,51 @@ def run_rollback(manifest, out, s, omit=None):
                                                                                    'cloud-console state']}, indent=1) + '\n')
     finally:
         f1.close()
-    # 3: the forward order on wiped roots: precheck, cut genesis, traffic
+    roots = f1.root / 'state'                       # THE state roots of this run: old line, forward order, restore
+    # 3: the forward order on the same roots: wipe (the precheck's list), precheck with the real projection rows, the cut
+    wiped = {m: _empty_dir(roots / m) for m in ENGINES}
     c = CoreFixture(manifest, drill=True)
     fixtures.append(c)
     try:
-        pre = r10_cut.precheck([c.root], pg_rows={})
-        (out / 'precheck.json').write_text(json.dumps(pre, indent=1) + '\n')
-        if pre['status'] != 'CLEAN':
-            raise Inconclusive(f'precheck refused the forward order: {pre["refusals"]}')
-        c.start(core_scenarios.SMOKE_PLAN)
-        result['forward'] = {'gate': c.tap_gate(0), 'funding': len(c.registry.get('funding') or [])}
+        c.bind_member_states(roots, ENGINES)
+
+        def precheck_hook():
+            pre = forward_precheck(c, [f1.root])
+            (out / 'precheck.json').write_text(json.dumps(pre, indent=1) + '\n')
+            if pre['status'] != 'CLEAN':
+                raise Inconclusive(f'precheck refused the forward order: {pre["refusals"]}')
+        c.start(core_scenarios.SMOKE_PLAN, before_engines=precheck_hook)
+        result['forward'] = {'gate': c.tap_gate(0), 'funding': len(c.registry.get('funding') or []), 'wiped_before': wiped,
+                             'bound_state': c.registry.get('bound_state')}
         _record(c, out, _audit(c, out, 'audit-forward.json'), 'rc2-activation-record.forward.json')
     finally:
         c.close()
-    # 4, 5: restore every archived item (or all but ``omit``) into a fresh legacy root on the same addresses; D1; new traffic
+    # 4: the cut stopped; what it wrote on the roots is wiped (evidence: it wrote there), the archive restored over them
+    cut_wrote = {m: _empty_dir(roots / m) for m in ENGINES}
+    result['forward']['cut_wrote'] = cut_wrote
+    if not all(v['files'] for v in cut_wrote.values()):
+        raise Inconclusive(f'the cut did not write on every bound root: {cut_wrote}')
+    omitted_items = {}
+    for m in ENGINES:
+        shutil.copytree(archive / 'state' / m, roots / m, symlinks=True, dirs_exist_ok=True)
+        if omit == 'ae-money-journal' and m.startswith('ae'):
+            omitted_items[m] = _omit_money_journal(roots / m)
+    result['omitted_items'] = omitted_items
+    # 5: the tag line on the same roots (a new legacy fixture, the same addresses), D1, a post-restore scenario
     l2_path, _ = legacy_tag.legacy_manifest(f'xr-{tag}-l2', s['XVER_LEGACY_OCTET'], B0 / 'local-runs/s17/legacy-xr')
     l2 = json.loads(l2_path.read_text())
-    l1m = json.loads(Path(l1).read_text())
-    l2['nodes'] = l1m['nodes']
+    l2['nodes'] = json.loads(Path(l1).read_text())['nodes']
     l2_path.write_text(json.dumps(l2, indent=1) + '\n')
-    d1, post, error = None, None, None
+    d1, post, error, phase = None, None, None, 'restore-start'
     f2 = RestoredLegacyFixture(l2_path)
-    f2.archive, f2.omit = archive, omit
+    f2.archive, f2.omit, f2.roots = archive, omit, roots
     try:
         f2.start()
         f2.restore_market()
+        phase = 'dump'
         d1 = legacy_tag.dump_d(f2)
         before = d1['combined']
+        phase = 'post'
         post = {'deposits': [], 'orders': []}
         for u in (72001, 72002):
             r = request(f2, 'POST', f'/api/v1/accounts/{u}/deposit', {'assetId': 0, 'amount': money(10000 * FP)}, u)
@@ -1414,31 +1618,27 @@ def run_rollback(manifest, out, s, omit=None):
         try:
             f2.close()
         except Exception as e:
-            error = error or f'teardown: {e}'
-    verdict = judge_rollback(d0, d1, post, omitted=omit, error=error)
-    (out / 'xr-dumps.json').write_text(json.dumps({'D0': d0, 'D1': d1, 'post': post, 'error': error}, indent=1) + '\n')
-    result.update(legacy_manifests=[str(l1), str(l2_path)], D0=d0['combined'], D1=(d1 or {}).get('combined'))
+            error, phase = error or f'teardown: {e}', phase if error else 'teardown'
+    verdict = judge_rollback(d0, d1, post, omitted=omit, error=error, smoke=smoke['status'], error_phase=phase if error else None)
+    (out / 'xr-dumps.json').write_text(json.dumps({'D0': d0, 'D1': d1, 'post': post, 'error': error, 'error_phase': phase},
+                                                  indent=1) + '\n')
+    result.update(legacy_manifests=[str(l1), str(l2_path)], D0=d0['combined'], D1=(d1 or {}).get('combined'), roots=str(roots))
     return _result(verdict, result, fixtures, 4)
 
 
 class RestoredLegacyFixture(SeededLegacyFixture):
-    """X-R step 4-5: every engine state tree and the OMS/money dumps restored (``omit``: ``ae-money-journal`` drops the AE
-    archive recordings other than the cluster log; ``pg-dump`` drops the r01_money dump); r01_market rows are reloaded after
-    the market gateway created its hypertable (20.1 line 21)."""
-    archive, omit = None, None
+    """X-R step 5: the tag line on the restored roots (``roots``: the members' /data are those dirs, linked as state/<member>);
+    the OMS/money dumps restored (``omit`` ``pg-dump`` drops the r01_money dump); r01_market rows reloaded after the market
+    gateway created its hypertable (20.1 line 21)."""
+    archive, omit, roots = None, None, None
 
     def spawn(self, name, command, environment=None):
-        src = self.archive / 'state' / name
-        if name[:2] in ('me', 'ae') and src.is_dir() and name not in (self.seeds or {}):
-            import legacy_tag
-            self.seed(name, src, legacy_tag.tree_hash(src)['sha256'])
-            if self.omit == 'ae-money-journal' and name.startswith('ae'):
-                import r10_cut
-                log = self.root / 'state' / name / 'state' / 'cluster' / 'recording.log'
-                keep = {e['recording_id'] for e in r10_cut.recording_log(log) if e['type'] == 'TERM'}
-                for rec in (self.root / 'state' / name / 'state' / 'archive').glob('*.rec'):
-                    if int(rec.name.split('-')[0]) not in keep:
-                        rec.unlink()
+        if name[:2] in ('me', 'ae') and self.roots is not None and (self.roots / name).is_dir() \
+                and name not in (self.seeds or {}):
+            link = self.root / 'state' / name
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to((self.roots / name).resolve(), target_is_directory=True)
+            self.seeds = dict(self.seeds or {}, **{name: str(self.roots / name)})
         return super().spawn(name, command, environment)
 
     def start_database(self):
@@ -1473,13 +1673,28 @@ def scenario(manifest_path, name, out_dir):
     m = json.loads(Path(manifest_path).read_text())
     case = case_for(name, m.get('manifest_kind'))
     s = settings()
+    _S.update(s)
+    try:
+        cut = json.loads(CUT.read_text())
+    except (OSError, ValueError) as error:
+        raise Inconclusive(f'the run\'s cut is unreadable ({CUT}): {error}')
+    stale = check_sites(cut)            # review V18: the site table cites the refusing binaries' own commits
+    if stale:
+        raise Inconclusive('refusal-site table stale for this cut: ' + '; '.join(stale))
+    for role, name_ in (('me', 'match-cluster.jar'), ('ae', 'assets-cluster.jar')):
+        if (m.get('artifacts') or {}).get(role, {}).get('sha256') != (cut.get('artifacts') or {}).get(name_, {}).get('sha256'):
+            raise Inconclusive(f'the manifest\'s {role} jar is not the cut\'s {name_} ({cut.get("cut_id")})')
+    if name.startswith('core-act-toolkill'):
+        require_probe_genesis(m)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    (out / 'settings.json').write_text(json.dumps({'settings': s, 'seeds': str(SEEDS), 'cut': str(CUT), 'case': case}, indent=1))
+    (out / 'settings.json').write_text(json.dumps({'settings': s, 'seeds': str(SEEDS), 'cut': str(CUT), 'cut_id': cut.get('cut_id'),
+                                                   'case': case, 'site_commits': COMMITS,
+                                                   'harness_drift': m.get('harness_drift')}, indent=1))
     if case.startswith('control:'):
         if name in ('core-xver-ctl-me-same', 'core-xver-ctl-ae-same'):
             return run_same_control(manifest_path, name, out, s)
-        if name.endswith('-old-same'):
+        if '-old-same-' in name:
             return run_old_same_control(manifest_path, name, out, s)
         if name == 'core-xver-ctl-x7-wiped':
             return run_x7(manifest_path, out, s, wiped=True)
