@@ -35,7 +35,9 @@ refuses, 0 when none does. The rules (3.3):
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
 import re
 import sys
 import zipfile
@@ -96,6 +98,7 @@ class Findings:
     def __init__(self, rules):
         self.rules = set(rules)
         self.items = []
+        self.waived = []          # RC2 S17 review V2: harness drift findings a rig manifest waived with a named reason
 
     def add(self, rule, text):
         if rule in self.rules and (rule, text) not in self.items:
@@ -227,6 +230,15 @@ def _derived_k4(f, name, entry, spec, repos, record, aeron_version, cls):
             f.add('K4', f'{name}: no two byte-equal builds of {source} in the build record (rebuild-equal not shown)')
         elif shas[0] != entry.get('sha256'):
             f.add('K4', f'{name}: the rebuild of {source} is {shas[0]}, the artifact is {entry.get("sha256")} (not derived)')
+        else:
+            # RC2 S17 review V3: two BUILDS, not one file listed twice: distinct real paths in distinct build roots, neither of
+            # them the artifact itself
+            art = os.path.realpath(str(entry.get('path', '')))
+            paths = {os.path.realpath(str(b.get('path', ''))) for b in builds}
+            roots = {os.path.dirname(p) for p in paths}
+            if len(paths) < 2 or len(roots) < 2 or art in paths:
+                f.add('K4', f'{name}: rebuild-equal needs two distinct builds (distinct paths in distinct build roots, neither the '
+                            f'artifact): {sorted(paths)}')
         return
     if spec['lang'] == 'java':
         f.add('K4', f'{name}: binary-build-info is the C++ derivation; a jar is derived by rebuild-equal')
@@ -240,6 +252,70 @@ def _derived_k4(f, name, entry, spec, repos, record, aeron_version, cls):
         if not token or token.encode() not in blob:
             what = 'source sha' if spec.get('stamped') else 'Aeron version'
             f.add('K4', f'{name}: the binary does not carry its {what} {token} (binary-build-info not shown)')
+
+
+# RC2 S17 review V2: the harness programs come from the cut's own commits (the probe sources of tools at harness_commit, the T1
+# drivers of cluster-tools at repos.cluster-tools); a stale probe or a stale harness_commit is refused.
+HARNESS_SOURCES = {'core_probe': ('tools', 'runtime-e2e/java/CoreProbe.java'),
+                   'journal_probe': ('tools', 'runtime-e2e/java/JournalProbe.java'),
+                   't1_me_driver': ('cluster-tools', 'app/forwarder/it/T1MeDriver.java'),
+                   't1_core_driver': ('cluster-tools', 'app/forwarder/it/T1CoreDriver.java')}
+REPO_PATHS = {'tools': Path(os.environ.get('R10_TOOLS_REPO', str(Path(__file__).resolve().parent.parent))),
+              'cluster-tools': Path(os.environ.get('R10_CT_REPO', str(B0 / 'workspace/cluster-tools-s16wt')))}
+
+
+def git_blob(repo, commit, rel):
+    """The bytes of ``rel`` at ``commit`` of a repo of REPO_PATHS, or None (the test seam of V2)."""
+    r = subprocess.run(['git', '-C', str(REPO_PATHS[repo]), 'show', f'{commit}:{rel}'], capture_output=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def _harness_at_commit(f, m, harness, repos):
+    commit = m.get('harness_commit')
+    if commit is not None and repos.get('tools') is not None and commit != repos.get('tools'):
+        f.add('K4', f'harness_commit {commit} is not repos.tools {repos.get("tools")} (one tools commit per cut)')
+    for name, (repo, rel) in HARNESS_SOURCES.items():
+        entry = harness.get(name)
+        if not isinstance(entry, dict) or not entry.get('source_sha256'):
+            continue
+        at = commit if repo == 'tools' else repos.get('cluster-tools')
+        where = 'harness_commit' if repo == 'tools' else 'repos.cluster-tools'
+        blob = git_blob(repo, at, rel) if at else None
+        if blob is None:
+            f.add('K4', f'harness.{name}: {rel} not found at {where} {at}')
+        elif hashlib.sha256(blob).hexdigest() != entry['source_sha256']:
+            f.add('K4', f'harness.{name}: source_sha256 {entry["source_sha256"][:12]} is not {rel} at {where} {at} '
+                        f'({hashlib.sha256(blob).hexdigest()[:12]}): a stale probe')
+
+
+AERON_VERSION_CLASS = 'io/aeron/AeronVersion.class'
+AERON_ROLE = {'match-cluster.jar': 'me', 'assets-cluster.jar': 'ae', 'assets-projector.jar': 'projector',
+              'libaeron_driver.so': 'cpp'}
+AERON_RE = re.compile(rb'(?<![0-9.])(1\.\d{1,3}\.\d{1,3})(?![0-9.])')
+
+
+def aeron_version_of(name, path):
+    """The Aeron version an artifact carries: ``io/aeron/AeronVersion.class`` of a jar, the version string of the C++ lib."""
+    data = _jar_member(path, AERON_VERSION_CLASS) if name.endswith('.jar') else (Path(path).read_bytes() if Path(path).is_file() else None)
+    if data is None:
+        return None
+    found = sorted(set(AERON_RE.findall(data)))
+    return found[0].decode() if len(found) == 1 else (None if not found else ','.join(v.decode() for v in found))
+
+
+def _aeron_k8(f, artifacts, aeron):
+    """RC2 S17 review V4: K8 reads the version from the artifacts, not only the substrate's declared strings."""
+    for name, role in AERON_ROLE.items():
+        entry = artifacts.get(name)
+        if not isinstance(entry, dict) or not Path(str(entry.get('path', ''))).is_file():
+            continue
+        found = aeron_version_of(name, entry['path'])
+        want = aeron.get(role)
+        if found is None:
+            f.add('K8', f'{name}: {AERON_VERSION_CLASS if name.endswith(".jar") else "the Aeron version string"} unreadable')
+        elif str(found) != str(want):
+            f.add('K8', f'{name}: carries Aeron {found} ({AERON_VERSION_CLASS if name.endswith(".jar") else "version string"}), '
+                        f'substrate.aeron.{role} is {want}')
 
 
 def load_record(f, ref):
@@ -392,6 +468,9 @@ def check_cut(m, rules=RULES, cls=None, old_pins=None):
             src = {'path': entry['source_path'], 'sha256': entry.get('source_sha256')}
             _rehash(f, what + ' source', src, need_source=False)
 
+    _harness_at_commit(f, m, harness, repos)
+    _aeron_k8(f, artifacts, aeron)
+
     genesis = m.get('genesis') if isinstance(m.get('genesis'), dict) else {}
     _unknown(f, 'genesis', genesis, GENESIS_KEYS)
     me = genesis.get('me') if isinstance(genesis.get('me'), dict) else {}
@@ -530,6 +609,19 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
             staged(key, {'path': m[key]['path'], 'sha256': m[key]['sha256']})
     if m.get('manifest_kind') and not str(m['manifest_kind']).startswith('s17'):
         f.add('K9', f'manifest_kind {m["manifest_kind"]} is not derived from an S17 cut')
+    # RC2 S17 review V2: the derived manifest runs the cut's harness, clean; a rig manifest may waive the drift with a named reason
+    # (harness_drift, recorded), never a product or nightly one
+    drift = []
+    if m.get('harness_commit') != cut.get('harness_commit'):
+        drift.append(f'harness_commit {m.get("harness_commit")} is not the cut\'s harness_commit {cut.get("harness_commit")}')
+    if m.get('harness_dirty') is not False:
+        drift.append(f'built from a dirty harness (harness_dirty {m.get("harness_dirty")!r}; 5.4 needs false)')
+    waiver = m.get('harness_drift')
+    if drift and isinstance(waiver, dict) and waiver.get('reason') and cls in ('rig', 'rig-xver'):
+        f.waived.extend(drift)
+    else:
+        for text in drift:
+            f.add('K4', text)
     if cls == 'product':
         for key in ('engine_driver', 'projector_driver'):
             if m.get(key, 'embedded') == 'embedded' and m.get('topology') == 'core':
@@ -661,7 +753,7 @@ def core_config_frames(member_dir, schema):
                 _, template, schema_id, version = struct.unpack_from('<HHHH', app, 0)
                 if template != CORE_CONFIG_TEMPLATE or schema_id != schema.schema_id:
                     continue
-                row = {'recording': rid, 'file': segment.name, 'offset': offset, 'schema_version': version}
+                row = {'recording': rid, 'file': segment.name, 'path': str(segment), 'offset': offset, 'schema_version': version}
                 row.update({f.name: f.decode(app, 8, schema.order) for f in message.fields if f.since <= version})
                 frames.append(row)
     return {'recordings': recordings, 'frames': frames}
@@ -1005,18 +1097,33 @@ def _decode_record5(lines, message, order):
 
 
 def check_record(record):
-    """Structural rules of a record (C3, C6): three values from three sources, never one value read twice."""
+    """Structural rules of a record (C3, C6): three values from three sources, never one value read twice. Review V10: the
+    sources are the files actually read (JournalProbe dump outputs, AE .rec segments, core-requests.jsonl); a value without a
+    file, or two values read from one file, is refused."""
     out = []
     src = record.get('sources') or {}
     if src.get('core_genesis_id') == src.get('me_genesis_id'):
         out.append(f'core genesisId and ME genesisId read from one source ({src.get("me_genesis_id")})')
     if src.get('core_bound_epoch') in (src.get('me_genesis_id'), src.get('core_genesis_id')):
         out.append(f'core bound epoch read from the source of a genesisId ({src.get("core_bound_epoch")})')
+    files = src.get('files')
+    if files is not None:
+        keys = ('me_genesis_id', 'core_genesis_id', 'core_bound_epoch')
+        for i, a in enumerate(keys):
+            for b in keys[i + 1:]:
+                shared = set(files.get(a) or []) & set(files.get(b) or [])
+                if shared:
+                    out.append(f'{a} and {b} read from one file: {sorted(shared)}')
     return out
 
 
+INVARIANTS = (('me', 'record5', 'behavior_version'), ('me', 'record5', 'max_wire_version'), ('me', 'record5', 'journal_seq'),
+              ('me', 'record5', 'decision'))
+
+
 def check_record_set(records):
-    """RC2 step 7: a genesisId that repeats across genesis runs is a refused record."""
+    """RC2 step 7: a genesisId that repeats across genesis runs is a refused record; the invariant fields of section 10
+    (behaviour 2, maxWireVersion 12, journalSeq 1 FRESH, the CoreConfig 1-2-3 acceptance, the gate transition) are equal."""
     seen, out = {}, []
     for i, record in enumerate(records):
         gid = (record.get('me') or {}).get('genesisId')
@@ -1025,6 +1132,22 @@ def check_record_set(records):
         if gid in seen:
             out.append(f'genesisId {gid} repeats across genesis runs (records {seen[gid]} and {i})')
         seen.setdefault(gid, i)
+    def value(record, path):
+        for key in path:
+            record = (record or {}).get(key) if isinstance(record, dict) else None
+        return record
+    for path in INVARIANTS:
+        values = {json.dumps(value(r, path)) for r in records}
+        if len(values) > 1:
+            out.append(f'invariant {".".join(path)} differs across records: {sorted(values)}')
+    accepted = {json.dumps(sorted({v for v, res in ((r.get('core') or {}).get('config_sequence') or []) if res in CONFIG_OK}))
+                for r in records}
+    if len(accepted) > 1:
+        out.append(f'invariant CoreConfig acceptance differs across records: {sorted(accepted)}')
+    gates = {json.dumps([g[:2] for g in (r.get('gate') or [])][:1] + ([['OPEN', 'ADMIN']] if any(g[:2] == ['OPEN', 'ADMIN']
+             for g in (r.get('gate') or [])) else [])) for r in records}
+    if len(gates) > 1:
+        out.append(f'invariant gate transition differs across records: {sorted(gates)}')
     return out
 
 
@@ -1073,7 +1196,7 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
     # ---- ME record 5 (JournalProbe dumps: the first successful dump of each member)
     schema = sbe_layout.load(journal_schema or ME_JOURNAL_SCHEMA)
     message = schema.messages[5]
-    record5 = {}
+    record5, me_files = {}, []
     for c in commands:
         argv = ' '.join(c.get('argv', []))
         hit = re.search(r'JournalProbe dump .*source=(me[0-2])', argv)
@@ -1086,6 +1209,7 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
         r5 = _decode_record5(log.read_text().splitlines(), message, schema.order)
         if r5 is not None:
             record5[hit.group(1)] = r5
+            me_files.append(str(log))
     me = {'members': sorted(record5)}
     if not record5:
         rec.say('INCOMPLETE', 'ME record 5 not dumped by any member')
@@ -1111,6 +1235,8 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
     me['genesisId'] = me_gid
     out['me'] = me
     derivation = (owner.get('genesis') or {}).get('derivation')
+    if not derivation and str(m.get('manifest_kind', '')).startswith('s17'):
+        rec.say('REFUSED', 'genesisId derivation missing: an s17 run derives its genesisId from its run_id (review V12)')
     if derivation:
         import core_contracts
         derived = int(core_contracts.derive_genesis_id(derivation.get('run_id'), life), 16)
@@ -1119,7 +1245,27 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
             rec.say('REFUSED', f'genesisId derivation: the run_id {derivation.get("run_id")} is not the run\'s {m.get("run_id")}')
         if me_gid is not None and me_gid != derived:
             rec.say('REFUSED', f'ME genesisId {me_gid} != the id derived from run_id {derivation.get("run_id")} ({derived})')
-    # ---- core genesisId (the AE's own replicated bytes)
+    # ---- CoreConfig acknowledgements in time order: the probe's core-config verbs (at_ns) and the genesis driver's first run
+    acks, driver_exit = [], None
+    for r in requests:
+        if r.get('verb') == 'core-config':
+            for reply in ((r.get('reply') or {}).get('replies') or []):
+                if reply.get('t') == 'AdminAck' and reply.get('ref') == CORE_CONFIG_TEMPLATE:
+                    acks.append((r.get('at_ns') or 0, int((r.get('args') or {}).get('version', reply.get('configVersion', 0))),
+                                 reply['result']))
+    for c in commands:
+        if re.search(r'\bT1CoreDriver genesis\b', ' '.join(c.get('argv', []))):
+            log = Path(c['output'])
+            text = log.read_text() if log.is_file() else ''
+            stamp = log.stat().st_mtime_ns if log.is_file() else 0
+            for k, (v, code) in enumerate(re.findall(r'CoreConfig (\d) result (\d+)', text)):
+                acks.append((stamp + k, int(v), ADMIN_RESULTS.get(int(code), str(code))))
+            driver_exit = c.get('exit_code')
+            break
+    acks.sort(key=lambda a: a[0])
+    sequence = [[v, result] for _, v, result in acks]
+    # ---- core genesisId (review V11): the CoreConfig 1 frame of each AE member's log recording that its ACCEPTED/ADOPTED
+    # AdminAck answered (the i-th frame of a version pairs with the i-th ack of that version); a refused frame never wins
     core = {}
     ae_jar = ((m.get('artifacts') or {}).get('ae') or {}).get('path')
     reader = None
@@ -1127,31 +1273,32 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
         try:
             reader = genesis_reader(root, load_money_schema(ae_jar))
         except (ValueError, OSError) as error:
-            reader = {'status': 'not observable', 'genesis_id': None, 'error': str(error)}
+            reader = {'status': 'not observable', 'genesis_id': None, 'error': str(error), 'members': {}}
     else:
-        reader = {'status': 'not observable', 'genesis_id': None, 'error': f'AE jar not readable: {ae_jar}'}
+        reader = {'status': 'not observable', 'genesis_id': None, 'error': f'AE jar not readable: {ae_jar}', 'members': {}}
+    applied, core_files = {}, set()
+    for member, row in (reader.get('members') or {}).items():
+        seen = {}
+        for frame in row.get('frames') or []:
+            v = frame.get('configVersion')
+            i = seen[v] = seen.get(v, -1) + 1
+            same = [a for a in acks if a[1] == v]
+            if v == 1 and i < len(same) and same[i][2] in ('ACCEPTED', 'ADOPTED') and member not in applied:
+                applied[member] = frame.get('genesisId')
+                core_files.add(frame.get('path'))
+    values = set(applied.values())
     core['genesis_reader'] = {k: reader.get(k) for k in ('status', 'genesis_id', 'equal', 'other_ids_in_log', 'error') if k in reader}
-    core['genesisId'] = reader['genesis_id'] if reader.get('genesis_id') is not None else 'not observable'
-    if reader.get('genesis_id') is None:
-        rec.say('INCOMPLETE' if reader.get('status') == 'not observable' else 'REFUSED',
-                f'core genesisId {reader.get("status")} (no CoreConfig frame common to every AE log recording)')
-    elif me_gid is not None and reader['genesis_id'] != me_gid:
-        rec.say('REFUSED', f'core genesisId {reader["genesis_id"]} != ME genesisId {me_gid}')
-    # ---- CoreConfig acknowledgements: the probe's core-config verbs, then the genesis driver's first run
-    sequence, refused, driver_exit = [], [], None
-    for r in requests:
-        if r.get('verb') == 'core-config':
-            for reply in ((r.get('reply') or {}).get('replies') or []):
-                if reply.get('t') == 'AdminAck' and reply.get('ref') == CORE_CONFIG_TEMPLATE:
-                    sequence.append([int((r.get('args') or {}).get('version', reply.get('configVersion', 0))), reply['result']])
-    for c in commands:
-        if re.search(r'\bT1CoreDriver genesis\b', ' '.join(c.get('argv', []))):
-            log = Path(c['output'])
-            text = log.read_text() if log.is_file() else ''
-            for v, code in re.findall(r'CoreConfig (\d) result (\d+)', text):
-                sequence.append([int(v), ADMIN_RESULTS.get(int(code), str(code))])
-            driver_exit = c.get('exit_code')
-            break
+    core['applied'] = applied
+    core_gid = values.pop() if len(values) == 1 and len(applied) == len(AE_MEMBERS) else None
+    core['genesisId'] = core_gid if core_gid is not None else 'not observable'
+    if core_gid is None:
+        if len(values) > 1:
+            rec.say('REFUSED', f'core genesisId differs across AE members: {applied}')
+        else:
+            rec.say('INCOMPLETE', f'core genesisId not observable (no CoreConfig 1 frame paired with an accepted AdminAck on '
+                                  f'every AE member; reader {reader.get("status")})')
+    elif me_gid is not None and core_gid != me_gid:
+        rec.say('REFUSED', f'core genesisId {core_gid} != ME genesisId {me_gid}')
     core['config_sequence'] = sequence
     core['driver_exit'] = driver_exit
     accepted = {v for v, result in sequence if result in CONFIG_OK}
@@ -1169,6 +1316,10 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
         core['bound_epoch'], core['feed_cursor'] = bound['meEpoch'], bound.get('lastAppliedJournalSeq')
         if me_gid is not None and bound['meEpoch'] != me_gid:
             rec.say('REFUSED', f'core bound epoch {bound["meEpoch"]} != ME record 5 meEpoch {me_gid}')
+    out['sources']['core_genesis_id'] = ('AE log recordings: the CoreConfig 1 frame paired with its accepted AdminAck (sequenced '
+                                         'CoreConfig ingress; the snapshot CORE_CONFIG section is not read)')
+    out['sources']['files'] = {'me_genesis_id': sorted(me_files), 'core_genesis_id': sorted(p for p in core_files if p),
+                               'core_bound_epoch': [str(root / 'core-requests.jsonl')] if bound is not None else []}
     out['core'] = core
     # ---- gate (the tap's GLOBAL admission rows)
     tap = ((owner.get('lives') or {}).get(str(life)) or {}).get('tap') or owner.get('tap') or {}
@@ -1249,6 +1400,9 @@ def main(argv=None):
     ar.add_argument('--journal-schema', type=Path)
     ar.add_argument('--audit', type=Path)
     ar.add_argument('--out', type=Path)
+    rs = sub.add_parser('activation-records', help='RC2 step 7: a set of records (files or dirs holding '
+                        'rc2-activation-record.json): no repeated genesisId, equal invariant fields, every record OK')
+    rs.add_argument('records', type=Path, nargs='+')
     g = sub.add_parser('genesis-ids', help='5.2 (v): the CoreConfig genesisId recorded in each AE member log')
     g.add_argument('state_root', type=Path)
     g.add_argument('--schema', type=Path, required=True, help='money schema XML or the AE jar')
@@ -1286,6 +1440,15 @@ def main(argv=None):
         record, path = write_activation_record(args.run_dir, args.out, journal_schema=args.journal_schema, audit=audit)
         print(json.dumps({'status': record['status'], 'refusals': record['refusals'], 'record': str(path)}, indent=1))
         return 0 if record['status'] == 'OK' else 1
+    if args.cmd == 'activation-records':
+        paths = []
+        for p in args.records:
+            paths += sorted(p.rglob('rc2-activation-record.json')) if p.is_dir() else [p]
+        records = [json.loads(p.read_text()) for p in paths]
+        refusals = check_record_set(records) + [f'{p}: status {r.get("status")}' for p, r in zip(paths, records)
+                                                if r.get('status') != 'OK']
+        print(json.dumps({'records': [str(p) for p in paths], 'refusals': refusals}, indent=1))
+        return 1 if refusals or not records else 0
     if args.cmd == 'genesis-ids':
         out = genesis_reader(args.state_root, args.schema)
         print(json.dumps(out, indent=1, default=str))

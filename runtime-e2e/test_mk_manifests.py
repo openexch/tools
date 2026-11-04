@@ -134,6 +134,7 @@ class CutManifestBuilderTest(unittest.TestCase):
         self.world = test_r10_cut.World(root / 'cut')
         self.cut_path = root / 'rc2-cut-manifest.json'
         self.cut_path.write_text(json.dumps(self.world.m))
+        patch = mock.patch.object(mk_manifests.r10_cut, 'git_blob', self.world.blob); patch.start(); self.addCleanup(patch.stop)
         def put(rel, data):
             path = root / rel; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(data); return path
         self.bin_a = root / 'bin-s15'

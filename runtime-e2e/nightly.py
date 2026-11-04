@@ -64,10 +64,14 @@ class Settings:
     cut: str = str(DEFAULT_CUT)
     template: str = None              # the pre-S17 path: derive every entry from this one template manifest
     keep_state: bool = False          # keep the state root of a PASSing entry (a failing entry's is always kept)
+    stop_grace_s: float = 180         # RC2 S17 review V17: the runner's SIGTERM-to-SIGKILL grace, a setting
+    cut_sha256: str = None            # review V13 (c): the cut the night derives from, by sha256 and id
+    cut_id: str = None
 
     def record(self):
         return {'lock': self.lock, 'bound_s': self.bound_s, 'after_interrupt': self.after_interrupt, 'load_max': self.load_max,
-                'cut': self.cut, 'template': self.template, 'keep_state': self.keep_state}
+                'cut': self.cut, 'cut_sha256': self.cut_sha256, 'cut_id': self.cut_id, 'template': self.template,
+                'keep_state': self.keep_state, 'stop_grace_s': self.stop_grace_s}
 
 
 def _number(env, key, default):
@@ -88,7 +92,8 @@ def settings_from_env(env=None):
     return Settings(lock=env.get('NIGHTLY_LOCK', r10_cut.HEAVY_LOCK), bound_s=_number(env, 'NIGHTLY_BOUND_S', DEFAULT_BOUND_S),
                     after_interrupt=after, load_max=_number(env, 'NIGHTLY_LOAD_MAX', 6.0),
                     harness_commit=env.get('NIGHTLY_HARNESS_COMMIT') or None, cut=env.get('NIGHTLY_CUT', str(DEFAULT_CUT)),
-                    keep_state=env.get('NIGHTLY_KEEP_STATE', '') in ('1', 'true', 'yes'))
+                    keep_state=env.get('NIGHTLY_KEEP_STATE', '') in ('1', 'true', 'yes'),
+                    stop_grace_s=_number(env, 'NIGHTLY_STOP_GRACE_S', 180))
 
 
 # ------------------------------------------------------------------ plan
@@ -293,11 +298,12 @@ class Host:
             self._stop(process)
             raise
 
-    @staticmethod
-    def _stop(process):
+    stop_grace_s = 180
+
+    def _stop(self, process):
         process.terminate()                  # the runner turns SIGTERM into INCONCLUSIVE and tears its fixture down
         try:
-            process.wait(timeout=180)
+            process.wait(timeout=self.stop_grace_s)
         except subprocess.TimeoutExpired:
             process.kill(); process.wait()
 
@@ -422,11 +428,45 @@ def _run_locked(plan, night, unfinished, work_root, settings, host, summary, sta
             summary['entries'][-1].update(status='INCONCLUSIVE', error='night terminated by a signal')
         for index, entry in pending:
             summary['entries'].append({'index': index, **entry, 'status': 'INCONCLUSIVE', 'error': 'night terminated by a signal'})
-        return _finish(night, summary, _overall(summary['entries']), started, host)
+        return _finish(night, summary, _records(night, summary, _overall(summary['entries'])), started, host)
     for index, entry in pending:
         summary['entries'].append({'index': index, **entry, 'status': 'INCONCLUSIVE',
                                    'error': f'not started: night bound {settings.bound_s:g} s reached'})
-    return _finish(night, summary, _overall(summary['entries']), started, host)
+    return _finish(night, summary, _records(night, summary, _overall(summary['entries'])), started, host)
+
+
+def _records(night, summary, status):
+    """RC2 step 7 (review V10): the night's activation records, checked as a set (no repeated genesisId, equal invariants,
+    each OK); a refused set makes the night FAIL."""
+    paths = sorted(night.rglob('rc2-activation-record.json'))
+    records = []
+    for p in paths:
+        try:
+            records.append(json.loads(p.read_text()))
+        except ValueError:
+            records.append({'status': 'UNREADABLE'})
+    refusals = r10_cut.check_record_set(records) + [f'{p.relative_to(night)}: status {r.get("status")}'
+                                                    for p, r in zip(paths, records) if r.get('status') != 'OK']
+    summary['activation_records'] = {'files': [str(p.relative_to(night)) for p in paths], 'refusals': refusals}
+    return 'FAIL' if refusals and status == 'PASS' else status
+
+
+def cut_identity(cut, commit):
+    """Review V2/V13 (c): the cut by sha256 and cut_id; its harness_commit must be the night's pinned commit."""
+    data = Path(cut).read_bytes()
+    m = json.loads(data)
+    if m.get('harness_commit') != commit:
+        raise Violation(f'the cut names harness_commit {m.get("harness_commit")}, the night is pinned at {commit}: a night runs the '
+                        'harness its cut was made with')
+    return {'cut_id': m.get('cut_id'), 'sha256': hashlib.sha256(data).hexdigest(), 'harness_commit': m.get('harness_commit')}
+
+
+def pinned_plan(plan, harness_dir):
+    """Review V13 (b): the plan the night runs is the one at the pinned commit (``<harness>/runtime-e2e/<name>``), byte-equal."""
+    plan, pinned = Path(plan), Path(harness_dir) / Path(plan).name
+    if not pinned.is_file() or pinned.read_bytes() != plan.read_bytes():
+        raise Violation(f'{plan} is not the plan at the pinned commit ({pinned}): edit the plan by commit, not in the working tree')
+    return pinned
 
 
 def _finish(night, summary, status, started, host, rename=None):
@@ -464,6 +504,9 @@ def main_with(argv, host=None):
     parser.add_argument('--after-interrupt', choices=('run', 'skip'), default=env.after_interrupt)
     parser.add_argument('--keep-state', action='store_true', default=env.keep_state)
     args = parser.parse_args(argv)
+    if args.plan is not None and not args.harness_commit:
+        # review V13 (a): an unset NIGHTLY_HARNESS_COMMIT expands to "" in ExecStart; a night never falls back to HEAD
+        raise Violation('an empty harness commit: --plan nights run only on a pinned NIGHTLY_HARNESS_COMMIT')
     commit = args.harness_commit or _git(args.tools_repo, 'rev-parse', 'HEAD').stdout.decode().strip()
     harness_root = args.harness_root or args.evidence_root.resolve().parent / 'harness'
     harness = prepare_harness(args.tools_repo, commit, harness_root)        # refuses a dirty harness before anything else
@@ -472,6 +515,10 @@ def main_with(argv, host=None):
         flags = [a for a in argv]
         if '--harness-commit' not in flags:
             flags += ['--harness-commit', commit]
+        if '--tools-repo' in flags:                 # review V13 (d): always the real repo, absolute, never harness-<sha>
+            flags[flags.index('--tools-repo') + 1] = str(args.tools_repo.resolve())
+        else:
+            flags += ['--tools-repo', str(args.tools_repo.resolve())]
         os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
         os.execv(sys.executable, [sys.executable, '-s', str(harness / 'runtime-e2e' / 'nightly.py')] + flags)
     settings = Settings(lock=args.lock, bound_s=args.bound_s, after_interrupt=args.after_interrupt, load_max=args.load_max,
@@ -485,11 +532,17 @@ def main_with(argv, host=None):
             if not scenario_known(entry['scenario']):
                 raise Violation(f'unknown scenario {entry["scenario"]!r}')
     else:
-        plan = parse_plan(json.loads(args.plan.read_text()))
+        plan_path = pinned_plan(args.plan, harness / 'runtime-e2e')
+        plan = parse_plan(json.loads(plan_path.read_text()))
+        ident = cut_identity(args.cut, commit)
+        settings.cut_sha256, settings.cut_id = ident['sha256'], ident['cut_id']
     work_root = args.work_root or args.evidence_root.resolve().parent / 'work'
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, _terminate)
-    code, summary = run_night(plan, args.evidence_root, work_root, settings, host or Host())
+    if host is None:
+        host = Host()
+        host.stop_grace_s = settings.stop_grace_s
+    code, summary = run_night(plan, args.evidence_root, work_root, settings, host)
     print(json.dumps({k: summary[k] for k in ('night', 'status', 'lock', 'wall_s')} | {
         'entries': [{k: e.get(k) for k in ('scenario', 'kind', 'status', 'wall_s')} for e in summary['entries']]}))
     return code

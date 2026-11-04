@@ -291,7 +291,12 @@ class CoreFixture(Fixture):
             raise Violation('D20: refusing a JVM timeout override for ' + name)
         # RC2 S17 W3: a seeded member (seed_state) or a slot replaced with keep_state starts on the dir already in place
         prepared = name in (self.registry.get('seeded') or {}) or name in (self.registry.get('kept_state') or {})
-        state = self.root / 'state' / name; state.mkdir(parents=True, exist_ok=prepared)
+        bound = (self.registry.get('bound_state') or {}).get(name)     # review V1: a member bound to another fixture's root
+        state = self.root / 'state' / name
+        if bound:
+            state = Path(bound)
+        else:
+            state.mkdir(parents=True, exist_ok=prepared)
         limits = self.m['limits']
         memory_mb = (limits.get('memory_mb_by_role') or {}).get(name, limits['memory_mb'])
         shm_mb = (limits.get('shm_mb_by_role') or {}).get(name, limits['shm_mb'])
@@ -624,11 +629,13 @@ class CoreFixture(Fixture):
             raise Inconclusive(f'{role} metrics unavailable: {response.get("status")}')
         return parse_prometheus(response['body'])
 
-    def start(self, plan=None):
+    def start(self, plan=None, before_engines=None):
         """Boot the topology. ``plan=None`` is the S14 boot (empty core, slots up; core-boot). A ``plan`` runs the
         contract 5.3 genesis phases and leaves a funded, OPEN core with bridges and forwarders ready."""
         self.check_image(); self.stage_artifacts(); self.start_network(); self.start_database()
         self.spawn('probe', self.probe_command())
+        if before_engines is not None:          # RC2 S17 review V1: the X-R precheck, with the projection database up
+            before_engines()
         boot = {'started_ns': time.time_ns(), 'phases': {}}
         self.registry['boot'] = boot
         for engine in ('ae', 'me'):
@@ -673,6 +680,20 @@ class CoreFixture(Fixture):
                                     'derivation': self.genesis_derivation()}
         self.save()
         check_genesis_order(phases)
+        self.audit_genesis()
+
+    def audit_genesis(self):
+        """Contract 7.2 / review V10: right after every s17 genesis the audit (3.5) is taken into ``audit.json`` of the state
+        root; runner.py turns it and the run's evidence into ``rc2-activation-record.json``. Never fatal: the record judges it."""
+        if not str(self.m.get('manifest_kind', '')).startswith('s17'):
+            return None
+        import r10_cut
+        try:
+            return r10_cut.audit_fixture(self, self.root / 'audit.json')
+        except Exception as error:
+            (self.root / 'audit.json').write_text(json.dumps({'status': 'ERROR', 'error': str(error)[:500], 'findings':
+                                                              [str(error)[:300]], 'stopped': [], 'members_up': {}}) + '\n')
+            return None
 
     def run_genesis_steps(self, plan, order, phases):
         for step, phase in order:
@@ -922,6 +943,27 @@ class CoreFixture(Fixture):
             self.slots[slot] = self.start_or_restart_slot(slot)
         for slot in ('shadow0',):
             self.slots[slot] = self.start_slot(slot)
+
+    def bind_member_states(self, state_dir, members=ENGINES):
+        """RC2 S17 review V1 (X-R, 6.9 step 3: "the forward order on the same state roots"): the members' /data are the dirs of
+        ``state_dir`` (another fixture's state, wiped by the precheck's list), linked as ``state/<member>`` so every reader of
+        this fixture's state root sees them. Each dir must exist and be empty; a member already started is refused."""
+        for member in members:
+            target = Path(state_dir) / member
+            if member in self.registry['containers']:
+                raise Violation(f'bind_member_states refuses {member}: already started')
+            if not target.is_dir():
+                raise Violation(f'bind_member_states: {target} does not exist')
+            if any(target.iterdir()):
+                raise Violation(f'bind_member_states: {target} is not empty (the forward order runs on wiped roots)')
+            link = self.root / 'state' / member
+            link.parent.mkdir(parents=True, exist_ok=True)
+            if link.exists() or link.is_symlink():
+                raise Violation(f'bind_member_states: {link} exists')
+            link.symlink_to(target.resolve(), target_is_directory=True)
+            self.registry.setdefault('bound_state', {})[member] = str(target.resolve())
+        self.save()
+        return dict(self.registry['bound_state'])
 
     # ---------------------------------------------------------------- seeds (RC2 S17 W3, contract 5.2)
 

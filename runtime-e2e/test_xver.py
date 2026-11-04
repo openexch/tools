@@ -26,8 +26,9 @@ AE_ENVELOPE = ('FATAL snapshot refused: snapshot envelope magic missing (length=
 
 def member(role, text, code=1, start_s=0.0, exit_s=2.0, running=False, ready=False):
     return {'role': role, 'running': running, 'exit_code': None if running else code, 'started_ns': T0 + int(start_s * NS),
-            'finished_ns': None if running else T0 + int(exit_s * NS), 'log': 'banner: engine starting\n' + text + '\n',
-            'ready_200': ready}
+            'finished_ns': None if running else T0 + int(exit_s * NS),
+            'log': f'{"Match" if role[:2] == "me" else "Assets"} Engine node {role[2:]} starting: portBase=9000\n' + text + '\n',
+            'ready_200': ready, 'restart_count': 0}
 
 
 def log_only(engine='me', where='session open', positions=(256, 256)):
@@ -61,8 +62,10 @@ class CaseTableTest(unittest.TestCase):
         self.assertEqual({c['under_test'] for c in xver.CONTROLS.values()}, {'rc2', 'tag-seed-validity', 'rollback-restore'})
 
     def test_controls_are_named(self):
-        self.assertEqual(set(xver.CONTROLS), {'core-xver-ctl-me-same', 'core-xver-ctl-me-old-same', 'core-xver-ctl-ae-same',
-                                              'core-xver-ctl-ae-old-same', 'core-xver-ctl-x7-wiped',
+        self.assertEqual(set(xver.CONTROLS), {'core-xver-ctl-me-same', 'core-xver-ctl-ae-same', 'core-xver-ctl-x7-wiped',
+                                              'core-xver-ctl-me-old-same-a', 'core-xver-ctl-me-old-same-b',
+                                              'core-xver-ctl-me-old-same-c', 'core-xver-ctl-ae-old-same-a',
+                                              'core-xver-ctl-ae-old-same-c',
                                               'core-rollback-ctl-omit-journal', 'core-rollback-ctl-omit-pgdump'})
 
 
@@ -146,7 +149,9 @@ class MemberClassTest(unittest.TestCase):
 
 
 class StatePassLineTest(unittest.TestCase):
-    def judge(self, case, members, probes=(), bound=150):
+    def judge(self, case, members, probes=None, bound=150):
+        if probes is None:              # review V5: one attempt in flight during every member's life
+            probes = [{'answered': False, 'started_ns': T0, 'ended_ns': T0 + 400 * NS}]
         return xver.judge_state(case, members, list(probes), bound_s=bound, quorum_wait_ms=120000)
 
     def test_x1a_three_replay_halted(self):
@@ -189,7 +194,7 @@ class StatePassLineTest(unittest.TestCase):
     def test_any_ready_or_answered_probe_is_guarded_silent(self):
         ms = log_only(); ms[0]['ready_200'] = True
         self.assertEqual(self.judge('X-1c-emb', ms)['verdict'], 'GUARDED-silent')
-        v = self.judge('X-1c-emb', log_only(), probes=[{'answered': True, 'at_ns': T0 + 3 * NS}])
+        v = self.judge('X-1c-emb', log_only(), probes=[{'answered': True, 'at_ns': T0 + 3 * NS, 'started_ns': T0}])
         self.assertEqual(v['verdict'], 'GUARDED-silent')
         self.assertEqual(xver.verdict_status(v['verdict']), 'FAIL')
         self.assertEqual(xver.verdict_status('REFUSED'), 'PASS')
@@ -204,10 +209,10 @@ class StatePassLineTest(unittest.TestCase):
         ms = log_only('ae', positions=(256, 512))
         self.assertIn('the two replaying members name different logPositions [256, 512]', self.judge('X-3b-ext', ms)['reasons'])
         ms = log_only('ae')
-        ms[0]['log'] = 'banner\nINGRESS DROP (schema): schemaId=2 version=4 templateId=32\n' + R0.format('session open', 1, 256)
+        ms[0]['log'] = 'Assets Engine node 0 starting\nINGRESS DROP (schema): schemaId=2 version=4 templateId=32\n' + R0.format('session open', 1, 256)
         v = self.judge('X-3b-ext', ms)
         self.assertEqual(v['verdict'], 'FAIL')
-        self.assertIn('ae0 dropped 1 frame(s) (INGRESS DROP (schema)) before its CRITICAL line', v['reasons'])
+        self.assertIn('ae0 dropped 1 frame(s) (INGRESS DROP) before its CRITICAL line', v['reasons'])
 
 
 def seed_dir(root, shape, snapshot, tail=0, opens=0):
@@ -271,7 +276,8 @@ def x7_obs(**over):
                                          'DRIVER FAIL ADMIN OPEN GLOBAL never accepted: last reason 40 FEED_HALTED\n'},
            'probe_order': {'meaning': 'REFUSED', 'reply': {'replies': [{'t': 'OrderReject', 'reason': 'GATE_CLOSED'}]},
                            'after_bridge_halt': True},
-           'probe_deposit': {'meaning': 'ANSWERED'}}
+           'probe_deposit': {'meaning': 'ANSWERED'}, 'tap_alive_after_sampling': True,
+           'last_feedhalt_ack_ns': {b: T0 - NS for b in ('bridge0', 'bridge1')}}
     obs.update(over)
     return obs
 
@@ -290,7 +296,7 @@ class X7PassLineTest(unittest.TestCase):
         obs = x7_obs()
         for s in obs['samples']:
             s['bridges']['bridge0']['health']['haltDetail'] = 'NONE'
-        obs['bridge_logs']['bridge0'] = ''
+        obs['bridge_logs']['bridge0'] = 'verdict source 2 e 1 UNREACHABLE seq 0 epoch 0 bad none fault NONE\n'   # review V8
         self.assertEqual(xver.judge_x7(obs)['verdict'], 'INCONCLUSIVE')
 
     def test_an_open_gate_or_a_bound_core_fails_the_w12_rule(self):
@@ -337,22 +343,15 @@ class ActJudgeTest(unittest.TestCase):
         self.assertIn('the ME FRESH re-run wrote a second engine_config record on me1', xver.judge_a1(bad)['reasons'])
 
     def test_xa2(self):
-        base = {'stop_after': 1, 'before': {'status': 'INCOMPLETE'}, 'gate_after_partial': 'GENESIS',
-                'new_id_core': {'exit': 1, 'out': 'CoreConfig 1 result 2\n'}, 'new_id_me_rejected': True,
-                'same_id': {'exit': 0, 'out': 'CoreConfig 1 result 1\nGLOBAL OPEN (bound through the bridge)\n'},
-                'gate_final': 'OPEN'}
-        self.assertEqual(xver.judge_a2(base)['verdict'], 'PASS', xver.judge_a2(base)['reasons'])
+        import test_s17_review as R          # review V15: the full 6.8 inputs (partial acks, order, the T1MeDriver output)
+        self.assertEqual(xver.judge_a2(R.a2())['verdict'], 'PASS', xver.judge_a2(R.a2())['reasons'])
         self.assertIn('the record before the recovery reads OK, want INCOMPLETE or ABORTED',
-                      xver.judge_a2(dict(base, before={'status': 'OK'}))['reasons'])
-        k2 = dict(base, stop_after=2, same_id={'exit': 1, 'out': 'CoreConfig 1 result 4\n'}, gate_final='GENESIS',
-                  bound_after_same_id=0, recovery={'finish': [[3, 'ACCEPTED']], 'opened': False})
-        v = xver.judge_a2(k2)
-        self.assertEqual(v['verdict'], 'PASS', v['reasons'])
-        self.assertEqual(v['recovery'], 'finish did not open: a wipe of both clusters and a new genesisId')
-        self.assertIn('after CoreConfig 1 and 2 the same-id re-run was not refused STALE at CoreConfig 1',
-                      xver.judge_a2(dict(k2, same_id={'exit': 0, 'out': ''}))['reasons'])
+                      xver.judge_a2(R.a2(before={'status': 'OK'}))['reasons'])
         self.assertIn('the new genesisId was not REJECTED at CoreConfig 1',
-                      xver.judge_a2(dict(base, new_id_core={'exit': 1, 'out': 'CoreConfig 1 result 4'}))['reasons'])
+                      xver.judge_a2(R.a2(new_id_core={'exit': 1, 'out': 'CoreConfig 1 result 4'}))['reasons'])
+        k2 = R.a2(stop_after=2, partial={'results': [[1, 'ACCEPTED'], [2, 'ACCEPTED']]},
+                  same_id={'exit': 0, 'out': ''}, gate_final='GENESIS', bound_after_same_id=0, recovery={})
+        self.assertIn('after CoreConfig 1 and 2 the same-id re-run was not refused STALE at CoreConfig 1', xver.judge_a2(k2)['reasons'])
 
     def test_xa3(self):
         obs = {'driver': {'exit': 1, 'out': 'ADMIN OPEN GLOBAL never accepted: last reason 41 ME_LANE_INACTIVE'},
@@ -377,7 +376,8 @@ class ActJudgeTest(unittest.TestCase):
 
     def test_xa5(self):
         obs = {'wait_rows': [{'fwd0': [True, 503], 'fwd1': [True, 503]}] * 30, 'wait_s': 30, 'epoch_waits': {'fwd0': 6, 'fwd1': 6},
-               'bound_lines': {'fwd0': 1, 'fwd1': 1}, 'restarts': {'fwd0': 0, 'fwd1': 0}, 'ready_after_genesis': True}
+               'bound_lines': {'fwd0': 1, 'fwd1': 1}, 'restarts': {'fwd0': 0, 'fwd1': 0}, 'ready_after_genesis': True,
+               'resync_after_bound': {'fwd0': 1, 'fwd1': 1}}
         self.assertEqual(xver.judge_a5(obs)['verdict'], 'PASS', xver.judge_a5(obs)['reasons'])
         bad = dict(obs, wait_rows=obs['wait_rows'][:-1] + [{'fwd0': [True, 200], 'fwd1': [True, 503]}])
         self.assertIn('fwd0 answered /ready 200 while the epoch was 0', xver.judge_a5(bad)['reasons'])
@@ -388,21 +388,22 @@ class ActJudgeTest(unittest.TestCase):
 
 class RollbackJudgeTest(unittest.TestCase):
     D = {'r01_oms': {'rows': 54, 'sha256': 'a'}, 'r01_money': {'rows': 68, 'sha256': 'b'}, 'r01_market': {'rows': 12, 'sha256': 'c'},
-         'ae': {'balances': 4, 'holds': 1, 'sha256': 'd'}, 'combined': 'x'}
+         'ae': {'balances': 4, 'holds': 1, 'lastAppliedTradeId': 12, 'sha256': 'd'}, 'combined': 'x'}
 
     def test_rollback_and_omit(self):
         post = {'deposits': [True, True], 'orders': [True, True, True], 'changed': True}
-        self.assertEqual(xver.judge_rollback(self.D, dict(self.D), post)['verdict'], 'PASS')
+        j = lambda *a, **k: xver.judge_rollback(*a, smoke='PASS', **k)
+        self.assertEqual(j(self.D, dict(self.D), post)['verdict'], 'PASS')
         d1 = json.loads(json.dumps(self.D)); d1['r01_money']['sha256'] = 'z'; d1['combined'] = 'y'
-        v = xver.judge_rollback(self.D, d1, post)
+        v = j(self.D, d1, post)
         self.assertEqual(v['verdict'], 'FAIL')
         self.assertIn('D1 != D0 in r01_money', v['reasons'])
-        self.assertEqual(xver.judge_rollback(self.D, d1, post, omitted='pg-dump')['verdict'], 'PASS')     # xr-omit: must fail
-        self.assertEqual(xver.judge_rollback(self.D, dict(self.D), post, omitted='ae-money-journal')['verdict'], 'FAIL')
-        self.assertEqual(xver.judge_rollback(self.D, None, None, omitted='ae-money-journal', error='restore died')['verdict'],
-                         'PASS')
+        self.assertEqual(j(self.D, d1, post, omitted='pg-dump')['verdict'], 'PASS')      # xr-omit: must fail on its part
+        self.assertEqual(j(self.D, dict(self.D), post, omitted='ae-money-journal')['verdict'], 'FAIL')
+        self.assertEqual(j(self.D, None, None, omitted='ae-money-journal', error='tag engine log marker missing: ae0',
+                           error_phase='restore-start')['verdict'], 'PASS')
         self.assertIn('the post-restore scenario did not pass',
-                      ' '.join(xver.judge_rollback(self.D, dict(self.D), dict(post, orders=[False]))['reasons']))
+                      ' '.join(j(self.D, dict(self.D), dict(post, orders=[False]))['reasons']))
 
 
 class ProbeAnswerTest(unittest.TestCase):

@@ -150,6 +150,15 @@ def main():
                 result['teardown'] = 'COMPLETE_OWNED_RESOURCES_ONLY'
             except Exception as error:
                 result.update(status='INCONCLUSIVE', teardown_error=str(error))
+            # RC2 S17 7.2 (review V10): an s17 genesis leaves its audit; the run dir gets the activation record (evidence only)
+            if (fixture.root / 'audit.json').is_file() and not (args.output / 'rc2-activation-record.json').exists():
+                try:
+                    import r10_cut
+                    shutil.copyfile(fixture.root / 'audit.json', args.output / 'audit.json')
+                    record, _ = r10_cut.write_activation_record(args.output, state_root=fixture.root)
+                    result['activation_record'] = {'status': record['status'], 'refusals': record['refusals']}
+                except Exception as error:
+                    result['activation_record'] = {'status': 'ERROR', 'error': str(error)[:300]}
             commands = fixture.root / 'commands.jsonl'
             if commands.exists():
                 # A row may declare exit codes that are evidence (a probe's REFUSED/UNKNOWN), judged by the scenario.

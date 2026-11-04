@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 import r10_cut
@@ -36,8 +37,10 @@ def jar_bytes(members):
     return buf.getvalue()
 
 
-def engine_jar(name, kit=KIT_PIN, schema_text=SCHEMA_TEXT, marker=b''):
+def engine_jar(name, kit=KIT_PIN, schema_text=SCHEMA_TEXT, marker=b'', aeron='1.53.1'):
     members = {'MANIFEST': b'jar ' + name.encode() + marker}
+    if aeron is not None:                                  # RC2 S17 review V4: K8 reads the version the jar carries
+        members[r10_cut.AERON_VERSION_CLASS] = b'\xca\xfe\x01\x00\x06' + aeron.encode() + b'\x01'
     spec = r10_cut.PRODUCT[name]
     for schema, member in spec['schemas'].items():
         if schema in schema_text:
@@ -110,8 +113,16 @@ class World:
 
     def build(self, name, repo, source, data, times, tag=''):
         for i in range(times):
-            p = self.put(f'builds/{name}{tag}-{source[:4]}-{i}', data)
+            p = self.put(f'builds/b{i}{tag}-{source[:4]}/{name}', data)      # one build root per build (review V3)
             self.record.setdefault(name, []).append({'repo': repo, 'source_sha': source, 'path': str(p), 'sha256': h(data)})
+
+    def blob(self, repo, commit, rel):
+        """The git seam of review V2: the harness source at the cut's commit is the source file the World wrote."""
+        name = {v[1]: k for k, v in r10_cut.HARNESS_SOURCES.items()}.get(rel)
+        want = self.m['harness_commit'] if repo == 'tools' else self.m['repos']['cluster-tools']
+        if name is None or commit != want:
+            return None
+        return Path(self.m['harness'][name]['source_path']).read_bytes()
 
     def write_record(self):
         self.put('builds/record.json', json.dumps(self.record).encode())
@@ -144,6 +155,7 @@ class CheckerBase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.w = World(self.temp.name)
+        patch = mock.patch.object(r10_cut, 'git_blob', self.w.blob); patch.start(); self.addCleanup(patch.stop)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -361,6 +373,7 @@ class FixtureManifestTest(CheckerBase):
                'bridge_b': slot('ct-bridge', 'bridge_b') if b else None, 'shadow': None}
         h_ = self.w.m['harness']
         return {'schema_version': 2, 'topology': 'core', 'manifest_kind': 's17-ext', 'artifacts': art,
+                'harness_commit': self.w.m['harness_commit'], 'harness_dirty': False,
                 'engine_driver': 'external', 'projector_driver': 'external',
                 **{k: {'path': h_[k]['path'], 'sha256': h_[k]['sha256']} for k in ('core_probe', 'journal_probe',
                                                                                     't1_me_driver', 't1_core_driver')}}
@@ -406,7 +419,8 @@ MONEY_SCHEMA = b"""<?xml version="1.0" encoding="UTF-8"?>
   </sbe:message>
 </sbe:messageSchema>
 """
-GID = 0xE6975B
+import core_contracts
+GID = int(core_contracts.derive_genesis_id('rc2-000000000001'), 16)     # review V12: the run's derived id
 
 
 def log_entry(recording_id, term_id, position, kind, service_id=-1):
@@ -693,6 +707,7 @@ class RunDir:
                       'lives': {'1': {'me': {'genesis_id': hex(gid)}, 'core': {'genesis_id': hex(gid)}}},
                       'genesis': {'genesis_id': hex(gid), 'ledger_capacity': 100000, 'life': 1},
                       'tap': {'path': str(self.state / 'state/probe/tap-life1.jsonl')}, 'fault_targets': {}}
+        self.owner['genesis']['derivation'] = {'rule': core_contracts.GENESIS_DERIVATION, 'run_id': 'rc2-000000000001'}
         self.commands = []
         self.command(['T1CoreDriver', 'genesis', '/dev/shm/probe-aeron', 'x', hex(gid)], 0,
                      'CoreConfig 1 result 0\nCoreConfig 2 result 0\nCoreConfig 3 result 0\nGLOBAL OPEN (bound through the bridge)\n')

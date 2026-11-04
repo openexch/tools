@@ -41,7 +41,9 @@ OPTIONAL_MANIFEST_KEYS = {'netfilter_helper', 'host_loss_acceptance', 'profile_n
                           # RC2 S16 (contract 5.2, 5.3): the engines' driver profile and its staged driver; the builder's kind
                           'engine_driver', 'engine_libs', 'manifest_kind',
                           # RC2 S17 W2 (W10, PO-11 (a)): the money projector's driver profile and its staged driver
-                          'projector_driver', 'projector_libs', 'node_layout'}
+                          'projector_driver', 'projector_libs', 'node_layout',
+                          # RC2 S17 review V2: a rig manifest's named waiver of the harness pin (smokes before a cut regeneration)
+                          'harness_drift'}
 DRIVER_MODES = {'embedded', 'external'}
 LIB_KEYS = {'path', 'sha256', 'exec'}
 # Pinned single-file helper programs, checked like core_probe / journal_probe (path + source_path hashes).
