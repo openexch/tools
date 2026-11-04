@@ -63,6 +63,7 @@ READY_AFTER_KILL_S = 5.0         # 20.1 line 7: the ready_after_kill bound, a se
 REPLACE_READY_BOUND_S = 60       # stops a hung replacement wait; not a line
 REGENESIS_HEAL_BOUND_S = 900     # a stopped or fenced role stays a fault target across both regenesis scopes and the halt phase
 ENGINE_LIBS_DIR = '/artifacts/engine_libs'
+PROJECTOR_LIBS_DIR = '/artifacts/projector_libs'      # RC2 S17 W2
 ENGINE_DRIVER_PIDFILE = '/data/aeronmd.pid'
 DEFAULT_RISK = {'version': 1, 'min_qty': 1, 'max_qty': 10**6 * FP, 'collar_bps': 5000, 'per_sec': 1000, 'max_open': 5000,
                 'slippage_bps': 100}
@@ -238,12 +239,14 @@ class CoreFixture(Fixture):
             for name, lib in (artifact.get('libs') or {}).items():
                 # contract 3.2: only a lib with exec: true (aeronmd) gets the exec bit; the shared objects do not
                 self._stage(lib['path'], target / name, lib['sha256'], what, 0o755 if lib.get('exec') else 0o644)
-        engine_libs = self.m.get('engine_libs') or {}
-        if engine_libs:      # RC2 S16 5.3: the engine containers' staged aeronmd and its pinned properties
-            (dest / 'engine_libs').mkdir()
-            for name, lib in engine_libs.items():
-                self._stage(lib['path'], dest / 'engine_libs' / name, lib['sha256'], 'engine_libs changed while staging: ' + name,
-                            0o755 if lib.get('exec') else 0o644)
+        # RC2 S16 5.3: the engine containers' staged aeronmd and its pinned properties; RC2 S17 W2: the projector's, the same set
+        for key in ('engine_libs', 'projector_libs'):
+            libs = self.m.get(key) or {}
+            if libs:
+                (dest / key).mkdir()
+                for name, lib in libs.items():
+                    self._stage(lib['path'], dest / key / name, lib['sha256'], f'{key} changed while staging: ' + name,
+                                0o755 if lib.get('exec') else 0o644)
         probe_libs = self.m.get('probe_libs') or {}
         if probe_libs:
             (dest / 'probe').mkdir()
@@ -375,6 +378,33 @@ class CoreFixture(Fixture):
         """5.2: ``embedded`` (dev default, D-S15-4) or ``external`` (the staged aeronmd in the engine container, C13)."""
         return self.m.get('engine_driver', 'embedded')
 
+    def projector_driver(self):
+        """RC2 S17 W2 (W10, PO-11 (a)): ``embedded`` (the default; the projector's own Java driver) or ``external`` (the staged
+        aeronmd in the projector container, attached through PROJECTOR_DRIVER_MODE=external and AERON_DIR)."""
+        return self.m.get('projector_driver', 'embedded')
+
+    def _driver_wrapper(self, role, libs_dir, jar):
+        """The external-driver wrapper of the engines (CF engine_command): a fresh driver dir, the staged aeronmd on the pinned
+        driver.properties plus the dev overlay in the background with its pid in /data, a 30 s wait for its cnc.dat with the
+        driver alive, then ``exec java``."""
+        d = '/dev/shm/aeron-' + role
+        env = ' '.join(f'{k}={v}' for k, v in sorted(DRIVER_ENV.items()))
+        alive = f'"$(cat {ENGINE_DRIVER_PIDFILE})"'
+        script = (f'rm -rf {d}; mkdir -p {d}; AERON_DIR={d} {env} AERON_PRINT_CONFIGURATION=1 LD_LIBRARY_PATH={libs_dir} '
+                  f'{libs_dir}/aeronmd {libs_dir}/driver.properties {libs_dir}/driver-dev.properties & '
+                  f'echo $! > {ENGINE_DRIVER_PIDFILE}; i=0; '
+                  f'while {{ [ ! -f {d}/cnc.dat ] || ! kill -0 {alive} 2>/dev/null; }} && [ $i -lt {DRIVER_WAIT_TENTHS} ]; '
+                  f'do sleep 0.1; i=$((i+1)); done; '
+                  f'[ -f {d}/cnc.dat ] && kill -0 {alive} 2>/dev/null || {{ echo "aeronmd did not come up in 30 s" >&2; exit 1; }}; '
+                  f'exec {shlex.join(jar)}')
+        return ['sh', '-c', script]
+
+    def projector_command(self):
+        jar = JAVA + ['-jar', '/artifacts/projector.jar']
+        if self.projector_driver() != 'external':
+            return jar
+        return self._driver_wrapper('projector', PROJECTOR_LIBS_DIR, jar)
+
     def engine_command(self, engine, index):
         """5.3: embedded engines run ``java -jar`` as before; external engines run through the S15 wrapper shape (CF:347-356):
         a fresh driver dir, the staged aeronmd on the pinned driver.properties plus the dev overlay in the background with its
@@ -388,20 +418,14 @@ class CoreFixture(Fixture):
         d = '/dev/shm/aeron-' + role
         if role in getattr(self, 'engine_driver_skip', ()):
             return ['sh', '-c', f'rm -rf {d}; mkdir -p {d}; exec {shlex.join(jar)}']
-        env = ' '.join(f'{k}={v}' for k, v in sorted(DRIVER_ENV.items()))
-        lib = ENGINE_LIBS_DIR
-        alive = f'"$(cat {ENGINE_DRIVER_PIDFILE})"'
-        script = (f'rm -rf {d}; mkdir -p {d}; AERON_DIR={d} {env} AERON_PRINT_CONFIGURATION=1 LD_LIBRARY_PATH={lib} {lib}/aeronmd '
-                  f'{lib}/driver.properties {lib}/driver-dev.properties & '
-                  f'echo $! > {ENGINE_DRIVER_PIDFILE}; i=0; '
-                  f'while {{ [ ! -f {d}/cnc.dat ] || ! kill -0 {alive} 2>/dev/null; }} && [ $i -lt {DRIVER_WAIT_TENTHS} ]; '
-                  f'do sleep 0.1; i=$((i+1)); done; '
-                  f'[ -f {d}/cnc.dat ] && kill -0 {alive} 2>/dev/null || {{ echo "aeronmd did not come up in 30 s" >&2; exit 1; }}; '
-                  f'exec {shlex.join(jar)}')
-        return ['sh', '-c', script]
+        return self._driver_wrapper(role, ENGINE_LIBS_DIR, jar)
 
     def engine_driver_pidfile(self, role):
         """5.1: the pid file the engine wrapper writes, so exec_kill can kill an engine's staged aeronmd."""
+        if role == 'projector':
+            if self.projector_driver() != 'external':
+                raise Violation(f'projector runs no staged driver (projector_driver {self.projector_driver()})')
+            return ENGINE_DRIVER_PIDFILE
         if role not in ENGINES or self.engine_driver() != 'external':
             raise Violation(f'{role} runs no staged driver (engine_driver {self.engine_driver()})')
         return ENGINE_DRIVER_PIDFILE
@@ -425,7 +449,17 @@ class CoreFixture(Fixture):
         return {'PROJECTOR_POSTGRES_URL': f'jdbc:postgresql://{self.gateway}:{self.pg_port}/r01_money',
                 'PROJECTOR_POSTGRES_USER': 'runtime_fixture', 'PROJECTOR_POSTGRES_PASSWORD': 'synthetic-fixture-only',
                 'PROJECTOR_AE_JOURNAL_ARCHIVES': ','.join(self.m['nodes'][f'ae{i}'] + ':' + str(19301 + 100 * i) for i in range(3)),
-                'PROJECTOR_LOCAL_HOST': self.m['nodes']['projector'], 'PROJECTOR_METRICS_PORT': str(self.m['ports']['projector_http'])}
+                'PROJECTOR_LOCAL_HOST': self.m['nodes']['projector'], 'PROJECTOR_METRICS_PORT': str(self.m['ports']['projector_http']),
+                **self.projector_driver_env()}
+
+    def projector_driver_env(self):
+        """RC2 S17 W2: no key in the manifest = the S16 env unchanged; embedded never sets AERON_DIR (ProjectorDriver refuses
+        it); external names the staged driver's dir."""
+        if 'projector_driver' not in self.m:
+            return {}
+        if self.projector_driver() == 'external':
+            return {'PROJECTOR_DRIVER_MODE': 'external', 'AERON_DIR': '/dev/shm/aeron-projector'}
+        return {'PROJECTOR_DRIVER_MODE': 'embedded'}
 
     def probe_command(self):
         """The probe idles; with pinned probe_libs it also runs the aeronmd the T1 drivers attach to (contract 3.3)."""
@@ -730,7 +764,7 @@ class CoreFixture(Fixture):
         if 'projector' in self.registry['containers']:      # S16 5.1: a second life restarts the same container, never spawns
             self.restart('projector')
             return
-        self.spawn('projector', JAVA + ['-jar', '/artifacts/projector.jar'], self.projector_env())
+        self.spawn('projector', self.projector_command(), self.projector_env())
         self.wait_http('projector', self.m['ports']['projector_http'], '/health')
 
     def start_or_restart_slot(self, slot):

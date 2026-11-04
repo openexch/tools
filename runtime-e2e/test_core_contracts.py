@@ -299,3 +299,43 @@ class EngineDriverManifestTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ProjectorDriverManifestTest(unittest.TestCase):
+    """RC2 S17 W2 (W10, PO-11 (a)): ``projector_driver`` mirrors ``engine_driver``."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.dir = self.temp.name
+        self.path = Path(self.dir) / 'manifest.json'
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def bad(self, m, text):
+        with self.assertRaises(Violation) as caught:
+            validate_core_manifest(m, self.path, cpu_count=24)
+        self.assertIn(text, str(caught.exception))
+
+    def test_projector_driver_values_and_complete_libs(self):
+        from test_core_fixture import projector_manifest
+        validate_core_manifest(projector_manifest(self.dir), self.path, cpu_count=24)
+        validate_core_manifest(projector_manifest(self.dir, 'embedded'), self.path, cpu_count=24)
+        self.bad(dict(projector_manifest(self.dir, 'embedded'), projector_driver='host'),
+                 'projector_driver must be embedded or external')
+        m = projector_manifest(self.dir); m.pop('projector_libs')
+        self.bad(m, 'projector_driver external needs projector_libs')
+        m = projector_manifest(self.dir); m['projector_libs'].pop('driver-dev.properties')
+        self.bad(m, 'projector_libs must be exactly')
+        m = projector_manifest(self.dir); m['projector_libs']['aeronmd'].pop('exec')
+        self.bad(m, 'projector_libs aeronmd must be exec')
+        m = projector_manifest(self.dir, 'embedded'); m['projector_libs'] = engine_libs(self.dir)
+        self.bad(m, 'projector_libs without projector_driver external')
+        m = projector_manifest(self.dir); Path(m['projector_libs']['libaeron.so']['path']).write_bytes(b'tampered')
+        self.bad(m, 'projector_libs changed: libaeron.so')
+        m = projector_manifest(self.dir)
+        Path(m['projector_libs']['driver.properties']['path']).write_text(DP_TEXT.replace('8192', '1408'))
+        m['projector_libs']['driver.properties']['sha256'] = hashlib.sha256(DP_TEXT.replace('8192', '1408').encode()).hexdigest()
+        self.bad(m, 'driver.properties drifts from the embedded overrides')
+
+    def test_projector_driver_mode_is_an_allowed_process_name(self):
+        self.assertIn('PROJECTOR_DRIVER_MODE', core_contracts.PROCESS_ENV)

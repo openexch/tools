@@ -11,20 +11,15 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-import uuid
 
-from core_contracts import validate_core_manifest
+from core_contracts import child_manifest, validate_core_manifest
 
 DEFAULT_SCENARIOS = ['core-boots-10', 'core-smoke']
 
 
 def derive(template, template_path, scenario):
-    manifest = json.loads(json.dumps(template))
-    manifest['run_id'] = 'rc2-' + uuid.uuid4().hex[:12]
-    parent = Path(template_path).absolute().parent
-    manifest['state_root'] = str(parent / 'fixtures' / manifest['run_id'])
-    path = parent / f'{manifest["run_id"]}-{scenario}-manifest.json'
-    with path.open('x') as stream: json.dump(manifest, stream, indent=1); stream.write('\n')
+    """A fresh run identity from the template; the child file keeps the template's kind in its name (20.1 line 20)."""
+    path, _ = child_manifest(template, Path(template_path).absolute().parent, scenario)
     return path
 
 

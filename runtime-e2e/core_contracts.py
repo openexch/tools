@@ -39,7 +39,9 @@ OPTIONAL_MANIFEST_KEYS = {'netfilter_helper', 'host_loss_acceptance', 'profile_n
                           # RC2 S15 (contract 3.2, 3.3): the probe's own aeronmd and the two T1 drivers, hash-pinned
                           'probe_libs', 't1_me_driver', 't1_core_driver',
                           # RC2 S16 (contract 5.2, 5.3): the engines' driver profile and its staged driver; the builder's kind
-                          'engine_driver', 'engine_libs', 'manifest_kind'}
+                          'engine_driver', 'engine_libs', 'manifest_kind',
+                          # RC2 S17 W2 (W10, PO-11 (a)): the money projector's driver profile and its staged driver
+                          'projector_driver', 'projector_libs'}
 DRIVER_MODES = {'embedded', 'external'}
 LIB_KEYS = {'path', 'sha256', 'exec'}
 # Pinned single-file helper programs, checked like core_probe / journal_probe (path + source_path hashes).
@@ -56,6 +58,8 @@ PROCESS_ENV = {
     'MATCH_ENGINE_FROM_CONFIG',
     'PROJECTOR_POSTGRES_URL', 'PROJECTOR_POSTGRES_USER', 'PROJECTOR_POSTGRES_PASSWORD', 'PROJECTOR_AE_JOURNAL_ARCHIVES',
     'PROJECTOR_LOCAL_HOST', 'PROJECTOR_METRICS_PORT',
+    # RC2 S17 W2: assets c68d163 ProjectorDriver (PROJECTOR_DRIVER_MODE embedded|external, strict; external reads AERON_DIR)
+    'PROJECTOR_DRIVER_MODE',
     # ct-forwarder strict env (FC:156-265). ME_AUTH_CREDENTIAL is NOT here: a manifest's credentials.me names reach
     # processes through allowed_env() (validate_core_manifest refuses a credentials.me name that is in this set).
     'FWD_CORE_INGRESS', 'FWD_CORE_RESPONSE_CHANNEL', 'FWD_ME_INGRESS', 'FWD_ME_RESPONSE_CHANNEL', 'FWD_INGRESS_CHANNEL',
@@ -98,7 +102,13 @@ DEV_OVERLAY_KEYS = {'aeron.threading.mode', 'aeron.conductor.idle.strategy', 'ae
 # ("<kind>--<tag>.json"), so a guard keyed on it cannot be satisfied by renaming a file.
 S16_KINDS = {'s16', 's16-ext', 's16-embedded', 's16-n1', 's16-a03', 's16-a03-embedded', 's16-a05', 's16-a05-embedded',
              's16-red-a03', 's16-red-a04', 's16-ctl-edk-cnctimeout'}
+# RC2 S17 W2 (contract 5.3): the s17 kinds, derived from the cut manifest by ``mk_manifests.py --cut``. The RED and A03 kinds
+# need negative targets built from the cut's cluster-tools commit and are added when those builds exist (W4/W6).
+S17_KINDS = {'s17', 's17-ext', 's17-embedded', 's17-n1', 's17-xver', 's17-xver-ext', 's17-act', 's17-rollback', 's17-a05',
+             's17-a05-embedded', 's17-a05-keep', 's17-a05-reverse', 's17-ctl-edk-cnctimeout'}
+KINDS = S16_KINDS | S17_KINDS
 EDK_CNCTIMEOUT_KIND = 's16-ctl-edk-cnctimeout'
+EDK_CNCTIMEOUT_KINDS = {EDK_CNCTIMEOUT_KIND, 's17-ctl-edk-cnctimeout'}
 ENGINE_DRIVER_SKIP_MEMBERS = ('ae0', 'me0')          # 8.4 cnc_timeout_loud: one AE member and one ME member
 NC_TARGET = re.compile(r'ct_(forwarder|bridge)_nc_[a-z0-9_]+')
 CMAKE_TARGET = re.compile(r'[A-Za-z0-9_.-]{1,64}')
@@ -183,25 +193,35 @@ def check_driver_properties(properties_text, overlay_text):
     return props, overlay
 
 
-def validate_engine_driver(manifest):
-    mode = manifest.get('engine_driver', 'embedded')
+def _validate_driver_block(manifest, mode_key, libs_key, who):
+    mode = manifest.get(mode_key, 'embedded')
     if mode not in DRIVER_MODES:
-        raise Violation('engine_driver must be embedded or external, got ' + str(mode))
-    libs = manifest.get('engine_libs')
+        raise Violation(f'{mode_key} must be embedded or external, got ' + str(mode))
+    libs = manifest.get(libs_key)
     if mode == 'embedded':
         if libs is not None:
-            raise Violation('engine_libs without engine_driver external: the embedded engines stage no driver')
+            raise Violation(f'{libs_key} without {mode_key} external: {who} stage no driver')
         return
     if not libs:
-        raise Violation('engine_driver external needs engine_libs (aeronmd, its two .so, driver.properties, the dev overlay)')
+        raise Violation(f'{mode_key} external needs {libs_key} (aeronmd, its two .so, driver.properties, the dev overlay)')
     if set(libs) != ENGINE_LIBS:
-        raise Violation('engine_libs must be exactly ' + ', '.join(sorted(ENGINE_LIBS)) + '; got ' + ', '.join(sorted(libs)))
+        raise Violation(f'{libs_key} must be exactly ' + ', '.join(sorted(ENGINE_LIBS)) + '; got ' + ', '.join(sorted(libs)))
     for name, lib in libs.items():
-        _lib(lib, 'engine_libs ' + name, changed='engine_libs changed: ' + name)
+        _lib(lib, f'{libs_key} ' + name, changed=f'{libs_key} changed: ' + name)
         if (name == 'aeronmd') != (lib.get('exec') is True):
-            raise Violation('engine_libs aeronmd must be exec and nothing else may be: ' + name)
+            raise Violation(f'{libs_key} aeronmd must be exec and nothing else may be: ' + name)
     check_driver_properties(Path(libs['driver.properties']['path']).read_text(),
                             Path(libs['driver-dev.properties']['path']).read_text())
+
+
+def validate_engine_driver(manifest):
+    _validate_driver_block(manifest, 'engine_driver', 'engine_libs', 'the embedded engines')
+
+
+def validate_projector_driver(manifest):
+    """RC2 S17 W2 (W10, PO-11 (a)): the money projector's driver mode, the same rules as the engines' (an external projector
+    stages the pinned aeronmd set and attaches to it at AERON_DIR; an embedded one stages nothing and never sets AERON_DIR)."""
+    _validate_driver_block(manifest, 'projector_driver', 'projector_libs', 'an embedded projector')
 
 
 def _target(manifest, name):
@@ -218,7 +238,7 @@ def validate_build_b(manifest, path):
     kind = manifest.get('manifest_kind')
     if kind is None:
         return
-    if kind not in S16_KINDS:
+    if kind not in KINDS:
         raise Violation('unknown manifest kind ' + str(kind))
     if Path(path).name.split('--')[0].removesuffix('.json') != kind:
         raise Violation(f'manifest kind {kind} does not match the file name {Path(path).name}')
@@ -229,16 +249,17 @@ def validate_build_b(manifest, path):
     for name in ('forwarder', 'bridge'):
         if manifest['artifacts'].get(name) is not None and NC_TARGET.fullmatch(_target(manifest, name)):
             raise Violation(f'build A {name} must be a real build, got {_target(manifest, name)}')
-    if kind.startswith('s16-a05'):
+    rest = kind.split('-', 1)[1] if '-' in kind else ''
+    if rest.startswith('a05'):
         for name in staged:
             if NC_TARGET.fullmatch(_target(manifest, name)):
                 raise Violation(f'an A05 manifest stages the negative build {_target(manifest, name)} as {name}: build B is a '
                                 'real ct build (3.2)')
-    elif kind.startswith('s16-red-'):
+    elif rest.startswith('red-'):
         for name in staged:
             if not NC_TARGET.fullmatch(_target(manifest, name)):
                 raise Violation(f'a RED manifest stages the real build {_target(manifest, name)} as {name} (8.1, 8.2)')
-    elif kind.startswith('s16-a03'):
+    elif rest.startswith('a03'):
         if staged != ['forwarder_b'] or _target(manifest, 'forwarder_b') != A03_NC_TARGET or manifest['artifacts'].get('forwarder') is None:
             raise Violation(f'an A03 manifest stages {A03_NC_TARGET} as forwarder_b and build A as forwarder, nothing else '
                             '(20.1 line 2)')
@@ -268,7 +289,7 @@ def check_engine_driver_skip(manifest, path, value):
     if value is None or value == '':
         return ()
     kind = manifest.get('manifest_kind')
-    if kind != EDK_CNCTIMEOUT_KIND or Path(path).name.split('--')[0].removesuffix('.json') != kind:
+    if kind not in EDK_CNCTIMEOUT_KINDS or Path(path).name.split('--')[0].removesuffix('.json') != kind:
         raise Violation(f'ENGINE_DRIVER_SKIP is refused outside {EDK_CNCTIMEOUT_KIND}.json (5.2); manifest {Path(path).name}')
     if manifest.get('engine_driver') != 'external':
         raise Violation('ENGINE_DRIVER_SKIP needs engine_driver external')
@@ -433,6 +454,7 @@ def validate_core_manifest(manifest, manifest_path, cpu_count=None, profiles=jou
         if me['keys_env'] == me['credential_env']:
             raise Violation('ME key table and credential need distinct environment names')
         validate_engine_driver(manifest)
+        validate_projector_driver(manifest)
         validate_build_b(manifest, path)
         profile = manifest['me_journal_profile']
         if profile not in journal_decode.profiles_spec(profiles):
@@ -465,6 +487,24 @@ def check_image_config(config):
         if JVM_TIMEOUT.search(text):
             raise Violation('D20: pinned image carries a timeout override: ' + text)
     return sorted(env)
+
+
+def child_manifest(manifest, parent, tag):
+    """RC2 S17 (contract 5.4, 20.1 line 20): a child of ``manifest`` with a fresh run identity, written under ``parent`` as
+    ``<kind>--<run_id>-<tag>.json`` when the manifest carries a kind (the name ``validate_build_b`` checks against
+    ``manifest_kind``, as mk_manifests.py writes them), else ``<run_id>-<tag>-manifest.json`` as before. Returns (path, child)."""
+    import uuid
+    child = json.loads(json.dumps(manifest))
+    child['run_id'] = 'rc2-' + uuid.uuid4().hex[:12]
+    parent = Path(parent)
+    child['state_root'] = str(parent / 'fixtures' / child['run_id'])
+    if '--' in tag or not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', tag):
+        raise Violation('a child manifest tag is a short name without "--": ' + tag)
+    kind = child.get('manifest_kind')
+    path = parent / (f'{kind}--{child["run_id"]}-{tag}.json' if kind else f'{child["run_id"]}-{tag}-manifest.json')
+    with path.open('x') as stream:
+        json.dump(child, stream, indent=1); stream.write('\n')
+    return path, child
 
 
 def load(path):
