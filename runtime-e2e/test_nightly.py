@@ -348,5 +348,22 @@ class UnitFilesTest(unittest.TestCase):
         self.assertIn('OnCalendar=*-*-* 03:17:00', text); self.assertIn('Persistent=true', text)
 
 
+
+class S17ScenarioTableTest(unittest.TestCase):
+    """RC2 S17 W3 (coordinator): the xver/activation/rollback names and A05-keep are known; the default plan carries RED-1,
+    RED-2 and A05-keep on their cut kinds."""
+
+    def test_every_w3_scenario_is_known(self):
+        import xver
+        for name in xver.SCENARIO_NAMES + ['core-drill-a05-keep']:
+            self.assertTrue(nightly.scenario_known(name), name)
+        self.assertFalse(nightly.scenario_known('core-xver-me-old-on-new'))
+
+    def test_default_plan_carries_red1_red2_and_a05_keep(self):
+        plan = nightly.parse_plan(json.loads((Path(__file__).with_name('nightly-cut.json')).read_text()))
+        pairs = {(e['kind'], e['scenario']) for e in plan}
+        self.assertTrue({('s17-red1', 'core-red-1'), ('s17-red2', 'core-red-2'), ('s17-a05-keep', 'core-drill-a05-keep')} <= pairs)
+
+
 if __name__ == '__main__':
     unittest.main()

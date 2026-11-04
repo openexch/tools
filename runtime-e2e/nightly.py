@@ -107,6 +107,9 @@ def scenario_known(scenario):
         return 1 <= int(m.group(1)) <= 20           # runner.py's bound
     if scenario == 'core-control-edk-cnctimeout':        # run_cnc_timeout, outside the CONTROLS table
         return True
+    if scenario.startswith(('core-xver-', 'core-act-', 'core-rollback-')):    # RC2 S17 W3: xver.scenario
+        import xver
+        return scenario in xver.SCENARIO_NAMES
     if scenario.startswith('core-red-'):                  # core_drills.scenario: S15 red1/red2(-negctl), S16 red-a03/red-a04
         suffix = scenario[len('core-red-'):]
         return 'red' + suffix in core_drills.REDS or 'red-' + suffix in core_drills.REDS

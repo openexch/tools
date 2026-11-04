@@ -41,7 +41,7 @@ OPTIONAL_MANIFEST_KEYS = {'netfilter_helper', 'host_loss_acceptance', 'profile_n
                           # RC2 S16 (contract 5.2, 5.3): the engines' driver profile and its staged driver; the builder's kind
                           'engine_driver', 'engine_libs', 'manifest_kind',
                           # RC2 S17 W2 (W10, PO-11 (a)): the money projector's driver profile and its staged driver
-                          'projector_driver', 'projector_libs'}
+                          'projector_driver', 'projector_libs', 'node_layout'}
 DRIVER_MODES = {'embedded', 'external'}
 LIB_KEYS = {'path', 'sha256', 'exec'}
 # Pinned single-file helper programs, checked like core_probe / journal_probe (path + source_path hashes).
@@ -106,7 +106,7 @@ S16_KINDS = {'s16', 's16-ext', 's16-embedded', 's16-n1', 's16-a03', 's16-a03-emb
 # stage negative targets of a test-config build of the cut's cluster-tools commit.
 S17_KINDS = {'s17', 's17-ext', 's17-embedded', 's17-n1', 's17-xver', 's17-xver-ext', 's17-act', 's17-rollback', 's17-a05',
              's17-a05-embedded', 's17-a05-keep', 's17-a05-reverse', 's17-ctl-edk-cnctimeout',
-             's17-a03', 's17-a03-embedded', 's17-red-a03', 's17-red-a04'}
+             's17-a03', 's17-a03-embedded', 's17-red-a03', 's17-red-a04', 's17-red1', 's17-red2'}
 KINDS = S16_KINDS | S17_KINDS
 EDK_CNCTIMEOUT_KIND = 's16-ctl-edk-cnctimeout'
 EDK_CNCTIMEOUT_KINDS = {EDK_CNCTIMEOUT_KIND, 's17-ctl-edk-cnctimeout'}
@@ -256,7 +256,7 @@ def validate_build_b(manifest, path):
             if NC_TARGET.fullmatch(_target(manifest, name)):
                 raise Violation(f'an A05 manifest stages the negative build {_target(manifest, name)} as {name}: build B is a '
                                 'real ct build (3.2)')
-    elif rest.startswith('red-'):
+    elif rest.startswith('red'):         # S16 red-a03/red-a04, S17 red1/red2
         for name in staged:
             if not NC_TARGET.fullmatch(_target(manifest, name)):
                 raise Violation(f'a RED manifest stages the real build {_target(manifest, name)} as {name} (8.1, 8.2)')
@@ -488,6 +488,19 @@ def check_image_config(config):
         if JVM_TIMEOUT.search(text):
             raise Violation('D20: pinned image carries a timeout override: ' + text)
     return sorted(env)
+
+
+GENESIS_DERIVATION = 'per-run: odd(sha256(run_id) mod 2^61 + life - 1), in [1, 2^62)'
+
+
+def derive_genesis_id(run_id, life=1):
+    """RC2 S17 W3 (coordinator): the ME/core genesisId of one run, derived from its run_id at run time (deterministic, odd,
+    in [1, 2^62), distinct per life), so two runs of one kind (siblings that differ only in run_id) never repeat an id."""
+    import hashlib
+    if type(life) is not int or life < 1:
+        raise Violation('a genesis life is a positive integer: ' + repr(life))
+    base = int.from_bytes(hashlib.sha256(str(run_id).encode()).digest(), 'big') % (1 << 61)
+    return hex(((base + life - 1) % (1 << 61)) * 2 + 1)
 
 
 def child_manifest(manifest, parent, tag):

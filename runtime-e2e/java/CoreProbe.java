@@ -434,7 +434,10 @@ public final class CoreProbe {
 
     private int coreConfig() {
         final CoreConfigEncoder e = new CoreConfigEncoder().wrapAndApplyHeader(buffer, 0, headerEncoder)
-                .correlationId(listener.expectCorrelation = corr()).configVersion(num("version")).behaviorVersion(num("behavior"));
+                .correlationId(listener.expectCorrelation = corr()).configVersion(num("version")).behaviorVersion(num("behavior"))
+                // RC2 S17 W3 (5.2 (iii)): the genesisId is explicit (the partial-genesis and finish options send the
+                // driver's id); before, the field was left unset
+                .genesisId(Long.decode(arg("genesis")));
         final CoreConfigEncoder.MarketsEncoder m = e.marketsCount(Market.ALL.length);
         for (final Market d : Market.ALL) {
             m.next().marketId(d.marketId()).symbol(d.symbol()).baseAssetId(d.baseAsset().id()).quoteAssetId(d.quoteAsset().id())
