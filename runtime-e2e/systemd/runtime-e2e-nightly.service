@@ -1,18 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
-# T2 core-topology fixture nightly (RC2 critic D20). User unit; install by hand:
+# T2 core-topology fixture nightly on the cut (RC2 critic D20; S17 contract 5.4). User unit; install by hand (NOT installed by the repo):
 #   cp runtime-e2e-nightly.{service,timer} ~/.config/systemd/user/
-#   edit RUNTIME_E2E_* below, then: systemctl --user daemon-reload && systemctl --user enable --now runtime-e2e-nightly.timer
-# Production timeouts are part of the template manifest (timeouts: production) and are not overridable here.
+#   mkdir -p ~/.config/systemd/user/runtime-e2e-nightly.service.d && cp runtime-e2e-nightly.service.d/timeout.conf there
+#   edit RUNTIME_E2E_* / NIGHTLY_* below, then: systemctl --user daemon-reload && systemctl --user enable --now runtime-e2e-nightly.timer
+# Production timeouts are part of every derived manifest and are not overridable here.
+# The night's wall bound is NIGHTLY_BOUND_S, enforced inside nightly.py (an expiry records the rest of the plan INCONCLUSIVE). systemd does
+# not expand Environment= values in TimeoutStartSec (only in Exec* lines), so the outer guard is a literal in the drop-in timeout.conf.
+# NIGHTLY_HARNESS_COMMIT pins the tools commit: the night runs from `git archive` of it, never from the working tree.
 [Unit]
-Description=Open Exchange runtime-e2e core fixture nightly (T2)
+Description=Open Exchange runtime-e2e core fixture nightly (T2, S17 plan)
 After=docker.service
 
 [Service]
 Type=oneshot
-Environment=RUNTIME_E2E_DIR=%h/Apps/openexchange/tools/runtime-e2e
-Environment=RUNTIME_E2E_TEMPLATE=%h/Apps/openexchange/.runtime-handoff/nightly/manifests/core-template.json
+Environment=RUNTIME_E2E_REPO=%h/Apps/openexchange/tools
+Environment=RUNTIME_E2E_PLAN=%h/Apps/openexchange/tools/runtime-e2e/nightly-cut.json
 Environment=RUNTIME_E2E_EVIDENCE=%h/Apps/openexchange/.runtime-handoff/nightly/evidence
-ExecStart=/usr/bin/python3 ${RUNTIME_E2E_DIR}/nightly.py --template ${RUNTIME_E2E_TEMPLATE} --evidence-root ${RUNTIME_E2E_EVIDENCE}
-# One nightly at a time; a hung fixture is bounded by the runner's own orchestration limits.
-TimeoutStartSec=3h
+Environment=NIGHTLY_HARNESS_COMMIT=REPLACE_WITH_THE_PINNED_TOOLS_COMMIT
+Environment=NIGHTLY_BOUND_S=18000
+Environment=NIGHTLY_AFTER_INTERRUPT=run
+Environment=NIGHTLY_LOAD_MAX=6
+ExecStart=/usr/bin/python3 ${RUNTIME_E2E_REPO}/runtime-e2e/nightly.py --tools-repo ${RUNTIME_E2E_REPO} --plan ${RUNTIME_E2E_PLAN} --evidence-root ${RUNTIME_E2E_EVIDENCE} --harness-commit ${NIGHTLY_HARNESS_COMMIT}
+# A held heavy lock or foreign load exits 75 (SKIPPED_BUSY): a skipped night is not a failed unit.
+SuccessExitStatus=75
 Nice=5
