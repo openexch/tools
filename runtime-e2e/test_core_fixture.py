@@ -778,8 +778,8 @@ class GenesisOrderTest(unittest.TestCase):
         with self.assertRaisesRegex(Violation, 'genesis phase missing: tap_started_ns'):
             core_fixture.check_genesis_order({k: v for k, v in good.items() if k != 'tap_started_ns'})
 
-    def test_genesis_id_is_the_odd_seed_and_recorded(self):
-        self.assertEqual(self.f.genesis_id(), hex(self.f.m['seed'] | 1))
+    def test_genesis_id_is_derived_from_the_run_id(self):
+        self.assertEqual(self.f.genesis_id(), core_contracts.derive_genesis_id(self.f.run_id))
 
 
 class TapRegistrationAndFundingGateTest(unittest.TestCase):
@@ -1262,8 +1262,8 @@ class RegenesisTest(V4Base):
     def test_genesis_id_per_life_is_odd_and_distinct(self):
         f = self.fx()
         ids = [f.genesis_id(n) for n in (1, 2, 3, 4)]
-        self.assertEqual(ids[0], hex(f.m['seed'] | 1)); self.assertEqual(f.genesis_id(), ids[0])
-        self.assertEqual(ids[1], hex((f.m['seed'] | 1) + 2))
+        self.assertEqual(ids[0], core_contracts.derive_genesis_id(f.run_id)); self.assertEqual(f.genesis_id(), ids[0])
+        self.assertEqual(ids[1], core_contracts.derive_genesis_id(f.run_id, 2))
         self.assertTrue(all(int(i, 16) % 2 == 1 for i in ids)); self.assertEqual(len(set(ids)), 4)
         with self.assertRaises(Violation):
             f.genesis_id(0)
@@ -1621,3 +1621,226 @@ class ProjectorDriverFixtureTest(V4Base):
         self.assertEqual(spawned[0][0], 'projector')
         self.assertEqual(spawned[0][1][:2], ['sh', '-c'])
         self.assertEqual(spawned[0][2]['PROJECTOR_DRIVER_MODE'], 'external')
+
+
+# ------------------------------------------------------------------ RC2 S17 W3 (contract 5.2): seeds, keep_state, member-aware
+# verify_funded, partial genesis and finish, the AE wipe of a foreign state
+
+import legacy_tag
+
+
+def seed_tree(directory, name='me0', files=None):
+    src = Path(directory) / 'seeds' / name
+    for rel, data in (files or {'state/cluster/recording.log': b'\0' * 64, 'journal/node0/archive/0-0.rec': b'j' * 10}).items():
+        (src / rel).parent.mkdir(parents=True, exist_ok=True)
+        (src / rel).write_bytes(data)
+    return src
+
+
+class SeedStateTest(V4Base):
+    ROLES = ('probe',)
+
+    def test_seed_copies_the_tree_before_the_member_starts_and_records_the_hash(self):
+        f = self.fx(roles=self.ROLES)
+        src = seed_tree(self.dir)
+        tree = legacy_tag.tree_hash(src)
+        w = f.seed_state('me0', src, tree['sha256'], witness={'shape': 'C'})
+        self.assertEqual((w['kind'], w['target'], w['tree']['sha256'], w['witness']), ('seed_state', 'me0', tree['sha256'],
+                                                                                       {'shape': 'C'}))
+        self.assertEqual(legacy_tag.tree_hash(f.root / 'state' / 'me0')['sha256'], tree['sha256'])
+        self.assertEqual(f.registry['seeded']['me0']['tree']['sha256'], tree['sha256'])
+        f.spawn('me0', ['java'], {})                                          # the seeded dir is the member's /data
+        create = [c for c in self.docker.calls if c[:2] == ['docker', 'create']][-1]
+        self.assertIn(f'type=bind,src={f.root / "state" / "me0"},dst=/data', create)
+
+    def test_seed_refuses_a_started_member_a_missing_source_and_a_changed_tree(self):
+        f = self.fx(roles=('probe', 'me1'))
+        src = seed_tree(self.dir)
+        tree = legacy_tag.tree_hash(src)['sha256']
+        with self.assertRaisesRegex(Violation, 'seed_state refuses me1: the member was already started'):
+            f.seed_state('me1', src, tree)
+        with self.assertRaisesRegex(Inconclusive, 'seed source missing'):
+            f.seed_state('me0', Path(self.dir) / 'nope', tree)
+        with self.assertRaisesRegex(Inconclusive, 'seed tree hash differs from the recorded one'):
+            f.seed_state('me0', src, '0' * 64)
+        with self.assertRaisesRegex(Violation, 'seed_state seeds an engine member only'):
+            f.seed_state('fwd0', src, tree)
+
+    def test_seed_parts_copies_only_the_named_subtrees(self):
+        f = self.fx(roles=self.ROLES)
+        src = seed_tree(self.dir)
+        w = f.seed_state('me2', src, legacy_tag.tree_hash(src)['sha256'], parts=('journal',))
+        self.assertEqual(w['parts'], ['journal'])
+        self.assertTrue((f.root / 'state' / 'me2' / 'journal' / 'node0' / 'archive' / '0-0.rec').is_file())
+        self.assertFalse((f.root / 'state' / 'me2' / 'state').exists())
+
+
+class ReplaceSlotKeepStateTest(V4Base):
+    def test_keep_state_leaves_the_state_dir_for_the_new_binary(self):
+        f = self.fx()
+        (f.root / 'state' / 'fwd0' / 'checkpoint').write_text('kept')
+        self.docker.polite.update(fwd0=(0, 0.1)); f.stop('fwd0')
+        w = f.replace_slot('fwd0', 'forwarder_b', keep_state=True)
+        self.assertTrue(w['keep_state'])
+        self.assertEqual((f.root / 'state' / 'fwd0' / 'checkpoint').read_text(), 'kept')
+        self.assertFalse((f.root / 'state' / 'fwd0.gen1').exists())
+        self.assertTrue((f.root / 'logs' / 'fwd0.gen1.log').is_file())        # the old container's log is still evidence
+        self.assertEqual(w['state_dir'], str(f.root / 'state' / 'fwd0'))
+        self.assertIn('driver_dir', w)
+        create = [c for c in self.docker.calls if c[:2] == ['docker', 'create']][-1]
+        self.assertIn(f'type=bind,src={f.root / "state" / "fwd0"},dst=/data', create)
+
+    def test_default_replace_still_moves_the_state_aside(self):
+        f = self.fx()
+        self.docker.polite.update(fwd0=(0, 0.1)); f.stop('fwd0')
+        w = f.replace_slot('fwd0', 'forwarder_b')
+        self.assertFalse(w['keep_state'])
+        self.assertTrue((f.root / 'state' / 'fwd0.gen1').is_dir())
+
+
+class VerifyFundedMemberAwareTest(V4Base):
+    def fx_verify(self):
+        f = self.fx()
+        f._ok = lambda verb, principal, **kv: {'journalEnabled': True, 'balances': [], 'holds': []}
+        f.tap_gate = lambda market=0, life=None: {'state': 'OPEN'}
+        self.dumped = []
+        f.journal_dump = lambda member: self.dumped.append(member) or ['{}']
+        return f
+
+    def test_a_registered_stopped_member_is_skipped_and_named(self):
+        f = self.fx_verify()
+        f.kill('me0')
+        with mock.patch('journal_decode.load_profile', lambda name: None), \
+                mock.patch('journal_decode.decode_dump', lambda lines, profile, require_end=False: [{'type': 'engine_config'}]):
+            f.verify_funded({})
+        self.assertEqual(self.dumped, ['me1', 'me2'])
+        self.assertEqual(f.registry['verify_funded'], {'members': ['me1', 'me2'], 'skipped': ['me0']})
+
+    def test_an_unregistered_stopped_member_is_not_skipped(self):
+        f = self.fx_verify()
+        self.docker.state['c-me0'].update(Running=False, ExitCode=1)
+        with mock.patch('journal_decode.load_profile', lambda name: None), \
+                mock.patch('journal_decode.decode_dump', lambda lines, profile, require_end=False: [{'type': 'engine_config'}]):
+            f.verify_funded({})
+        self.assertEqual(self.dumped, ['me0', 'me1', 'me2'])
+
+    def test_fewer_than_two_members_is_no_witness(self):
+        f = self.fx_verify()
+        f.kill('me0'); f.kill('me1')
+        with mock.patch('journal_decode.load_profile', lambda name: None), \
+                mock.patch('journal_decode.decode_dump', lambda lines, profile, require_end=False: [{'type': 'engine_config'}]), \
+                self.assertRaisesRegex(Inconclusive, 'verify_funded needs at least two ME members'):
+            f.verify_funded({})
+
+
+class PartialGenesisTest(V4Base):
+    def fx_core(self, results=None):
+        f = self.fx()
+        self.sent = []
+        results = results or {}
+
+        def core(verb, principal, timeout=60, **kv):
+            self.sent.append((verb, principal, kv))
+            result = results.get(int(kv['version']), 'ACCEPTED')
+            return ('REFUSED' if result == 'REJECTED' else 'ANSWERED',
+                    {'verb': verb, 'replies': [{'t': 'AdminAck', 'ref': 70, 'result': result, 'reason': 0,
+                                                'configVersion': int(kv['version'])}]})
+        f.core = core
+        f.registry['lives'] = {'1': {'me': {'genesis_id': f.genesis_id(1)}, 'core': {'genesis_id': f.genesis_id(1)}}}
+        return f
+
+    def test_partial_genesis_sends_coreconfig_1_to_k_with_the_drivers_values(self):
+        f = self.fx_core()
+        out = f.core_genesis_partial({}, 2)
+        self.assertEqual([s[2]['version'] for s in self.sent], [1, 2])
+        self.assertEqual(self.sent[0], ('core-config', 'probe-admin', {'version': 1, 'behavior': 1, 'genesis': f.genesis_id(1),
+                                                                     'tick': 1, 'min': 1, 'max': 10**18, 'lot': 0}))
+        self.assertEqual(out['results'], [[1, 'ACCEPTED'], [2, 'ACCEPTED']])
+        self.assertEqual(f.registry['partial_genesis']['stop_after'], 2)
+        with self.assertRaisesRegex(Violation, 'stops after CoreConfig 1 or 2'):
+            f.core_genesis_partial({}, 3)
+
+    def test_finish_sends_coreconfig_3_only(self):
+        f = self.fx_core({3: 'STALE'})
+        out = f.core_genesis_finish({})
+        self.assertEqual([s[2]['version'] for s in self.sent], [3])
+        self.assertEqual(self.sent[0][2]['behavior'], 3)
+        self.assertEqual(out['results'], [[3, 'STALE']])
+
+    def test_a_new_genesis_id_can_be_named(self):
+        f = self.fx_core()
+        f.core_genesis_partial({}, 1, genesis_id=f.genesis_id(2))
+        self.assertEqual(self.sent[0][2]['genesis'], f.genesis_id(2))
+
+
+class ForeignWipeTest(V4Base):
+    def test_an_ae_member_on_a_foreign_seed_wipes_without_a_projection_dump_and_says_why(self):
+        f = self.fx()
+        self.docker.state['c-ae1'].update(Running=False, ExitCode=1)
+        (f.root / 'state' / 'ae1' / 'x').write_text('seed')
+        with self.assertRaisesRegex(Violation, 'no projection dump'):
+            f.wipe_engine('ae1')
+        w = f.wipe_engine('ae1', projection_dump_required=False, reason='foreign seed: no money moved in this fixture')
+        self.assertEqual(w['projection_dump'], 'not required: foreign seed: no money moved in this fixture')
+        self.assertFalse((f.root / 'state' / 'ae1' / 'x').exists())
+        with self.assertRaisesRegex(Violation, 'a reason'):
+            f.wipe_engine('ae1', projection_dump_required=False)
+
+
+class CutBootMeGenesisTest(V4Base):
+    """RC2 S17 W3 (coordinator): on the cut the forwarder waits for the ME epoch, so a bare-ME core-boot never reaches fwd0
+    /ready; core-boot on an s17 kind runs the ME genesis (epoch) before the forwarder slots; S16 kinds keep the S14 boot."""
+
+    def boot(self, kind):
+        f = self.fx(roles=('probe',))
+        f.m['manifest_kind'] = kind
+        calls = []
+        for name in ('check_image', 'stage_artifacts', 'start_network', 'start_database'):
+            setattr(f, name, lambda name=name: calls.append(name))
+        f.spawn = lambda name, command, env=None: calls.append('spawn ' + name)
+        f.wait_http = lambda *a, **k: {'status': 200}
+        f.arm_money_journal = lambda plan: calls.append('arm')
+        f.start_projector = lambda plan: calls.append('projector')
+        f.me_genesis = lambda plan: calls.append('me_genesis')
+        f.start_slot = lambda slot: calls.append('slot ' + slot) or {'state': 'STARTED'}
+        f.driver_identity = lambda role: {}
+        f.start(None)
+        return calls, f
+
+    def test_s17_core_boot_binds_the_epoch_before_the_forwarders(self):
+        calls, f = self.boot('s17')
+        self.assertLess(calls.index('me_genesis'), calls.index('slot fwd0'))
+        self.assertLess(calls.index('slot bridge1'), calls.index('me_genesis'))
+        self.assertEqual(f.registry['lives']['1']['me']['genesis_id'], f.genesis_id(1))
+        self.assertIn('me_genesis_ns', f.registry['boot']['phases'])
+
+    def test_s16_core_boot_is_unchanged(self):
+        calls, _ = self.boot('s16')
+        self.assertNotIn('me_genesis', calls)
+
+
+class GenesisIdDerivationTest(unittest.TestCase):
+    """RC2 S17 W3 (coordinator, PO list item 1): the genesisId is derived per run from the run_id (never the kind's constant
+    seed), so siblings of one kind still differ only in run_id and RC2 step 7 sees a distinct id per genesis run."""
+
+    def test_two_runs_of_one_kind_differ_and_one_run_is_stable(self):
+        a, b = core_contracts.derive_genesis_id('rc2-0123456789ab'), core_contracts.derive_genesis_id('rc2-0123456789ac')
+        self.assertNotEqual(a, b)
+        self.assertEqual(a, core_contracts.derive_genesis_id('rc2-0123456789ab'))
+        for gid in (a, b):
+            value = int(gid, 16)
+            self.assertEqual(value % 2, 1)
+            self.assertTrue(1 <= value < 2 ** 62)
+
+    def test_lives_are_odd_distinct_and_in_range(self):
+        ids = [int(core_contracts.derive_genesis_id('rc2-0123456789ab', n), 16) for n in range(1, 6)]
+        self.assertEqual(len(set(ids)), 5)
+        self.assertTrue(all(i % 2 == 1 and 1 <= i < 2 ** 62 for i in ids))
+        with self.assertRaises(Violation):
+            core_contracts.derive_genesis_id('rc2-0123456789ab', 0)
+
+    def test_the_fixture_records_the_derivation(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = fixture_for(manifest(d), d)
+            f.registry['lives'] = {}
+            self.assertEqual(f.genesis_derivation(), {'rule': core_contracts.GENESIS_DERIVATION, 'run_id': f.run_id})

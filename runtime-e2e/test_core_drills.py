@@ -2122,5 +2122,36 @@ class S16ScheduleTest(unittest.TestCase):
         self.assertEqual(cd._iso_ns('1970-01-01T00:00:02.123456789Z') - cd._iso_ns('1970-01-01T00:00:02Z'), 123456789)
 
 
+
+class A05KeepTest(unittest.TestCase):
+    """RC2 S17 W3 (7.1, row 47): A05-keep swaps one forwarder and one bridge with keep_state=True."""
+
+    def test_the_drill_is_declared(self):
+        spec = cd.DRILLS['a05-keep']
+        self.assertEqual((spec['swap'], spec['how'], spec['keep_state']), ('both', 'stop', True))
+        self.assertIn('keep_state', spec['lines'])
+
+    def test_faults_swap_fwd0_then_bridge0_keeping_state(self):
+        run = cd.DrillRun.__new__(cd.DrillRun)
+        run.spec, run.variant, run.removed = cd.DRILLS['a05-keep'], {}, set()
+        calls = []
+        run.at = lambda t: calls.append(('at', t))
+        run.health_of = lambda slot: (200, {})
+        def swap(slot, artifact, how='stop', record=None, hold_s=0.0, keep_state=False):
+            calls.append((slot, artifact, keep_state)); record.append({'slot': slot})
+        run.swap = swap
+        run.f = None
+        run.faults_a05()
+        self.assertEqual([c for c in calls if c[0] != 'at'], [('fwd0', 'forwarder_b', True), ('bridge0', 'bridge_b', True)])
+
+    def test_keep_state_line(self):
+        swaps = [{'slot': 'fwd0', 'replace': {'keep_state': True, 'state_dir': '/x/state/fwd0'}},
+                 {'slot': 'bridge0', 'replace': {'keep_state': True, 'state_dir': '/x/state/bridge0'}}]
+        self.assertTrue(cd.line_keep_state({'swaps': swaps})['holds'])
+        swaps[1]['replace']['keep_state'] = False
+        self.assertFalse(cd.line_keep_state({'swaps': swaps})['holds'])
+        self.assertFalse(cd.line_keep_state({'swaps': swaps[:1]})['holds'])
+
+
 if __name__ == '__main__':
     unittest.main()

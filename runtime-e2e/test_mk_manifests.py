@@ -143,7 +143,8 @@ class CutManifestBuilderTest(unittest.TestCase):
         dp = put('me/driver.properties', DP_TEXT.encode())
         put('helper/iptables-legacy', b'ipt')
         ct = self.world.m['repos']['cluster-tools']        # the negative targets: a test-config build of the cut's ct commit
-        for sub, target in (('forwarder', 'ct_forwarder_nc_norelease'), ('bridge', 'ct_bridge_nc_noepoch')):
+        for sub, target in (('forwarder', 'ct_forwarder_nc_norelease'), ('bridge', 'ct_bridge_nc_noepoch'),
+                            ('forwarder', 'ct_forwarder_nc_noresync'), ('bridge', 'ct_bridge_nc_legacy')):
             put(f'ct-test/app/{sub}/{target}', b'ELF nc ' + target.encode() + b' ' + ct.encode())
         self.cfg = mk_manifests.Config(
             runs=root / 'runs', bin_a=self.bin_a, driver_properties=dp,
@@ -205,6 +206,33 @@ class CutManifestBuilderTest(unittest.TestCase):
         (self.root / 'ct-test/app/bridge/ct_bridge_nc_noepoch').write_bytes(b'ELF nc built from another commit')
         with self.assertRaisesRegex(Violation, 'K4 .*not a build of the cut'):
             self.built('s17-red-a04')
+
+    def test_xver_kinds_take_the_legacy_member_addresses(self):
+        """RC2 S17 W3 (W0 mk_dr --legacy-ips): a seeded state meets the member addresses it was written with (the legacy
+        fixture's me .10-.12, ae .13-.15); every other kind keeps the sorted layout."""
+        for kind in ('s17-xver', 's17-xver-ext', 's17-rollback'):
+            with self.subTest(kind=kind):
+                _, m = self.built(kind)
+                o = m['network']['subnet'].split('.')[2]
+                self.assertEqual([m['nodes'][f'me{i}'] for i in range(3)], [f'172.30.{o}.{10 + i}' for i in range(3)])
+                self.assertEqual([m['nodes'][f'ae{i}'] for i in range(3)], [f'172.30.{o}.{13 + i}' for i in range(3)])
+                self.assertEqual(len(set(m['nodes'].values())), len(m['nodes']))
+                self.assertEqual(m['node_layout'], 'legacy')
+        _, m = self.built('s17-act')
+        self.assertNotIn('node_layout', m)
+        self.assertEqual(m['nodes']['ae0'].rsplit('.', 1)[1], '10')
+
+    def test_red1_and_red2_on_the_cut(self):
+        """RC2 S17 W3 (coordinator): the S15 RED-1 / RED-2 on the cut: the nc target of the cut's ct commit in both slots."""
+        _, m = self.built('s17-red1')
+        self.assertEqual((m['artifacts']['forwarder_b']['target'], m['slot_artifacts']['fwd0'], m['slot_artifacts']['fwd1']),
+                         ('ct_forwarder_nc_noresync', 'forwarder_b', 'forwarder_b'))
+        self.assertIsNone(m['artifacts']['forwarder'])
+        _, m = self.built('s17-red2')
+        self.assertEqual((m['artifacts']['bridge_b']['target'], m['slot_artifacts']['bridge0'], m['slot_artifacts']['bridge1']),
+                         ('ct_bridge_nc_legacy', 'bridge_b', 'bridge_b'))
+        self.assertIsNone(m['artifacts']['bridge'])
+        self.assertEqual(m['artifacts']['bridge_b']['source_sha'], self.world.m['repos']['cluster-tools'])
 
     def test_build_a_must_be_pinned(self):
         self.world.pins.clear()

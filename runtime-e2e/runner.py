@@ -69,6 +69,11 @@ def main():
             fixture = CoreFixture(args.manifest, drill=True)
             result['state_root'] = str(fixture.root)
             result.update(core_drills.scenario(fixture, args.scenario, args.output))
+        elif args.scenario.startswith(('core-xver-', 'core-act-', 'core-rollback-')):
+            # RC2 S17 W3 (contract 5.2, 6): cross-version (new side), activation and rollback; each scenario owns and closes
+            # its fixtures (the X runs boot members one by one, seed them, and X-R runs two legacy fixtures around the cut)
+            import xver
+            result.update(xver.scenario(args.manifest, args.scenario, args.output))
         elif args.scenario == 'harness-negative-controls':
             from negative_controls import run
             result.update(run(args.output, manifest, args.manifest))

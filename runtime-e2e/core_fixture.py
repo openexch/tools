@@ -289,7 +289,9 @@ class CoreFixture(Fixture):
         assert_production_timeouts(environment or {}, self.allowed_env())
         if any(core_contracts.JVM_TIMEOUT.search(str(a)) for a in command):
             raise Violation('D20: refusing a JVM timeout override for ' + name)
-        state = self.root / 'state' / name; state.mkdir(parents=True)
+        # RC2 S17 W3: a seeded member (seed_state) or a slot replaced with keep_state starts on the dir already in place
+        prepared = name in (self.registry.get('seeded') or {}) or name in (self.registry.get('kept_state') or {})
+        state = self.root / 'state' / name; state.mkdir(parents=True, exist_ok=prepared)
         limits = self.m['limits']
         memory_mb = (limits.get('memory_mb_by_role') or {}).get(name, limits['memory_mb'])
         shm_mb = (limits.get('shm_mb_by_role') or {}).get(name, limits['shm_mb'])
@@ -473,11 +475,13 @@ class CoreFixture(Fixture):
         return ['sh', '-c', script]
 
     def genesis_id(self, life=1):
-        """The ME/core genesis identity: the manifest seed made odd, as T1 does (RUN: randbits(62) | 1), plus 2 per later life
-        (S16 5.1: odd and distinct per life). Recorded in the sample."""
-        if type(life) is not int or life < 1:
-            raise Violation('a genesis life is a positive integer: ' + repr(life))
-        return hex((self.m['seed'] | 1) + 2 * (life - 1))
+        """The ME/core genesis identity, odd and distinct per life (S16 5.1). RC2 S17 W3 (coordinator): derived from the run_id
+        at run time (core_contracts.derive_genesis_id), not from the kind's constant seed, so RC2 step 7 sees a distinct id per
+        genesis run; the rule is recorded with the genesis (genesis_derivation)."""
+        return core_contracts.derive_genesis_id(self.run_id, life)
+
+    def genesis_derivation(self):
+        return {'rule': core_contracts.GENESIS_DERIVATION, 'run_id': self.run_id}
 
     def life(self, scope='core'):
         """The newest life whose ``scope`` (me | core) genesis has started (S16 5.1); 1 before any genesis record."""
@@ -641,7 +645,14 @@ class CoreFixture(Fixture):
         boot['phases']['engines_ready_ns'] = time.time_ns()
         if plan is None:
             self.arm_money_journal(None); self.start_projector(None)
+            cut = str(self.m.get('manifest_kind', '')).startswith('s17')
             for slot in sorted(SLOTS):
+                if cut and slot == 'fwd0':
+                    # RC2 S17 W3 (coordinator): the cut forwarder waits for the ME epoch (not ready on a bare ME), so the
+                    # cut's core-boot binds the epoch (the ME genesis, behaviour 2) before the forwarder slots
+                    self.registry['lives'] = {'1': {'me': {'genesis_id': self.genesis_id(1)}}}
+                    self.me_genesis({})
+                    boot['phases']['me_genesis_ns'] = time.time_ns()
                 self.slots[slot] = self.start_slot(slot)
         else:
             self.genesis(plan)
@@ -658,7 +669,8 @@ class CoreFixture(Fixture):
         gid = self.genesis_id(1)
         self.registry['lives'] = {'1': {'me': {'genesis_id': gid}, 'core': {'genesis_id': gid}}}
         self.run_genesis_steps(plan, GENESIS_ORDER, phases)
-        self.registry['genesis'] = {'genesis_id': gid, 'ledger_capacity': plan.get('ledger_capacity', 100_000), 'life': 1}
+        self.registry['genesis'] = {'genesis_id': gid, 'ledger_capacity': plan.get('ledger_capacity', 100_000), 'life': 1,
+                                    'derivation': self.genesis_derivation()}
         self.save()
         check_genesis_order(phases)
 
@@ -738,13 +750,13 @@ class CoreFixture(Fixture):
                     rows.append(entry['row'])
         return rows[-1] if rows else None
 
-    def _driver(self, key, main, *args, timeout=150):
+    def _driver(self, key, main, *args, timeout=150, check=True, accepted=(0,)):
         if key not in self.m:
             raise Inconclusive(f'manifest has no {key}: the genesis drivers are pinned through build_core_probes.py --ct-dir')
         jar = '/artifacts/' + key.replace('_', '-') + '.jar'
         base = '/artifacts/me.jar' if main == 'T1MeDriver' else '/artifacts/ae.jar'
         argv = JAVA + ['-cp', f'{jar}:{base}', main, *map(str, args)]
-        return self.execute('probe', argv, environment=self.t1_env(), timeout=timeout)
+        return self.execute('probe', argv, environment=self.t1_env(), timeout=timeout, check=check, accepted=accepted)
 
     def _ingress(self, engine):
         nodes, ports = self.m['nodes'], self.m['ports']
@@ -788,6 +800,35 @@ class CoreFixture(Fixture):
         fire-and-forget deposits (T1C:269-281); the oracle-grade funding is step 9."""
         self._driver('t1_core_driver', 'T1CoreDriver', 'genesis', PROBE_AERON_DIR, self._ingress('ae'),
                      self.genesis_id(self.life('core')), plan.get('ledger_capacity', 100_000), 0, 'via-bridge')
+
+    T1_MARKET = {'tick': 1, 'min': 1, 'max': 10**18, 'lot': 0}      # the market rows T1CoreDriver genesis sends (T1C:214-219)
+
+    def core_config(self, version, genesis_id=None):
+        """RC2 S17 W3 (5.2 (iii)): one CoreConfig through ``CoreProbe core-config`` on the ADMIN principal, with the values the
+        genesis driver sends (configVersion = behaviorVersion = version, the genesisId, its market rows), so a later driver run
+        meets an equal record (DUPLICATE). Returns [version, AdminAck result name]."""
+        gid = genesis_id or self.genesis_id(self.life('core'))
+        meaning, reply = self.core('core-config', 'probe-admin', version=version, behavior=version, genesis=gid, **self.T1_MARKET)
+        acks = [r for r in (reply or {}).get('replies') or [] if r.get('t') == 'AdminAck']
+        if not acks:
+            raise Inconclusive(f'CoreConfig {version}: no AdminAck ({meaning})')
+        return [version, acks[-1]['result']]
+
+    def core_genesis_partial(self, plan, stop_after, genesis_id=None):
+        """X-A2: the core genesis stopped after CoreConfig ``stop_after`` (1 or 2): the W0 scratch switch ``-Dt1.maxv=k`` as a
+        harness option (the driver's three frames leave within 70 ms, so an outside kill cannot stop it, 20.1 line 12)."""
+        if stop_after not in (1, 2):
+            raise Violation('a partial genesis stops after CoreConfig 1 or 2, got ' + repr(stop_after))
+        results = [self.core_config(v, genesis_id) for v in range(1, stop_after + 1)]
+        row = {'stop_after': stop_after, 'genesis_id': genesis_id or self.genesis_id(self.life('core')), 'results': results}
+        self.registry['partial_genesis'] = row; self.save()
+        return row
+
+    def core_genesis_finish(self, plan, genesis_id=None):
+        """X-A2 recovery: CoreConfig 3 only (5.2 (iii)), measured."""
+        row = {'genesis_id': genesis_id or self.genesis_id(self.life('core')), 'results': [self.core_config(3, genesis_id)]}
+        self.registry['finish_genesis'] = row; self.save()
+        return row
 
     def configure_risk(self, plan):
         """Step 8: an explicit RiskConfig per market, recorded as sample.risk."""
@@ -853,16 +894,68 @@ class CoreFixture(Fixture):
         if global_gate is None or global_gate['state'] != 'OPEN':
             raise Violation(f'GLOBAL gate is not OPEN after genesis: {global_gate}')
         profile = journal_decode.load_profile(self.m['me_journal_profile'])
-        for i in range(3):
-            events = journal_decode.decode_dump(self.journal_dump(f'me{i}'), profile, require_end=True)
+        # RC2 S17 W3 (5.2 (ii), 20.1 line 11): a member a scenario stopped (a registered fault target, not Running) is skipped
+        # and named; any other stopped member is still dumped (and fails loudly), and two members are the minimum witness
+        members, skipped = self.members_up('me')
+        if len(members) < 2:
+            raise Inconclusive(f'verify_funded needs at least two ME members; up {members}, stopped {skipped}')
+        self.registry['verify_funded'] = {'members': members, 'skipped': skipped}; self.save()
+        for member in members:
+            events = journal_decode.decode_dump(self.journal_dump(member), profile, require_end=True)
             if [e['type'] for e in events] != ['engine_config']:
-                raise Violation(f'me{i} journal is not a clean genesis: {[e["type"] for e in events]}')
+                raise Violation(f'{member} journal is not a clean genesis: {[e["type"] for e in events]}')
+
+    def members_up(self, engine):
+        """RC2 S17 W3 (5.2 (ii)): (members to read, members skipped) of an engine. Skipped: a registered fault target whose
+        container is not Running (X-A1's killed leader, X-A4's late members); every other member is read."""
+        targets = self.registry.get('fault_targets') or {}
+        members, skipped = [], []
+        for i in range(3):
+            role = f'{engine}{i}'
+            cid = self.registry['containers'].get(role)
+            down = cid is None or not self.inspect('container', cid)['State']['Running']
+            (skipped if down and role in targets else members).append(role)
+        return members, skipped
 
     def start_forwarders(self, plan):
         for slot in ('fwd0', 'fwd1'):
             self.slots[slot] = self.start_or_restart_slot(slot)
         for slot in ('shadow0',):
             self.slots[slot] = self.start_slot(slot)
+
+    # ---------------------------------------------------------------- seeds (RC2 S17 W3, contract 5.2)
+
+    def seed_state(self, role, src, recorded_sha256, witness=None, parts=None):
+        """Copy a member's state dir from a stopped earlier run into ``state/<role>`` before the member starts. Refused: a
+        member already started, a missing source, a source whose tree hash (sha256 over sorted relative paths and file sha256)
+        differs from the recorded one. ``parts`` copies only those subtrees (X-7: the ME journal archive). The hash and the
+        non-vacuity ``witness`` go in the fault witness."""
+        from legacy_tag import tree_hash
+        if role not in ENGINES:
+            raise Violation('seed_state seeds an engine member only: ' + role)
+        if role in self.registry['containers']:
+            raise Violation(f'seed_state refuses {role}: the member was already started (a seed goes in before the start)')
+        src = Path(src)
+        if not src.is_dir():
+            raise Inconclusive(f'seed source missing: {src}')
+        tree = tree_hash(src)
+        if tree['sha256'] != recorded_sha256:
+            raise Inconclusive(f'seed tree hash differs from the recorded one: {src} {tree["sha256"]} != {recorded_sha256}')
+        dest = self.root / 'state' / role
+        if dest.exists():
+            raise Violation('seed_state needs a fresh member state dir: ' + str(dest))
+        if parts:
+            dest.mkdir(parents=True)
+            for part in parts:
+                if (src / part).exists():
+                    shutil.copytree(src / part, dest / part, symlinks=True)
+        else:
+            shutil.copytree(src, dest, symlinks=True)
+            if tree_hash(dest)['sha256'] != tree['sha256']:
+                raise Inconclusive(f'seed copy of {role} differs from its source')
+        row = {'source': str(src), 'tree': tree, 'parts': list(parts) if parts else None, 'witness': witness}
+        self.registry.setdefault('seeded', {})[role] = row; self.save()
+        return self.record_fault({'kind': 'seed_state', 'target': role, **row})
 
     # ---------------------------------------------------------------- slots
 
@@ -1161,11 +1254,14 @@ class CoreFixture(Fixture):
             raise Inconclusive(f'polite stop exited {code}: {name} (contract 5.1)')
         return witness
 
-    def replace_slot(self, slot, artifact, after_kill=False):
+    def replace_slot(self, slot, artifact, after_kill=False, keep_state=False):
         """R7: the only way a slot's binary changes. The slot must be stopped or exited; its state dir is kept as
         ``state/<slot>.gen<n>`` and its log as ``logs/<slot>.gen<n>.log``, the container is removed, the slot restarts from
         ``artifact`` (same env, key id and IP). ``after_kill``: a replacement that exits 78 (F7_REJECTED) inside the 10 s
-        session window is witnessed and started once more after the window (F-S16-11). The fault row closes on /ready 200."""
+        session window is witnessed and started once more after the window (F-S16-11). The fault row closes on /ready 200.
+        ``keep_state`` (RC2 S17 W3, A05-keep): the slot's state dir stays in place for the new binary, as a production unit
+        restart does; the old container's log is still kept as evidence. In embedded mode the driver dir lives in the removed
+        container's own /dev/shm tmpfs and cannot survive the replacement in this rig (recorded in the witness)."""
         if slot not in ('fwd0', 'fwd1', 'bridge0', 'bridge1'):
             raise Violation('replace_slot swaps a forwarder or bridge slot only: ' + slot)
         if self.m['artifacts'].get(artifact) is None:
@@ -1188,9 +1284,14 @@ class CoreFixture(Fixture):
         gen = 1
         while (state / f'{slot}.gen{gen}').exists():
             gen += 1
+        while keep_state and (self.root / 'logs' / f'{slot}.gen{gen}.log').exists():
+            gen += 1
         logs = self.command(['docker', 'logs', '--timestamps', cid], check=False)
         (self.root / 'logs' / f'{slot}.gen{gen}.log').write_text(redact(logs.stdout + logs.stderr, self.secret_values))
-        (state / slot).rename(state / f'{slot}.gen{gen}')
+        if keep_state:
+            self.registry.setdefault('kept_state', {})[slot] = {'generation': gen, 'state_dir': str(state / slot)}
+        else:
+            (state / slot).rename(state / f'{slot}.gen{gen}')
         self.inspect('container', cid)
         self.command(['docker', 'rm', cid])
         del self.registry['containers'][slot]
@@ -1207,7 +1308,14 @@ class CoreFixture(Fixture):
         witness = {'kind': 'replace_slot', 'target': slot, 'generation': gen, 'after_kill': after_kill,
                    'old': {'artifact': old_name, 'sha256': old['sha256'], 'source_sha': old['source_sha']},
                    'new': {'artifact': artifact, 'sha256': new['sha256'], 'source_sha': new['source_sha']},
-                   'build_health': build, 'f7_rejected': f7, 'ready_after_s': ready_s}
+                   'build_health': build, 'f7_rejected': f7, 'ready_after_s': ready_s, 'keep_state': keep_state}
+        if keep_state:
+            _, mode = self.slot_binary(slot)
+            witness['state_dir'] = str(state / slot)
+            witness['driver_dir'] = (f'/dev/shm/aeron-{slot}: the staged aeronmd deletes its dir on start (DRIVER_ENV)'
+                                     if mode == 'external' else
+                                     f'{EMBEDDED_DIRS["fwd" if slot.startswith("fwd") else "bridge"]}: in the removed container\'s '
+                                     '/dev/shm tmpfs, not kept across a container replacement in the rig')
         if after_kill:
             witness.update(ready_after_kill_s=round(self.clock() - killed['at'], 3), ready_after_kill_bound_s=READY_AFTER_KILL_S)
         return self.record_fault(witness)
@@ -1240,17 +1348,21 @@ class CoreFixture(Fixture):
                 raise Inconclusive(f'replacement {slot} not ready within {REPLACE_READY_BOUND_S} s')
             self.sleep(0.1)
 
-    def wipe_engine(self, role):
+    def wipe_engine(self, role, projection_dump_required=True, reason=None):
         """Empty the member's bind-mounted state dir on the host (CF:243, 261), keeping the directory. The member must not be
         Running; the witness carries the byte count removed and the listing before. S16 fix round V6: an AE member is the
         source of the life's money state, so its wipe needs that core life's projection dump on disk with the digest
-        reset_projection recorded (a precondition, never a fallback: no dump, no wipe)."""
+        reset_projection recorded (a precondition, never a fallback: no dump, no wipe). RC2 S17 W3: the X runs' recovery line
+        wipes members that ran on a foreign seed in a fixture where no money ever moved; ``projection_dump_required=False``
+        names that with a ``reason`` (required), recorded in the witness."""
         if role not in ENGINES:
             raise Violation('wipe_engine wipes an engine member only: ' + role)
         cid = self._fault_target(role)
         if self.inspect('container', cid)['State']['Running']:
             raise Violation('wipe_engine refuses a running member: ' + role)
-        if role.startswith('ae'):
+        if not projection_dump_required and not reason:
+            raise Violation('wipe_engine without the projection dump needs a reason')
+        if role.startswith('ae') and projection_dump_required:
             life = self.life('core')
             dump = (self.registry.get('projection_dumps') or {}).get(str(life))
             if not dump:
@@ -1274,8 +1386,11 @@ class CoreFixture(Fixture):
             raise Inconclusive('wipe_engine left files behind in ' + str(state))
         if role not in (self.registry.get('fault_targets') or {}):
             self.open_fault(role, 0, REGENESIS_HEAL_BOUND_S, reason='wiped')
-        return self.record_fault({'kind': 'wipe_engine', 'target': role, 'bytes_removed': total, 'files_removed': len(listing),
-                                  'listing_before': listing})
+        witness = {'kind': 'wipe_engine', 'target': role, 'bytes_removed': total, 'files_removed': len(listing),
+                   'listing_before': listing}
+        if not projection_dump_required:
+            witness['projection_dump'] = 'not required: ' + reason
+        return self.record_fault(witness)
 
     def reset_projection(self, out_dir=None):
         """Stop the projector, dump every table of the run's money database to ``<out>/life-<n>/money_journal.pg.jsonl``

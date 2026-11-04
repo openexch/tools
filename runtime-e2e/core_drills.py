@@ -608,6 +608,9 @@ DRILLS.update({
                      'lines': ['build_witness', 'no_delay', 'survivor_delivered', 'dup_outcomes', 'ready_after_kill']},
     'a05-bridge-upgrade': {'s16': True, 'faults': 'a05', 'swap': 'bridge', 'how': 'stop', 'cycles': 2,
                            'story': _s16_a01(90, A05_USERS), 'lines': ['build_witness', 'settle_no_gap', 'bridge_never_halted']},
+    # RC2 S17 W3 (7.1, row 47): A05-keep, one forwarder and one bridge replaced with keep_state=True (the unit restart shape)
+    'a05-keep': {'s16': True, 'faults': 'a05', 'swap': 'both', 'how': 'stop', 'keep_state': True, 'cycles': 2,
+                 'story': _s16_a01(90, A05_USERS), 'lines': ['build_witness', 'no_delay', 'settle_no_gap', 'keep_state']},
     'a06-two-forwarders-ticks': {'s16': True, 'faults': 'a06', 'cycles': 1, 'story': _s16_a01(60, A01_USERS),
                                  'lines': ['tick_conservation', 'tick_stale_positive', 'tick_end_state', 'tick_invalid_zero',
                                            'tick_survivor']},
@@ -1040,6 +1043,14 @@ def line_dup_outcomes(w):
         return _line(False, {'why': 'a dup window edge has no sampler row', 'windows': out}, inconclusive=True)
     ok = all(v['dispatches'] > 0 and abs(v['duplicates'] - v['expected']) <= s['A05_DUP_EDGE_SLACK'] for v in out.values())
     return _line(ok, {'windows': out, 'slack': s['A05_DUP_EDGE_SLACK']})
+
+
+def line_keep_state(w):
+    """A05-keep (row 47): both swaps (one forwarder, one bridge) replaced the binary with the slot's state dir in place."""
+    out = [{'slot': s['slot'], 'keep_state': s['replace'].get('keep_state'), 'state_dir': s['replace'].get('state_dir')}
+           for s in w.get('swaps') or []]
+    ok = len(out) == 2 and {o['slot'][:3] for o in out} == {'fwd', 'bri'} and all(o['keep_state'] and o['state_dir'] for o in out)
+    return _line(ok, out)
 
 
 def line_ready_after_kill(w):
@@ -1532,7 +1543,7 @@ class S16Drills:
         self.a03_hold = dict(hold_w, kill_in_closed_window=in_window, restarted=True,
                              pause_s=round((thawed - pause['opened_ns']) / 1e9, 3))
 
-    def swap(self, slot, artifact, how='stop', record=None, hold_s=0.0):
+    def swap(self, slot, artifact, how='stop', record=None, hold_s=0.0, keep_state=False):
         """stop (polite, exit 0) or kill, then replace_slot (R7); one ledger row healed by the replacement's /ready.
         ``hold_s``: the slot stays down that long before the replacement (the N = 1 controls, A05_N1_HOLD_S)."""
         f = self.f
@@ -1546,7 +1557,8 @@ class S16Drills:
             self.sleep(hold_s)
             row['witness']['held_s'] = hold_s
         f.readiness_override.pop(slot, None)
-        rep = f.replace_slot(slot, artifact, after_kill=how == 'kill')
+        rep = (f.replace_slot(slot, artifact, after_kill=how == 'kill', keep_state=True) if keep_state
+               else f.replace_slot(slot, artifact, after_kill=how == 'kill'))
         ready = time.time()
         self.ledger.heal(row, 'replace', rep)
         if record is not None:
@@ -1616,6 +1628,16 @@ class S16Drills:
         stopped at t=25 and never replaced (the ledger records it as the control's switch, not a fault)."""
         f = self.f
         kind, how = self.spec['swap'], self.spec['how']
+        if kind == 'both':           # A05-keep: t=30 fwd0, t=50 bridge0, each on build B with its state kept
+            self.swaps = []
+            for slot, artifact, t in (('fwd0', 'forwarder_b', 30), ('bridge0', 'bridge_b', 50)):
+                self.at(t)
+                pre = self.health_of(slot)[1].get('build')
+                record = []
+                self.swap(slot, artifact, how=how, record=record, keep_state=True)
+                record[0]['pre_build'] = pre
+                self.swaps += record
+            return
         slots, artifact = (FORWARDERS, 'forwarder_b') if kind == 'fwd' else (BRIDGES, 'bridge_b')
         self.swaps = []
         if self.variant.get('n1'):

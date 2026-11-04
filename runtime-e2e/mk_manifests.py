@@ -262,11 +262,27 @@ KINDS17 = {
     's17-a03-embedded': ('embedded', 'embedded', 'CUT', 'A03', {'forwarder_b': 'ct_forwarder_nc_norelease'}),
     's17-red-a03': ('external', 'embedded', 'CUT', 'REDA03', {'forwarder_b': 'ct_forwarder_nc_norelease', 'forwarder': None}),
     's17-red-a04': ('external', 'external', 'CUT', 'REDA04', {'bridge_b': 'ct_bridge_nc_noepoch', 'bridge': None}),
+    # RC2 S17 W3 (coordinator): the S15 RED-1 (forwarder without RESYNC) and RED-2 (legacy bridge) on the cut
+    's17-red1': ('external', 'embedded', 'CUT', 'REDA03', {'forwarder_b': 'ct_forwarder_nc_noresync', 'forwarder': None}),
+    's17-red2': ('external', 'embedded', 'CUT', 'REDA04', {'bridge_b': 'ct_bridge_nc_legacy', 'bridge': None}),
 }
 CUT_ROLES = {'me': 'match-cluster.jar', 'ae': 'assets-cluster.jar', 'projector': 'assets-projector.jar'}
 CUT_HARNESS = {'core_probe': 'core_probe', 'journal_probe': 'journal_probe', 't1_me_driver': 't1_me_driver',
                't1_core_driver': 't1_core_driver'}
 PROBE_LIBS = {'aeronmd': 'probe_aeronmd', 'libaeron_driver.so': 'probe_libaeron_driver.so', 'libaeron.so': 'probe_libaeron.so'}
+
+
+# RC2 S17 W3 (W0 mk_dr.py --legacy-ips): the kinds that start the RC2 engines on a seeded v0.5.0-beta state (and X-R, which
+# restores the tag line on the same addresses) give the members the legacy fixture's addresses: me .10-.12, ae .13-.15.
+LEGACY_LAYOUT_KINDS = {'s17-xver', 's17-xver-ext', 's17-rollback'}
+
+
+def legacy_nodes(roles, octet):
+    nodes = {f'me{i}': f'172.30.{octet}.{10 + i}' for i in range(3)}
+    nodes.update({f'ae{i}': f'172.30.{octet}.{13 + i}' for i in range(3)})
+    others = [r for r in roles if r not in nodes]
+    nodes.update({r: f'172.30.{octet}.{20 + j}' for j, r in enumerate(others)})
+    return nodes
 
 
 def cut_class(kind):
@@ -347,6 +363,9 @@ def build_from_cut(kind, tag, cut_path, cfg=None, old_pins=None):
                          f'projector {engine_driver}; shm/memory sizes are settings, not acceptance limits'),
         'projector_driver': engine_driver,
     }
+    if kind in LEGACY_LAYOUT_KINDS:
+        m['nodes'] = legacy_nodes(roles, cfg.octet)
+        m['node_layout'] = 'legacy'
     for key, name in CUT_HARNESS.items():
         e = harness[name]
         m[key] = {'path': e['path'], 'sha256': e['sha256'], 'source_path': e['source_path'], 'source_sha256': e['source_sha256']}
