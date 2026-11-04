@@ -103,9 +103,10 @@ DEV_OVERLAY_KEYS = {'aeron.threading.mode', 'aeron.conductor.idle.strategy', 'ae
 S16_KINDS = {'s16', 's16-ext', 's16-embedded', 's16-n1', 's16-a03', 's16-a03-embedded', 's16-a05', 's16-a05-embedded',
              's16-red-a03', 's16-red-a04', 's16-ctl-edk-cnctimeout'}
 # RC2 S17 W2 (contract 5.3): the s17 kinds, derived from the cut manifest by ``mk_manifests.py --cut``. The RED and A03 kinds
-# need negative targets built from the cut's cluster-tools commit and are added when those builds exist (W4/W6).
+# stage negative targets of a test-config build of the cut's cluster-tools commit.
 S17_KINDS = {'s17', 's17-ext', 's17-embedded', 's17-n1', 's17-xver', 's17-xver-ext', 's17-act', 's17-rollback', 's17-a05',
-             's17-a05-embedded', 's17-a05-keep', 's17-a05-reverse', 's17-ctl-edk-cnctimeout'}
+             's17-a05-embedded', 's17-a05-keep', 's17-a05-reverse', 's17-ctl-edk-cnctimeout',
+             's17-a03', 's17-a03-embedded', 's17-red-a03', 's17-red-a04'}
 KINDS = S16_KINDS | S17_KINDS
 EDK_CNCTIMEOUT_KIND = 's16-ctl-edk-cnctimeout'
 EDK_CNCTIMEOUT_KINDS = {EDK_CNCTIMEOUT_KIND, 's17-ctl-edk-cnctimeout'}

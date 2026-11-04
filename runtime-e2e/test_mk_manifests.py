@@ -142,10 +142,13 @@ class CutManifestBuilderTest(unittest.TestCase):
             self.world.pin(p, mk_manifests.CT_A_SOURCE_SHA, name)
         dp = put('me/driver.properties', DP_TEXT.encode())
         put('helper/iptables-legacy', b'ipt')
+        ct = self.world.m['repos']['cluster-tools']        # the negative targets: a test-config build of the cut's ct commit
+        for sub, target in (('forwarder', 'ct_forwarder_nc_norelease'), ('bridge', 'ct_bridge_nc_noepoch')):
+            put(f'ct-test/app/{sub}/{target}', b'ELF nc ' + target.encode() + b' ' + ct.encode())
         self.cfg = mk_manifests.Config(
             runs=root / 'runs', bin_a=self.bin_a, driver_properties=dp,
             driver_properties_sha256=hashlib.sha256(DP_TEXT.encode()).hexdigest(), netfilter_helper=root / 'helper',
-            harness_commit='e' * 40, harness_dirty=False, image='sha256:' + 'e' * 64)
+            harness_commit='e' * 40, harness_dirty=False, image='sha256:' + 'e' * 64, cut_nc_dir=root / 'ct-test')
 
     def tearDown(self):
         self.temp.cleanup()
@@ -188,6 +191,20 @@ class CutManifestBuilderTest(unittest.TestCase):
         _, m = self.built('s17-a05-reverse')
         self.assertEqual(m['artifacts']['forwarder']['sha256'], cut['ct-forwarder']['sha256'])
         self.assertEqual(m['artifacts']['bridge_b']['source_sha'], mk_manifests.CT_A_SOURCE_SHA)
+
+    def test_negative_kinds_stage_the_cut_s_test_builds(self):
+        cut = self.world.m['artifacts']
+        _, m = self.built('s17-a03')
+        self.assertEqual((m['artifacts']['forwarder_b']['target'], m['slot_artifacts']['fwd0']), ('ct_forwarder_nc_norelease', 'forwarder_b'))
+        self.assertEqual(m['artifacts']['forwarder']['sha256'], cut['ct-forwarder']['sha256'])
+        _, m = self.built('s17-red-a03')
+        self.assertIsNone(m['artifacts']['forwarder'])
+        _, m = self.built('s17-red-a04')
+        self.assertEqual((m['artifacts']['bridge_b']['target'], m['engine_driver']), ('ct_bridge_nc_noepoch', 'external'))
+        self.assertEqual(m['artifacts']['bridge_b']['source_sha'], self.world.m['repos']['cluster-tools'])
+        (self.root / 'ct-test/app/bridge/ct_bridge_nc_noepoch').write_bytes(b'ELF nc built from another commit')
+        with self.assertRaisesRegex(Violation, 'K4 .*not a build of the cut'):
+            self.built('s17-red-a04')
 
     def test_build_a_must_be_pinned(self):
         self.world.pins.clear()

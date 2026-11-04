@@ -110,6 +110,7 @@ class Config:
     octet: int = 216
     pg_port: int = 55481
     seed: int = SEED
+    cut_nc_dir: Path = B0 / 'local-runs/s17/cut17/ct2t'       # RC2 S17: the test-config build of the cut's ct commit (nc targets)
     shm_mb: dict = field(default_factory=dict)                 # per-role overrides of SHM_MB (settings)
     memory_mb: dict = field(default_factory=dict)
 
@@ -256,6 +257,11 @@ KINDS17 = {
     's17-a05-keep': ('external', 'embedded', 'A', 'A', {'forwarder_b': 'CUT', 'bridge_b': 'CUT'}),
     's17-a05-reverse': ('external', 'embedded', 'CUT', 'A', {'forwarder_b': 'A', 'bridge_b': 'A'}),
     's17-ctl-edk-cnctimeout': ('external', 'external', 'CUT', 'A', {}),
+    # the negative kinds stage nc targets of a TEST-config build of the cut's cluster-tools commit (cut_nc_dir), never a product
+    's17-a03': ('external', 'embedded', 'CUT', 'A03', {'forwarder_b': 'ct_forwarder_nc_norelease'}),
+    's17-a03-embedded': ('embedded', 'embedded', 'CUT', 'A03', {'forwarder_b': 'ct_forwarder_nc_norelease'}),
+    's17-red-a03': ('external', 'embedded', 'CUT', 'REDA03', {'forwarder_b': 'ct_forwarder_nc_norelease', 'forwarder': None}),
+    's17-red-a04': ('external', 'external', 'CUT', 'REDA04', {'bridge_b': 'ct_bridge_nc_noepoch', 'bridge': None}),
 }
 CUT_ROLES = {'me': 'match-cluster.jar', 'ae': 'assets-cluster.jar', 'projector': 'assets-projector.jar'}
 CUT_HARNESS = {'core_probe': 'core_probe', 'journal_probe': 'journal_probe', 't1_me_driver': 't1_me_driver',
@@ -296,6 +302,10 @@ def build_from_cut(kind, tag, cut_path, cfg=None, old_pins=None):
             e = a['ct-' + sub]
             return {'path': e['path'], 'sha256': e['sha256'], 'source_sha': e['source_sha'], 'driver': slot_driver,
                     'target': 'ct-' + sub, 'libs': json.loads(json.dumps(cut_libs))}
+        if source.startswith('ct_'):          # a negative target of the cut's ct commit (the checker verifies the stamp, K4)
+            path = _need(Path(cfg.cut_nc_dir) / 'app' / sub / source, f'{role} {source}')
+            return {'path': str(path), 'sha256': sha(path), 'source_sha': cut['repos']['cluster-tools'], 'driver': slot_driver,
+                    'target': source, 'libs': json.loads(json.dumps(cut_libs))}
         path = _need(cfg.bin_a / f'ct-{sub}', f'{role} build A')
         return {'path': str(path), 'sha256': sha(path), 'source_sha': CT_A_SOURCE_SHA, 'driver': slot_driver,
                 'target': f'ct-{sub}', 'libs': _driver_libs(cfg)}
@@ -309,7 +319,7 @@ def build_from_cut(kind, tag, cut_path, cfg=None, old_pins=None):
     artifacts['forwarder'] = binary(base, 'forwarder')
     artifacts['bridge'] = binary(base, 'bridge')
     for name, source in seconds.items():
-        artifacts[name] = binary(source, name)
+        artifacts[name] = None if source is None else binary(source, name)
     for role, name in CUT_ROLES.items():
         artifacts[role] = {k: a[name][k] for k in ('path', 'sha256', 'source_sha')}
     helper = Path(cfg.netfilter_helper)
