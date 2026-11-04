@@ -438,13 +438,14 @@ def _run_locked(plan, night, unfinished, work_root, settings, host, summary, sta
 def _records(night, summary, status):
     """RC2 step 7 (review V10): the night's activation records, checked as a set (no repeated genesisId, equal invariants,
     each OK); a refused set makes the night FAIL."""
-    paths = sorted(night.rglob('rc2-activation-record.json'))
-    records = []
-    for p in paths:
+    paths, records = [], []
+    for p in sorted(night.rglob('rc2-activation-record*.json')):
         try:
-            records.append(json.loads(p.read_text()))
+            r = json.loads(p.read_text())
         except ValueError:
-            records.append({'status': 'UNREADABLE'})
+            r = {'status': 'UNREADABLE'}
+        if r.get('record_kind', 'final') == 'final':            # rc2-cut-4: intermediate (pre-recovery) records stay out
+            paths.append(p); records.append(r)
     refusals = r10_cut.check_record_set(records) + [f'{p.relative_to(night)}: status {r.get("status")}'
                                                     for p, r in zip(paths, records) if r.get('status') != 'OK']
     summary['activation_records'] = {'files': [str(p.relative_to(night)) for p in paths], 'refusals': refusals}

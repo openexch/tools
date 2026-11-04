@@ -556,5 +556,79 @@ class W5LateJoinerCatchUpTest(unittest.TestCase):
         self.assertIn('did not catch up', ' '.join(xver.judge_a4(obs)['reasons']))
 
 
+
+# ------------------------------------------------------------------ W5 on rc2-cut-4: the final record after a recovery
+
+class Cut4LateJoinerCoreIdTest(RecordBase):
+    def test_a_member_that_has_not_applied_coreconfig_yet_does_not_make_the_id_unobservable(self):
+        T.write_ae_member(self.d.state, 'ae2', [b'\0' * 40])           # the late joiner: no CoreConfig in its log yet
+        rec = self.record()
+        self.assertEqual(rec['core']['genesisId'], self.gid, rec['refusals'])
+        self.assertEqual(rec['core']['read_from'], ['ae0', 'ae1'])
+        self.assertEqual(rec['core']['not_applied'], ['ae2'])
+        self.assertEqual(rec['status'], 'OK', rec['refusals'])
+
+    def test_two_different_applied_ids_still_refuse_and_one_member_alone_is_not_enough(self):
+        T.write_ae_member(self.d.state, 'ae1', [T.core_config_payload(v, self.gid + 2) for v in (1, 2, 3)])
+        self.assertEqual(self.record()['status'], 'REFUSED')
+        T.write_ae_member(self.d.state, 'ae1', [b'\0' * 40])
+        T.write_ae_member(self.d.state, 'ae2', [b'\0' * 40])
+        rec = self.record()
+        self.assertEqual(rec['core']['genesisId'], 'not observable')     # a majority must hold the applied id
+
+
+class Cut4RecordKindTest(RecordBase):
+    def test_intermediate_records_stay_out_of_the_set(self):
+        final = self.record()
+        self.assertEqual(final['record_kind'], 'final')
+        pre = r10_cut.activation_record(self.d.run, journal_schema=T.ME_JOURNAL, record_kind='intermediate')
+        self.assertEqual(pre['record_kind'], 'intermediate')
+        self.assertEqual(r10_cut.check_record_set([pre, final]), [])     # same run id by design, never a repeat
+        r10_cut.write_activation_record(self.d.run, self.d.run / 'rc2-activation-record.before-recovery.json',
+                                        journal_schema=T.ME_JOURNAL, record_kind='intermediate')
+        r10_cut.write_activation_record(self.d.run, journal_schema=T.ME_JOURNAL)
+        r10_cut.write_activation_record(self.d.run, self.d.run / 'rc2-activation-record.forward.json', journal_schema=T.ME_JOURNAL)
+        import contextlib, io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = r10_cut.main(['activation-records', str(self.d.run)])
+        listed = json.loads(out.getvalue())
+        self.assertEqual(sorted(Path(p).name for p in listed['records']),
+                         ['rc2-activation-record.forward.json', 'rc2-activation-record.json'])
+        self.assertEqual(listed['skipped_intermediate'], [str(self.d.run / 'rc2-activation-record.before-recovery.json')])
+        self.assertIn('repeats', ' '.join(listed['refusals']))           # two FINAL records of one run do repeat: refused
+
+
+class Cut4CompleteAfterRecoveryTest(unittest.TestCase):
+    def test_the_steps_after_a_recovery_complete_the_activation(self):
+        self.assertEqual(xver.COMPLETE_STEPS, ['configure_risk', 'fund', 'verify_funded', 'start_forwarders'])
+        f = types.SimpleNamespace(registry={'boot': {'phases': {}}}, save=lambda: None)
+        calls = []
+        moneys = iter([{'meEpoch': 0}, {'meEpoch': 7}])
+        with mock.patch.object(xver, '_money', lambda fx: next(moneys)), \
+                mock.patch.object(xver, '_steps', lambda fx, plan, steps: calls.append(list(steps))), \
+                mock.patch.object(xver.time, 'sleep', lambda s: None):
+            out = xver.complete_activation(f, {}, bound_s=10)
+        self.assertTrue(out['bound'])
+        self.assertIn('core_bound_ns', f.registry['boot']['phases'])
+        self.assertEqual(calls, [xver.COMPLETE_STEPS])
+        moneys = iter([{'meEpoch': 0}] * 50)
+        with mock.patch.object(xver, '_money', lambda fx: next(moneys)), \
+                mock.patch.object(xver, '_steps', lambda fx, plan, steps: calls.append(steps)), \
+                mock.patch.object(xver.time, 'sleep', lambda s: None), mock.patch.object(xver.time, 'time', iter(range(0, 1000, 5)).__next__):
+            self.assertFalse(xver.complete_activation(f, {}, bound_s=10)['bound'])
+
+
+    def test_the_judges_require_the_final_record_ok_after_a_successful_recovery(self):
+        done = {'steps': list(xver.COMPLETE_STEPS)}
+        self.assertEqual(xver.judge_a2(a2(completion=done, record_after={'status': 'OK'}))['verdict'], 'PASS')
+        v = xver.judge_a2(a2(completion=done, record_after={'status': 'INCOMPLETE', 'refusals': ['phase order']}))
+        self.assertIn('the final record after the recovery reads INCOMPLETE', ' '.join(v['reasons']))
+        r5 = {'journal_seq': 1}
+        obs = {'record5': {'me0': r5, 'me1': dict(r5), 'me2': dict(r5)}, 'late_ready': {}, 'ae_catch_up': {'caught_up': True},
+               'record': {'status': 'INCOMPLETE', 'refusals': ['core genesisId not observable']}}
+        self.assertIn('the activation record reads INCOMPLETE', ' '.join(xver.judge_a4(obs)['reasons']))
+
+
 if __name__ == '__main__':
     unittest.main()

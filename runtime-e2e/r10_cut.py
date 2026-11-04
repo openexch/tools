@@ -1128,6 +1128,7 @@ def check_record_set(records):
     """RC2 step 7: a genesisId that repeats across genesis runs is a refused record; the invariant fields of section 10
     (behaviour 2, maxWireVersion 12, journalSeq 1 FRESH, the CoreConfig 1-2-3 acceptance, the gate transition) are equal."""
     seen, out = {}, []
+    records = [r for r in records if r.get('record_kind', 'final') == 'final']
     for i, record in enumerate(records):
         gid = (record.get('me') or {}).get('genesisId')
         if gid is None:
@@ -1154,7 +1155,7 @@ def check_record_set(records):
     return out
 
 
-def activation_record(run_dir, journal_schema=None, state_root=None, audit=None, cut=None, life=1):
+def activation_record(run_dir, journal_schema=None, state_root=None, audit=None, cut=None, life=1, record_kind='final'):
     """``rc2-activation-record.json`` of one genesis, from the run's evidence only (C3: what happened, never what was sent):
     record 5 from the JournalProbe dumps, the core genesisId from the AE log recordings, the bound epoch from money-dump, the
     CoreConfig acknowledgements from the genesis driver's and the probe's outputs, the gate from the tap rows, the phases from
@@ -1163,7 +1164,11 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
     import sbe_layout
     run = Path(run_dir)
     rec = _Record()
-    out = {'schema': 'rc2-activation-record/1', 'run_dir': str(run), 'life': life, 'sources': dict(SOURCES),
+    if record_kind not in ('final', 'intermediate'):
+        raise ValueError('record_kind is final or intermediate')
+    # rc2-cut-4: a pre-recovery record is intermediate (it shares the run's genesisId by design); RC2 step 7 reads finals only
+    out = {'schema': 'rc2-activation-record/1', 'record_kind': record_kind, 'run_dir': str(run), 'life': life,
+           'sources': dict(SOURCES),
            'downgrade_boundary': DOWNGRADE_BOUNDARY}
     manifest_path = run / 'manifest.json'
     if state_root is None:
@@ -1295,14 +1300,18 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
     values = set(applied.values())
     core['genesis_reader'] = {k: reader.get(k) for k in ('status', 'genesis_id', 'equal', 'other_ids_in_log', 'error') if k in reader}
     core['applied'] = applied
-    core_gid = values.pop() if len(values) == 1 and len(applied) == len(AE_MEMBERS) else None
+    # rc2-cut-4 (X-A4): the members that hold the applied CoreConfig are read; a member that has not applied it yet (a late
+    # joiner still catching up) is named, never a disagreement; two different applied ids refuse; a majority must hold it
+    core['read_from'] = sorted(applied)
+    core['not_applied'] = sorted(set(AE_MEMBERS) - set(applied))
+    core_gid = values.pop() if len(values) == 1 and len(applied) * 2 > len(AE_MEMBERS) else None
     core['genesisId'] = core_gid if core_gid is not None else 'not observable'
     if core_gid is None:
         if len(values) > 1:
             rec.say('REFUSED', f'core genesisId differs across AE members: {applied}')
         else:
-            rec.say('INCOMPLETE', f'core genesisId not observable (no CoreConfig 1 frame paired with an accepted AdminAck on '
-                                  f'every AE member; reader {reader.get("status")})')
+            rec.say('INCOMPLETE', f'core genesisId not observable (the applied CoreConfig 1 on {sorted(applied)}, a majority of '
+                                  f'{list(AE_MEMBERS)} needed; reader {reader.get("status")})')
     elif me_gid is not None and core_gid != me_gid:
         rec.say('REFUSED', f'core genesisId {core_gid} != ME genesisId {me_gid}')
     core['config_sequence'] = sequence
@@ -1447,13 +1456,17 @@ def main(argv=None):
         print(json.dumps({'status': record['status'], 'refusals': record['refusals'], 'record': str(path)}, indent=1))
         return 0 if record['status'] == 'OK' else 1
     if args.cmd == 'activation-records':
-        paths = []
+        found = []
         for p in args.records:
-            paths += sorted(p.rglob('rc2-activation-record.json')) if p.is_dir() else [p]
-        records = [json.loads(p.read_text()) for p in paths]
+            found += sorted(p.rglob('rc2-activation-record*.json')) if p.is_dir() else [p]
+        loaded = [(p, json.loads(p.read_text())) for p in found]
+        paths = [p for p, r in loaded if r.get('record_kind', 'final') == 'final']
+        skipped = [str(p) for p, r in loaded if r.get('record_kind', 'final') != 'final']
+        records = [r for p, r in loaded if r.get('record_kind', 'final') == 'final']
         refusals = check_record_set(records) + [f'{p}: status {r.get("status")}' for p, r in zip(paths, records)
                                                 if r.get('status') != 'OK']
-        print(json.dumps({'records': [str(p) for p in paths], 'refusals': refusals}, indent=1))
+        print(json.dumps({'records': [str(p) for p in paths], 'skipped_intermediate': skipped, 'refusals': refusals},
+                         indent=1))
         return 1 if refusals or not records else 0
     if args.cmd == 'genesis-ids':
         out = genesis_reader(args.state_root, args.schema)

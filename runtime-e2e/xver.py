@@ -567,7 +567,16 @@ def judge_a2(obs):
         opened = (f'the explicit OPEN then opened [OPEN, ADMIN]' if rec.get('gate_after_open') == 'OPEN' else
                   'the explicit OPEN did not open: a wipe of both clusters and a new genesisId')
         out['recovery'] = f'{bound} (gate {rec.get("gate_after_finish")}); {opened}'
+    _final_ok(obs, reasons)
     return dict(out, verdict='FAIL' if reasons else 'PASS', reasons=reasons)
+
+
+def _final_ok(obs, reasons):
+    """rc2-cut-4: after a successful recovery the final activation record (RC2 step 7's deliverable) reads OK."""
+    if 'record_after' in obs and (obs.get('completion') or {}).get('steps'):
+        status = (obs['record_after'] or {}).get('status')
+        if status != 'OK':
+            reasons.append(f'the final record after the recovery reads {status}: {(obs["record_after"] or {}).get("refusals")}')
 
 
 def judge_a3(obs):
@@ -589,6 +598,7 @@ def judge_a3(obs):
     p = obs['probe_open_after_bind']
     if p.get('result') != 'ACCEPTED' or obs.get('gate_final') != 'OPEN':
         reasons.append(f'the explicit OPEN after the bind was not ACCEPTED to [OPEN, ADMIN]: {p} gate {obs.get("gate_final")}')
+    _final_ok(obs, reasons)
     return {'verdict': 'FAIL' if reasons else 'PASS', 'reasons': reasons}
 
 
@@ -613,6 +623,8 @@ def judge_a4(obs):
         pos = obs['ae_log_positions']
         if len(pos) != 3 or len(set(pos.values())) != 1:
             reasons.append(f'AE logPositions differ at quiescence: {pos}')
+    if 'record' in obs and (obs['record'] or {}).get('status') != 'OK':
+        reasons.append(f'the activation record reads {(obs["record"] or {}).get("status")}: {(obs["record"] or {}).get("refusals")}')
     for m, ready in sorted(obs['late_ready'].items()):
         if not ready:
             reasons.append(f'the late member {m} did not become ready')
@@ -854,8 +866,27 @@ def _audit(f, out, name, started_only=False, not_started=()):
 
 def _record(f, out, audit, name='rc2-activation-record.json'):
     import r10_cut
-    record, _ = r10_cut.write_activation_record(out, Path(out) / name, state_root=f.root, audit=audit)
+    kind = 'intermediate' if 'before-recovery' in name else 'final'
+    record, _ = r10_cut.write_activation_record(out, Path(out) / name, state_root=f.root, audit=audit, record_kind=kind)
     return record
+
+
+COMPLETE_STEPS = ['configure_risk', 'fund', 'verify_funded', 'start_forwarders']
+
+
+def complete_activation(f, plan, bound_s=None):
+    """rc2-cut-4: after a successful recovery the activation is completed as a clean genesis completes it: the bind is
+    observed (money-dump meEpoch, the core_bound_ns phase), then risk, a first deposit, the funded check and the forwarders,
+    so the final record has every field. Not bound within the bound: nothing more is run (the record stays INCOMPLETE)."""
+    bound_s = _S['XVER_BIND_WAIT_S'] if bound_s is None else bound_s
+    t = time.time()
+    while time.time() - t < bound_s:
+        if _money(f).get('meEpoch'):
+            f.registry['boot']['phases']['core_bound_ns'] = time.time_ns(); f.save()
+            _steps(f, plan, COMPLETE_STEPS)
+            return {'bound': True, 'steps': list(COMPLETE_STEPS)}
+        time.sleep(2)
+    return {'bound': False, 'steps': []}
 
 
 def _child_exits(fixtures):
@@ -1397,7 +1428,10 @@ def run_act(manifest, name, out, s):
                 time.sleep(3)
                 obs['recovery'] = {'finish': finish['results'], 'bound': bound, 'gate_after_finish': gate_after_finish,
                                    'open': {'meaning': meaning, 'reply': reply}, 'gate_after_open': _gate_now(f)}
-            obs['record_after'] = _record(f, out, _audit(f, out, 'audit-end.json', not_started=('fwd0', 'fwd1')))
+            opened = (obs['recovery']['gate_after_open'] if k == 2 else obs['gate_final']) == 'OPEN'
+            obs['completion'] = complete_activation(f, plan) if opened else {'bound': False, 'steps': [], 'why': 'not opened'}
+            obs['record_after'] = _record(f, out, _audit(f, out, 'audit-end.json',
+                                                         not_started=() if obs['completion']['steps'] else ('fwd0', 'fwd1')))
             verdict = judge_a2(obs)
         elif name == 'core-act-nobridge':
             _boot_engines(f)
@@ -1426,7 +1460,10 @@ def run_act(manifest, name, out, s):
             obs = {'driver': driver, 'gate_no_bridge': gate0, 'probe_open_no_bridge': {'meaning': meaning, 'reason': ack.get('reason')},
                    'before': before, 'bound_after_s': bound_after, 'gate_after_bind': gate1,
                    'probe_open_after_bind': {'meaning': m2, 'result': ack2.get('result')}, 'gate_final': _gate_now(f)}
-            obs['record_after'] = _record(f, out, _audit(f, out, 'audit-end.json', not_started=('fwd0', 'fwd1')))
+            obs['completion'] = (complete_activation(f, plan) if obs['gate_final'] == 'OPEN'
+                                 else {'bound': False, 'steps': [], 'why': 'not opened'})
+            obs['record_after'] = _record(f, out, _audit(f, out, 'audit-end.json',
+                                                         not_started=() if obs['completion']['steps'] else ('fwd0', 'fwd1')))
             verdict = judge_a3(obs)
         elif name == 'core-act-latemember':
             late = ('me2', 'ae2')
