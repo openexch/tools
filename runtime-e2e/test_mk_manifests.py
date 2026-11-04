@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from contracts import Violation
 import core_contracts
@@ -121,3 +122,90 @@ class ManifestBuilderTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class CutManifestBuilderTest(unittest.TestCase):
+    """RC2 S17 W2 (contract 5.3): ``mk_manifests.py --cut`` derives the s17 kinds from the cut manifest and refuses to emit a
+    manifest the checker refuses."""
+
+    def setUp(self):
+        import test_r10_cut
+        self.temp = tempfile.TemporaryDirectory(); root = self.root = Path(self.temp.name)
+        self.world = test_r10_cut.World(root / 'cut')
+        self.cut_path = root / 'rc2-cut-manifest.json'
+        self.cut_path.write_text(json.dumps(self.world.m))
+        def put(rel, data):
+            path = root / rel; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(data); return path
+        self.bin_a = root / 'bin-s15'
+        for name in ('ct-forwarder', 'ct-bridge', 'aeronmd', 'libaeron.so', 'libaeron_driver.so'):
+            p = put('bin-s15/' + name, b'build A ' + name.encode())
+            self.world.pin(p, mk_manifests.CT_A_SOURCE_SHA, name)
+        dp = put('me/driver.properties', DP_TEXT.encode())
+        put('helper/iptables-legacy', b'ipt')
+        self.cfg = mk_manifests.Config(
+            runs=root / 'runs', bin_a=self.bin_a, driver_properties=dp,
+            driver_properties_sha256=hashlib.sha256(DP_TEXT.encode()).hexdigest(), netfilter_helper=root / 'helper',
+            harness_commit='e' * 40, harness_dirty=False, image='sha256:' + 'e' * 64)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def built(self, kind, cut=None):
+        path, m = mk_manifests.build_from_cut(kind, 'r1', cut or self.cut_path, self.cfg, old_pins=self.world.pins)
+        core_contracts.validate_core_manifest(json.loads(path.read_text()), path, cpu_count=24, require_me_enforced=True)
+        return path, m
+
+    def test_every_s17_kind_builds_validates_and_passes_the_checker(self):
+        import r10_cut
+        self.assertEqual(set(mk_manifests.KINDS17), core_contracts.S17_KINDS)
+        cut = self.world.m['artifacts']
+        for kind in sorted(mk_manifests.KINDS17):
+            with self.subTest(kind=kind):
+                path, m = self.built(kind)
+                self.assertEqual(path.name, kind + '--r1.json')
+                self.assertEqual(m['manifest_kind'], kind)
+                for role, name in (('me', 'match-cluster.jar'), ('ae', 'assets-cluster.jar'), ('projector', 'assets-projector.jar')):
+                    self.assertEqual(m['artifacts'][role]['sha256'], cut[name]['sha256'], (kind, role))
+                cls = mk_manifests.cut_class(kind)
+                self.assertEqual(r10_cut.check(m, self.world.m, cls, old_pins=self.world.pins).items, [], kind)
+                self.assertEqual(m['core_probe']['sha256'], self.world.m['harness']['core_probe']['sha256'])
+                self.assertEqual(m['probe_libs']['aeronmd']['sha256'], self.world.m['harness']['probe_aeronmd']['sha256'])
+
+    def test_slots_profiles_and_build_a(self):
+        cut = self.world.m['artifacts']
+        _, m = self.built('s17')
+        self.assertEqual((m['artifacts']['forwarder']['sha256'], m['artifacts']['bridge']['sha256']),
+                         (cut['ct-forwarder']['sha256'], cut['ct-bridge']['sha256']))
+        self.assertEqual(m['artifacts']['forwarder']['libs']['aeronmd']['sha256'], cut['aeronmd']['sha256'])
+        self.assertEqual((m.get('engine_driver', 'embedded'), m['projector_driver']), ('embedded', 'embedded'))
+        _, m = self.built('s17-ext')
+        self.assertEqual((m['engine_driver'], m['projector_driver']), ('external', 'external'))
+        self.assertEqual(m['projector_libs']['aeronmd']['sha256'], cut['aeronmd']['sha256'])
+        self.assertEqual(m['engine_libs']['aeronmd']['sha256'], cut['aeronmd']['sha256'])
+        _, m = self.built('s17-a05')
+        self.assertEqual(m['artifacts']['forwarder']['source_sha'], mk_manifests.CT_A_SOURCE_SHA)    # build A = upgrade_from
+        self.assertEqual(m['artifacts']['forwarder_b']['sha256'], cut['ct-forwarder']['sha256'])     # build B = the cut
+        _, m = self.built('s17-a05-reverse')
+        self.assertEqual(m['artifacts']['forwarder']['sha256'], cut['ct-forwarder']['sha256'])
+        self.assertEqual(m['artifacts']['bridge_b']['source_sha'], mk_manifests.CT_A_SOURCE_SHA)
+
+    def test_build_a_must_be_pinned(self):
+        self.world.pins.clear()
+        with self.assertRaisesRegex(Violation, 'K4 .*not pinned in R10/old-artifacts.sha256'):
+            self.built('s17-a05')
+        self.built('s17-ext')           # a kind without build A needs no pin
+
+    def test_a_cut_the_checker_refuses_is_refused(self):
+        bad = json.loads(self.cut_path.read_text()); bad['substrate']['aeron']['ae'] = '1.53.0'
+        path = self.root / 'bad-cut.json'; path.write_text(json.dumps(bad))
+        with self.assertRaisesRegex(Violation, 'K8 cut: substrate Aeron versions differ'):
+            self.built('s17-ext', cut=path)
+        self.assertFalse((self.cfg.runs / 'manifests' / 's17-ext--r1.json').exists())
+
+    def test_cli_cut_option(self):
+        import contextlib, io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(mk_manifests, 'Config', lambda **kw: self.cfg), \
+                mock.patch.object(mk_manifests.r10_cut, 'load_old_pins', lambda path: self.world.pins):
+            mk_manifests.main(['s17-ext', 'r1', '--cut', str(self.cut_path)])
+        self.assertTrue(out.getvalue().strip().endswith('s17-ext--r1.json'))

@@ -383,6 +383,8 @@ class SlotEnvTest(unittest.TestCase):
                 for i in range(3):
                     names |= set(f.engine_env(engine, i))
             names |= set(f.projector_env())
+            for mode in ('embedded', 'external'):      # RC2 S17 W2: the projector_driver key
+                names |= set(fixture_for(dict(f.m, projector_driver=mode), self.dir).projector_env())
             for slot in ('fwd0', 'fwd1', 'bridge0', 'bridge1'):
                 names |= set(f.slot_process_env(slot))
             for principal in (None, 'probe-admin'):
@@ -1559,3 +1561,63 @@ class FaultTargetsV4Test(V4Base):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def projector_manifest(directory, mode='external', engines='external'):
+    """RC2 S17 W2 (W10, PO-11 (a)): the fixture key ``projector_driver`` beside ``engine_driver``; external mode stages the
+    same pinned driver set as the engines (``projector_libs``)."""
+    m = ext_manifest(directory, engines=engines)
+    m['projector_driver'] = mode
+    if mode == 'external':
+        own = Path(directory) / 'projector-libs'; own.mkdir(exist_ok=True)
+        m['projector_libs'] = engine_libs(own)
+    return m
+
+
+class ProjectorDriverFixtureTest(V4Base):
+    def test_embedded_projector_never_sets_aeron_dir(self):
+        for m in (ext_manifest(self.dir), projector_manifest(self.dir, 'embedded')):
+            f = self.fx(m, roles=())
+            env = f.projector_env()
+            self.assertNotIn('AERON_DIR', env)
+            self.assertEqual(f.projector_command(), core_fixture.JAVA + ['-jar', '/artifacts/projector.jar'])
+            assert_production_timeouts(env, f.allowed_env())
+        self.assertEqual(self.fx(projector_manifest(self.dir, 'embedded'), roles=()).projector_env()['PROJECTOR_DRIVER_MODE'],
+                         'embedded')
+        self.assertNotIn('PROJECTOR_DRIVER_MODE', self.fx(ext_manifest(self.dir), roles=()).projector_env())
+
+    def test_external_projector_attaches_to_its_staged_aeronmd(self):
+        f = self.fx(projector_manifest(self.dir), roles=())
+        env = f.projector_env()
+        self.assertEqual((env['PROJECTOR_DRIVER_MODE'], env['AERON_DIR']), ('external', '/dev/shm/aeron-projector'))
+        assert_production_timeouts(env, f.allowed_env())
+        entry, flag, script = f.projector_command()
+        self.assertEqual((entry, flag), ('sh', '-c'))
+        d = '/dev/shm/aeron-projector'
+        order = ['rm -rf ' + d, 'mkdir -p ' + d,
+                 'LD_LIBRARY_PATH=/artifacts/projector_libs /artifacts/projector_libs/aeronmd '
+                 '/artifacts/projector_libs/driver.properties /artifacts/projector_libs/driver-dev.properties',
+                 'echo $! > /data/aeronmd.pid', d + '/cnc.dat', 'exec java']
+        positions = [script.index(t) for t in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn('-jar /artifacts/projector.jar', script)
+        self.assertEqual(f.engine_driver_pidfile('projector'), '/data/aeronmd.pid')
+        with self.assertRaises(Violation):
+            self.fx(projector_manifest(self.dir, 'embedded'), roles=()).engine_driver_pidfile('projector')
+
+    def test_projector_libs_are_staged_with_their_modes(self):
+        f = fixture_for(projector_manifest(self.dir), self.dir)
+        f.stage_artifacts()
+        mode = lambda name: os.stat(f.root / 'artifacts' / 'projector_libs' / name).st_mode & 0o777
+        self.assertEqual(mode('aeronmd'), 0o755)
+        for name in ('libaeron.so', 'libaeron_driver.so', 'driver.properties', 'driver-dev.properties'):
+            self.assertEqual(mode(name) & 0o111, 0, name)
+
+    def test_start_projector_spawns_the_wrapper(self):
+        f = self.fx(projector_manifest(self.dir), roles=())
+        spawned = []
+        f.spawn = lambda name, command, env: spawned.append((name, command, env))
+        f.start_projector(None)
+        self.assertEqual(spawned[0][0], 'projector')
+        self.assertEqual(spawned[0][1][:2], ['sh', '-c'])
+        self.assertEqual(spawned[0][2]['PROJECTOR_DRIVER_MODE'], 'external')

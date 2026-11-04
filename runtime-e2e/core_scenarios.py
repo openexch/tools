@@ -13,7 +13,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-import uuid
+import core_contracts
 
 from contracts import FP, Inconclusive, Violation, fingerprint
 import core_oracle
@@ -372,11 +372,8 @@ def core_smoke(fixture):
 def consecutive_boots(manifest, manifest_path, output, count):
     children, parent = [], Path(manifest_path).absolute().parent
     for index in range(count):
-        derived = json.loads(json.dumps(manifest))
-        derived['run_id'] = 'rc2-' + uuid.uuid4().hex[:12]
-        derived['state_root'] = str(parent / 'fixtures' / derived['run_id'])
-        child_manifest = parent / (derived['run_id'] + '-manifest.json')
-        with child_manifest.open('x') as stream: json.dump(derived, stream, indent=2); stream.write('\n')
+        # RC2 S17 (20.1 line 20): <kind>--<run_id>-boot-NN.json, the name the S16 kind rule accepts
+        child_manifest, derived = core_contracts.child_manifest(manifest, parent, f'boot-{index:02d}')
         destination = output / f'boot-{index:02d}'
         started = time.monotonic()
         with (output / f'boot-{index:02d}.log').open('x') as log:

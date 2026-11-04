@@ -5,6 +5,8 @@
 
 usage: mk_manifests.py <kind> <tag> [--b-source-sha SHA] [--build-b DIR] [--octet N] [--pg-port P]
                        [--shm ROLE=MB ...] [--memory ROLE=MB ...]          prints the manifest path
+       mk_manifests.py <s17 kind> <tag> --cut R10/rc2-cut-manifest.json [...]   RC2 S17 W2: derived from the cut (5.3);
+                       written only when ``r10_cut.py check`` accepts it (build A must be pinned in R10/old-artifacts.sha256)
 
 Kinds (the eleven S16 manifests; ``core_contracts.S16_KINDS``):
   s16                  C++ slots external (build A), engines embedded (dev profile, D-S15-4)
@@ -35,6 +37,7 @@ import sys
 
 from contracts import Violation
 import core_contracts
+import r10_cut
 
 B0 = Path('/home/emre/Apps/openexchange/.runtime-handoff/20260927-r00')
 SCRATCH = Path('/tmp/claude-1000/-home-emre-Apps-openexchange/de45670d-240c-4516-be8a-a5827d03f716/scratchpad')
@@ -235,6 +238,123 @@ def build(kind, tag, cfg=None):
     return out, m
 
 
+# ------------------------------------------------------------------ RC2 S17 W2: the s17 kinds, derived from the cut (5.3)
+
+# kind -> (slot driver, engine/projector driver, slot base build, slot plan, second builds); CUT = the cut manifest's ct
+# binaries, A = build A (ct 2be3a19 bin-s15, the upgrade_from of the A05 rows, pinned in R10/old-artifacts.sha256)
+KINDS17 = {
+    's17': ('external', 'embedded', 'CUT', 'A', {}),
+    's17-ext': ('external', 'external', 'CUT', 'A', {}),
+    's17-embedded': ('embedded', 'embedded', 'CUT', 'A', {}),
+    's17-n1': ('external', 'embedded', 'CUT', 'N1', {}),
+    's17-xver': ('external', 'embedded', 'CUT', 'A', {}),
+    's17-xver-ext': ('external', 'external', 'CUT', 'A', {}),
+    's17-act': ('external', 'external', 'CUT', 'A', {}),
+    's17-rollback': ('external', 'external', 'CUT', 'A', {}),
+    's17-a05': ('external', 'embedded', 'A', 'A', {'forwarder_b': 'CUT', 'bridge_b': 'CUT'}),
+    's17-a05-embedded': ('embedded', 'embedded', 'A', 'A', {'forwarder_b': 'CUT', 'bridge_b': 'CUT'}),
+    's17-a05-keep': ('external', 'embedded', 'A', 'A', {'forwarder_b': 'CUT', 'bridge_b': 'CUT'}),
+    's17-a05-reverse': ('external', 'embedded', 'CUT', 'A', {'forwarder_b': 'A', 'bridge_b': 'A'}),
+    's17-ctl-edk-cnctimeout': ('external', 'external', 'CUT', 'A', {}),
+}
+CUT_ROLES = {'me': 'match-cluster.jar', 'ae': 'assets-cluster.jar', 'projector': 'assets-projector.jar'}
+CUT_HARNESS = {'core_probe': 'core_probe', 'journal_probe': 'journal_probe', 't1_me_driver': 't1_me_driver',
+               't1_core_driver': 't1_core_driver'}
+PROBE_LIBS = {'aeronmd': 'probe_aeronmd', 'libaeron_driver.so': 'probe_libaeron_driver.so', 'libaeron.so': 'probe_libaeron.so'}
+
+
+def cut_class(kind):
+    """The checker class of a derived kind (3.3): the xver kinds may stage old artifacts, every other s17 kind is a rig."""
+    return 'rig-xver' if kind.startswith('s17-xver') or kind == 's17-rollback' else 'rig'
+
+
+def _cut_lib(entry, exec_=False):
+    lib = {'path': entry['path'], 'sha256': entry['sha256']}
+    if exec_:
+        lib['exec'] = True
+    return lib
+
+
+def build_from_cut(kind, tag, cut_path, cfg=None, old_pins=None):
+    """``mk_manifests.py <s17 kind> <tag> --cut <cut>``: the fixture manifest of ``kind`` whose every staged byte comes from the
+    cut manifest (or, for build A, from a pin of R10/old-artifacts.sha256); written only when ``r10_cut.check`` accepts it."""
+    cfg = cfg or Config()
+    if kind not in KINDS17:
+        raise Violation('unknown s17 kind ' + kind + '; kinds: ' + ', '.join(sorted(KINDS17)))
+    if not re.fullmatch(r'[A-Za-z0-9_.-]{1,40}', tag) or '--' in tag:
+        raise Violation('a tag is a short name without "--"')
+    cut = json.loads(Path(cut_path).read_text())
+    pins = r10_cut.load_old_pins(r10_cut.OLD_PINS) if old_pins is None else old_pins
+    slot_driver, engine_driver, base, slot_plan, seconds = KINDS17[kind]
+    a, harness = cut['artifacts'], cut['harness']
+    cut_libs = {'aeronmd': _cut_lib(a['aeronmd'], True), 'libaeron_driver.so': _cut_lib(a['libaeron_driver.so']),
+                'libaeron.so': _cut_lib(a['libaeron.so'])}
+
+    def binary(source, role):
+        sub = 'forwarder' if role.startswith('forwarder') else 'bridge'
+        if source == 'CUT':
+            e = a['ct-' + sub]
+            return {'path': e['path'], 'sha256': e['sha256'], 'source_sha': e['source_sha'], 'driver': slot_driver,
+                    'target': 'ct-' + sub, 'libs': json.loads(json.dumps(cut_libs))}
+        path = _need(cfg.bin_a / f'ct-{sub}', f'{role} build A')
+        return {'path': str(path), 'sha256': sha(path), 'source_sha': CT_A_SOURCE_SHA, 'driver': slot_driver,
+                'target': f'ct-{sub}', 'libs': _driver_libs(cfg)}
+
+    roles = sorted(core_contracts.ROLES)
+    rid = 'rc2-' + secrets.token_hex(6)
+    out_dir = Path(cfg.runs) / 'manifests'
+    out = out_dir / f'{kind}--{tag}.json'
+    commit, dirty = _harness(cfg)
+    artifacts = {name: None for name in core_contracts.OPTIONAL_BINARIES}
+    artifacts['forwarder'] = binary(base, 'forwarder')
+    artifacts['bridge'] = binary(base, 'bridge')
+    for name, source in seconds.items():
+        artifacts[name] = binary(source, name)
+    for role, name in CUT_ROLES.items():
+        artifacts[role] = {k: a[name][k] for k in ('path', 'sha256', 'source_sha')}
+    helper = Path(cfg.netfilter_helper)
+    m = {
+        'schema_version': 2, 'topology': 'core', 'run_id': rid, 'timeouts': 'production', 'image': cfg.image,
+        'state_root': str(out_dir / 'fixtures' / rid), 'failure_domain': 'single_host_process_loss',
+        'host_loss_acceptance': 'NOT_RUN_REQUIRES_SEPARATE_HOSTS',
+        'network': {'subnet': f'172.30.{cfg.octet}.0/24', 'internal': True},
+        'nodes': {role: f'172.30.{cfg.octet}.{10 + i}' for i, role in enumerate(roles)},
+        'ports': dict(core_contracts.PORT_PROFILE), 'seed': cfg.seed, 'cpu_set': list(range(10)),
+        'limits': {'shm_mb': 1024, 'memory_mb': 2048, 'disk_min_free_mb': 20480,
+                   'cpu_set_by_role': json.loads(json.dumps(CPU_SET_BY_ROLE)), 'cpu_quota_by_role': dict(CPU_QUOTA_BY_ROLE),
+                   'shm_mb_by_role': {**SHM_MB, **cfg.shm_mb}, 'memory_mb_by_role': {**MEMORY_MB, **cfg.memory_mb}},
+        'artifacts': artifacts,
+        'slot_artifacts': {**SLOTS[slot_plan], 'shadow0': None},
+        'credentials': {'ae': dict(core_contracts.AE_CREDENTIAL_ENV),
+                        'me': {'mode': 'enforced', 'keys_env': 'ME_AUTH_KEYS', 'credential_env': 'ME_AUTH_CREDENTIAL'}},
+        'me_journal_profile': 'me-journal-4', 'postgres_bin': '/usr/lib/postgresql/16/bin', 'postgres_port': cfg.pg_port,
+        'probe_libs': {lib: _cut_lib(harness[key], lib == 'aeronmd') for lib, key in PROBE_LIBS.items()},
+        'netfilter_helper': {'path': str(helper), 'files': {str(p.relative_to(helper)): {'sha256': sha(p)}
+                                                            for p in sorted(helper.rglob('*')) if p.is_file()}},
+        'manifest_kind': kind, 'harness_commit': commit, 'harness_dirty': dirty,
+        'profile_note': (f'RC2 S17 {kind} from cut {cut.get("cut_id")}: production timeouts; contract 3.4 cpu plan; C++ slots '
+                         f'{slot_driver} on {"build A ct " + CT_A_SOURCE_SHA[:7] if base == "A" else "the cut"}, engines and '
+                         f'projector {engine_driver}; shm/memory sizes are settings, not acceptance limits'),
+        'projector_driver': engine_driver,
+    }
+    for key, name in CUT_HARNESS.items():
+        e = harness[name]
+        m[key] = {'path': e['path'], 'sha256': e['sha256'], 'source_path': e['source_path'], 'source_sha256': e['source_sha256']}
+    if engine_driver == 'external':
+        m['engine_driver'] = 'external'
+        libs = _engine_libs(cfg)
+        libs.update(json.loads(json.dumps(cut_libs)))           # the cut's aeronmd under the pinned driver.properties
+        m['engine_libs'] = libs
+        m['projector_libs'] = json.loads(json.dumps(libs))
+    findings = r10_cut.check(m, cut, cut_class(kind), old_pins=pins)
+    if findings.items:
+        raise Violation(f'{kind}: the cut checker refuses the derived manifest: '
+                        + '; '.join(f'{rule} {text}' for rule, text in findings.items))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(m, indent=1) + '\n')
+    return out, m
+
+
 def _sizes(pairs):
     sizes = {}
     for pair in pairs or []:
@@ -247,17 +367,28 @@ def _sizes(pairs):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    parser.add_argument('kind', choices=sorted(KINDS)); parser.add_argument('tag')
+    parser.add_argument('kind', choices=sorted(set(KINDS) | set(KINDS17))); parser.add_argument('tag')
+    parser.add_argument('--cut', type=Path, help='RC2 S17: derive an s17 kind from this cut manifest (R10/rc2-cut-manifest.json)')
     parser.add_argument('--b-source-sha'); parser.add_argument('--build-b', type=Path)
     parser.add_argument('--octet', type=int); parser.add_argument('--pg-port', type=int)
     parser.add_argument('--shm', action='append'); parser.add_argument('--memory', action='append')
+    parser.add_argument('--runs', type=Path, help='the runs root (default local-runs/s16; the s17 kinds default to local-runs/s17)')
     args = parser.parse_args(argv)
     cfg = Config(shm_mb=_sizes(args.shm), memory_mb=_sizes(args.memory))
+    if args.kind in KINDS17 and args.runs is None:
+        args.runs = B0 / 'local-runs/s17'
     for key, value in (('b_source_sha', args.b_source_sha), ('build_b', args.build_b), ('octet', args.octet),
-                       ('pg_port', args.pg_port)):
+                       ('pg_port', args.pg_port), ('runs', args.runs)):
         if value is not None:
             setattr(cfg, key, value)
-    out, _ = build(args.kind, args.tag, cfg)
+    if args.kind in KINDS17:
+        if args.cut is None:
+            raise SystemExit(f'{args.kind} is derived from the cut: --cut <rc2-cut-manifest.json>')
+        out, _ = build_from_cut(args.kind, args.tag, args.cut, cfg)
+    elif args.cut is not None:
+        raise SystemExit(f'--cut derives the s17 kinds only; {args.kind} is an S16 kind')
+    else:
+        out, _ = build(args.kind, args.tag, cfg)
     print(out)
 
 
