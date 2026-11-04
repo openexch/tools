@@ -445,5 +445,116 @@ class V1SameRootsTest(unittest.TestCase):
         self.assertIn('projection database holds 3 row(s) in money_journal_events', report['refusals'])
 
 
+
+# ------------------------------------------------------------------ W5 findings (coordinator 2026-11-04, rc2-cut-3)
+
+class W5X1aEnvelopeTest(unittest.TestCase):
+    def test_x1a_accepts_the_envelope_refusal_of_the_tag_snapshot(self):
+        ms = [X.member(f'me{i}', 'CRITICAL: snapshot refused: snapshot envelope magic missing (length=120): refusing a bare or '
+                                  'foreign snapshot image', start_s=5 * i, exit_s=5 * i + 0.2) for i in range(3)]
+        v = judge('X-1a-emb', ms, covering(ms))
+        self.assertEqual(v['verdict'], 'REFUSED', v['reasons'])
+
+
+class W5PartialActivationTest(RecordBase):
+    def test_an_audit_of_a_partial_step_accepts_slots_not_started_yet_and_still_refuses_foreign(self):
+        m = T.audit_manifest(self.temp.name)
+        listing = T.listing_for(m)
+        listing['processes'] = [p for p in listing['processes'] if not p['role'].startswith('fwd')]
+        self.assertEqual(r10_cut.audit_check(listing, m, aeron_version='1.53.1')['status'], 'REFUSED')
+        report = r10_cut.audit_check(listing, m, aeron_version='1.53.1', not_started=('fwd0', 'fwd1'))
+        self.assertEqual(report['status'], 'OK', report['findings'])
+        self.assertEqual(sorted(report['not_started']), ['fwd0', 'fwd1'])
+        listing['processes'].append({'role': 'assets-bridge', 'running': True, 'files': {}})
+        self.assertEqual(r10_cut.audit_check(listing, m, aeron_version='1.53.1', not_started=('fwd0', 'fwd1'))['status'],
+                         'REFUSED')
+
+    def test_the_not_started_set_is_derived_from_the_steps_run(self):
+        self.assertEqual(xver.not_started_by_steps(['snapshot_genesis', 'start_tap_witness', 'me_genesis', 'arm_money_journal',
+                                                    'start_projector', 'start_bridges']), ('fwd0', 'fwd1'))
+        self.assertEqual(xver.not_started_by_steps(['snapshot_genesis', 'start_tap_witness', 'me_genesis', 'arm_money_journal',
+                                                    'start_projector']), ('bridge0', 'bridge1', 'fwd0', 'fwd1'))
+
+    def test_a_partial_activation_reads_incomplete_not_refused(self):
+        self.d.tap = self.d.tap[:1]
+        Path(self.d.commands[0]['output']).write_text('CoreConfig 1 result 3\n')
+        self.d.requests = [r for r in self.d.requests if not r['reply'].get('meEpoch')]
+        self.d.audit = {'status': 'OK', 'findings': [], 'members_up': {'me': 3, 'ae': 3}, 'stopped': [],
+                        'not_started': ['fwd0', 'fwd1']}
+        del self.d.owner['boot']['phases']['core_bound_ns']
+        self.d.write()
+        rec = self.record()
+        self.assertIn(rec['status'], ('INCOMPLETE', 'ABORTED'), rec['refusals'])
+
+
+class W5T1MarketRowsTest(unittest.TestCase):
+    T1 = ('m.next().marketId(d.marketId()).symbol(d.symbol()).baseAssetId(d.baseAsset().id())\n'
+          '        .quoteAssetId(d.quoteAsset().id()).tickSize(1).minPrice(1).maxPrice(1_000_000_000_000_000L).lotSize(0);\n')
+
+    def test_the_partial_genesis_sends_the_drivers_own_market_rows(self):
+        import core_fixture
+        rows = core_fixture.t1_market_rows(self.T1)
+        self.assertEqual(rows, {'tick': 1, 'min': 1, 'max': 10 ** 15, 'lot': 0})     # W3 sent max 10**18: tables differ -> STALE
+        with self.assertRaisesRegex(Violation, 'market rows'):
+            core_fixture.t1_market_rows('no rows here')
+
+
+class W5AeLogPositionsTest(unittest.TestCase):
+    def test_list_members_output_is_noted_without_an_argument_clash(self):
+        with tempfile.TemporaryDirectory() as d:
+            text = 'memberId=0 leaderMemberId=0 activeMembers=[ClusterMember{id=0, logPosition=4096}, ClusterMember{id=1, ' \
+                   'logPosition=4096}, ClusterMember{id=2, logPosition=4096}]'
+            f = types.SimpleNamespace(engine_driver=lambda: 'embedded',
+                                      execute=lambda role, argv, **kw: types.SimpleNamespace(
+                                          stdout=text.replace('memberId=0', f'memberId={role[2]}'), stderr=''))
+            self.assertEqual(xver._ae_log_positions(f, Path(d), bound_s=5), {'ae0': 4096, 'ae1': 4096, 'ae2': 4096})
+
+
+class W5OmitControlTest(unittest.TestCase):
+    def test_the_omit_control_drops_a_part_the_restore_needs(self):
+        self.assertNotIn('core-rollback-ctl-omit-journal', xver.CONTROLS)
+        self.assertEqual(xver.CONTROLS['core-rollback-ctl-omit-aestate']['omit'], 'ae-state')
+        full = V9RollbackJudgeTest().full()
+        d1 = json.loads(json.dumps(full)); d1['ae']['sha256'] = 'z'
+        post = V9RollbackJudgeTest.POST
+        self.assertEqual(xver.judge_rollback(full, d1, post, omitted='ae-state', smoke='PASS')['verdict'], 'PASS')
+        self.assertEqual(xver.judge_rollback(full, full, post, omitted='ae-state', smoke='PASS')['verdict'], 'FAIL')
+
+
+class W5RecordCliTest(RecordBase):
+    def test_a_run_dir_whose_result_has_no_state_root_reads_it_from_the_manifest(self):
+        (self.d.run / 'result.json').write_text(json.dumps({'status': 'PASS'}))
+        (self.d.run / 'manifest.json').write_text(json.dumps(dict(self.d.manifest, state_root=str(self.d.state))))
+        rec = self.record()
+        self.assertEqual(rec['status'], 'OK', rec['refusals'])
+
+
+
+class W5LateJoinerCatchUpTest(unittest.TestCase):
+    """X-A4 live (W5 rerun): the followers' views are stale (-1 / 96) and the leader's advances under timers, so the late
+    member's catch-up is judged in the leader's view against an earlier leader position."""
+    LEADER = ('memberId=0 leaderMemberId=0 activeMembers=[ClusterMember{id=0, isBallotSent=false, isLeader=true, leadershipTermId=1, '
+              'logPosition=%d, x=1}, ClusterMember{id=1, isBallotSent=false, isLeader=false, leadershipTermId=1, logPosition=%d, '
+              'x=1}, ClusterMember{id=2, isBallotSent=false, isLeader=false, leadershipTermId=1, logPosition=%d, x=1}]')
+    FOLLOWER = ('memberId=2 leaderMemberId=0 activeMembers=[ClusterMember{id=0, isBallotSent=false, isLeader=true, '
+                'leadershipTermId=1, logPosition=-1, x=1}, ClusterMember{id=2, isBallotSent=false, isLeader=false, '
+                'leadershipTermId=0, logPosition=96, x=1}]')
+
+    def test_only_the_leaders_own_view_counts(self):
+        self.assertIsNone(xver.leader_view(self.FOLLOWER))
+        self.assertEqual(xver.leader_view(self.LEADER % (442208, 442208, 264096)), (0, {0: 442208, 1: 442208, 2: 264096}))
+
+    def test_catch_up_against_an_earlier_leader_position(self):
+        s1 = {'leader': 0, 'positions': {0: 442208, 1: 442208, 2: 264096}}
+        s2 = {'leader': 0, 'positions': {0: 470000, 1: 470000, 2: 289632}}
+        s3 = {'leader': 0, 'positions': {0: 495000, 1: 495000, 2: 471000}}
+        self.assertFalse(xver.caught_up([s1, s2], 2)['caught_up'])
+        self.assertTrue(xver.caught_up([s1, s2, s3], 2)['caught_up'])
+        r5 = {'journal_seq': 1, 'me_epoch': 7}
+        obs = {'record5': {'me0': r5, 'me1': dict(r5), 'me2': dict(r5)}, 'late_ready': {'me2': True, 'ae2': True},
+               'ae_catch_up': {'caught_up': False}}
+        self.assertIn('did not catch up', ' '.join(xver.judge_a4(obs)['reasons']))
+
+
 if __name__ == '__main__':
     unittest.main()

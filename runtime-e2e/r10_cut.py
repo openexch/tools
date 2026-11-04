@@ -839,7 +839,7 @@ def audit_expected(m, registry=None):
     return out
 
 
-def audit_check(listing, m, registry=None, swap=None, aeron_version=None, started_only=False):
+def audit_check(listing, m, registry=None, swap=None, aeron_version=None, started_only=False, not_started=()):
     """Compare a process listing (live, from ``audit_collect``, or recorded: R08's host list, the unit-test REDs) with the
     manifest. ``swap``: {slot: (artifact a, artifact b)}, the declared upgrade_from pair accepted during that slot's swap window
     only. A member that is not Running is named; it is a finding unless it is a registered fault target (5.2 (ii))."""
@@ -847,12 +847,14 @@ def audit_check(listing, m, registry=None, swap=None, aeron_version=None, starte
     expected = audit_expected(m, registry)
     procs = {p['role']: p for p in listing.get('processes', [])}
     targets = registry.get('fault_targets') or {}
-    findings, stopped, rows, not_started = [], [], [], []
+    findings, stopped, rows, unstarted = [], [], [], []
     for role, want in expected.items():
         proc = procs.get(role)
-        if proc is None and started_only:
+        if proc is None and (started_only or role in not_started):
+            # W5 item 2: a role the step has not started yet (an activation stopped before start_bridges or
+            # start_forwarders) is named; a role that ran and stopped, or any foreign process, is still a finding
             # an X run starts only the engine under test (6): a role the scenario never started is named, not a finding
-            not_started.append(role)
+            unstarted.append(role)
             continue
         if proc is None or not proc.get('running'):
             stopped.append({'role': role, 'registered_fault_target': role in targets,
@@ -897,7 +899,7 @@ def audit_check(listing, m, registry=None, swap=None, aeron_version=None, starte
                  is not False) for e in ('me', 'ae')}
     return {'status': 'REFUSED' if findings else 'OK', 'findings': findings, 'stopped': stopped, 'members_up': up,
             'processes': rows, 'source': listing.get('source'), 'swap': {k: list(v) for k, v in (swap or {}).items()},
-            'not_started': not_started,
+            'not_started': unstarted,
             'aeron_version': aeron_version}
 
 
@@ -956,9 +958,10 @@ def audit_collect(f):
     return {'source': 'rig containers (r10_cut.audit_collect)', 'run_id': f.run_id, 'processes': procs}
 
 
-def audit_fixture(f, out=None, swap=None, aeron_version=None, started_only=False):
+def audit_fixture(f, out=None, swap=None, aeron_version=None, started_only=False, not_started=()):
     """``audit`` on a live fixture: collect, check, and (``out``) write the report: the evidence of 3.5."""
-    report = audit_check(audit_collect(f), f.m, f.registry, swap=swap, aeron_version=aeron_version, started_only=started_only)
+    report = audit_check(audit_collect(f), f.m, f.registry, swap=swap, aeron_version=aeron_version, started_only=started_only,
+                         not_started=not_started)
     if out is not None:
         Path(out).write_text(json.dumps(report, indent=1) + '\n')
     return report
@@ -1167,6 +1170,9 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
         result = run / 'result.json'
         if result.is_file():
             state_root = json.loads(result.read_text()).get('state_root')
+        if state_root is None and manifest_path.is_file():
+            # W5 item 6: an X run's result.json carries no state_root (xver owns its fixtures); the manifest names it
+            state_root = json.loads(manifest_path.read_text()).get('state_root')
         if state_root is None:
             rec.say('REFUSED', f'run evidence missing: {result} (state_root)')
     if not manifest_path.is_file():

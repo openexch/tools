@@ -66,7 +66,7 @@ class CaseTableTest(unittest.TestCase):
                                               'core-xver-ctl-me-old-same-a', 'core-xver-ctl-me-old-same-b',
                                               'core-xver-ctl-me-old-same-c', 'core-xver-ctl-ae-old-same-a',
                                               'core-xver-ctl-ae-old-same-c',
-                                              'core-rollback-ctl-omit-journal', 'core-rollback-ctl-omit-pgdump'})
+                                              'core-rollback-ctl-omit-aestate', 'core-rollback-ctl-omit-pgdump'})
 
 
 class SettingsTest(unittest.TestCase):

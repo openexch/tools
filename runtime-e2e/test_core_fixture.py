@@ -1736,6 +1736,9 @@ class VerifyFundedMemberAwareTest(V4Base):
 class PartialGenesisTest(V4Base):
     def fx_core(self, results=None):
         f = self.fx()
+        src = Path(self.dir) / 'T1CoreDriver.java'          # W5 item 3: the rows come from the pinned driver source
+        src.write_text('.quoteAssetId(d.quoteAsset().id()).tickSize(1).minPrice(1).maxPrice(1_000_000_000_000_000L).lotSize(0);')
+        f.m['t1_core_driver'] = {'path': str(src), 'sha256': '0' * 64, 'source_path': str(src), 'source_sha256': '0' * 64}
         self.sent = []
         results = results or {}
 
@@ -1754,7 +1757,7 @@ class PartialGenesisTest(V4Base):
         out = f.core_genesis_partial({}, 2)
         self.assertEqual([s[2]['version'] for s in self.sent], [1, 2])
         self.assertEqual(self.sent[0], ('core-config', 'probe-admin', {'version': 1, 'behavior': 1, 'genesis': f.genesis_id(1),
-                                                                     'tick': 1, 'min': 1, 'max': 10**18, 'lot': 0}))
+                                                                     'tick': 1, 'min': 1, 'max': 10**15, 'lot': 0}))
         self.assertEqual(out['results'], [[1, 'ACCEPTED'], [2, 'ACCEPTED']])
         self.assertEqual(f.registry['partial_genesis']['stop_after'], 2)
         with self.assertRaisesRegex(Violation, 'stops after CoreConfig 1 or 2'):
