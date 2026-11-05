@@ -365,5 +365,108 @@ class S17ScenarioTableTest(unittest.TestCase):
         self.assertTrue({('s17-red1', 'core-red-1'), ('s17-red2', 'core-red-2'), ('s17-a05-keep', 'core-drill-a05-keep')} <= pairs)
 
 
+class EntryEnvironmentTest(unittest.TestCase):
+    """RC2 S17 W6 fix round item 2. RED 5d0339f: entry 26 (s17-ctl-edk-cnctimeout) ran without ENGINE_DRIVER_SKIP=1 and was
+    INCONCLUSIVE 3/3 ('edk-cnctimeout needs ENGINE_DRIVER_SKIP=1 on its own manifest (5.2)'). S16 set it in its driver script
+    for that kind only (S16/evidence/w6/run1.sh:6); the night sets it for that kind and scenario only, and strips it elsewhere."""
+
+    def env_of(self, entry, outer):
+        seen = {}
+
+        def popen(argv, **kw):
+            seen.update(kw['env']); return types.SimpleNamespace(wait=lambda timeout=None: 0)
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, outer, clear=False), \
+                mock.patch.object(nightly.subprocess, 'Popen', popen), open(Path(d) / 'log', 'w') as log:
+            nightly.Host().run_entry(entry, Path(d) / 'm.json', Path(d) / 'out', log, 10)
+        return seen
+
+    def test_the_cnc_timeout_control_alone_runs_with_engine_driver_skip(self):
+        env = self.env_of({'kind': 's17-ctl-edk-cnctimeout', 'scenario': 'core-control-edk-cnctimeout'}, {})
+        self.assertEqual(env.get('ENGINE_DRIVER_SKIP'), '1')
+        for entry in ({'kind': 's17-ext', 'scenario': 'core-drill-c13-enginedriverkill'},
+                      {'kind': 's17-ctl-edk-cnctimeout', 'scenario': 'core-drill-c13-enginedriverkill'},
+                      {'kind': 's17-ext', 'scenario': 'core-control-edk-cnctimeout'}):
+            with self.subTest(entry=entry):
+                self.assertNotIn('ENGINE_DRIVER_SKIP', self.env_of(entry, {'ENGINE_DRIVER_SKIP': '1'}))
+        self.assertEqual(nightly.entry_env({'kind': 's17-ctl-edk-cnctimeout', 'scenario': 'core-control-edk-cnctimeout'}, {}),
+                         {'ENGINE_DRIVER_SKIP': '1'})
+
+    def test_the_derived_cnc_manifest_accepts_the_setting_and_others_refuse_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = {'manifest_kind': 's17-ctl-edk-cnctimeout', 'engine_driver': 'external'}
+            path = Path(d) / 's17-ctl-edk-cnctimeout--night-26.json'
+            self.assertEqual(core_contracts.check_engine_driver_skip(m, path, '1'), ('ae0', 'me0'))
+            with self.assertRaisesRegex(Violation, 'ENGINE_DRIVER_SKIP is refused outside'):
+                core_contracts.check_engine_driver_skip(dict(m, manifest_kind='s17-ext'), Path(d) / 's17-ext--night-17.json', '1')
+
+
+class RepoPathsTest(unittest.TestCase):
+    """RC2 S17 W6 fix round item 5. RED 5d0339f: a night from the pinned archive read r10_cut.REPO_PATHS['tools'] as the
+    unpacked harness-<sha>/ (not a git repo), so the cut checker could not read the probe sources at harness_commit (W6
+    aborted-env/, every entry INCONCLUSIVE in 8 s); W6 needed R10_TOOLS_REPO / R10_CT_REPO by hand. The night passes both."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.dir = Path(self.temp.name)
+        self.tools, self.ct = self.dir / 'tools', self.dir / 'ct'
+        for repo in (self.tools, self.ct):
+            repo.mkdir(); subprocess.run(['git', '-C', str(repo), 'init', '-q'], check=True)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def launch(self, *extra, env=None):
+        execs = []
+        harness = self.dir / 'h' / 'runtime-e2e'; harness.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(nightly, 'prepare_harness', lambda repo, commit, root: harness.parent), \
+                mock.patch.object(nightly.os, 'execv', lambda exe, argv: execs.append((argv, dict(os.environ)))), \
+                mock.patch.dict(os.environ, env or {}, clear=False), \
+                mock.patch.dict(nightly.r10_cut.REPO_PATHS, {}, clear=False):
+            try:
+                nightly.main_with(['--plan', str(self.dir / 'p.json'), '--evidence-root', str(self.dir / 'e'),
+                                   '--harness-commit', 'a' * 40, '--tools-repo', str(self.tools), *extra])
+            except (Violation, OSError, ValueError):
+                pass
+            paths = dict(nightly.r10_cut.REPO_PATHS)
+        return execs, paths
+
+    def test_the_launcher_passes_both_repos_to_the_archived_night(self):
+        execs, _ = self.launch('--ct-repo', str(self.ct), env={'R10_TOOLS_REPO': '/nowhere', 'R10_CT_REPO': '/nowhere'})
+        self.assertTrue(execs)
+        argv, env = execs[0]
+        self.assertEqual(argv[argv.index('--ct-repo') + 1], str(self.ct.resolve()))
+        self.assertEqual(env['R10_TOOLS_REPO'], str(self.tools.resolve()))
+        self.assertEqual(env['R10_CT_REPO'], str(self.ct.resolve()))
+
+    def test_the_ct_repo_default_is_a_setting_and_a_non_git_dir_is_refused(self):
+        execs, _ = self.launch(env={'NIGHTLY_CT_REPO': str(self.ct)})
+        self.assertEqual(execs[0][1]['R10_CT_REPO'], str(self.ct.resolve()))
+        plain = self.dir / 'plain'; plain.mkdir()
+        with mock.patch.object(nightly, 'prepare_harness', lambda repo, commit, root: self.dir), \
+                mock.patch.object(nightly.os, 'execv', lambda exe, argv: self.fail('a non-git ct repo must not launch')):
+            with self.assertRaisesRegex(Violation, 'not a git repository'):
+                nightly.main_with(['--plan', str(self.dir / 'p.json'), '--evidence-root', str(self.dir / 'e'),
+                                   '--harness-commit', 'a' * 40, '--tools-repo', str(self.tools), '--ct-repo', str(plain)])
+
+    def test_the_night_itself_reads_the_repos_it_was_given(self):
+        harness = self.dir / 'h'
+        with mock.patch.object(nightly, 'prepare_harness', lambda repo, commit, root: harness), \
+                mock.patch.object(nightly, '__file__', str(harness / 'runtime-e2e' / 'nightly.py')), \
+                mock.patch.object(nightly, 'pinned_plan', lambda plan, h: (_ for _ in ()).throw(Violation('stop here'))), \
+                mock.patch.dict(nightly.r10_cut.REPO_PATHS, {}, clear=False), mock.patch.dict(os.environ, {}, clear=False):
+            (harness / 'runtime-e2e').mkdir(parents=True)
+            with self.assertRaisesRegex(Violation, 'stop here'):
+                nightly.main_with(['--plan', str(self.dir / 'p.json'), '--evidence-root', str(self.dir / 'e'),
+                                   '--harness-commit', 'a' * 40, '--tools-repo', str(self.tools), '--ct-repo', str(self.ct)])
+            self.assertEqual(nightly.r10_cut.REPO_PATHS['tools'], self.tools.resolve())
+            self.assertEqual(nightly.r10_cut.REPO_PATHS['cluster-tools'], self.ct.resolve())
+            self.assertEqual(os.environ['R10_TOOLS_REPO'], str(self.tools.resolve()))
+
+    def test_the_unit_template_names_both_repos(self):
+        text = (Path(__file__).with_name('systemd') / 'runtime-e2e-nightly.service').read_text()
+        self.assertRegex(text, r'(?m)^Environment=NIGHTLY_CT_REPO=\S+$')
+        self.assertIn('--tools-repo ${RUNTIME_E2E_REPO}', text)
+        self.assertIn('--ct-repo ${NIGHTLY_CT_REPO}', text)
+
+
 if __name__ == '__main__':
     unittest.main()

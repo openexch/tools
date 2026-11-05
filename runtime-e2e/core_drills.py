@@ -550,7 +550,7 @@ A04_HALT_PHASE_S = 60                         # life-1 tap beyond the story: fre
                                               # the halt ~5 s and the funding done ~12 s after the ME restart (W9 stops 0.2-0.3 s),
                                               # then 640 s idle on 420; the default is 60 s, a setting (SETTINGS)
 SETTINGS = {
-    'A05_P999_SLACK_MS': 10,                  # PO-2 (a): swap p99.9 <= baseline p99.9 + slack; default 10 ms (W6: ~150-sample windows, 5 ms flaked; PO 2026-11-03)
+    'A05_P999_SLACK_MS': 20,                  # PO-2 (a): swap p99.9 <= baseline p99.9 + slack; default 20 ms (S17 W6: the replacement's session setup costs 16-28 ms on the 1-CPU ME; PO 2026-11-05; was 10, S16 PO 2026-11-03)
     'A05_DUP_EDGE_SLACK': 10,                 # the in-flight count at the window edges; W5 measured duplicates - dispatches = -1
     'A05_SETTLE_LAG_SLACK': 40,               # [E] trades; W0 measured a lag of 10-36 trades (answers-14.2 item 6)
     'SWAP_WINDOW_MIN_S': 1.0,                 # proposed 20.1: W0 measured swap windows of 1.45-1.49 s (answers item 5)
@@ -974,11 +974,21 @@ def _t0_s(w):
 
 
 def line_build_witness(w):
+    """Both swaps happened, each witnessed by /health.build: before the swap the slot answers what the swapped-out binary
+    reports, after it what the swapped-in binary reports (core_contracts.health_build_expected: the source sha, or none for
+    the pinned build A, ct 2be3a19, which has no build field), the bytes differ and the swapped-in one is the manifest's build B
+    (``b_source_sha``). RC2 S17 W6 fix round item 3: the reverse kind (cut -> build A) is judged by the same rule."""
     swaps = w.get('swaps') or []
-    out = [{'slot': s['slot'], 'pre_build': s.get('pre_build'), 'build': s['replace'].get('build_health'),
-            'old_sha256': s['replace']['old']['sha256'], 'new_sha256': s['replace']['new']['sha256']} for s in swaps]
-    ok = len(out) == 2 and all(o['pre_build'] is None and o['build'] == w['b_source_sha'] and o['old_sha256'] != o['new_sha256']
-                               for o in out)
+    out = []
+    for s in swaps:
+        old, new = s['replace']['old'], s['replace']['new']
+        out.append({'slot': s['slot'], 'pre_build': s.get('pre_build'), 'build': s['replace'].get('build_health'),
+                    'old_sha256': old['sha256'], 'new_sha256': new['sha256'],
+                    'want_pre_build': core_contracts.health_build_expected(old),
+                    'want_build': core_contracts.health_build_expected(new), 'new_source_sha': new.get('source_sha')})
+    ok = len(out) == 2 and all(o['pre_build'] == o['want_pre_build'] and o['build'] == o['want_build']
+                               and o['pre_build'] != o['build'] and o['old_sha256'] != o['new_sha256']
+                               and o['new_source_sha'] == w['b_source_sha'] for o in out)
     return _line(ok, {'swaps': out, 'b_source_sha': w.get('b_source_sha')})
 
 
@@ -3217,8 +3227,9 @@ def scenario(fixture, scenario_name, out_dir):
     if name not in DRILLS:
         raise Inconclusive('scenario is not implemented and cannot pass: ' + scenario_name)
     if not red:
-        # 20.1 line 2 (PO): A03 phase 1 runs ct_forwarder_nc_norelease in both forwarder slots, on an s16-a03* manifest only
-        a03 = name == 'a03-lifetime' and str(fixture.m.get('manifest_kind', '')).startswith('s16-a03')
+        # 20.1 line 2 (PO): A03 phase 1 runs ct_forwarder_nc_norelease in both forwarder slots, on a manifest of an A03 kind
+        # (S16 or the S17 cut) that declares that swap and nothing more (RC2 S17 W6 fix round item 1)
+        a03 = name == 'a03-lifetime' and core_contracts.a03_phase1_declared(fixture.m)
         for slot in FORWARDERS + BRIDGES:
             artifact = fixture.m['slot_artifacts'].get(slot)
             if artifact in {'forwarder_b', 'bridge_b'} and not (a03 and slot in FORWARDERS and artifact == 'forwarder_b'):

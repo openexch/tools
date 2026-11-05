@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import shutil
 import struct
+import subprocess
 import tempfile
 import types
 import unittest
@@ -340,6 +341,7 @@ class V13NightlyPinTest(unittest.TestCase):
 
     def test_the_launcher_re_execs_with_the_tools_repo(self):
         execs = []
+        subprocess.run(['git', '-C', str(self.dir), 'init', '-q'], check=True)   # W6 fix round item 5: a git work tree
         harness = self.dir / 'h' / 'runtime-e2e'; harness.mkdir(parents=True)
         with mock.patch.object(self.nightly, 'prepare_harness', lambda repo, commit, root: harness.parent), \
                 mock.patch.object(self.nightly.os, 'execv', lambda exe, argv: execs.append(argv)), \

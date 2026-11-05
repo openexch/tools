@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """T2 nightly on the dev box (critic D20; RC2 S17 carry X5, contract 5.4): a local systemd timer runs this, never a GitHub runner.
 
-usage: nightly.py --plan nightly-cut.json --evidence-root DIR [--harness-commit SHA] [--tools-repo DIR] [settings]
+usage: nightly.py --plan nightly-cut.json --evidence-root DIR [--harness-commit SHA] [--tools-repo DIR] [--ct-repo DIR] [settings]
        nightly.py --template core-template.json --evidence-root DIR [--scenario S ...]    the pre-S17 path (core-smoke)
 
 A plan lists entries ``{kind, scenario}``; every entry derives its OWN manifest from the cut (``mk_manifests.build_from_cut``, so one
@@ -67,11 +67,12 @@ class Settings:
     stop_grace_s: float = 180         # RC2 S17 review V17: the runner's SIGTERM-to-SIGKILL grace, a setting
     cut_sha256: str = None            # review V13 (c): the cut the night derives from, by sha256 and id
     cut_id: str = None
+    repos: dict = None                # W6 fix round item 5: the tools and cluster-tools repos the cut checker reads
 
     def record(self):
         return {'lock': self.lock, 'bound_s': self.bound_s, 'after_interrupt': self.after_interrupt, 'load_max': self.load_max,
                 'cut': self.cut, 'cut_sha256': self.cut_sha256, 'cut_id': self.cut_id, 'template': self.template,
-                'keep_state': self.keep_state, 'stop_grace_s': self.stop_grace_s}
+                'keep_state': self.keep_state, 'stop_grace_s': self.stop_grace_s, 'repos': self.repos}
 
 
 def _number(env, key, default):
@@ -144,6 +145,33 @@ def derive(template, template_path, scenario):
     """A fresh run identity from the template; the child file keeps the template's kind in its name (20.1 line 20)."""
     path, _ = child_manifest(template, Path(template_path).absolute().parent, scenario)
     return path
+
+
+def entry_env(entry, env):
+    """RC2 S17 W6 fix round item 2: the per-entry settings of the runner's environment. ENGINE_DRIVER_SKIP=1 (5.2) only for the
+    edk-cnctimeout control on its own kind (as S16's driver script did, ``S16/evidence/w6/run1.sh:6``); every other entry runs
+    without it (``Host.run_entry`` strips an inherited value), and ``core_contracts.check_engine_driver_skip`` still refuses it on
+    any other manifest."""
+    if entry.get('scenario') == 'core-control-edk-cnctimeout' and entry.get('kind') in core_contracts.EDK_CNCTIMEOUT_KINDS:
+        return {'ENGINE_DRIVER_SKIP': '1'}
+    return {}
+
+
+def git_repo(path, what):
+    """An existing git work tree (absolute), or a refusal: the cut checker reads the probe and driver sources from it."""
+    path = Path(path).resolve()
+    if not path.is_dir() or _git(path, 'rev-parse', '--git-dir', check=False).returncode:
+        raise Violation(f'{what} {path} is not a git repository')
+    return path
+
+
+def use_repos(tools_repo, ct_repo):
+    """RC2 S17 W6 fix round item 5: the night from ``harness-<sha>/`` is no git repo, so ``r10_cut.REPO_PATHS`` (read by the
+    cut checker at every derivation, in this process and in each runner child) is set from the night's own flags."""
+    tools, ct = git_repo(tools_repo, '--tools-repo'), git_repo(ct_repo, '--ct-repo')
+    os.environ['R10_TOOLS_REPO'], os.environ['R10_CT_REPO'] = str(tools), str(ct)
+    r10_cut.REPO_PATHS.update({'tools': tools, 'cluster-tools': ct})
+    return tools, ct
 
 
 # ------------------------------------------------------------------ pinned harness
@@ -285,7 +313,8 @@ class Host:
 
     def run_entry(self, entry, manifest, output, log, timeout):
         """Runs runner.py from this harness; returns ('DONE', exit code) or ('TIMEOUT', code) after stopping it at ``timeout``."""
-        env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
+        env = {k: v for k, v in os.environ.items() if k != 'ENGINE_DRIVER_SKIP'}
+        env.update(entry_env(entry, env), PYTHONDONTWRITEBYTECODE='1')
         process = subprocess.Popen([sys.executable, '-s', str(Path(__file__).with_name('runner.py')), '--manifest', str(manifest),
                                     '--scenario', entry['scenario'], '--output', str(output)],
                                    stdout=log, stderr=subprocess.STDOUT, env=env)
@@ -395,6 +424,8 @@ def _run_locked(plan, night, unfinished, work_root, settings, host, summary, sta
             index, entry = pending[0]
             remaining = settings.bound_s - (host.monotonic() - started)
             record = {'index': index, 'kind': entry['kind'], 'scenario': entry['scenario']}
+            if entry_env(entry, {}):
+                record['env'] = entry_env(entry, {})
             if remaining <= 0:
                 break
             summary['entries'].append(record); pending.pop(0)
@@ -495,6 +526,8 @@ def main_with(argv, host=None):
     parser.add_argument('--evidence-root', required=True, type=Path)
     parser.add_argument('--scenario', action='append', help='with --template: the scenarios (default core-boots-10, core-smoke)')
     parser.add_argument('--tools-repo', type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument('--ct-repo', type=Path, default=Path(os.environ.get('NIGHTLY_CT_REPO') or r10_cut.REPO_PATHS['cluster-tools']),
+                        help='the cluster-tools repo the cut checker reads the T1 driver sources from (setting NIGHTLY_CT_REPO)')
     parser.add_argument('--harness-commit', default=env.harness_commit)
     parser.add_argument('--harness-root', type=Path, help='where harness-<sha>/ is unpacked (default: next to the evidence root)')
     parser.add_argument('--work-root', type=Path, help='manifests and fixture state of the night (default: next to the evidence root)')
@@ -509,6 +542,7 @@ def main_with(argv, host=None):
         # review V13 (a): an unset NIGHTLY_HARNESS_COMMIT expands to "" in ExecStart; a night never falls back to HEAD
         raise Violation('an empty harness commit: --plan nights run only on a pinned NIGHTLY_HARNESS_COMMIT')
     commit = args.harness_commit or _git(args.tools_repo, 'rev-parse', 'HEAD').stdout.decode().strip()
+    tools_repo, ct_repo = use_repos(args.tools_repo, args.ct_repo)
     harness_root = args.harness_root or args.evidence_root.resolve().parent / 'harness'
     harness = prepare_harness(args.tools_repo, commit, harness_root)        # refuses a dirty harness before anything else
     if host is None and Path(__file__).resolve().parent != (harness / 'runtime-e2e').resolve():
@@ -516,14 +550,16 @@ def main_with(argv, host=None):
         flags = [a for a in argv]
         if '--harness-commit' not in flags:
             flags += ['--harness-commit', commit]
-        if '--tools-repo' in flags:                 # review V13 (d): always the real repo, absolute, never harness-<sha>
-            flags[flags.index('--tools-repo') + 1] = str(args.tools_repo.resolve())
-        else:
-            flags += ['--tools-repo', str(args.tools_repo.resolve())]
+        for flag, repo in (('--tools-repo', tools_repo), ('--ct-repo', ct_repo)):
+            if flag in flags:                       # review V13 (d): always the real repo, absolute, never harness-<sha>
+                flags[flags.index(flag) + 1] = str(repo)
+            else:
+                flags += [flag, str(repo)]
         os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
         os.execv(sys.executable, [sys.executable, '-s', str(harness / 'runtime-e2e' / 'nightly.py')] + flags)
     settings = Settings(lock=args.lock, bound_s=args.bound_s, after_interrupt=args.after_interrupt, load_max=args.load_max,
                         harness_commit=commit, cut=args.cut, keep_state=args.keep_state,
+                        repos={'tools': str(tools_repo), 'cluster-tools': str(ct_repo)},
                         template=str(args.template.absolute()) if args.template else None)
     if args.template:
         template = json.loads(args.template.read_text())

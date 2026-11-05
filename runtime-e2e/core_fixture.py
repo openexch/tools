@@ -694,18 +694,46 @@ class CoreFixture(Fixture):
         check_genesis_order(phases)
         self.audit_genesis()
 
-    def audit_genesis(self):
+    def audit_genesis(self, life=1):
         """Contract 7.2 / review V10: right after every s17 genesis the audit (3.5) is taken into ``audit.json`` of the state
-        root; runner.py turns it and the run's evidence into ``rc2-activation-record.json``. Never fatal: the record judges it."""
+        root (``audit-life<n>.json`` for a later core life, W6 fix round item 4); runner.py turns it and the run's evidence into
+        the activation record of that life. Never fatal: the record judges it."""
+        if not str(self.m.get('manifest_kind', '')).startswith('s17'):
+            return None
+        import r10_cut
+        path = self.root / ('audit.json' if life == 1 else f'audit-life{life}.json')
+        try:
+            return r10_cut.audit_fixture(self, path)
+        except Exception as error:
+            path.write_text(json.dumps({'status': 'ERROR', 'error': str(error)[:500], 'findings':
+                                        [str(error)[:300]], 'stopped': [], 'members_up': {}}) + '\n')
+            return None
+
+    def evidence_marks(self):
+        """W6 fix round item 4: the row counts of the two evidence logs the activation record reads; a regenesis records them
+        where its life begins, so each life's record reads its own rows only."""
+        def rows(name):
+            path = self.root / name
+            return sum(1 for line in path.read_text().splitlines() if line.strip()) if path.is_file() else 0
+        return {'commands': rows('commands.jsonl'), 'core_requests': rows('core-requests.jsonl')}
+
+    def capture_core_genesis(self, life):
+        """W6 fix round item 4: the core's recorded genesisId of ``life`` is in the AE log recordings that regenesis('core')
+        is about to wipe; the reader output (r10_cut.genesis_reader) is kept in the state root with its sha256 first. s17 kinds
+        (the ones that issue activation records); an error is recorded as the capture, so the record cannot read OK."""
         if not str(self.m.get('manifest_kind', '')).startswith('s17'):
             return None
         import r10_cut
         try:
-            return r10_cut.audit_fixture(self, self.root / 'audit.json')
+            reader = r10_cut.genesis_reader(self.root, r10_cut.load_money_schema(self.m['artifacts']['ae']['path']))
         except Exception as error:
-            (self.root / 'audit.json').write_text(json.dumps({'status': 'ERROR', 'error': str(error)[:500], 'findings':
-                                                              [str(error)[:300]], 'stopped': [], 'members_up': {}}) + '\n')
-            return None
+            reader = {'status': 'not observable', 'genesis_id': None, 'error': str(error)[:300], 'members': {}}
+        path = self.root / f'core-genesis-life{life}.json'
+        path.write_text(json.dumps(reader, indent=1) + '\n')
+        entry = {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+        self.registry.setdefault('lives', {}).setdefault(str(life), {})['core_genesis_reader'] = entry
+        self.save()
+        return entry
 
     def run_genesis_steps(self, plan, order, phases):
         for step, phase in order:
@@ -1524,7 +1552,8 @@ class CoreFixture(Fixture):
         if scope == 'me':
             life = self.life('me') + 1
             gid = self.genesis_id(life)
-            lives[str(life)] = {'me': {'genesis_id': gid, 'ledger_capacity': plan.get('ledger_capacity', 100_000)}}
+            lives[str(life)] = {'me': {'genesis_id': gid, 'ledger_capacity': plan.get('ledger_capacity', 100_000)},
+                                'evidence_from': {'me': self.evidence_marks()}}      # W6 item 4: where life n's ME rows begin
             phases = boot_lives.setdefault(str(life), {}).setdefault('me_phases', {})
             phases['started_ns'] = time.time_ns()
             for fwd in ('fwd0', 'fwd1'):      # 20.1 line 6: they exit 78 (F8_EPOCH) a few seconds after the first ME start
@@ -1546,6 +1575,7 @@ class CoreFixture(Fixture):
         if 'me' not in lives.get(str(life), {}):
             raise Violation(f'regenesis core needs the ME re-genesis of life {life} first (regenesis(plan, "me"))')
         gid = self.genesis_id(life)
+        lives[str(life)].setdefault('evidence_from', {})['core'] = self.evidence_marks()   # W6 item 4: life n's core rows
         lives.setdefault(str(life - 1), {})['records'] = copy.deepcopy(
             {k: self.registry.get(k) for k in ('tap', 'funding', 'genesis', 'genesis_snapshot', 'risk', 'slots')})
         exited, stops = {}, []
@@ -1562,16 +1592,19 @@ class CoreFixture(Fixture):
             if role in containers and self.inspect('container', containers[role])['State']['Running']:
                 stops.append(self.stop(role, heal_bound_s=REGENESIS_HEAL_BOUND_S))
         self.reset_projection()        # V6: the life's projection is dumped BEFORE the AE (its source) is wiped
+        self.capture_core_genesis(life - 1)      # W6 item 4: the life's core genesisId, read before its AE log is wiped
         wipes = [self.wipe_engine(f'ae{i}') for i in range(3)]
         self.start_members('ae')
         lives[str(life)]['core'] = {'genesis_id': gid}
         self.registry['funding'] = []
         phases = boot_lives.setdefault(str(life), {}).setdefault('phases', {})
         self.run_genesis_steps(plan, LIFE2_CORE_ORDER, phases)
-        self.registry['genesis'] = {'genesis_id': gid, 'ledger_capacity': plan.get('ledger_capacity', 100_000), 'life': life}
+        self.registry['genesis'] = {'genesis_id': gid, 'ledger_capacity': plan.get('ledger_capacity', 100_000), 'life': life,
+                                    'derivation': self.genesis_derivation()}       # W6 item 4: the life-2 record checks it
         lives[str(life)]['core'].update(ledger_capacity=self.registry['genesis']['ledger_capacity'])
         self.save()
         check_genesis_order(phases, expected=LIFE2_CORE_PHASES)
+        self.audit_genesis(life)
         return self.record_fault({'kind': 'regenesis', 'scope': 'core', 'life': life, 'genesis_id': gid,
                                   'forwarders_exited': exited, 'stop_exit_codes': {(s or {}).get('target'): (s or {}).get('exit_code')
                                                                                    for s in stops},

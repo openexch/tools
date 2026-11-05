@@ -155,8 +155,15 @@ def main():
                 try:
                     import r10_cut
                     shutil.copyfile(fixture.root / 'audit.json', args.output / 'audit.json')
-                    record, _ = r10_cut.write_activation_record(args.output, state_root=fixture.root)
-                    result['activation_record'] = {'status': record['status'], 'refusals': record['refusals']}
+                    for later in sorted(fixture.root.glob('audit-life*.json')):     # W6 item 4: a later core life's audit
+                        shutil.copyfile(later, args.output / later.name)
+                    # W6 item 4: one final record per core life (A04 regenesis has two genesisIds by design)
+                    records = r10_cut.write_activation_records(args.output, state_root=fixture.root)
+                    record = max((r for r, _ in records), key=lambda r: r10_cut.STATUS_ORDER.index(r['status']))   # the worst life
+                    result['activation_record'] = {'status': record['status'], 'refusals': record['refusals'],
+                                                   'life': record['life']}
+                    result['activation_records'] = [{'life': r['life'], 'file': path.name, 'status': r['status'],
+                                                     'refusals': r['refusals']} for r, path in records]
                 except Exception as error:
                     result['activation_record'] = {'status': 'ERROR', 'error': str(error)[:300]}
             commands = fixture.root / 'commands.jsonl'

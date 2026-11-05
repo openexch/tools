@@ -392,6 +392,35 @@ class FixtureManifestTest(CheckerBase):
         m['artifacts']['ae'] = {'path': str(p), 'sha256': h(b'foreign'), 'source_sha': SHAS['assets']}
         self.assertEqual(r10_cut.check(m, self.w.m, 'rig', old_pins=self.w.pins).by_rule(), ['K4'])
 
+    def a03(self, kind, target='ct_forwarder_nc_norelease', slots=None):
+        """An A03-shaped rig manifest: ``forwarder_b`` a negative target of the cut's ct commit (its stamp inside)."""
+        m = self.fixture()
+        p = self.w.put(f'artifacts/{target}', b'nc ' + SHAS['cluster-tools'].encode())
+        m['manifest_kind'] = kind
+        m['artifacts']['forwarder_b'] = {'path': str(p), 'sha256': h(p.read_bytes()), 'source_sha': SHAS['cluster-tools'],
+                                         'driver': 'external', 'target': target}
+        m['slot_artifacts'] = slots or {'fwd0': 'forwarder_b', 'fwd1': 'forwarder_b', 'bridge0': 'bridge', 'bridge1': 'bridge',
+                                        'shadow0': None}
+        return m
+
+    def test_the_declared_a03_phase_1_exception_and_nowhere_else(self):
+        """RC2 S17 W6 fix round item 1 (S16 20.1 line 2, PO): a negative target in a GREEN rig kind is refused (K3); the A03
+        kinds stage ct_forwarder_nc_norelease in both forwarder slots with build A as forwarder; the RED kinds stage theirs.
+        RED 5d0339f: the checker accepted the A03 negative staging on any rig kind (s17 included)."""
+        for kind in ('s17-a03', 's17-a03-embedded'):
+            with self.subTest(kind=kind):
+                self.assertEqual(r10_cut.check(self.a03(kind), self.w.m, 'rig', old_pins=self.w.pins).items, [])
+        red = self.a03('s17-red-a03'); red['artifacts']['forwarder'] = None
+        self.assertEqual(r10_cut.check(red, self.w.m, 'rig', old_pins=self.w.pins).items, [])
+        for why, m in {'GREEN kind': self.a03('s17'), 'A05 kind': self.a03('s17-a05'),
+                       'other nc target': self.a03('s17-a03', target='ct_forwarder_nc_noresync'),
+                       'one slot only': self.a03('s17-a03', slots={'fwd0': 'forwarder_b', 'fwd1': 'forwarder',
+                                                                   'bridge0': 'bridge', 'bridge1': 'bridge', 'shadow0': None})}.items():
+            with self.subTest(refused=why):
+                found = r10_cut.check(m, self.w.m, 'rig', old_pins=self.w.pins)
+                self.assertEqual(found.by_rule(), ['K3'], found.items)
+                self.assertIn('S16 20.1 line 2', ' '.join(t for _, t in found.items))
+
     def test_a_fixture_manifest_needs_its_cut(self):
         self.assertEqual(r10_cut.check(self.fixture(), None).by_rule(), ['K9'])
 
@@ -577,6 +606,39 @@ class AuditTest(unittest.TestCase):
         row['files'] = {'/artifacts/forwarder_b/bin': self.m['artifacts']['forwarder_b']['sha256'],
                         '/artifacts/forwarder_b/aeronmd': h(b'md')}
         self.assertEqual(r10_cut.audit_check(listing2, self.m, registry=reg, aeron_version='1.53.1')['status'], 'OK')
+
+    def test_build_a_without_a_health_build_field_is_judged_by_its_bytes(self):
+        """RC2 S17 W6 fix round item 4. RED 5d0339f: the genesis audit of every A05 kind (slots on build A, ct 2be3a19) was
+        REFUSED, 'fwd0: /health.build None is not the source sha 2be3a1999ca1' x4, so the final records of entries 12, 13, 14,
+        21, 27 read REFUSED in all three passes. Build A predates the field; its identity is its pinned sha256. Only those
+        bytes may answer no build; build A answering one, or any other binary answering none, is still refused."""
+        import core_contracts
+        a = self.m['artifacts']
+        for name in ('forwarder', 'bridge'):
+            a[name]['source_sha'] = '2' * 40
+        absent = {a['forwarder']['sha256']: 'ct-2be3a19/ct-forwarder', a['bridge']['sha256']: 'ct-2be3a19/ct-bridge'}
+        listing = listing_for(self.m)
+        for row in listing['processes']:
+            if row['role'] in r10_cut.SLOT_ROLES:
+                row.pop('build', None)
+        self.assertEqual(self.audit(listing)['status'], 'REFUSED')                  # not pinned as build-field-absent
+        with mock.patch.dict(core_contracts.HEALTH_BUILD_ABSENT, absent):
+            report = self.audit(listing)
+            self.assertEqual(report['status'], 'OK', report['findings'])
+            reporting = copy.deepcopy(listing)
+            next(p for p in reporting['processes'] if p['role'] == 'fwd0')['build'] = '2' * 40
+            self.assertIn('fwd0: /health.build 222222222222 but ct-2be3a19/ct-forwarder has no build field',
+                          ' '.join(self.audit(reporting)['findings']))
+            foreign = listing_for(self.m, [('bridge1', '/artifacts/bridge/bin', 'f' * 64)])
+            next(p for p in foreign['processes'] if p['role'] == 'bridge1').pop('build', None)
+            self.assertEqual(self.audit(foreign)['status'], 'REFUSED')
+            # the declared upgrade pair in its window: build A (none) or build B (its source sha) both answer
+            swapped = copy.deepcopy(listing)
+            row = next(p for p in swapped['processes'] if p['role'] == 'fwd0')
+            row.update(build=a['forwarder_b']['source_sha'], files=dict(row['files'], **{
+                '/artifacts/forwarder/bin': a['forwarder_b']['sha256']}))
+            self.assertEqual(self.audit(swapped, swap={'fwd0': ('forwarder', 'forwarder_b')})['status'], 'OK')
+            self.assertEqual(self.audit(swapped)['status'], 'REFUSED')
 
     def test_red_a_host_aeronmd_of_another_version(self):
         listing = listing_for(self.m)
@@ -842,6 +904,98 @@ class ActivationRecordTest(unittest.TestCase):
         (d.run / 'manifest.json').write_text(json.dumps(dict(d.manifest, run_id='rc2-000000000002')))
         rec = r10_cut.activation_record(d.run, journal_schema=ME_JOURNAL)
         self.assertEqual(rec['status'], 'REFUSED')
+
+    def two_lives(self, d, gid2=None, capture=True, boundary=True):
+        """The A04 regenesis shape on a RunDir: life 1 as built, then regenesis('me') (boundary, ME wiped, a life-2 record 5),
+        regenesis('core') (boundary, the life-1 core reader captured before the AE wipe, life-2 CoreConfig frames, life-2
+        genesis tool, money-dump, tap, phases, audit-life2.json)."""
+        rid = d.manifest['run_id']
+        gid1 = int(core_contracts.derive_genesis_id(rid, 1), 16)
+        gid2 = int(core_contracts.derive_genesis_id(rid, 2), 16) if gid2 is None else gid2
+        t0 = 1_793_726_196_000_000_000 + 600 * 10**9
+        lives = d.owner['lives']
+        lives['2'] = {'me': {'genesis_id': hex(gid2)}}
+        if boundary:
+            lives['2']['evidence_from'] = {'me': {'commands': len(d.commands), 'core_requests': len(d.requests)}}
+        for m in ('me0', 'me1', 'me2'):
+            d.command(['JournalProbe', 'dump', f'source={m}'], 0, record5(gid2, source=m))
+        d.requests.append({'verb': 'money-dump', 'reply': {'meEpoch': gid1, 'lastAppliedJournalSeq': 40}, 'at_ns': t0})
+        if boundary:
+            lives['2']['evidence_from']['core'] = {'commands': len(d.commands), 'core_requests': len(d.requests)}
+        lives['1']['records'] = {'genesis': copy.deepcopy(d.owner['genesis']), 'tap': copy.deepcopy(d.owner['tap'])}
+        lives['1']['tap'] = copy.deepcopy(d.owner['tap'])
+        if capture:
+            reader = r10_cut.genesis_reader(d.state, r10_cut.load_money_schema(d.manifest['artifacts']['ae']['path']))
+            path = d.state / 'core-genesis-life1.json'; path.write_text(json.dumps(reader))
+            lives['1']['core_genesis_reader'] = {'path': str(path), 'sha256': h(path.read_bytes())}
+        for m in ('ae0', 'ae1', 'ae2'):                    # the AE wipe: life 2's frames only
+            write_ae_member(d.state, m, [core_config_payload(v, gid2) for v in (1, 2, 3)])
+        lives['2']['core'] = {'genesis_id': hex(gid2)}
+        d.command(['T1CoreDriver', 'genesis', '/dev/shm/probe-aeron', 'x', hex(gid2)], 0,
+                  'CoreConfig 1 result 0\nCoreConfig 2 result 0\nCoreConfig 3 result 0\nGLOBAL OPEN (bound through the bridge)\n')
+        d.requests.append({'verb': 'money-dump', 'reply': {'meEpoch': gid2, 'lastAppliedJournalSeq': 1}, 'at_ns': t0 + 8})
+        tap2 = d.state / 'state/probe/tap-life2.jsonl'
+        tap2.write_text(''.join(json.dumps({'tap': 'admission', 'row': {'market': 0, 'state': s, 'reason': r, 'log_position': p,
+                                                                     'at_ms': t0 // 10**6 + k * 1000}}) + '\n'
+                                for k, (s, r, p) in enumerate((('SUSPENDED', 'GENESIS', 6304), ('OPEN', 'ADMIN', 9000)), 1)))
+        lives['2']['tap'] = {'path': str(tap2)}
+        d.owner['tap'] = {'path': str(tap2)}
+        d.owner['boot']['lives'] = {'2': {'phases': {'genesis_snapshot_ns': t0 + 1, 'tap_started_ns': t0 + 2,
+                                                     'bridges_ready_ns': t0 + 4, 'core_bound_ns': t0 + 5,
+                                                     'first_deposit_ns': t0 + 6, 'funded_ns': t0 + 7,
+                                                     'forwarders_ready_ns': t0 + 9 * 10**9}}}
+        d.owner['genesis'] = {'genesis_id': hex(gid2), 'ledger_capacity': 100000, 'life': 2,
+                              'derivation': {'rule': core_contracts.GENESIS_DERIVATION, 'run_id': rid}}
+        d.write()
+        (d.run / 'audit-life2.json').write_text(json.dumps(d.audit))
+        return gid1, gid2
+
+    def test_a_regenesis_run_gets_one_final_record_per_life(self):
+        """RC2 S17 W6 fix round item 4. RED 5d0339f: entry 10 (s17-ext a04-regenesis) wrote ONE record, life 1, REFUSED 3/3:
+        'genesisId derivation missing' (owner.genesis was life 2's, written without the derivation) and 'core genesisId
+        ...141 != ME genesisId ...139' (the core id read from the life-2 AE, the ME id from the first, life-1, dump). A04 has
+        two lives with two ids by design: one final record per life, each from that life's evidence."""
+        rid = 'rc2-000000000001'
+        d = RunDir(Path(self.temp.name) / 'regen', gid=int(core_contracts.derive_genesis_id(rid, 1), 16))
+        gid1, gid2 = self.two_lives(d)
+        life1 = r10_cut.activation_record(d.run, journal_schema=ME_JOURNAL)        # the W6 call: life 1, from the run dir
+        self.assertEqual(life1['status'], 'OK', life1['refusals'])
+        self.assertEqual(life1['core']['genesisId'], gid1)
+        recs = r10_cut.write_activation_records(d.run, journal_schema=ME_JOURNAL)
+        self.assertEqual([(r['life'], p.name) for r, p in recs],
+                         [(1, 'rc2-activation-record.json'), (2, 'rc2-activation-record-life2.json')])
+        for rec, _ in recs:
+            with self.subTest(life=rec['life']):
+                self.assertEqual(rec['status'], 'OK', rec['refusals'])
+        (r1, _), (r2, _) = recs
+        self.assertEqual((r1['me']['genesisId'], r1['core']['genesisId'], r1['core']['bound_epoch']), (gid1, gid1, gid1))
+        self.assertEqual((r2['me']['genesisId'], r2['core']['genesisId'], r2['core']['bound_epoch']), (gid2, gid2, gid2))
+        self.assertEqual(r2['core']['config_sequence'], [[1, 'ACCEPTED'], [2, 'ACCEPTED'], [3, 'ACCEPTED']])
+        self.assertEqual(r10_cut.check_record_set([r1, r2]), [])
+        self.assertTrue((d.run / 'rc2-activation-record-life2.json').is_file())
+
+    def test_a_regenesis_without_its_life_evidence_is_refused(self):
+        rid = 'rc2-000000000001'
+        g1 = int(core_contracts.derive_genesis_id(rid, 1), 16)
+        cases = {'no boundary': dict(boundary=False), 'life 1 core id not captured before the wipe': dict(capture=False),
+                 'life 2 reuses the life 1 id': dict(gid2=g1)}
+        texts = {'no boundary': 'life 2 has no me evidence boundary', 'life 1 core id not captured before the wipe':
+                 'core genesisId of life 1 was not captured before the AE wipe',
+                 'life 2 reuses the life 1 id': 'ME genesisId'}
+        for why, kw in cases.items():
+            with self.subTest(why=why):
+                d = RunDir(Path(self.temp.name) / why.replace(' ', '-'), gid=g1)
+                self.two_lives(d, **kw)
+                recs = [r for r, _ in r10_cut.write_activation_records(d.run, journal_schema=ME_JOURNAL)]
+                bad = [r for r in recs if r['status'] != 'OK']
+                self.assertTrue(bad, [r['refusals'] for r in recs])
+                self.assertTrue(any(texts[why] in t for r in bad for t in r['refusals']), [r['refusals'] for r in recs])
+                if why == 'life 2 reuses the life 1 id':
+                    self.assertIn('repeats across genesis runs', ' '.join(r10_cut.check_record_set(recs)))
+
+    def test_a_single_life_run_keeps_one_record(self):
+        recs = r10_cut.write_activation_records(self.d.run, journal_schema=ME_JOURNAL)
+        self.assertEqual([(r['life'], r['status'], p.name) for r, p in recs], [(1, 'OK', 'rc2-activation-record.json')])
 
     def test_a_repeated_genesis_id_across_records_is_refused(self):
         rec = self.record()

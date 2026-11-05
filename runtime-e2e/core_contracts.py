@@ -116,6 +116,41 @@ ENGINE_DRIVER_SKIP_MEMBERS = ('ae0', 'me0')          # 8.4 cnc_timeout_loud: one
 NC_TARGET = re.compile(r'ct_(forwarder|bridge)_nc_[a-z0-9_]+')
 CMAKE_TARGET = re.compile(r'[A-Za-z0-9_.-]{1,64}')
 A03_NC_TARGET = 'ct_forwarder_nc_norelease'           # 20.1 line 2 (PO): A03 phase 1 only
+# RC2 S17 W6 fix round items 3/4: build A (ct 2be3a19, the sealed S15 bin-s15 pinned in R10/old-artifacts.sha256) predates the
+# /health "build" field: its /health format strings have no "build" key (the cut's ct-forwarder/ct-bridge end in
+# ``"build":"%s"``). Its identity is its pinned sha256 alone. Keyed by those exact bytes, so no other binary may omit the field.
+HEALTH_BUILD_ABSENT = {
+    '75baf2994c0b898fc4fadd6cbe889b3cc189acc3ed9d0be9b0d03fa15ff513c4': 'ct-2be3a19/ct-forwarder',
+    'c6e68edc2d7bc0cde3b95c449e476cf945e1869b2a6dd85392d951fcd6eca88a': 'ct-2be3a19/ct-bridge',
+}
+
+
+def health_build_expected(entry):
+    """What ``/health.build`` of a slot binary answers: None for a pinned build without the field (HEALTH_BUILD_ABSENT, by
+    sha256), else the artifact's ``source_sha`` (absent: None, which then never equals a reported build)."""
+    entry = entry or {}
+    if entry.get('sha256') in HEALTH_BUILD_ABSENT:
+        return None
+    return entry.get('source_sha')
+
+
+# S16 20.1 line 2 (PO), a dated exception to "negative builds never share a manifest with build B": the A03 kinds of S16 and
+# of the S17 cut (mk_manifests KINDS / KINDS17, slot plan A03). RC2 S17 W6 fix round item 1: the runner keyed it on 's16-a03'.
+A03_KINDS = {'s16-a03', 's16-a03-embedded', 's17-a03', 's17-a03-embedded'}
+
+
+def a03_phase1_declared(manifest):
+    """True when ``manifest`` declares the A03 phase-1 swap of S16 20.1 line 2 and nothing more: an A03 kind, both forwarder
+    slots on ``forwarder_b`` = ``ct_forwarder_nc_norelease``, build A (a real build) staged as ``forwarder`` for the
+    ``replace_slot`` swap, both bridges on ``bridge`` and no ``bridge_b``."""
+    if manifest.get('manifest_kind') not in A03_KINDS:
+        return False
+    art, slots = manifest.get('artifacts') or {}, manifest.get('slot_artifacts') or {}
+    swap_to = art.get('forwarder') or {}
+    return (slots.get('fwd0') == 'forwarder_b' and slots.get('fwd1') == 'forwarder_b'
+            and (art.get('forwarder_b') or {}).get('target') == A03_NC_TARGET
+            and bool(swap_to) and not NC_TARGET.fullmatch(str(swap_to.get('target') or ''))
+            and art.get('bridge_b') is None and slots.get('bridge0') == 'bridge' and slots.get('bridge1') == 'bridge')
 
 
 def _file(entry, what, keys=('path', 'sha256')):

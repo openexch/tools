@@ -1314,6 +1314,47 @@ class RegenesisTest(V4Base):
         f2.regenesis({}, 'core')
         self.assertEqual([c[1] for c in calls if c[0] == 'stop'][:2], ['fwd0', 'fwd1'])
 
+    def test_regenesis_keeps_each_lifes_evidence_for_its_record(self):
+        """RC2 S17 W6 fix round item 4. RED 5d0339f: regenesis('core') replaced registry.genesis by life 2's WITHOUT its
+        derivation and took no audit, and the AE wipe erased life 1's CoreConfig frames, so no record of life 1 or life 2
+        could be read from its own evidence. Now: each regenesis scope records where its life's rows begin
+        (commands.jsonl, core-requests.jsonl), life 1's core genesis reader is captured before the AE wipe, life 2's
+        genesis keeps its derivation, and life 2 gets its own audit (audit-life2.json)."""
+        f = self.fx(); g1 = life1(f)
+        f.registry['genesis']['derivation'] = f.genesis_derivation()
+        (f.root / 'commands.jsonl').write_text('{}\n' * 7); (f.root / 'core-requests.jsonl').write_text('{}\n' * 3)
+        calls = self.recorded(f, ['stop', 'wipe_engine', 'start_members', 'me_genesis'])
+        f.regenesis({}, 'me')
+        self.assertEqual(f.registry['lives']['2']['evidence_from']['me'], {'commands': 7, 'core_requests': 3})
+        with (f.root / 'commands.jsonl').open('a') as log:
+            log.write('{}\n' * 4)
+        order = []
+        f.capture_core_genesis = lambda life: order.append(('capture', life))
+        f.audit_genesis = lambda life=1: order.append(('audit', life))
+        calls = self.recorded(f, ['stop', 'wipe_engine', 'reset_projection', 'start_members'] + self.CORE_STEPS)
+        wipe = f.wipe_engine
+        f.wipe_engine = lambda role, **kw: order.append(('wipe', role)) or wipe(role, **kw)
+        f.regenesis({'users': [1]}, 'core')
+        self.assertEqual(f.registry['lives']['2']['evidence_from']['core'], {'commands': 11, 'core_requests': 3})
+        self.assertEqual(order[0], ('capture', 1))                       # before the first AE wipe
+        self.assertEqual(order[1], ('wipe', 'ae0'))
+        self.assertEqual(order[-1], ('audit', 2))
+        self.assertEqual(f.registry['genesis']['derivation'], f.genesis_derivation())
+        self.assertEqual(f.registry['genesis']['life'], 2)
+        self.assertEqual(f.registry['lives']['1']['records']['genesis']['genesis_id'], g1)
+
+    def test_core_genesis_capture_writes_the_reader_and_its_digest(self):
+        f = self.fx()
+        f.m['manifest_kind'] = 's17-ext'
+        fake = {'status': 'observed', 'genesis_id': 7, 'members': {}}
+        import r10_cut
+        with mock.patch.object(r10_cut, 'genesis_reader', lambda root, schema: fake), \
+                mock.patch.object(r10_cut, 'load_money_schema', lambda jar: 'schema'):
+            f.capture_core_genesis(1)
+        entry = f.registry['lives']['1']['core_genesis_reader']
+        self.assertEqual(json.loads(Path(entry['path']).read_text()), fake)
+        self.assertEqual(entry['sha256'], hashlib.sha256(Path(entry['path']).read_bytes()).hexdigest())
+
     def test_regenesis_core_needs_an_me_regenesis_first(self):
         f = self.fx(); life1(f)
         with self.assertRaisesRegex(Violation, 'regenesis core needs the ME re-genesis of life 2 first'):
