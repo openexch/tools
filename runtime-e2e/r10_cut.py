@@ -600,6 +600,17 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
         staged(what, entry, FIXTURE_NAMES.get(key))
         for lib, lentry in ((entry or {}).get('libs') or {}).items():
             staged(f'{what}.libs.{lib}', lentry, lib)
+    # RC2 S17 W6 fix round item 1: in a rig kind a negative target is a RED's (a s17-red* kind) or the declared A03 phase 1
+    # (S16 20.1 line 2: an A03 kind, ct_forwarder_nc_norelease as forwarder_b in both forwarder slots, build A as forwarder);
+    # any other GREEN kind stages real builds only
+    import core_contracts
+    kind = str(m.get('manifest_kind') or '')
+    negatives = sorted(k for k, e in artifacts.items() if isinstance(e, dict) and e.get('target')
+                       and TEST_BUILD.search(str(e['target'])))
+    if negatives and cls != 'product' and not (kind.split('-', 1)[1:] or [''])[0].startswith('red') \
+            and not (core_contracts.a03_phase1_declared(m) and negatives == ['forwarder_b']):
+        f.add('K3', f'{kind}: negative target(s) {", ".join(negatives)} in a GREEN rig kind: only a RED kind or the declared '
+                    'A03 phase 1 (S16 20.1 line 2) stages one')
     for block in ('engine_libs', 'projector_libs', 'probe_libs'):
         for lib, lentry in (m.get(block) or {}).items():
             if lib in PRODUCT:
@@ -831,7 +842,10 @@ def audit_expected(m, registry=None):
         files = [{'path': f'/artifacts/{name}/bin', 'sha256': entry['sha256'], 'what': f'{name} binary'}]
         if entry.get('driver') == 'external':
             files += aeronmd(entry.get('libs'), f'/artifacts/{name}')
-        out[slot] = {'files': files, 'build': entry.get('source_sha'), 'artifact': name,
+        # W6 fix round item 4: what /health.build answers (none for the pinned build A, which predates the field)
+        import core_contracts
+        out[slot] = {'files': files, 'build': core_contracts.health_build_expected(entry), 'artifact': name,
+                     'build_absent': core_contracts.HEALTH_BUILD_ABSENT.get(entry['sha256']),
                      'aeron_version_of': files[-1]['path'] if len(files) > 1 else None}
     probe = aeronmd(m.get('probe_libs'), '/artifacts/probe')
     if probe:
@@ -876,9 +890,20 @@ def audit_check(listing, m, registry=None, swap=None, aeron_version=None, starte
                 findings.append(f'{role}: {f["path"]} was not read')
             elif got not in allowed:
                 findings.append(f'{role}: {f["path"]} sha256 {got[:12]} is not the manifest\'s {f["sha256"][:12]} ({f["what"]})')
-        if want.get('build') and proc.get('build') != want['build']:
-            if not (pair and proc.get('build') in {m['artifacts'][a].get('source_sha') for a in pair if m['artifacts'].get(a)}):
-                findings.append(f'{role}: /health.build {str(proc.get("build"))[:12]} is not the source sha {want["build"][:12]}')
+        if role in SLOT_ROLES:
+            # W6 fix round item 4: /health.build is what the expected binary answers (its source sha, or none for a pinned
+            # build without the field); during a declared swap window either side of the pair may answer
+            import core_contracts
+            wanted = {want.get('build')}
+            if pair:
+                wanted |= {core_contracts.health_build_expected(m['artifacts'][a]) for a in pair if m['artifacts'].get(a)}
+            got_build = proc.get('build')
+            if got_build not in wanted:
+                if want.get('build') is None and want.get('build_absent'):
+                    findings.append(f'{role}: /health.build {str(got_build)[:12]} but {want["build_absent"]} has no build field')
+                else:
+                    findings.append(f'{role}: /health.build {str(got_build)[:12]} is not the source sha '
+                                    f'{str(want.get("build"))[:12]}')
         if aeron_version and want.get('aeron_version_of') and proc.get('aeron_version') != aeron_version:
             findings.append(f'{role}: aeronmd version {proc.get("aeron_version")}, the cut substrate is {aeron_version}')
         rows.append({'role': role, 'ready': proc.get('ready'), 'files': proc.get('files'), 'build': proc.get('build'),
@@ -949,7 +974,7 @@ def audit_collect(f):
                 port, path = f.ready_target(role) if role != 'probe' else (None, None)
                 if port:
                     out['ready'] = f.http(role, port, path).get('status') == 200
-                if want.get('build'):
+                if role in SLOT_ROLES:            # W6 fix round item 4: every slot, so build A answering one is seen
                     body = f.http(role, port, '/health').get('body') or '{}'
                     out['build'] = json.loads(body).get('build')
             except Exception as error:          # recorded, never fatal: the check names the missing value
@@ -1155,6 +1180,36 @@ def check_record_set(records):
     return out
 
 
+def _lives(owner, scope):
+    """The lives of a run whose ``scope`` (me | core) genesis started (``owner.lives``), sorted; [1] before any record."""
+    lives = owner.get('lives') or {}
+    found = sorted(int(n) for n, rec in lives.items() if scope in (rec or {}))
+    return found or [1]
+
+
+def _life_window(owner, life, scope, key, rec):
+    """RC2 S17 W6 fix round item 4: the rows of ``key`` (commands | core_requests) that belong to ``life`` for ``scope``:
+    [the row count recorded when that life's regenesis(scope) began, the next life's count). Life 1 starts at row 0; a later
+    life, or a next life, without its recorded boundary is refused (a precondition, never all rows)."""
+    lives = owner.get('lives') or {}
+
+    def start(n):
+        if n == 1:
+            return 0
+        bound = (((lives.get(str(n)) or {}).get('evidence_from') or {}).get(scope) or {}).get(key)
+        if bound is None:
+            rec.say('REFUSED', f'life {n} has no {scope} evidence boundary ({key}): its rows cannot be told from life {n - 1}\'s')
+        return bound
+    lo = start(life)
+    hi = start(life + 1) if life + 1 in _lives(owner, scope) else None
+    return (lo or 0), hi
+
+
+def _rows_in(rows, window):
+    lo, hi = window
+    return list(enumerate(rows))[lo:hi]
+
+
 def activation_record(run_dir, journal_schema=None, state_root=None, audit=None, cut=None, life=1, record_kind='final'):
     """``rc2-activation-record.json`` of one genesis, from the run's evidence only (C3: what happened, never what was sent):
     record 5 from the JournalProbe dumps, the core genesisId from the AE log recordings, the bound epoch from money-dump, the
@@ -1199,7 +1254,7 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
     commands = _jsonl(root / 'commands.jsonl', rec)
     requests = _jsonl(root / 'core-requests.jsonl', rec)
     if audit is None:
-        audit_path = run / 'audit.json'
+        audit_path = run / ('audit.json' if life == 1 else f'audit-life{life}.json')      # W6 item 4: each life's own
         if audit_path.is_file():
             audit = json.loads(audit_path.read_text())
         else:
@@ -1208,7 +1263,16 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
     schema = sbe_layout.load(journal_schema or ME_JOURNAL_SCHEMA)
     message = schema.messages[5]
     record5, me_files = {}, []
-    for c in commands:
+    me_commands = [c for _, c in _rows_in(commands, _life_window(owner, life, 'me', 'commands', rec))]
+    core_window_commands = [c for _, c in _rows_in(commands, _life_window(owner, life, 'core', 'commands', rec))]
+    requests = [r for _, r in _rows_in(requests, _life_window(owner, life, 'core', 'core_requests', rec))]
+    genesis = owner.get('genesis') or {}
+    if int(genesis.get('life') or 1) != life:
+        # W6 item 4: an earlier life's genesis block, kept by regenesis('core') under lives[n].records
+        genesis = ((((owner.get('lives') or {}).get(str(life)) or {}).get('records') or {}).get('genesis')) or {}
+        if not genesis:
+            rec.say('REFUSED', f'run evidence missing: the genesis record of life {life} (owner.lives.{life}.records.genesis)')
+    for c in me_commands:
         argv = ' '.join(c.get('argv', []))
         hit = re.search(r'JournalProbe dump .*source=(me[0-2])', argv)
         if not hit or c.get('exit_code') != 0 or hit.group(1) in record5:
@@ -1232,7 +1296,7 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
         first = record5[sorted(record5)[0]]
         me_gid = first['me_epoch']
         me['record5'] = {k: first[k] for k in ('journal_seq', 'behavior_version', 'ledger_capacity', 'max_wire_version', 'decision')}
-        want_capacity = (owner.get('genesis') or {}).get('ledger_capacity')
+        want_capacity = genesis.get('ledger_capacity')
         for member, r in sorted(record5.items()):
             if r['behavior_version'] != 2:
                 rec.say('REFUSED', f'ME record 5 on {member}: behaviorVersion {r["behavior_version"]}, the activation needs 2')
@@ -1245,7 +1309,7 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
                                    f'{want_capacity}')
     me['genesisId'] = me_gid
     out['me'] = me
-    derivation = (owner.get('genesis') or {}).get('derivation')
+    derivation = genesis.get('derivation')
     if not derivation and str(m.get('manifest_kind', '')).startswith('s17'):
         rec.say('REFUSED', 'genesisId derivation missing: an s17 run derives its genesisId from its run_id (review V12)')
     if derivation:
@@ -1264,7 +1328,7 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
                 if reply.get('t') == 'AdminAck' and reply.get('ref') == CORE_CONFIG_TEMPLATE:
                     acks.append((r.get('at_ns') or 0, int((r.get('args') or {}).get('version', reply.get('configVersion', 0))),
                                  reply['result']))
-    for c in commands:
+    for c in core_window_commands:
         if re.search(r'\bT1CoreDriver genesis\b', ' '.join(c.get('argv', []))):
             log = Path(c['output'])
             text = log.read_text() if log.is_file() else ''
@@ -1280,7 +1344,19 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
     core = {}
     ae_jar = ((m.get('artifacts') or {}).get('ae') or {}).get('path')
     reader = None
-    if ae_jar and Path(ae_jar).is_file():
+    captured = (((owner.get('lives') or {}).get(str(life)) or {}).get('core_genesis_reader')) or None
+    if captured:
+        # W6 item 4: an earlier life's AE was wiped by regenesis('core'); its reader output was saved just before the wipe
+        path = Path(captured.get('path') or '')
+        if not path.is_file() or sha256_file(path) != captured.get('sha256'):
+            rec.say('REFUSED', f'run evidence missing or changed: the life {life} core genesis reader capture {path}')
+            reader = {'status': 'not observable', 'genesis_id': None, 'error': 'capture missing', 'members': {}}
+        else:
+            reader = json.loads(path.read_text())
+    elif life != max(_lives(owner, 'core')):
+        rec.say('REFUSED', f'core genesisId of life {life} was not captured before the AE wipe of life {life + 1}')
+        reader = {'status': 'not observable', 'genesis_id': None, 'error': 'not captured', 'members': {}}
+    elif ae_jar and Path(ae_jar).is_file():
         try:
             reader = genesis_reader(root, load_money_schema(ae_jar))
         except (ValueError, OSError) as error:
@@ -1352,11 +1428,12 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
     if opened is None:
         rec.say('INCOMPLETE', 'the gate never reached [OPEN, ADMIN]')
     # ---- phases and the forwarders after the open
-    phases = (owner.get('boot') or {}).get('phases') or {}
+    boot = owner.get('boot') or {}
+    phases = (boot.get('phases') or {}) if life == 1 else ((((boot.get('lives') or {}).get(str(life)) or {}).get('phases')) or {})
     out['phases'] = phases
     try:
-        from core_fixture import check_genesis_order
-        check_genesis_order(phases)
+        from core_fixture import check_genesis_order, GENESIS_PHASES, LIFE2_CORE_PHASES
+        check_genesis_order(phases, expected=GENESIS_PHASES if life == 1 else LIFE2_CORE_PHASES)
     except Exception as error:
         rec.say('INCOMPLETE' if 'missing' in str(error) else 'REFUSED', f'phase order: {error}')
     if opened is not None and phases.get('forwarders_ready_ns') and opened[3] is not None \
@@ -1387,6 +1464,27 @@ def write_activation_record(run_dir, out=None, **kw):
     path = Path(out) if out else Path(run_dir) / 'rc2-activation-record.json'
     path.write_text(json.dumps(record, indent=1) + '\n')
     return record, path
+
+
+def record_name(life):
+    return 'rc2-activation-record.json' if life == 1 else f'rc2-activation-record-life{life}.json'
+
+
+def write_activation_records(run_dir, state_root=None, **kw):
+    """RC2 S17 W6 fix round item 4: one final record per core life of the run (A04 regenesis has two, with two genesisIds
+    by design), ``rc2-activation-record.json`` for life 1 and ``rc2-activation-record-life<n>.json`` after it; each is read
+    from its own life's evidence. Returns [(record, path)]."""
+    run = Path(run_dir)
+    root = state_root
+    if root is None and (run / 'result.json').is_file():
+        root = json.loads((run / 'result.json').read_text()).get('state_root')
+    owner_path = Path(root) / 'owner.json' if root else None
+    owner = json.loads(owner_path.read_text()) if owner_path and owner_path.is_file() else {}
+    out = []
+    for life in _lives(owner, 'core'):
+        out.append(write_activation_record(run, run / record_name(life), state_root=state_root, life=life, **kw))
+    return out
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])

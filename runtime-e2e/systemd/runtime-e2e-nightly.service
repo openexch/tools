@@ -16,11 +16,14 @@ Type=oneshot
 Environment=RUNTIME_E2E_REPO=%h/Apps/openexchange/tools
 Environment=RUNTIME_E2E_PLAN=%h/Apps/openexchange/tools/runtime-e2e/nightly-cut.json
 Environment=RUNTIME_E2E_EVIDENCE=%h/Apps/openexchange/.runtime-handoff/nightly/evidence
+# the cluster-tools repo (a git work tree) the cut checker reads the T1 driver sources from; the tools repo is RUNTIME_E2E_REPO.
+# nightly.py hands both to the archived night as R10_TOOLS_REPO / R10_CT_REPO (harness-<sha>/ is no git repo).
+Environment=NIGHTLY_CT_REPO=%h/Apps/openexchange/cluster-tools
 Environment=NIGHTLY_HARNESS_COMMIT=REPLACE_WITH_THE_PINNED_TOOLS_COMMIT
 Environment=NIGHTLY_BOUND_S=18000
 Environment=NIGHTLY_AFTER_INTERRUPT=run
 Environment=NIGHTLY_LOAD_MAX=6
-ExecStart=/usr/bin/python3 ${RUNTIME_E2E_REPO}/runtime-e2e/nightly.py --tools-repo ${RUNTIME_E2E_REPO} --plan ${RUNTIME_E2E_PLAN} --evidence-root ${RUNTIME_E2E_EVIDENCE} --harness-commit ${NIGHTLY_HARNESS_COMMIT}
+ExecStart=/usr/bin/python3 ${RUNTIME_E2E_REPO}/runtime-e2e/nightly.py --tools-repo ${RUNTIME_E2E_REPO} --ct-repo ${NIGHTLY_CT_REPO} --plan ${RUNTIME_E2E_PLAN} --evidence-root ${RUNTIME_E2E_EVIDENCE} --harness-commit ${NIGHTLY_HARNESS_COMMIT}
 # A held heavy lock or foreign load exits 75 (SKIPPED_BUSY): a skipped night is not a failed unit.
 SuccessExitStatus=75
 Nice=5

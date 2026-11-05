@@ -14,6 +14,7 @@ import types
 import unittest
 from unittest import mock
 
+import core_contracts
 import core_drills as cd
 import core_oracle
 import core_scenarios
@@ -1415,7 +1416,9 @@ class A05LinesTest(unittest.TestCase):
         out = []
         for n, (a, b) in enumerate(((30.0, 31.6), (50.0, 51.5))):
             out.append({'slot': f'fwd{n}', 'kind': kind, 'start_s': a, 'ready_s': b, 'pre_build': None,
-                        'replace': {'old': {'sha256': 'a' * 64}, 'new': {'sha256': 'c' * 64}, 'build_health': build or self.B,
+                        'replace': {'old': {'sha256': next(iter(core_contracts.HEALTH_BUILD_ABSENT)),
+                                            'source_sha': '2be3a1999ca193c0f37db7f6e460edd652c55fa1'},
+                                    'new': {'sha256': 'c' * 64, 'source_sha': self.B}, 'build_health': build or self.B,
                                     'f7_rejected': 0, 'ready_after_kill_s': ready_after_kill if kind == 'kill' else None}})
         return out
 
@@ -1441,6 +1444,39 @@ class A05LinesTest(unittest.TestCase):
         pre = self.swaps(); pre[0]['pre_build'] = self.B
         self.assertFalse(cd.line_build_witness(self.w(swaps=pre))['holds'])     # build A must not report build B
         self.assertFalse(cd.line_build_witness(self.w(swaps=self.swaps()[:1]))['holds'])
+
+    def test_build_witness_judges_the_reverse_direction(self):
+        """RC2 S17 W6 fix round item 3. RED 5d0339f: entries 22/23 (s17-a05-reverse, cut -> build A) FAIL build_witness 9/9:
+        the line wanted 'no build before, build B after', but there the swapped-out cut binary reports its source sha and the
+        swapped-in build A (ct 2be3a19) has no /health build field. Each side is judged by what its binary reports."""
+        A = '2be3a1999ca193c0f37db7f6e460edd652c55fa1'                       # build A, ct 2be3a19 (S15 bin-s15)
+        a_fwd = next(iter(core_contracts.HEALTH_BUILD_ABSENT))
+        cut, cut_sha = 'e' * 40, 'f' * 64
+
+        def rev(build=None, pre=cut, new_sha=a_fwd, old_sha=cut_sha, n=2):
+            return [{'slot': f'fwd{i}', 'kind': 'stop', 'start_s': 30.0 + 20 * i, 'ready_s': 31.5 + 20 * i, 'pre_build': pre,
+                     'replace': {'old': {'artifact': 'forwarder', 'sha256': old_sha, 'source_sha': cut},
+                                 'new': {'artifact': 'forwarder_b', 'sha256': new_sha, 'source_sha': A},
+                                 'build_health': build, 'f7_rejected': 0}} for i in range(n)]
+        line = cd.line_build_witness(self.w(b_source_sha=A, swaps=rev()))
+        self.assertTrue(line['holds'], line)
+        refused = {'no swap: the cut binary still answers': rev(build=cut),
+                   'build A does not report a build': rev(build=A),
+                   'the swapped-out cut binary reported none': rev(pre=None),
+                   'a swapped-in binary that is not the pinned build A': rev(new_sha='9' * 64),
+                   'one swap only': rev(n=1),
+                   'same bytes': rev(new_sha=cut_sha)}
+        for why, swaps in refused.items():
+            with self.subTest(refused=why):
+                self.assertFalse(cd.line_build_witness(self.w(b_source_sha=A, swaps=swaps))['holds'])
+        # the forward direction keeps its rule: build A before (no build field), build B after
+        fwd = rev(build=self.B, pre=None)
+        for s in fwd:
+            s['replace']['old'], s['replace']['new'] = ({'artifact': 'forwarder', 'sha256': a_fwd, 'source_sha': A},
+                                                        {'artifact': 'forwarder_b', 'sha256': cut_sha, 'source_sha': self.B})
+        self.assertTrue(cd.line_build_witness(self.w(swaps=fwd))['holds'])
+        fwd[0]['pre_build'] = A
+        self.assertFalse(cd.line_build_witness(self.w(swaps=fwd))['holds'])
 
     def test_survivor_delivered_n1_control_and_a_vacuous_window(self):
         self.assertTrue(cd.line_survivor_delivered(self.w())['holds'])
@@ -1936,6 +1972,34 @@ class S16TableTest(unittest.TestCase):
             a03.m['artifacts']['forwarder_b']['target'] = 'ct-forwarder'     # past check_build_b: the slot guard itself
             with self.assertRaisesRegex(Inconclusive, 'GREEN drills run the real binaries only'):
                 cd.scenario(a03, 'core-drill-a05-fwd-upgrade', '/nonexistent')
+
+    def test_s17_a03_kinds_run_the_declared_phase_1_exception_and_nothing_else(self):
+        """RC2 S17 W6 fix round item 1. RED 5d0339f: entries 09/20 (s17-a03, s17-a03-embedded) refused before running,
+        'fwd0 stages forwarder_b: GREEN drills run the real binaries only (8.3)'. S16 20.1 line 2 (PO): A03 phase 1 runs
+        ct_forwarder_nc_norelease in both forwarder slots, build A as forwarder for the swap, on an A03 kind only."""
+        def a03(kind, target='ct_forwarder_nc_norelease', slots=None, bridge_b=None):
+            f = StubFixture(slots=slots or {'fwd0': 'forwarder_b', 'fwd1': 'forwarder_b', 'bridge0': 'bridge', 'bridge1': 'bridge'},
+                            artifacts={'forwarder_b': {'driver': 'external', 'target': target},
+                                       'forwarder': {'driver': 'external', 'target': 'ct-forwarder'},
+                                       'bridge': {'driver': 'external', 'target': 'ct-bridge'}, 'bridge_b': bridge_b})
+            f.m['manifest_kind'] = kind
+            return f
+        with mock.patch.object(cd.DrillRun, 'run', lambda self: {'status': 'PASS', 'lines': {}, 'of_rows': {}}):
+            for kind in ('s17-a03', 's17-a03-embedded', 's16-a03', 's16-a03-embedded'):
+                with self.subTest(kind=kind):
+                    self.assertEqual(cd.scenario(a03(kind), 'core-drill-a03-lifetime', '/nonexistent')['status'], 'PASS')
+            refused = {'GREEN kind': (a03('s17'), 'core-drill-a03-lifetime'),
+                       'A05 kind': (a03('s17-a05'), 'core-drill-a03-lifetime'),
+                       'other drill': (a03('s17-a03'), 'core-drill-lostack'),
+                       'other nc target': (a03('s17-a03', target='ct_forwarder_nc_noresync'), 'core-drill-a03-lifetime'),
+                       'one slot only': (a03('s17-a03', slots={'fwd0': 'forwarder_b', 'fwd1': 'forwarder', 'bridge0': 'bridge',
+                                                               'bridge1': 'bridge'}), 'core-drill-a03-lifetime'),
+                       'a bridge_b too': (a03('s17-a03', slots={'fwd0': 'forwarder_b', 'fwd1': 'forwarder_b',
+                                                                'bridge0': 'bridge_b', 'bridge1': 'bridge'},
+                                              bridge_b={'driver': 'external', 'target': 'ct-bridge'}), 'core-drill-a03-lifetime')}
+            for why, (fixture, name) in refused.items():
+                with self.subTest(refused=why), self.assertRaisesRegex(Inconclusive, 'GREEN drills run the real binaries only'):
+                    cd.scenario(fixture, name, '/nonexistent')
 
     def test_s16_red_scenarios_need_their_negative_builds(self):
         with self.assertRaisesRegex(Inconclusive, 'needs the negative build bridge_b'):
