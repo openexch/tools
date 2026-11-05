@@ -178,3 +178,31 @@ Contract: `notebook/reports/runtime-handoff-execution/RC2-me-link/S16/contract.m
   `A05_N1_HOLD_S` 5, `A04_HALT_PHASE_S` 60, `CNC_TIMEOUT_BOUND_S` 35 (measured from the engine's own driver-wait log line, not the
   container spawn), `A05_DUP_EDGE_SLACK` 10, `ENGINE_SHUTDOWN_TIMEOUT_S` 4 plus `ENGINE_STOP_SLACK_S` 1.
 
+## R10 cut, cross-version runs, activation record, nightly plan (RC2 S17, 2026-11-05)
+
+Contract: `notebook/reports/runtime-handoff-execution/RC2-me-link/S17/contract.md`. Rollout page:
+`notebook/reports/runtime-handoff-execution/R10/rc2-rcs-rollout.md`. Run every tool with plain `python3` (not `-I`: they import
+their module dir).
+
+* `r10_cut.py check <cut manifest> --old-pins <old-artifacts.sha256>`: rules K1-K10 over the cut (`ACCEPTED <name>`, exit 0;
+  else one `K<n>` line per refusal and `REFUSED`, exit 1). `--cut <cut>` checks a derived fixture manifest. `harness_commit` must
+  equal `repos.tools`, every probe source its blob at that commit, the tree clean, so every tools commit takes a new cut id.
+* `r10_cut.py audit`, `precheck`, `activation-record`, `activation-records`, `genesis-ids`: the runtime audit against the
+  manifest, the wipe precheck of runbook step 1, the RC2 step 7 record of one run (`OK`, `INCOMPLETE`, `ABORTED`, `REFUSED`;
+  `record_kind` final or intermediate; the CLI writes life 1, the harness later lives), the set check over final records, and
+  the CoreConfig `genesisId` read from each AE member's log.
+* `mk_manifests.py <kind> <tag> --cut <cut>`: the `s17*` kinds derived from the cut (19 kinds), refused when the checker
+  refuses them.
+* `xver.py`: the cross-version (new side), activation and rollback cases X-1a/b/c, X-3a/b (both driver modes), X-7, X-A1,
+  X-A2a, X-A2b, X-A3, X-A4, X-A5, X-R and their controls; `legacy_tag.py` runs the v0.5.0-beta jars (timescaledb pin, log-marker
+  readiness, `ClusterTool snapshot` seeds). Timing sizes are `XVER_*` settings (`XVER_BOUND_S` 150, `XVER_STAGGER_S` 5).
+* `core_fixture.py`: `seed_state` with witnesses, `replace_slot(keep_state)`, member-aware `verify_funded`, partial genesis and
+  `finish`; a core boot on the cut runs the ME genesis before the forwarders.
+* `nightly.py --plan nightly-cut.json --tools-repo <tools> --ct-repo <cluster-tools>`: drill and manifest pairs from a git
+  archive of the pinned tools commit, the non-blocking heavy lock (`SKIPPED_BUSY` exit 75), the preflight (`INTERRUPTED`),
+  `NIGHTLY_BOUND_S` 5 h, the night seal written last; `systemd/` holds the service template, the timeout drop-in and the timer.
+* Settings changed in S17: `A05_P999_SLACK_MS` default 20 (PO 2026-11-05: the replacement forwarder's session setup costs 16 to
+  28 ms on the 1-CPU fixture ME), still a setting.
+* Known: the order tap loses order events across an AE leader change (product behaviour, no replay by `eventSeq` before RC3's
+  `RequestOrderEvents`); the order oracle reads that as O5 INCONCLUSIVE (`tap_loss`), never FAIL.
+
