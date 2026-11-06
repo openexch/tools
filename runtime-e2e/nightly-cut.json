@@ -1,0 +1,129 @@
+{
+ "note": "RC2 S17 5.4 / 7.1 default plan, fixed order (RED-1, RED-2 on s17-red1 / s17-red2 and A05-keep added by W3).",
+ "entries": [
+  {
+   "kind": "s17",
+   "scenario": "core-drill-lostack"
+  },
+  {
+   "kind": "s17",
+   "scenario": "core-drill-coreleader"
+  },
+  {
+   "kind": "s17",
+   "scenario": "core-drill-meleader"
+  },
+  {
+   "kind": "s17",
+   "scenario": "core-drill-fwdrestart"
+  },
+  {
+   "kind": "s17",
+   "scenario": "core-drill-partition"
+  },
+  {
+   "kind": "s17",
+   "scenario": "core-drill-fwdpause"
+  },
+  {
+   "kind": "s17",
+   "scenario": "core-drill-driverkill"
+  },
+  {
+   "kind": "s17",
+   "scenario": "core-drill-lifecycle"
+  },
+  {
+   "kind": "s17",
+   "scenario": "core-drill-lifecycle-faults"
+  },
+  {
+   "kind": "s17-a03",
+   "scenario": "core-drill-a03-lifetime"
+  },
+  {
+   "kind": "s17-ext",
+   "scenario": "core-drill-a04-regenesis"
+  },
+  {
+   "kind": "s17",
+   "scenario": "core-drill-a04-one-bridge-halt"
+  },
+  {
+   "kind": "s17-a05",
+   "scenario": "core-drill-a05-fwd-upgrade"
+  },
+  {
+   "kind": "s17-a05",
+   "scenario": "core-drill-a05-fwd-kill"
+  },
+  {
+   "kind": "s17-a05",
+   "scenario": "core-drill-a05-bridge-upgrade"
+  },
+  {
+   "kind": "s17",
+   "scenario": "core-drill-a06-two-forwarders-ticks"
+  },
+  {
+   "kind": "s17",
+   "scenario": "core-drill-a01-fwdring"
+  },
+  {
+   "kind": "s17-ext",
+   "scenario": "core-drill-c13-enginedriverkill"
+  },
+  {
+   "kind": "s17-embedded",
+   "scenario": "core-drill-fwdrestart"
+  },
+  {
+   "kind": "s17-embedded",
+   "scenario": "core-drill-lifecycle"
+  },
+  {
+   "kind": "s17-a03-embedded",
+   "scenario": "core-drill-a03-lifetime"
+  },
+  {
+   "kind": "s17-a05-embedded",
+   "scenario": "core-drill-a05-fwd-upgrade"
+  },
+  {
+   "kind": "s17-a05-reverse",
+   "scenario": "core-drill-a05-fwd-upgrade"
+  },
+  {
+   "kind": "s17-a05-reverse",
+   "scenario": "core-drill-a05-bridge-upgrade"
+  },
+  {
+   "kind": "s17-red-a03",
+   "scenario": "core-red-a03"
+  },
+  {
+   "kind": "s17-red-a04",
+   "scenario": "core-red-a04"
+  },
+  {
+   "kind": "s17-ctl-edk-cnctimeout",
+   "scenario": "core-control-edk-cnctimeout"
+  },
+  {
+   "kind": "s17-a05-keep",
+   "scenario": "core-drill-a05-keep"
+  },
+  {
+   "kind": "s17-red1",
+   "scenario": "core-red-1"
+  },
+  {
+   "kind": "s17-red2",
+   "scenario": "core-red-2"
+  },
+  {
+   "kind": "s17",
+   "scenario": "core-boots-10"
+  }
+ ]
+}
