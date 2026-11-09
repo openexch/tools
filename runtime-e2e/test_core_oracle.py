@@ -61,7 +61,7 @@ class CoreOracleTest(unittest.TestCase):
         self.assertRule(variant(clean_sample(), edit), 'M4')
 
     def test_m5_amend_top_up_missing(self):
-        # Order 1003 amended 0.02@90 -> 0.03@95: the hold must be topped up by 1.05 (2.85 total).
+        # Order 1003 amended 0.02@90 -> 0.03@95: the hold must be topped up (2.85 total).
         def edit(s):
             hold = next(h for h in s['core']['holds'] if h['order'] == 1003)
             short = hold['remaining'] - q(P(90), 2 * Q)
@@ -142,7 +142,7 @@ class CoreOracleTest(unittest.TestCase):
         self.assertRule(variant(clean_sample(), lambda s: s['core'].update(last_applied_trade_id=2)), 'M10')
 
     def test_m10_bound_epoch_reads_the_cursor_against_the_core_epoch(self):
-        """RC2 S16 5.4 (X2, D-S16-6). Journal: epoch 77 trades 1..k, then epoch 99 trades 1..j with j < k; the core is bound
+        """Journal: epoch 77 trades 1..k, then epoch 99 trades 1..j with j < k; the core is bound
         to 77 with its cursor at k. RED 6380b01: M10 FAIL "lastAppliedTradeId k != max ME trade id j" (keys on the last
         journal epoch). The bound-epoch rule PASSes it and still FAILs a cursor behind the bound epoch's top."""
         def two_epochs(s, bound, cursor):

@@ -1,5 +1,5 @@
 {
-  "comment": "ME journal decoder profiles. A profile maps (schemaId, version, templateId) of each journal frame to a normalized oracle event. Each schema file is pinned by SHA-256. RC2 S1 freezes ME journal schema 4: drop its XML as schemas/me-journal-schema-4.xml, set its sha256, adjust the field names below if S1 named them differently, and set status to active. Loading refuses a pending profile, a changed file, and a mapped field the XML does not declare.",
+  "comment": "ME journal decoder profiles. A profile maps (schemaId, version, templateId) of each journal frame to a normalized oracle event. Each schema file is pinned by SHA-256. To add a schema version, drop its XML under schemas/, set its sha256, map its field names below, and set status to active. Loading refuses a pending profile, a changed file, and a mapped field the XML does not declare.",
   "profiles": {
     "me-journal-v1": {
       "status": "active",
@@ -71,7 +71,7 @@
     },
     "me-journal-4": {
       "status": "active",
-      "source": "RC2 S1 wire freeze: match-common me-journal-schema.xml (schemaId 4 v1), copied byte-identical from match c53dd20; records 1-5, every record with journalSeq + meEpoch; record 4 carries the flat 'releases' group (RC2 S15 W1, contract 5.4); records 1-3 map the ME cluster timestamp (RC2 S16 W3, contract 5.4 / F-S16-17)",
+      "source": "ME journal schema 4 wire freeze: match-common me-journal-schema.xml (schemaId 4 v1), copied byte-identical from match c53dd20; records 1-5, every record with journalSeq + meEpoch; record 4 carries the flat 'releases' group; records 1-3 map the ME cluster timestamp",
       "has_journal_seq": true,
       "schemas": [
         {

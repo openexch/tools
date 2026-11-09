@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Order oracle v2 for the core topology (rc2-rcs-harness.md 2.6, rules O1-O12).
+"""Order oracle v2 for the core topology (rules O1-O12).
 
 Same sample and decision rule as ``core_oracle``. Witnesses: the core's own replies and OrderEvent
-tap, an independent dispatch tap (TOOL session on CH_DISPATCH, harness Q4), the ME journal and the
+tap, an independent dispatch tap (TOOL session on CH_DISPATCH), the ME journal and the
 ME's resting legs (OpenOrdersSnapshot 27).
 """
 from collections import Counter, defaultdict
@@ -55,7 +55,7 @@ def o2(m):
         first = copies[0]
         for copy in copies[1:]:
             if copy['result'] == RESULT_RELEASED and first['result'] != RESULT_RELEASED:
-                continue   # L8 item 4: Model checked it is leg-less and follows a release of the order
+                continue   # Model checked it is leg-less and follows a release of the order
             if (copy['applied_position'], copy['leg'], copy['result']) != (first['applied_position'], first['leg'], first['result']):
                 raise Violation(f'command {key}: repeat outcome differs from the first '
                                 f'(position {copy["applied_position"]} vs {first["applied_position"]})')
@@ -66,7 +66,7 @@ def o2(m):
 
 
 def o3(m):
-    m.require_tap_closed()   # 5.7 rule 3: a hole in the tap is INCONCLUSIVE, never "the core never dispatched"
+    m.require_tap_closed()   # A hole in the tap is INCONCLUSIVE, never "the core never dispatched"
     attempts = defaultdict(list)
     for key, row in m.tap.items():
         high, low = key
@@ -78,7 +78,7 @@ def o3(m):
         attempts[high].append(low >> 2)
     triggered = {e['order'] for e in m.s['core_events'] if e['kind'] == 'TRIGGERED'}
     for oid, seen in attempts.items():
-        # S15 W5: a stop order's accept consumes attempt 0 and its trigger mints the child CREATE as attempt 1
+        # A stop order's accept consumes attempt 0 and its trigger mints the child CREATE as attempt 1
         # (OrderEngine.fire: attempt++), so the first dispatch of a triggered order is attempt 1 (dense from there)
         first = 1 if oid in triggered and min(seen) == 1 else 0
         if sorted(seen) != list(range(first, first + len(seen))):
@@ -124,7 +124,7 @@ def o4(m):
 
 
 def o5(m):
-    """5.7 rule 4: a non-live order with no tapped terminal is ``tap_loss`` (INCONCLUSIVE on that id) when an order-event
+    """A non-live order with no tapped terminal is ``tap_loss`` (INCONCLUSIVE on that id) when an order-event
     gap or a tap session window lies after its last tapped event; outside every window it stays a FAIL."""
     last_event = defaultdict(int)
     for event in m.s['core_events']:
@@ -221,7 +221,7 @@ def o8(m):
 
 
 def in_ordering_exception(window, row, outcome):
-    """S15 7 / D9: an inversion inside the declared window (the ids the new ME term's first resync re-sent) is recorded,
+    """An inversion inside the declared window (the ids the new ME term's first resync re-sent) is recorded,
     not judged: dispatchSeq <= until_seq and, when declared, first-applied at or after from_journal_seq."""
     if not window:
         return False
@@ -254,8 +254,8 @@ def o9(m):
 
 
 def moot_command(m, key):
-    """S15 W5: a CANCEL or AMEND the forwarders lost whose order the ME itself ended (a terminal in the journal). The core
-    resolves such an order by the ME's trade or terminal (S8 implicit ack) and clears the pending command, so the
+    """A CANCEL or AMEND the forwarders lost whose order the ME itself ended (a terminal in the journal). The core
+    resolves such an order by the ME's trade or terminal (implicit ack) and clears the pending command, so the
     forwarders' resync has nothing left to re-send and the ME never sees it: nothing is owed. A CREATE is never moot (the
     ME cannot end an order it never created) and a live order's lost cancel or amend is still a FAIL (it stays pending)."""
     if key[1] & 3 not in (1, 2):
@@ -264,19 +264,19 @@ def moot_command(m, key):
 
 
 def o10(m):
-    m.require_tap_closed()   # judged on the union of tapped and backfilled dispatches (5.7 rule 3)
+    m.require_tap_closed()   # judged on the union of tapped and backfilled dispatches
     missing = [key for key in m.tap if key not in m.first_outcome and not moot_command(m, key)]
     if missing:
         if m.declared.get('fault_open') or m.declared.get('forwarder_absent'):
             raise Inconclusive(f'{len(missing)} dispatches not applied with a declared open fault or no forwarder')
         raise Violation(f'dispatched commands never applied at the ME: {missing[:5]}')
-    # review FIX-1: the excused moot commands are counted per run, so a drill that leans on the rule shows it
+    # The excused moot commands are counted per run, so a drill that leans on the rule shows it
     return {'status': 'PASS', 'moot_excused': sum(1 for key in m.tap if key not in m.first_outcome)}
 
 
 def preempted_outcomes(m):
     """First outcomes the core can no longer match to a pending command, because the ME's own records resolved the
-    command first (S8 implicit acks): a CREATE or AMEND outcome after a trade or terminal on its leg, a CANCEL outcome
+    command first (implicit acks): a CREATE or AMEND outcome after a trade or terminal on its leg, a CANCEL outcome
     after the terminal of its leg. OrderEngine.outcomeV3 sends every such record to Table D (unmatchedV3)."""
     traded, ended, ended_orders, first, count = set(), set(), set(), set(), 0
     for event in m.journal:
@@ -293,7 +293,7 @@ def preempted_outcomes(m):
             if event['leg'] and (event['leg'] in ended or event['kind'] in (0, 2) and event['leg'] in traded):
                 count += 1
             elif not event['leg'] and event['kind'] in (1, 2) and event['order'] in ended_orders:
-                # S15 W5: a CANCEL or AMEND for an order the ME had already ended answers UNKNOWN_LEG with leg 0, so the
+                # A CANCEL or AMEND for an order the ME had already ended answers UNKNOWN_LEG with leg 0, so the
                 # leg tests above cannot see it; the order id still names the ended order (counted by the core as stale)
                 count += 1
     return count
@@ -302,8 +302,8 @@ def preempted_outcomes(m):
 def o11(m):
     """Every ME outcome record the core did not match to its pending command is counted once by Table D: stale (U3,
     U7), redundant (U2, U6) or released late (U1, a RELEASED copy). The unmatched records are the copies beyond the
-    first plus the first outcomes the ME's own trade or terminal resolved first (S15 W3 amendment: "stale + redundant ==
-    duplicates" of S14 held only while no forwarder ran; the first forwarder run counted 15 preempted, 0 copies)."""
+    first plus the first outcomes the ME's own trade or terminal resolved first (an amendment: "stale + redundant ==
+    duplicates" held only while no forwarder ran; the first forwarder run counted 15 preempted, 0 copies)."""
     quarantined = m.s['faults'].get('quarantined')
     if type(quarantined) is not int:
         raise Inconclusive('quarantine count missing')
@@ -311,7 +311,7 @@ def o11(m):
         raise Violation(f'quarantined {quarantined} != declared {m.declared.get("quarantined", 0)}')
     counters = m.s.get('counters')
     if not counters:
-        raise Inconclusive('order-engine stale/redundant counters not exported (G6)')
+        raise Inconclusive('order-engine stale/redundant counters not exported')
     duplicates = sum(len(c) - 1 for c in m.outcome_copies.values())
     released = len(m.released_repeats)
     if 'released_late' not in counters and released:

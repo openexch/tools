@@ -2,7 +2,7 @@
 """Pluggable, fail-loud decoder for ME journal frames dumped by JournalProbe.
 
 A profile (``schemas/journal-profiles.json``) names the pinned schema files and maps each
-(schemaId, templateId) to a normalized oracle event. RC2 S1's schema 4 is a pending profile until
+(schemaId, templateId) to a normalized oracle event. Schema 4 is a pending profile until
 its XML is dropped in and pinned. Anything not declared, a changed schema file, a fragmented or
 mis-sized frame, or a frame of a schema the profile does not carry stops decoding with
 ``JournalSchemaError``: the oracle never guesses a record.

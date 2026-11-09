@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""RC2 S17 W3: the cross-version (new side), activation and rollback scenarios (contract 5.2, 6, 8.2, 10, 20.1). No Docker: the
-case table, the settings, the refusal-site table with the W12 texts, the member classes and the 6.10 pass lines, the seed
+"""The cross-version (new side), activation and rollback scenarios. No Docker: the
+case table, the settings, the refusal-site table with the envelope-reader texts, the member classes and the pass lines, the seed
 witnesses, the X-7 pass line, the X-A and X-R judges, the active probe's answered rule, the runner dispatch."""
 import json
 from pathlib import Path
@@ -105,7 +105,7 @@ class RefusalSiteTest(unittest.TestCase):
         'quorum': QUORUM,
     }
 
-    def test_every_w12_text_maps_to_its_site_at_the_cut_commit(self):
+    def test_every_refusal_text_maps_to_its_site_at_the_cut_commit(self):
         for key, line in self.LINES.items():
             with self.subTest(key=key):
                 site = xver.match_site(line, 'me')
@@ -150,7 +150,7 @@ class MemberClassTest(unittest.TestCase):
 
 class StatePassLineTest(unittest.TestCase):
     def judge(self, case, members, probes=None, bound=150):
-        if probes is None:              # review V5: one attempt in flight during every member's life
+        if probes is None:              # One attempt in flight during every member's life
             probes = [{'answered': False, 'started_ns': T0, 'ended_ns': T0 + 400 * NS}]
         return xver.judge_state(case, members, list(probes), bound_s=bound, quorum_wait_ms=120000)
 
@@ -170,7 +170,7 @@ class StatePassLineTest(unittest.TestCase):
 
     def test_x1c_two_halts_and_one_quorum_exit(self):
         self.assertEqual(self.judge('X-1c-emb', log_only())['verdict'], 'REFUSED')
-        ms = log_only(); ms[2] = member('me2', '', start_s=10, running=True)       # F-S17-20: Running and unready at the bound
+        ms = log_only(); ms[2] = member('me2', '', start_s=10, running=True)       # Running and unready at the bound
         v = self.judge('X-1c-emb', ms)
         self.assertEqual(v['verdict'], 'INCONCLUSIVE')
         self.assertIn('me2 other: still Running', v['reasons'])
@@ -296,10 +296,10 @@ class X7PassLineTest(unittest.TestCase):
         obs = x7_obs()
         for s in obs['samples']:
             s['bridges']['bridge0']['health']['haltDetail'] = 'NONE'
-        obs['bridge_logs']['bridge0'] = 'verdict source 2 e 1 UNREACHABLE seq 0 epoch 0 bad none fault NONE\n'   # review V8
+        obs['bridge_logs']['bridge0'] = 'verdict source 2 e 1 UNREACHABLE seq 0 epoch 0 bad none fault NONE\n'
         self.assertEqual(xver.judge_x7(obs)['verdict'], 'INCONCLUSIVE')
 
-    def test_an_open_gate_or_a_bound_core_fails_the_w12_rule(self):
+    def test_an_open_gate_or_a_bound_core_fails_the_x7_rule(self):
         v = xver.judge_x7(x7_obs(gate_rows=[['SUSPENDED', 'GENESIS'], ['SUSPENDED', 'BRIDGE_HALT'], ['OPEN', 'ADMIN']]))
         self.assertEqual(v['verdict'], 'FAIL')
         v = xver.judge_x7(x7_obs(money=[{'meEpoch': 7, 'lastAppliedJournalSeq': 3, 'feedHalted': True,
@@ -343,7 +343,7 @@ class ActJudgeTest(unittest.TestCase):
         self.assertIn('the ME FRESH re-run wrote a second engine_config record on me1', xver.judge_a1(bad)['reasons'])
 
     def test_xa2(self):
-        import test_s17_review as R          # review V15: the full 6.8 inputs (partial acks, order, the T1MeDriver output)
+        import test_cut_review as R          # The full X-A inputs (partial acks, order, the T1MeDriver output)
         self.assertEqual(xver.judge_a2(R.a2())['verdict'], 'PASS', xver.judge_a2(R.a2())['reasons'])
         self.assertIn('the record before the recovery reads OK, want INCOMPLETE or ABORTED',
                       xver.judge_a2(R.a2(before={'status': 'OK'}))['reasons'])
@@ -419,7 +419,7 @@ class RunnerDispatchTest(unittest.TestCase):
     def test_runner_routes_the_s17_prefixes_to_xver(self):
         source = (Path(__file__).resolve().parent / 'runner.py').read_text()
         self.assertTrue("args.scenario.startswith(('core-xver-', 'core-act-', 'core-rollback-'))" in source,
-                        'runner.py does not dispatch the S17 prefixes to xver')
+                        'runner.py does not dispatch the cross-version prefixes to xver')
         self.assertEqual(xver.PREFIXES, ('core-xver-', 'core-act-', 'core-rollback-'))
 
     def test_scenario_refuses_an_unknown_name_before_touching_the_box(self):

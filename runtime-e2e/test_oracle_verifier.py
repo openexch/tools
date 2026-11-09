@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Independent verifier cases for the core oracles (RC2 S14 review, 2026-10-26).
+"""Independent verifier cases for the core oracles (review of 2026-10-26).
 
 Each case is a stream where money or ownership is wrong but every rule the implementer shipped is
 self-consistent. A case marked RED fails on the reviewed tree on purpose: it documents a false PASS
-the oracle must stop giving (review.md DEFECT-1..3, FIX-1). GREEN cases pin branches the shipped
+the oracle must stop giving. GREEN cases pin branches the shipped
 negative controls did not reach.
 """
 import unittest
@@ -24,7 +24,7 @@ def judged(sample):
 
 class OracleVerifierTest(unittest.TestCase):
 
-    # DEFECT-1 (RED): a SELL order whose hold sits on the QUOTE asset. ACK says base, the live row,
+    # RED: a SELL order whose hold sits on the QUOTE asset. ACK says base, the live row,
     # the hold row and the balances all say quote. LifecycleInvariants I4 checks holdAssetId against
     # the side; the Python port only checks the hold row against the live row.
     def test_hold_on_the_wrong_asset_for_the_side_fails(self):
@@ -37,7 +37,7 @@ class OracleVerifierTest(unittest.TestCase):
         money, _, rules = judged(variant(clean_sample(), edit))
         self.assertEqual(money['status'], 'FAIL', rules)
 
-    # DEFECT-2 (RED): trade 2's maker leg is settled to BUYER although order 1005 belongs to SELLER;
+    # RED: trade 2's maker leg is settled to BUYER although order 1005 belongs to SELLER;
     # the ME trade, the dispatch tap and the money journal all carry the wrong user, so M2/M7/M14
     # agree with each other. No rule anchors trade or dispatch users on the probe's own create log.
     def test_trade_settled_to_a_user_who_does_not_own_the_order_fails(self):
@@ -51,8 +51,8 @@ class OracleVerifierTest(unittest.TestCase):
         money, order, rules = judged(variant(clean_sample(), edit))
         self.assertIn('FAIL', {money['status'], order['status']}, rules)
 
-    # DEFECT-3 (RED): STOP_LOSS BUY 1007 declares an explicit budget of 1 quote; the core held 2 and
-    # the child spent 1. M5 must recompute the create hold for price-less BUY types (harness 2.5 M5:
+    # RED: STOP_LOSS BUY 1007 declares an explicit budget of 1 quote; the core held 2 and
+    # the child spent 1. M5 must recompute the create hold for price-less BUY types (M5:
     # "MARKET BUY budget, stop-buy stop x slippage x qty"), not read it back from the ACK.
     def test_stop_buy_hold_is_recomputed_from_the_intent(self):
         def edit(s):
@@ -63,7 +63,7 @@ class OracleVerifierTest(unittest.TestCase):
         money, _, rules = judged(variant(clean_sample(), edit))
         self.assertEqual(rules['M5']['status'], 'FAIL', rules)
 
-    # FIX-1 (RED): an open replace window under a declared fault. Contract 3.4 / LifecycleInvariants
+    # An open replace window under a declared fault. LifecycleInvariants
     # expectedResidual: holdRemaining shows the top-up while REPLACE_PENDING. The oracle must not call
     # the engine's correct hold a FAIL.
     def test_pending_top_up_in_an_open_replace_window_is_not_a_fail(self):

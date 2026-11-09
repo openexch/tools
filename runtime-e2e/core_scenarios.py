@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Core-topology scenarios for fixture v2 (RC2 S14, harness H0).
+"""Core-topology scenarios for fixture v2.
 
 ``core-boot``  boot, empty genesis on the core, three authentication refusals and one authority refusal
                (the core moves ``assets_ingress_unauthorised_total``), slot states recorded.
-``core-smoke`` H0 GREEN: funding while the gate is at GENESIS, gate OPEN, creates (one replayed) that
+``core-smoke`` GREEN: funding while the gate is at GENESIS, gate OPEN, creates (one replayed) that
                reach DISPATCH_PENDING. With no forwarder the work must stay pending and the oracles
                must say INCONCLUSIVE, never PASS; a PASS would mean they accept unapplied commands.
-``core-boots`` G15: N consecutive fresh boots (``ten_consecutive_boots`` when N = 10), flake rate kept.
+``core-boots``: N consecutive fresh boots (``ten_consecutive_boots`` when N = 10), flake rate kept.
 """
 import json
 from pathlib import Path
@@ -22,15 +22,15 @@ import order_oracle
 from oracle_model import BARRIER_COLLECTIONS
 
 BUYER, SELLER = 72001, 72002
-# The ME price band of BTC-USD is 0.01..100.00 (W0 answer 7), so the smoke prices inside it (S14's 100,000 predates the band).
+# The ME price band of BTC-USD is 0.01..100.00, so the smoke prices sit inside it (an older 100,000 predates the band).
 PRICE, QTY = 50 * FP, FP // 100
 SLIPPAGE_BPS = 500
-# Genesis plan of core-smoke (contract 5.3): funded at genesis through the TOOL principal, no forwarder slot.
+# Genesis plan of core-smoke: funded at genesis through the TOOL principal, no forwarder slot.
 SMOKE_PLAN = {'users': [BUYER, SELLER], 'markets': [1],
               'funding': [{'user': BUYER, 'asset': 0, 'amount': 50_000 * FP}, {'user': SELLER, 'asset': 1, 'amount': FP}],
               'risk': {'slippage_bps': SLIPPAGE_BPS, 'collar_bps': 5000, 'per_sec': 200, 'max_open': 40}, 'tap_ms': 60_000}
-# legacy_none is the H0 G2 RED witness (substituted, see README): a client presenting no credential, as
-# every pre-RC1 client and today's v1 fixture does, is refused by the RC1 core.
+# legacy_none is the RED witness (substituted, see README): a client presenting no credential, as
+# every older client and the v1 fixture does, is refused by an authenticating core.
 AUTH_MODES = ['legacy_none', 'unknown_key', 'wrong_secret', 'class_mismatch']
 
 
@@ -72,10 +72,10 @@ def verify_core_genesis(fixture):
 
 
 def me_refusal_control(fixture):
-    """core-boot control (RC2 S15 5.3): an S6 ME refuses a session that presents no credential. Closes the
+    """core-boot control: an authenticating ME refuses a session that presents no credential. Closes the
     ENFORCED_NOT_YET_EXERCISED placeholder; a not-enforced artifact is recorded as such, never as a pass."""
     if fixture.m['credentials']['me']['mode'] != 'enforced':
-        return 'NOT_ENFORCED_BY_ARTIFACT: ME keys provisioned; refusal lands with RC2 S6'
+        return 'NOT_ENFORCED_BY_ARTIFACT: ME keys provisioned; refusal lands with an authenticating ME'
     result = fixture.me_open_legs_unauthenticated()
     text = (result.stdout or '') + (result.stderr or '')
     if result.returncode == 0:
@@ -96,8 +96,8 @@ def authentication_controls(fixture):
             raise Inconclusive(f'connect ({mode}) failed, but not by an authentication refusal: {reply.get("error")}')
         controls[mode] = 'REFUSED'
         if mode == 'legacy_none':
-            controls['g2_legacy_witness'] = {
-                'substitutes': 'H0 RED "a boot of a9a865d with today\'s fixture fails on authentication"',
+            controls['legacy_witness'] = {
+                'substitutes': 'RED "a boot of a9a865d with today\'s fixture fails on authentication"',
                 'client': 'CoreProbe with NullCredentialsSupplier (what the v1 fixture clients present)',
                 'refusal': reply['error']}
     before = unauthorised_total(fixture)
@@ -190,14 +190,14 @@ def money_journal(fixture):
 
 def merge_member_lives(events, has_journal_seq):
     """One member's journal as one logical sequence. A member that was killed and restarted starts a NEW archive recording
-    and re-journals the whole log it replays from journalSeq 1 (S15 W5 finding F-S15-31: me2 of lifecycle-faults held two
+    and re-journals the whole log it replays from journalSeq 1 (found on me2 of lifecycle-faults, which held two
     recordings, 1..1233 then 1..1465, a second engine_config included). A journalSeq that appears in more than one
     recording must carry the same content in each (the journal is a function of the log), then it counts once; the same
     seq with different content is a divergence and stays a Violation. Without journalSeq (legacy profiles) nothing is merged."""
     plain = [{k: v for k, v in e.items() if k not in {'source', 'recording', 'position'}} for e in events]
     if not has_journal_seq or len({e.get('recording') for e in events}) <= 1:
         return plain
-    # RC2 S16 5.4: keyed on (meEpoch, journalSeq), so two ME lives (a re-genesis restarts journalSeq at 1) never merge;
+    # Keyed on (meEpoch, journalSeq), so two ME lives (a re-genesis restarts journalSeq at 1) never merge;
     # epochs keep the order of their first appearance
     order = {epoch: n for n, epoch in enumerate(dict.fromkeys(e.get('me_epoch') for e in plain))}
     by_seq = {}
@@ -220,19 +220,19 @@ def me_journal(fixture):
     return decoded['me0'], profile.has_journal_seq
 
 
-# G6 export of the AE leader -> sample['counters'] (OM:37), so O11 is judged (OO:231-237)
+# The counter export of the AE leader -> sample['counters'] (OM:37), so O11 is judged (OO:231-237)
 COUNTER_METRICS = {'stale_outcomes': 'assets_order_stale_outcomes_total', 'redundant_outcomes': 'assets_order_redundant_outcomes_total',
                    'stale_terminals': 'assets_order_stale_terminals_total', 'conflicts': 'assets_order_conflicts_total',
-                   'released_late': 'assets_released_late_total'}    # U1: RELEASED copies (L8 item 4, O11 W3)
+                   'released_late': 'assets_released_late_total'}    # U1: RELEASED copies (O11)
 SCRAPE_PREFIXES = {
     'ae': ('assets_cluster_role', 'assets_pending_commands', 'assets_order_', 'assets_release_confirm_stale_total', 'assets_market_',
            'assets_released_late_total', 'assets_me_release_early_total', 'assets_late_apply_on_dead_order_total',
            'assets_release_backlog', 'assets_me_ledger_size',                   # O-F4 (RUN:372-380)
-           # RC2 S16 5.4: the capacity gate, the release path, the feed latch, the ticks
+           # The capacity gate, the release path, the feed latch, the ticks
            'assets_release_', 'assets_me_capacity_', 'assets_feed_', 'assets_ticks_', 'assets_last_applied_trade_id'),
     'me': ('match_cluster_role', 'match_engine_next_journal_seq', 'match_durable_', 'match_command_ledger_size',
            'match_ingress_decode_rejects_total', 'match_ingress_unauthorized_total',    # O-F1 (RUN:331-338)
-           'match_command_ledger_', 'match_release_', 'match_orders_submitted_total', 'match_trades_total'),   # S16 5.4
+           'match_command_ledger_', 'match_release_', 'match_orders_submitted_total', 'match_trades_total'),
     'fwd': ('forwarder_resync_total', 'forwarder_session_reconnect_total', 'forwarder_session_new_leader_total',
             'forwarder_dispatch_seq', 'forwarder_ready', 'forwarder_tick_', 'forwarder_ticks_ready'),
     'bridge': ('bridge_ae_connected', 'bridge_ready', 'bridge_not_ready_bits', 'bridge_state', 'bridge_halted',
@@ -241,8 +241,8 @@ SCRAPE_PREFIXES = {
 
 
 def barrier_scrape(fixture, skip_me=False):
-    """The contract 5.6 scrape set, per role. Names a role does not export are simply absent (the oracle reads
-    sample.counters, this is evidence); a slot that is not STARTED is not scraped. ``skip_me``: RC2 S16 5.4, A04 life 1
+    """The scrape set, per role. Names a role does not export are simply absent (the oracle reads
+    sample.counters, this is evidence); a slot that is not STARTED is not scraped. ``skip_me``: A04 life 1
     is judged on the ME frozen before the wipe, so the fresh ME is not read."""
     ports = fixture.m['ports']
     targets = [(f'{e}{i}', e, ports[e + '_metrics']) for e in (('ae',) if skip_me else ('ae', 'me')) for i in range(3)]
@@ -261,7 +261,7 @@ def barrier_scrape(fixture, skip_me=False):
 
 
 def observe(fixture, frozen=None):
-    """One barrier observation. ``frozen`` (RC2 S16 5.4, R6): A04 life 1's ME evidence read BEFORE the wipe
+    """One barrier observation. ``frozen``: A04 life 1's ME evidence read BEFORE the wipe
     ({me_journal, me_journal_seq, me_open_legs, scrape_me}); the fresh ME is then never queried."""
     money, orders = money_dump(fixture), order_dump(fixture)
     pending = _ok(*fixture.core('pending-dump', 'probe-forwarder'), 'pending-dump')
@@ -289,7 +289,7 @@ def observe(fixture, frozen=None):
             'holds': sorted(money['holds'], key=lambda h: h['order']),
             'live_orders': orders, 'last_applied_trade_id': money['lastAppliedTradeId'],
             'pending_dispatch': {'count': pending['count'], 'head': pending['head']}}
-    # RC2 S16 3.3 / 5.4: the v7 FeedPositionReport fields money-dump exports since W2 (meEpoch, lastAppliedJournalSeq,
+    # The v7 FeedPositionReport fields money-dump exports (meEpoch, lastAppliedJournalSeq,
     # feedHalted, haltReason); absent on an older probe, then M10 keeps its old rule
     for name, key in (('bound_me_epoch', 'meEpoch'), ('feed_cursor', 'lastAppliedJournalSeq'), ('feed_halted', 'feedHalted'),
                       ('halt_reason', 'haltReason')):
@@ -329,7 +329,7 @@ def core_smoke(fixture):
               'declared': {'settle_fault': 0, 'settle_rejected': 0, 'order_fault': 0, 'quarantined': 0, 'halt': False,
                            'fault_open': False, 'forwarder_absent': all(fixture.slots[s]['state'] != 'STARTED' for s in ('fwd0', 'fwd1')),
                            'gate_sequence': [['SUSPENDED', 'GENESIS'], ['OPEN', 'ADMIN']],
-                           'epochs': [int(fixture.genesis_id(), 16)]}}    # W0: the journal's meEpoch is the genesis id
+                           'epochs': [int(fixture.genesis_id(), 16)]}}    # The journal's meEpoch is the genesis id
     observations = []
     for obs in (first, second):
         view = dict(sample, **{k: obs[k] for k in ['core', 'me_journal', 'me_open_legs', 'money_journal', 'money_journal_legs']})
@@ -363,16 +363,16 @@ def core_smoke(fixture):
             'child_exit_codes': [0], 'oracle_status': {'money': money['status'], 'order': orders['status']},
             'order_inconclusive_rules': sorted(inconclusive), 'pending_orders': pending,
             'dispatches_tapped': len(sample['dispatch_tap']),
-            'scope': 'H0 smoke: pending without a forwarder is INCONCLUSIVE by design; not product acceptance'}
+            'scope': 'smoke: pending without a forwarder is INCONCLUSIVE by design; not product acceptance'}
 
 
-# ------------------------------------------------------------------ G15 boot stability
+# ------------------------------------------------------------------ boot stability
 
 
 def consecutive_boots(manifest, manifest_path, output, count):
     children, parent = [], Path(manifest_path).absolute().parent
     for index in range(count):
-        # RC2 S17 (20.1 line 20): <kind>--<run_id>-boot-NN.json, the name the S16 kind rule accepts
+        # <kind>--<run_id>-boot-NN.json, the name the kind rule accepts
         child_manifest, derived = core_contracts.child_manifest(manifest, parent, f'boot-{index:02d}')
         destination = output / f'boot-{index:02d}'
         started = time.monotonic()
@@ -401,4 +401,4 @@ def consecutive_boots(manifest, manifest_path, output, count):
     (output / (name + '.json')).write_text(json.dumps({**record, 'children': children}, indent=2) + '\n')
     return {'status': 'PASS' if passes == count else 'FAIL', 'assertions': count, 'processed': count, 'skipped': 0,
             'child_exit_codes': [c['exit_code'] for c in children], name: record, 'children': children,
-            'scope': 'G15 boot stability, functional fixture profile (R-T: no latency claim)'}
+            'scope': 'boot stability, functional fixture profile (no latency claim)'}

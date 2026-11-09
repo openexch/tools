@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""RC2 S17 cut checker (contract 3.1, 3.3, 5.1, 8.1; critic X5, D-S17-4, D-S17-6). The R10-A03 "artifact bound to a single source
-SHA" mechanism of the RC2 lane: a harness tool, not the R10 release gate.
+"""Release cut checker: every artifact of a cut is bound to a single source SHA. A harness tool, not the release gate itself.
 
-usage: r10_cut.py check <manifest> [--cut <cut manifest>] [--class product|rig|rig-xver|nightly] [--old-pins <file>]
-       r10_cut.py record-builds <out.json> <name>=<repo>:<source_sha>:<path>[,<path>...] ...
-       r10_cut.py audit <state root | listing.json> --manifest <m> [--cut <cut>] [--swap SLOT=A,B]     (3.5, RC2 S17 W3)
-       r10_cut.py precheck <state root>... [--pg-rows <rows.json>] [--aeron-dir <dir>]                (3.5, runbook step 1)
-       r10_cut.py activation-record <run dir> [--audit <audit.json>]                                   (section 10)
-       r10_cut.py genesis-ids <state root> --schema <money-schema.xml | AE jar>                        (5.2 (v))
+usage: release_cut.py check <manifest> [--cut <cut manifest>] [--class product|rig|rig-xver|nightly] [--old-pins <file>]
+       release_cut.py record-builds <out.json> <name>=<repo>:<source_sha>:<path>[,<path>...] ...
+       release_cut.py audit <state root | listing.json> --manifest <m> [--cut <cut>] [--swap SLOT=A,B]
+       release_cut.py precheck <state root>... [--pg-rows <rows.json>] [--aeron-dir <dir>]                (runbook step 1)
+       release_cut.py activation-record <run dir> [--audit <audit.json>]
+       release_cut.py genesis-ids <state root> --schema <money-schema.xml | AE jar>
 
 ``check`` takes either the cut manifest itself (schema ``rc2-cut/1``) or a fixture manifest derived from it (schema_version 2,
 ``manifest_kind`` s17-*, checked against ``--cut``). It prints one line per refusal, ``K<n> <text>``, and exits 1 when any rule
-refuses, 0 when none does. The rules (3.3):
+refuses, 0 when none does. The rules:
   K1  an artifact without sha256, without a 40-hex source_sha, with tree_dirty true, or whose file re-hash differs
   K2  an embedded schema identity that differs from ``schemas`` (Java: the sha256 of the schema XML resources in the jar; C++: the
       schema sha256 strings compiled into the binary, the identity its start line prints, ct/app/bridge/main.cpp:143-144)
@@ -21,7 +20,7 @@ refuses, 0 when none does. The rules (3.3):
       of that source in the build record are byte-equal and equal the artifact; binary-build-info: the build record holds the
       artifact and the binary carries the source sha (or, for the Aeron driver files, the substrate Aeron version); attested is
       refused in a product kind); the upgrade_from / old_artifacts exemption only in rig kinds and only when pinned in
-      R10/old-artifacts.sha256
+      the old-artifact pins (``--old-pins``, default ``$CUT_OLD_PINS``)
   K5  a retired artifact (assets-bridge, oms-app, match-gateway) in a core-topology manifest
   K6  a genesis block with ME behaviour != 2, maxWireVersion != 12, a core sequence other than 1 -> 2 -> 3, two genesisId values,
       or a constant genesisId in a product kind
@@ -30,7 +29,12 @@ refuses, 0 when none does. The rules (3.3):
   K9  an unknown key, a missing required key, a short sha (a per-member artifact key is unknown by design)
   K10 two engine jars built against different cluster-kit pins, or a pin other than the substrate's
 
-``rules`` is the test seam of 5.1 (C6): a RED manifest is refused with the rule's text, and passes with that rule switched off.
+``rules`` is the test seam: a RED manifest is refused with the rule's text, and passes with that rule switched off.
+
+Environment (no machine defaults; a path that is needed and unset stops with a message naming its variable):
+  CUT_OLD_PINS    the old-artifact pins file (``old-artifacts.sha256``) when ``--old-pins`` is not given
+  CUT_TOOLS_REPO  the tools git work tree the probe sources are read from (default: the checkout this file lives in)
+  CUT_CT_REPO     the cluster-tools git work tree the T1 driver sources are read from
 """
 import argparse
 import hashlib
@@ -42,19 +46,22 @@ import re
 import sys
 import zipfile
 
+from machine_paths import env_path
+
 SCHEMA = 'rc2-cut/1'
 RULES = tuple(f'K{n}' for n in range(1, 11))
 CLASSES = ('product', 'rig', 'rig-xver', 'nightly')
 RIG_CLASSES = ('rig', 'rig-xver', 'nightly')
 REPOS = ('assets', 'match', 'cluster-kit', 'cluster-tools', 'tools')
 SCHEMA_NAMES = ('money', 'order', 'me_journal')
-# The one heavy-job lock of S17 (0.2, 20.1 line 1): set here and in S17/evidence/dry-run/env.sh, recorded in every summary.json.
-HEAVY_LOCK = '/tmp/claude-1000/-home-emre-Apps-openexchange/de45670d-240c-4516-be8a-a5827d03f716/scratchpad/heavy.lock'
-B0 = Path('/home/emre/Apps/openexchange/.runtime-handoff/20260927-r00')
-R10 = B0 / 'workspace/notebook/reports/runtime-handoff-execution/R10'
-OLD_PINS = R10 / 'old-artifacts.sha256'
 
-# Product artifacts of the cut (3.1): repo, language, derivations accepted in a product kind, embedded schema identities.
+
+def old_pins_path():
+    """The old-artifact pins file (``CUT_OLD_PINS``): the pre-cut builds a rig kind may stage, one pin per line."""
+    return env_path('CUT_OLD_PINS', 'the old-artifact pins file (old-artifacts.sha256)')
+
+
+# Product artifacts of the cut: repo, language, derivations accepted in a product kind, embedded schema identities.
 PRODUCT = {
     'match-cluster.jar': {'repo': 'match', 'lang': 'java', 'engine': True,
                           'schemas': {'order': 'sbe/order-schema.xml', 'me_journal': 'sbe/me-journal-schema.xml'}},
@@ -98,7 +105,7 @@ class Findings:
     def __init__(self, rules):
         self.rules = set(rules)
         self.items = []
-        self.waived = []          # RC2 S17 review V2: harness drift findings a rig manifest waived with a named reason
+        self.waived = []          # Harness drift findings a rig manifest waived with a named reason
 
     def add(self, rule, text):
         if rule in self.rules and (rule, text) not in self.items:
@@ -114,7 +121,7 @@ def sha256_file(path):
 
 
 def load_old_pins(path):
-    """R10/old-artifacts.sha256: ``<sha256>  <name>  source_sha=<40 hex>  recipe=<path>  recipe_sha256=<64 hex>`` per line."""
+    """The old-artifact pins: ``<sha256>  <name>  source_sha=<40 hex>  recipe=<path>  recipe_sha256=<64 hex>`` per line."""
     pins = {}
     path = Path(path)
     if not path.is_file():
@@ -152,7 +159,7 @@ def _shas(f, what, entry):
 
 
 def _rehash(f, what, entry, need_source=True):
-    """K1: sha256 present, 40-hex source_sha, tree_dirty false, the file re-hash equal."""
+    """sha256 present, 40-hex source_sha, tree_dirty false, the file re-hash equal."""
     digest = entry.get('sha256')
     if not (isinstance(digest, str) and HEX64.fullmatch(digest)):
         f.add('K1', f'{what}: no sha256')
@@ -231,7 +238,7 @@ def _derived_k4(f, name, entry, spec, repos, record, aeron_version, cls):
         elif shas[0] != entry.get('sha256'):
             f.add('K4', f'{name}: the rebuild of {source} is {shas[0]}, the artifact is {entry.get("sha256")} (not derived)')
         else:
-            # RC2 S17 review V3: two BUILDS, not one file listed twice: distinct real paths in distinct build roots, neither of
+            # Two BUILDS, not one file listed twice: distinct real paths in distinct build roots, neither of
             # them the artifact itself
             art = os.path.realpath(str(entry.get('path', '')))
             paths = {os.path.realpath(str(b.get('path', ''))) for b in builds}
@@ -254,18 +261,18 @@ def _derived_k4(f, name, entry, spec, repos, record, aeron_version, cls):
             f.add('K4', f'{name}: the binary does not carry its {what} {token} (binary-build-info not shown)')
 
 
-# RC2 S17 review V2: the harness programs come from the cut's own commits (the probe sources of tools at harness_commit, the T1
+# The harness programs come from the cut's own commits (the probe sources of tools at harness_commit, the T1
 # drivers of cluster-tools at repos.cluster-tools); a stale probe or a stale harness_commit is refused.
 HARNESS_SOURCES = {'core_probe': ('tools', 'runtime-e2e/java/CoreProbe.java'),
                    'journal_probe': ('tools', 'runtime-e2e/java/JournalProbe.java'),
                    't1_me_driver': ('cluster-tools', 'app/forwarder/it/T1MeDriver.java'),
                    't1_core_driver': ('cluster-tools', 'app/forwarder/it/T1CoreDriver.java')}
-REPO_PATHS = {'tools': Path(os.environ.get('R10_TOOLS_REPO', str(Path(__file__).resolve().parent.parent))),
-              'cluster-tools': Path(os.environ.get('R10_CT_REPO', str(B0 / 'workspace/cluster-tools-s16wt')))}
+REPO_PATHS = {'tools': Path(os.environ.get('CUT_TOOLS_REPO', str(Path(__file__).resolve().parent.parent))),
+              'cluster-tools': env_path('CUT_CT_REPO', 'the cluster-tools git work tree the T1 driver sources are read from')}
 
 
 def git_blob(repo, commit, rel):
-    """The bytes of ``rel`` at ``commit`` of a repo of REPO_PATHS, or None (the test seam of V2)."""
+    """The bytes of ``rel`` at ``commit`` of a repo of REPO_PATHS, or None (the test seam of the harness check)."""
     r = subprocess.run(['git', '-C', str(REPO_PATHS[repo]), 'show', f'{commit}:{rel}'], capture_output=True)
     return r.stdout if r.returncode == 0 else None
 
@@ -304,7 +311,7 @@ def aeron_version_of(name, path):
 
 
 def _aeron_k8(f, artifacts, aeron):
-    """RC2 S17 review V4: K8 reads the version from the artifacts, not only the substrate's declared strings."""
+    """K8 reads the version from the artifacts, not only the substrate's declared strings."""
     for name, role in AERON_ROLE.items():
         entry = artifacts.get(name)
         if not isinstance(entry, dict) or not Path(str(entry.get('path', ''))).is_file():
@@ -320,7 +327,7 @@ def _aeron_k8(f, artifacts, aeron):
 
 def load_record(f, ref):
     """The build record (``record-builds``): {name: [{source_sha, path, sha256}, ...]}, pinned by sha256 in the manifest; every
-    listed build output is re-hashed (K1)."""
+    listed build output is re-hashed."""
     if not isinstance(ref, dict) or not _rehash(f, 'build_record', ref, need_source=False):
         return {}
     try:
@@ -359,13 +366,13 @@ def _old_entries(f, m, cls, old_pins):
                 f.add('K5', f'{what}: retired artifact in a core-topology manifest')
             pin = old_pins.get(entry.get('sha256'))
             if pin is None or pin.get('source_sha') != entry.get('source_sha'):
-                f.add('K4', f'{what}: not pinned in R10/old-artifacts.sha256 with source {entry.get("source_sha")}')
+                f.add('K4', f'{what}: not pinned in the old-artifact pins with source {entry.get("source_sha")}')
             if cls == 'product' and TEST_BUILD.search(name):
                 f.add('K3', f'{what}: test or negative build in a product kind')
 
 
 def check_cut(m, rules=RULES, cls=None, old_pins=None):
-    """The checks of 3.3 over a cut manifest (``rc2-cut/1``). Returns the Findings (empty = accepted)."""
+    """The checks over a cut manifest (``rc2-cut/1``). Returns the Findings (empty = accepted)."""
     f = Findings(rules)
     if not isinstance(m, dict):
         f.add('K9', 'manifest is not an object')
@@ -376,7 +383,7 @@ def check_cut(m, rules=RULES, cls=None, old_pins=None):
     if cls not in CLASSES:
         f.add('K9', 'class must be one of ' + ', '.join(CLASSES) + f', got {cls!r}')
         cls = 'product'
-    old_pins = load_old_pins(OLD_PINS) if old_pins is None else old_pins
+    old_pins = load_old_pins(old_pins_path()) if old_pins is None else old_pins
     _unknown(f, 'manifest', m, TOP_KEYS | TOP_OPTIONAL, TOP_KEYS)
     if 'harness_commit' in m and not (isinstance(m['harness_commit'], str) and HEX40.fullmatch(m['harness_commit'])):
         f.add('K9', f'harness_commit: not a 40-hex commit ({m.get("harness_commit")!r})')
@@ -426,7 +433,7 @@ def check_cut(m, rules=RULES, cls=None, old_pins=None):
         if spec is None:
             f.add('K9', f'{what}: unknown artifact key (one artifact per role; a per-member key is unknown by design)')
             base = PRODUCT.get(name.split('@', 1)[0])
-            if base is not None and isinstance(entry, dict):      # rows 41, 52: the second jar's bytes are judged too (K4)
+            if base is not None and isinstance(entry, dict):      # rows 41, 52: the second jar's bytes are judged too
                 _derived_k4(f, name, {**entry, 'derivation': entry.get('derivation', 'attested')}, base, repos, record,
                             aeron_version, 'product')
             continue
@@ -512,13 +519,13 @@ def check_cut(m, rules=RULES, cls=None, old_pins=None):
     for member, block in (m.get('members') or {}).items() if isinstance(m.get('members'), dict) else ():
         entry = block.get('artifact') if isinstance(block, dict) else None
         base = PRODUCT.get({'me': 'match-cluster.jar', 'ae': 'assets-cluster.jar'}.get(str(member)[:2], ''))
-        if base is not None and isinstance(entry, dict):          # row 41: a per-member jar is unknown (K9) and not derived (K4)
+        if base is not None and isinstance(entry, dict):          # row 41: a per-member jar is unknown and not derived
             _derived_k4(f, f'members.{member}.artifact', {**entry, 'derivation': entry.get('derivation', 'attested')}, base,
                         repos, record, aeron_version, 'product')
     return f
 
 
-# ------------------------------------------------------------------ fixture manifests derived from the cut (5.3)
+# ------------------------------------------------------------------ fixture manifests derived from the cut
 
 FIXTURE_NAMES = {'me': 'match-cluster.jar', 'ae': 'assets-cluster.jar', 'projector': 'assets-projector.jar',
                  'forwarder': 'ct-forwarder', 'bridge': 'ct-bridge', 'forwarder_b': 'ct-forwarder', 'bridge_b': 'ct-bridge'}
@@ -537,11 +544,11 @@ def _cut_index(cut):
 
 
 def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
-    """5.3: a fixture manifest derived from the cut stages only the cut's bytes. Every staged file is found in the cut by sha256:
+    """A fixture manifest derived from the cut stages only the cut's bytes. Every staged file is found in the cut by sha256:
     a product artifact (its role and source must agree), a harness program, or, in a rig kind only, a pinned upgrade_from /
-    old_artifacts entry; a ``*_b`` or negative target is refused in a product kind (K3)."""
+    old_artifacts entry; a ``*_b`` or negative target is refused in a product kind."""
     f = Findings(rules)
-    old_pins = load_old_pins(OLD_PINS) if old_pins is None else old_pins
+    old_pins = load_old_pins(old_pins_path()) if old_pins is None else old_pins
     cut_findings = check_cut(cut, rules, cls=cut.get('class'), old_pins=old_pins)
     for rule, text in cut_findings.items:
         f.add(rule, 'cut: ' + text)
@@ -557,7 +564,7 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
             pin = old_pins.get(entry['sha256'])
             if pin is None:
                 f.add('K4', f'{what}: sha256 {entry["sha256"]} is not an artifact of cut {cut.get("cut_id")} and not pinned in '
-                            'R10/old-artifacts.sha256')
+                            'the old-artifact pins')
             elif cls == 'product':
                 f.add('K4', f'{what}: an old artifact ({pin["name"]}, the K4 exemption) is refused in a product kind')
             elif 'source_sha' in entry and entry['source_sha'] != pin.get('source_sha'):
@@ -573,7 +580,7 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
                 f.add('K4', f'{what}: old_artifacts only in the xver rig kinds')
             pin = old_pins.get(entry['sha256'])
             if pin is None:
-                f.add('K4', f'{what}: {block}.{cut_name} not pinned in R10/old-artifacts.sha256')
+                f.add('K4', f'{what}: {block}.{cut_name} not pinned in the old-artifact pins')
             return
         if name is not None and block == 'artifacts' and cut_name != name:
             f.add('K4', f'{what}: carries the bytes of {cut_name}, not of {name}')
@@ -600,8 +607,8 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
         staged(what, entry, FIXTURE_NAMES.get(key))
         for lib, lentry in ((entry or {}).get('libs') or {}).items():
             staged(f'{what}.libs.{lib}', lentry, lib)
-    # RC2 S17 W6 fix round item 1: in a rig kind a negative target is a RED's (a s17-red* kind) or the declared A03 phase 1
-    # (S16 20.1 line 2: an A03 kind, ct_forwarder_nc_norelease as forwarder_b in both forwarder slots, build A as forwarder);
+    # In a rig kind a negative target is a RED's (a s17-red* kind) or the declared A03 phase 1
+    # (an A03 kind, ct_forwarder_nc_norelease as forwarder_b in both forwarder slots, build A as forwarder);
     # any other GREEN kind stages real builds only
     import core_contracts
     kind = str(m.get('manifest_kind') or '')
@@ -610,7 +617,7 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
     if negatives and cls != 'product' and not (kind.split('-', 1)[1:] or [''])[0].startswith('red') \
             and not (core_contracts.a03_phase1_declared(m) and negatives == ['forwarder_b']):
         f.add('K3', f'{kind}: negative target(s) {", ".join(negatives)} in a GREEN rig kind: only a RED kind or the declared '
-                    'A03 phase 1 (S16 20.1 line 2) stages one')
+                    'A03 phase 1 stages one')
     for block in ('engine_libs', 'projector_libs', 'probe_libs'):
         for lib, lentry in (m.get(block) or {}).items():
             if lib in PRODUCT:
@@ -619,14 +626,14 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
         if key in m:
             staged(key, {'path': m[key]['path'], 'sha256': m[key]['sha256']})
     if m.get('manifest_kind') and not str(m['manifest_kind']).startswith('s17'):
-        f.add('K9', f'manifest_kind {m["manifest_kind"]} is not derived from an S17 cut')
-    # RC2 S17 review V2: the derived manifest runs the cut's harness, clean; a rig manifest may waive the drift with a named reason
+        f.add('K9', f'manifest_kind {m["manifest_kind"]} is not derived from a cut')
+    # The derived manifest runs the cut's harness, clean; a rig manifest may waive the drift with a named reason
     # (harness_drift, recorded), never a product or nightly one
     drift = []
     if m.get('harness_commit') != cut.get('harness_commit'):
         drift.append(f'harness_commit {m.get("harness_commit")} is not the cut\'s harness_commit {cut.get("harness_commit")}')
     if m.get('harness_dirty') is not False:
-        drift.append(f'built from a dirty harness (harness_dirty {m.get("harness_dirty")!r}; 5.4 needs false)')
+        drift.append(f'built from a dirty harness (harness_dirty {m.get("harness_dirty")!r}; needs false)')
     waiver = m.get('harness_drift')
     if drift and isinstance(waiver, dict) and waiver.get('reason') and cls in ('rig', 'rig-xver'):
         f.waived.extend(drift)
@@ -666,7 +673,7 @@ def record_builds(out, specs):
 
 
 
-# ------------------------------------------------------------------ RC2 S17 W3: the recording log and the genesisId log reader
+# ------------------------------------------------------------------ the recording log and the genesisId log reader
 
 RECORDING_LOG_ENTRY = 64                      # Aeron RecordingLog: recordingId, termId, base, logPosition, timestamp, serviceId, type
 ENTRY_TYPES = {0: 'TERM', 1: 'SNAPSHOT', 2: 'STANDBY_SNAPSHOT'}
@@ -680,7 +687,7 @@ ME_MEMBERS = ('me0', 'me1', 'me2')
 
 
 def recording_log(path):
-    """The entries of a cluster ``recording.log`` (fixed 64-byte entries, the same layout in the tag's Aeron and in 1.53.1)."""
+    """The entries of a cluster ``recording.log`` (fixed 64-byte entries, the same layout in the tag's Aeron and)."""
     import struct
     data = Path(path).read_bytes()
     if len(data) % RECORDING_LOG_ENTRY:
@@ -696,7 +703,7 @@ def recording_log(path):
 
 
 def snapshot_count(path):
-    """Valid SNAPSHOT entries in a recording.log (the seed witness of 5.2 and the row-51 precheck)."""
+    """Valid SNAPSHOT entries in a recording.log (the seed witness and the row-51 precheck)."""
     return sum(1 for e in recording_log(path) if e['type'] == 'SNAPSHOT' and e['valid'])
 
 
@@ -742,7 +749,7 @@ def load_money_schema(source):
 
 def core_config_frames(member_dir, schema):
     """The CoreConfig (template 70) frames of one AE member's LOG recordings (the TERM entries of its recording.log; snapshot
-    recordings are not walked): the core's own replicated bytes (section 10, 20.1 line 16; no engine change)."""
+    recordings are not walked): the core's own replicated bytes (read from the recordings as they are; no engine change)."""
     import struct
     base = Path(member_dir) / 'state'
     log = base / 'cluster' / 'recording.log'
@@ -771,11 +778,11 @@ def core_config_frames(member_dir, schema):
 
 
 def genesis_reader(state_root, schema, members=AE_MEMBERS):
-    """5.2 (v): the core's recorded genesisId per AE member (the genesisId of the first CoreConfig 1 in its log), compared
+    """The core's recorded genesisId per AE member (the genesisId of the first CoreConfig 1 in its log), compared
     across members. A later CoreConfig with another id (a refused re-genesis, X-A2 (b)) is listed, never taken."""
     if not hasattr(schema, 'messages'):
         schema = load_money_schema(schema)
-    out = {'source': 'AE log recordings: CoreConfig (template 70) frames, r10_cut.genesis_reader', 'members': {}}
+    out = {'source': 'AE log recordings: CoreConfig (template 70) frames, release_cut.genesis_reader', 'members': {}}
     firsts, ids = {}, set()
     for member in members:
         directory = Path(state_root) / 'state' / member
@@ -803,7 +810,7 @@ def genesis_reader(state_root, schema, members=AE_MEMBERS):
     return out
 
 
-# ------------------------------------------------------------------ RC2 S17 W3: the runtime audit (3.5)
+# ------------------------------------------------------------------ the runtime audit
 
 SLOT_ROLES = ('fwd0', 'fwd1', 'bridge0', 'bridge1')
 VERSION_RE = re.compile(rb'\x00(1\.\d{1,3}\.\d{1,3})\x00')
@@ -842,7 +849,7 @@ def audit_expected(m, registry=None):
         files = [{'path': f'/artifacts/{name}/bin', 'sha256': entry['sha256'], 'what': f'{name} binary'}]
         if entry.get('driver') == 'external':
             files += aeronmd(entry.get('libs'), f'/artifacts/{name}')
-        # W6 fix round item 4: what /health.build answers (none for the pinned build A, which predates the field)
+        # What /health.build answers (none for the pinned build A, which predates the field)
         import core_contracts
         out[slot] = {'files': files, 'build': core_contracts.health_build_expected(entry), 'artifact': name,
                      'build_absent': core_contracts.HEALTH_BUILD_ABSENT.get(entry['sha256']),
@@ -854,9 +861,9 @@ def audit_expected(m, registry=None):
 
 
 def audit_check(listing, m, registry=None, swap=None, aeron_version=None, started_only=False, not_started=()):
-    """Compare a process listing (live, from ``audit_collect``, or recorded: R08's host list, the unit-test REDs) with the
+    """Compare a process listing (live, from ``audit_collect``, or recorded: a host list, the unit-test REDs) with the
     manifest. ``swap``: {slot: (artifact a, artifact b)}, the declared upgrade_from pair accepted during that slot's swap window
-    only. A member that is not Running is named; it is a finding unless it is a registered fault target (5.2 (ii))."""
+    only. A member that is not Running is named; it is a finding unless it is a registered fault target."""
     registry = registry or {}
     expected = audit_expected(m, registry)
     procs = {p['role']: p for p in listing.get('processes', [])}
@@ -865,7 +872,7 @@ def audit_check(listing, m, registry=None, swap=None, aeron_version=None, starte
     for role, want in expected.items():
         proc = procs.get(role)
         if proc is None and (started_only or role in not_started):
-            # W5 item 2: a role the step has not started yet (an activation stopped before start_bridges or
+            # A role the step has not started yet (an activation stopped before start_bridges or
             # start_forwarders) is named; a role that ran and stopped, or any foreign process, is still a finding
             # an X run starts only the engine under test (6): a role the scenario never started is named, not a finding
             unstarted.append(role)
@@ -891,7 +898,7 @@ def audit_check(listing, m, registry=None, swap=None, aeron_version=None, starte
             elif got not in allowed:
                 findings.append(f'{role}: {f["path"]} sha256 {got[:12]} is not the manifest\'s {f["sha256"][:12]} ({f["what"]})')
         if role in SLOT_ROLES:
-            # W6 fix round item 4: /health.build is what the expected binary answers (its source sha, or none for a pinned
+            # /health.build is what the expected binary answers (its source sha, or none for a pinned
             # build without the field); during a declared swap window either side of the pair may answer
             import core_contracts
             wanted = {want.get('build')}
@@ -974,17 +981,17 @@ def audit_collect(f):
                 port, path = f.ready_target(role) if role != 'probe' else (None, None)
                 if port:
                     out['ready'] = f.http(role, port, path).get('status') == 200
-                if role in SLOT_ROLES:            # W6 fix round item 4: every slot, so build A answering one is seen
+                if role in SLOT_ROLES:            # Every slot, so build A answering one is seen
                     body = f.http(role, port, '/health').get('body') or '{}'
                     out['build'] = json.loads(body).get('build')
             except Exception as error:          # recorded, never fatal: the check names the missing value
                 out['ready_error'] = str(error)[:200]
         procs.append(out)
-    return {'source': 'rig containers (r10_cut.audit_collect)', 'run_id': f.run_id, 'processes': procs}
+    return {'source': 'rig containers (release_cut.audit_collect)', 'run_id': f.run_id, 'processes': procs}
 
 
 def audit_fixture(f, out=None, swap=None, aeron_version=None, started_only=False, not_started=()):
-    """``audit`` on a live fixture: collect, check, and (``out``) write the report: the evidence of 3.5."""
+    """``audit`` on a live fixture: collect, check, and (``out``) write the report: the evidence."""
     report = audit_check(audit_collect(f), f.m, f.registry, swap=swap, aeron_version=aeron_version, started_only=started_only,
                          not_started=not_started)
     if out is not None:
@@ -992,7 +999,7 @@ def audit_fixture(f, out=None, swap=None, aeron_version=None, started_only=False
     return report
 
 
-# ------------------------------------------------------------------ RC2 S17 W3: the wipe precheck (3.5)
+# ------------------------------------------------------------------ the wipe precheck
 
 WIPED = [('me', 'ME state', 'state'), ('me', 'ME journal archive', 'journal'), ('ae', 'AE state', 'state/cluster'),
          ('ae', 'AE archive (money journal)', 'state/archive')]
@@ -1036,7 +1043,7 @@ def precheck(roots, pg_rows=None, aeron_dirs=()):
                         refusals.append(f'{member}: {error}')
                         snaps = 0
                     if snaps:
-                        refusals.append(f'{member}: recording.log lists {snaps} snapshot(s); an S16-era bare RC2 snapshot '
+                        refusals.append(f'{member}: recording.log lists {snaps} snapshot(s); an older bare snapshot '
                                         '(row 51) is unsupported: archive it and wipe')
     wipe.append({'label': 'projection database rows', 'path': 'r01_money'})
     if pg_rows is None:
@@ -1066,18 +1073,18 @@ def projection_rows(f):
     return out
 
 
-# ------------------------------------------------------------------ RC2 S17 W3: the activation record (section 10)
+# ------------------------------------------------------------------ the activation record
 
 ADMIN_RESULTS = {0: 'ACCEPTED', 1: 'DUPLICATE', 2: 'REJECTED', 3: 'ADOPTED', 4: 'STALE'}
 CONFIG_OK = {'ACCEPTED', 'DUPLICATE', 'ADOPTED'}
 ME_JOURNAL_SCHEMA = Path(__file__).resolve().parent / 'schemas' / 'me-journal-schema-4.xml'
 SOURCES = {'me_genesis_id': 'ME journal record 5 (JournalProbe dump)',
-           'core_genesis_id': 'AE log recordings, CoreConfig frames (r10_cut.genesis_reader)',
+           'core_genesis_id': 'AE log recordings, CoreConfig frames (release_cut.genesis_reader)',
            'core_bound_epoch': 'money-dump meEpoch (CoreProbe)'}
 STATUS_ORDER = ['OK', 'INCOMPLETE', 'ABORTED', 'REFUSED']
-DOWNGRADE_BOUNDARY = ('after this record no ME behaviour 1, no pre-RC2 jar, no S16 jar and no tag member may run on this state; '
-                      'row 04 refused by measurement (S17/evidence row 04), rows 02, 11, 41, 52 unsupported, not measured, '
-                      'guarded (test_r10_cut GuardedRowRedTest, AuditTest.test_guarded_rows_name_the_foreign_member)')
+DOWNGRADE_BOUNDARY = ('after this record no ME behaviour 1, no pre-cut jar, no older core jar and no tag member may run on this state; '
+                      'row 04 refused by measurement, rows 02, 11, 41, 52 unsupported, not measured, '
+                      'guarded (test_release_cut GuardedRowRedTest, AuditTest.test_guarded_rows_name_the_foreign_member)')
 
 
 class _Record:
@@ -1125,7 +1132,7 @@ def _decode_record5(lines, message, order):
 
 
 def check_record(record):
-    """Structural rules of a record (C3, C6): three values from three sources, never one value read twice. Review V10: the
+    """Structural rules of a record: three values from three sources, never one value read twice. The
     sources are the files actually read (JournalProbe dump outputs, AE .rec segments, core-requests.jsonl); a value without a
     file, or two values read from one file, is refused."""
     out = []
@@ -1150,7 +1157,7 @@ INVARIANTS = (('me', 'record5', 'behavior_version'), ('me', 'record5', 'max_wire
 
 
 def check_record_set(records):
-    """RC2 step 7: a genesisId that repeats across genesis runs is a refused record; the invariant fields of section 10
+    """Activation step 7: a genesisId that repeats across genesis runs is a refused record; the invariant fields
     (behaviour 2, maxWireVersion 12, journalSeq 1 FRESH, the CoreConfig 1-2-3 acceptance, the gate transition) are equal."""
     seen, out = {}, []
     records = [r for r in records if r.get('record_kind', 'final') == 'final']
@@ -1188,7 +1195,7 @@ def _lives(owner, scope):
 
 
 def _life_window(owner, life, scope, key, rec):
-    """RC2 S17 W6 fix round item 4: the rows of ``key`` (commands | core_requests) that belong to ``life`` for ``scope``:
+    """The rows of ``key`` (commands | core_requests) that belong to ``life`` for ``scope``:
     [the row count recorded when that life's regenesis(scope) began, the next life's count). Life 1 starts at row 0; a later
     life, or a next life, without its recorded boundary is refused (a precondition, never all rows)."""
     lives = owner.get('lives') or {}
@@ -1211,17 +1218,17 @@ def _rows_in(rows, window):
 
 
 def activation_record(run_dir, journal_schema=None, state_root=None, audit=None, cut=None, life=1, record_kind='final'):
-    """``rc2-activation-record.json`` of one genesis, from the run's evidence only (C3: what happened, never what was sent):
+    """``rc2-activation-record.json`` of one genesis, from the run's evidence only (what happened, never what was sent):
     record 5 from the JournalProbe dumps, the core genesisId from the AE log recordings, the bound epoch from money-dump, the
     CoreConfig acknowledgements from the genesis driver's and the probe's outputs, the gate from the tap rows, the phases from
-    the fixture registry, the audit report and ``members_up``. Status OK / INCOMPLETE / ABORTED (section 10) or REFUSED (the
+    the fixture registry, the audit report and ``members_up``. Status OK / INCOMPLETE / ABORTED or REFUSED (the
     evidence is inconsistent or missing: no record can be issued)."""
     import sbe_layout
     run = Path(run_dir)
     rec = _Record()
     if record_kind not in ('final', 'intermediate'):
         raise ValueError('record_kind is final or intermediate')
-    # rc2-cut-4: a pre-recovery record is intermediate (it shares the run's genesisId by design); RC2 step 7 reads finals only
+    # rc2-cut-4: a pre-recovery record is intermediate (it shares the run's genesisId by design); activation step 7 reads finals only
     out = {'schema': 'rc2-activation-record/1', 'record_kind': record_kind, 'run_dir': str(run), 'life': life,
            'sources': dict(SOURCES),
            'downgrade_boundary': DOWNGRADE_BOUNDARY}
@@ -1231,7 +1238,7 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
         if result.is_file():
             state_root = json.loads(result.read_text()).get('state_root')
         if state_root is None and manifest_path.is_file():
-            # W5 item 6: an X run's result.json carries no state_root (xver owns its fixtures); the manifest names it
+            # An X run's result.json carries no state_root (xver owns its fixtures); the manifest names it
             state_root = json.loads(manifest_path.read_text()).get('state_root')
         if state_root is None:
             rec.say('REFUSED', f'run evidence missing: {result} (state_root)')
@@ -1254,7 +1261,7 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
     commands = _jsonl(root / 'commands.jsonl', rec)
     requests = _jsonl(root / 'core-requests.jsonl', rec)
     if audit is None:
-        audit_path = run / ('audit.json' if life == 1 else f'audit-life{life}.json')      # W6 item 4: each life's own
+        audit_path = run / ('audit.json' if life == 1 else f'audit-life{life}.json')      # Each life's own
         if audit_path.is_file():
             audit = json.loads(audit_path.read_text())
         else:
@@ -1268,7 +1275,7 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
     requests = [r for _, r in _rows_in(requests, _life_window(owner, life, 'core', 'core_requests', rec))]
     genesis = owner.get('genesis') or {}
     if int(genesis.get('life') or 1) != life:
-        # W6 item 4: an earlier life's genesis block, kept by regenesis('core') under lives[n].records
+        # An earlier life's genesis block, kept by regenesis('core') under lives[n].records
         genesis = ((((owner.get('lives') or {}).get(str(life)) or {}).get('records') or {}).get('genesis')) or {}
         if not genesis:
             rec.say('REFUSED', f'run evidence missing: the genesis record of life {life} (owner.lives.{life}.records.genesis)')
@@ -1311,7 +1318,7 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
     out['me'] = me
     derivation = genesis.get('derivation')
     if not derivation and str(m.get('manifest_kind', '')).startswith('s17'):
-        rec.say('REFUSED', 'genesisId derivation missing: an s17 run derives its genesisId from its run_id (review V12)')
+        rec.say('REFUSED', 'genesisId derivation missing: an s17 run derives its genesisId from its run_id')
     if derivation:
         import core_contracts
         derived = int(core_contracts.derive_genesis_id(derivation.get('run_id'), life), 16)
@@ -1339,14 +1346,14 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
             break
     acks.sort(key=lambda a: a[0])
     sequence = [[v, result] for _, v, result in acks]
-    # ---- core genesisId (review V11): the CoreConfig 1 frame of each AE member's log recording that its ACCEPTED/ADOPTED
+    # ---- core genesisId: the CoreConfig 1 frame of each AE member's log recording that its ACCEPTED/ADOPTED
     # AdminAck answered (the i-th frame of a version pairs with the i-th ack of that version); a refused frame never wins
     core = {}
     ae_jar = ((m.get('artifacts') or {}).get('ae') or {}).get('path')
     reader = None
     captured = (((owner.get('lives') or {}).get(str(life)) or {}).get('core_genesis_reader')) or None
     if captured:
-        # W6 item 4: an earlier life's AE was wiped by regenesis('core'); its reader output was saved just before the wipe
+        # An earlier life's AE was wiped by regenesis('core'); its reader output was saved just before the wipe
         path = Path(captured.get('path') or '')
         if not path.is_file() or sha256_file(path) != captured.get('sha256'):
             rec.say('REFUSED', f'run evidence missing or changed: the life {life} core genesis reader capture {path}')
@@ -1471,7 +1478,7 @@ def record_name(life):
 
 
 def write_activation_records(run_dir, state_root=None, **kw):
-    """RC2 S17 W6 fix round item 4: one final record per core life of the run (A04 regenesis has two, with two genesisIds
+    """One final record per core life of the run (A04 regenesis has two, with two genesisIds
     by design), ``rc2-activation-record.json`` for life 1 and ``rc2-activation-record-life<n>.json`` after it; each is read
     from its own life's evidence. Returns [(record, path)]."""
     run = Path(run_dir)
@@ -1508,15 +1515,15 @@ def main(argv=None):
     p.add_argument('--manifest', type=Path)
     p.add_argument('--pg-rows', type=Path, help='{table: rows} of the projection database (JSON); without it the precheck refuses')
     p.add_argument('--aeron-dir', type=Path, action='append', default=[])
-    ar = sub.add_parser('activation-record', help='rc2-activation-record.json of a genesis run dir (section 10)')
+    ar = sub.add_parser('activation-record', help='rc2-activation-record.json of a genesis run dir')
     ar.add_argument('run_dir', type=Path)
     ar.add_argument('--journal-schema', type=Path)
     ar.add_argument('--audit', type=Path)
     ar.add_argument('--out', type=Path)
-    rs = sub.add_parser('activation-records', help='RC2 step 7: a set of records (files or dirs holding '
+    rs = sub.add_parser('activation-records', help='activation step 7: a set of records (files or dirs holding '
                         'rc2-activation-record.json): no repeated genesisId, equal invariant fields, every record OK')
     rs.add_argument('records', type=Path, nargs='+')
-    g = sub.add_parser('genesis-ids', help='5.2 (v): the CoreConfig genesisId recorded in each AE member log')
+    g = sub.add_parser('genesis-ids', help='the CoreConfig genesisId recorded in each AE member log')
     g.add_argument('state_root', type=Path)
     g.add_argument('--schema', type=Path, required=True, help='money schema XML or the AE jar')
     args = parser.parse_args(argv)

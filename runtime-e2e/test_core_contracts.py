@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""RC2 S15 W1, contract 5.1 / 5.2 / 3.2: manifest and environment contracts of fixture v3 (no Docker)."""
+"""Manifest and environment contracts of fixture v3 (no Docker)."""
 import copy
 import hashlib
 from pathlib import Path
@@ -15,15 +15,15 @@ from test_core_fixture import manifest, write
 
 
 class DriverTimeoutExemptionTest(unittest.TestCase):
-    """D-S15-11 / PO-8: exactly the two driver-liveness names at exactly the string 5000."""
+    """Exactly the two driver-liveness names at exactly the string 5000."""
 
     def allowed(self):
         return core_contracts.PROCESS_ENV | {'ME_SESSION_TIMEOUT_MS', 'ME_AUTH_KEYS', 'ME_AUTH_CREDENTIAL'}
 
     def test_driver_timeout_exemption_is_exact(self):
-        # W0 answer 1 / amendment A3: on c781b4c the name is first refused by the allowlist
+        # On c781b4c the name is first refused by the allowlist
         # ("environment names are an allowlist; refusing FWD_DRIVER_TIMEOUT_MS"), and only once it is allowlisted
-        # does it reach "refusing to pass a timeout setting". After W1 the exact pair passes.
+        # does it reach "refusing to pass a timeout setting". With the liveness names allowed, the exact pair passes.
         for key in ('FWD_DRIVER_TIMEOUT_MS', 'BRIDGE_DRIVER_TIMEOUT_MS'):
             assert_production_timeouts({key: '5000'}, self.allowed())
         refused = [{'FWD_DRIVER_TIMEOUT_MS': '3000'}, {'FWD_DRIVER_TIMEOUT_MS': '60001'}, {'FWD_DRIVER_TIMEOUT_MS': '5000 '},
@@ -32,7 +32,7 @@ class DriverTimeoutExemptionTest(unittest.TestCase):
                    {'ME_SESSION_TIMEOUT_MS': '5000'}]
         for env in refused:
             with self.subTest(env=env), self.assertRaisesRegex(
-                    Violation, 'D20: refusing to pass a timeout setting to a fixture process: ' + next(iter(env))):
+                    Violation, 'refusing to pass a timeout setting to a fixture process: ' + next(iter(env))):
                 assert_production_timeouts(env, self.allowed())
 
     def test_exemption_is_by_name_not_by_pattern(self):
@@ -109,7 +109,7 @@ class ManifestV3Test(unittest.TestCase):
             validate_core_manifest(self.m, self.path, cpu_count=24)
 
     def test_t1_drivers_without_the_probe_aeronmd_are_refused(self):
-        """Review F8: pinned T1 drivers with no probe_libs.aeronmd are refused before any container starts (3.3); c781b4c's
+        """Pinned T1 drivers with no probe_libs.aeronmd are refused before any container starts; c781b4c's
         probe silently idled ('sleep infinity') and the drivers failed later at me_genesis with an opaque Aeron error."""
         for key in ('t1_me_driver', 't1_core_driver'):
             jar, src = write(self.dir, key + '.jar', b'jar-' + key.encode()), write(self.dir, key + '.java', b'src-' + key.encode())
@@ -117,7 +117,7 @@ class ManifestV3Test(unittest.TestCase):
         self.bad(lambda m: None, text='t1_me_driver and t1_core_driver pinned without probe_libs.aeronmd')
         self.bad(lambda m: m.pop('t1_me_driver'), text='t1_core_driver pinned without probe_libs.aeronmd')
         lib = {k: v for k, v in write(self.dir, 'libaeron.so', b'so').items() if k != 'source_sha'}
-        self.bad(lambda m: m.update(probe_libs={'libaeron.so': lib}), text='(contract 3.3)')
+        self.bad(lambda m: m.update(probe_libs={'libaeron.so': lib}), text='staged media driver')
         m = copy.deepcopy(self.m)
         for key in ('t1_me_driver', 't1_core_driver'):
             m.pop(key)
@@ -147,7 +147,7 @@ class ManifestV3Test(unittest.TestCase):
 
 
 # ======================================================================================================
-# RC2 S16 W1 (contract 5.2, 5.3; 20.1 lines 2 and 11): engine driver profile, build B and the control guards.
+# Engine driver profile, build B and the control guards.
 # ======================================================================================================
 
 import json
@@ -157,7 +157,8 @@ from unittest import mock
 import core_drills
 from test_core_fixture import DEV_TEXT, DP_TEXT, engine_libs, ext_manifest, slot_manifest
 
-REAL_DP = Path(__file__).resolve().parents[2] / 'match-s13wt' / 'deploy' / 'media-driver' / 'driver.properties'
+# MK_DRIVER_PROPERTIES: the ME tree's deploy/media-driver/driver.properties (no default; the real-file case skips without it)
+REAL_DP = Path(os.environ.get('MK_DRIVER_PROPERTIES') or '/nonexistent/driver.properties')
 
 
 class EngineDriverManifestTest(unittest.TestCase):
@@ -215,7 +216,7 @@ class EngineDriverManifestTest(unittest.TestCase):
         m['engine_libs']['driver.properties']['sha256'] = hashlib.sha256(DP_TEXT.replace('8192', '1408').encode()).hexdigest()
         self.bad(m, 'driver.properties drifts from the embedded overrides: aeron.mtu.length')
 
-    @unittest.skipUnless(REAL_DP.is_file(), 'the me tree is not checked out beside tools')
+    @unittest.skipUnless(REAL_DP.is_file(), "set MK_DRIVER_PROPERTIES to the ME tree's driver.properties")
     def test_the_real_driver_properties_pass(self):
         core_contracts.check_driver_properties(REAL_DP.read_text(), DEV_TEXT)
 
@@ -238,7 +239,7 @@ class EngineDriverManifestTest(unittest.TestCase):
             core_drills.scenario(fx, 'core-drill-a05-fwd-upgrade', self.dir)
         fx.m['artifacts']['forwarder_b']['target'] = 'ct-forwarder'
         fx.clock, fx.sleep = time.time, (lambda s: None)
-        from unittest import mock                                              # the guard passed; W3 added the drill
+        from unittest import mock                                              # the guard passed; the drill was added later
         with mock.patch.object(core_drills.DrillRun, 'run', lambda run: {'status': 'PASS', 'lines': {}, 'of_rows': {}}):
             self.assertEqual(core_drills.scenario(fx, 'core-drill-a05-fwd-upgrade', self.dir)['status'], 'PASS')
 
@@ -251,7 +252,7 @@ class EngineDriverManifestTest(unittest.TestCase):
             core_drills.scenario(fx, 'core-red-a03', self.dir)
 
     def test_a03_manifest_pins_the_norelease_phase_and_build_a(self):
-        """20.1 line 2 (PO): A03 phase 1 runs ct_forwarder_nc_norelease, then replace_slot swaps to build A."""
+        """A03 phase 1 runs ct_forwarder_nc_norelease, then replace_slot swaps to build A."""
         m, path = self.b_manifest('s16-a03', 'ct_forwarder_nc_norelease'); self.check(m, path)
         m, path = self.b_manifest('s16-a03', 'ct_forwarder_nc_noresync')
         self.bad(m, 'an A03 manifest stages ct_forwarder_nc_norelease as forwarder_b', path=path)
@@ -302,7 +303,7 @@ if __name__ == '__main__':
 
 
 class ProjectorDriverManifestTest(unittest.TestCase):
-    """RC2 S17 W2 (W10, PO-11 (a)): ``projector_driver`` mirrors ``engine_driver``."""
+    """``projector_driver`` mirrors ``engine_driver``."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(); self.dir = self.temp.name

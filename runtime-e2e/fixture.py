@@ -73,7 +73,7 @@ class Fixture:
         (self.root / 'logs').mkdir(exist_ok=True)
 
     def save(self):
-        # S15 fix round (FIX-4): the partition sampler reads from the main thread while a helper call runs on another
+        # The partition sampler reads from the main thread while a helper call runs on another
         # thread, so the registry is saved under one lock; a dict resized by the other thread mid-dump is retried.
         with REGISTRY_LOCK:
             for _ in range(20):
@@ -253,7 +253,7 @@ except Exception as e:print(json.dumps({'status':0,'error':str(e)}))
             for role, cid in self.registry['containers'].items():
                 state = self.inspect('container', cid)['State']
                 if not state['Running']:
-                    # RC2 S15 (F-S15-17): a container that a fault helper deliberately took down is not an unexpected
+                    # A container that a fault helper deliberately took down is not an unexpected
                     # exit while its fault row is open and inside its declared bound; anything else still aborts.
                     row = targets.get(role)
                     if row and time.time_ns() <= row['until_ns']:

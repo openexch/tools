@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 [Unit]
-Description=Nightly runtime-e2e core fixture (T2, dev box, D20)
+Description=Nightly runtime-e2e core fixture (dev box)
 
 [Timer]
 OnCalendar=*-*-* 03:17:00

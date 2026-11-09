@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fixture v2: the OMS + ledger core topology (RC2 S14, harness H0 / 2.7).
+"""Fixture v2: the OMS + ledger core topology.
 
 Same ownership, evidence and teardown rules as the legacy Fixture (it is reused, not copied): every
 Docker object carries the run label and an unpredictable token, nothing is reset, failed state is
 kept. What changes: the role set (no OMS, no market gateway, no legacy bridge), per-run session keys
 for AE and ME with secrets redacted from every retained log, the core probe and journal probe,
 optional slots for the C++ forwarder and bridge that start from a pinned binary or are skipped and
-said so, a reserved ``shadow0`` slot for RCS, cpuset-pinned engines and production timeouts (D20).
+said so, a reserved ``shadow0`` slot for the shadow replica, cpuset-pinned engines and production timeouts.
 """
 import hashlib
 import ipaddress
@@ -34,18 +34,18 @@ ENGINE_COMMON = {'CLUSTER_PORT_STRIDE': '100', 'BASE_DIR': '/data/state', 'TRANS
                  'TRANSPORT_IDLE_MODE': 'backoff', 'TRANSPORT_TERM_LENGTH': '1m', 'TRANSPORT_LOG_TERM_LENGTH': '1m',
                  'TRANSPORT_SNAPSHOT_TERM_LENGTH': '1m', 'MATCH_ENGINE_BOOK_CAPACITY': '4096',
                  'SNAPSHOT_LOG_BYTES': '1073741824', 'SNAPSHOT_INTERVAL_MINUTES': '5'}
-# RC2 S15 (contract 5.2). The staged aeronmd deletes its dir on start and shutdown so that a restart of a killed
+# The staged aeronmd deletes its dir on start and shutdown so that a restart of a killed
 # container (the tmpfs /dev/shm survives a kill) never attaches the new process to the dead driver's cnc.dat.
 DRIVER_ENV = {'AERON_DIR_DELETE_ON_START': '1', 'AERON_DIR_DELETE_ON_SHUTDOWN': '1'}
 EMBEDDED_DIRS = {'fwd': '/dev/shm/fwd-embedded', 'bridge': '/dev/shm/bridge-embedded'}
 PROBE_AERON_DIR = '/dev/shm/probe-aeron'
 DRIVER_WAIT_TENTHS = 300                      # 30 s for the staged aeronmd to publish its cnc.dat
 TAP_REGISTER_BOUND_S = 30                     # review F5: the tap's 'registered' note, observed before ME genesis
-AE_RESTART_MIN_AFTER_KILL_S = 12.5            # W0 answer 2: a restart earlier hits "active mark file detected" and hangs
+AE_RESTART_MIN_AFTER_KILL_S = 12.5            # measured: a restart earlier hits "active mark file detected" and hangs
 KILL_HEAL_BOUND_S = 120
 GENESIS_PHASES = ['genesis_snapshot_ns', 'tap_started_ns', 'me_genesis_ns', 'bridges_ready_ns', 'core_bound_ns',
                   'first_deposit_ns', 'funded_ns', 'forwarders_ready_ns']
-# RC2 S16 5.1: a second core life runs on an ME that regenesis('me') already re-genesised, so it has no me_genesis phase
+# A second core life runs on an ME that regenesis('me') already re-genesised, so it has no me_genesis phase
 LIFE2_CORE_PHASES = [p for p in GENESIS_PHASES if p != 'me_genesis_ns']
 GENESIS_ORDER = [('snapshot_genesis', 'genesis_snapshot_ns'), ('start_tap_witness', 'tap_started_ns'),
                  ('me_genesis', 'me_genesis_ns'), ('arm_money_journal', 'money_journal_ns'),
@@ -53,17 +53,17 @@ GENESIS_ORDER = [('snapshot_genesis', 'genesis_snapshot_ns'), ('start_tap_witnes
                  ('core_genesis', 'core_bound_ns'), ('configure_risk', 'risk_ns'),
                  ('fund', 'funded_ns'), ('verify_funded', 'verified_ns'), ('start_forwarders', 'forwarders_ready_ns')]
 LIFE2_CORE_ORDER = [step for step in GENESIS_ORDER if step[0] != 'me_genesis']
-# RC2 S16 5.1 stop(): the polite-stop bound per role (docker stop -t). Forwarder: exit 0, contract <= 1 s (RUN:465-472);
-# bridge: exit 0 within 10 s (RUN:1768-1770); engines: 15 s then kill (20.1 line 4) is the escalation bound only; on the W9
-# jars the code and time are judged by the drills' engine_polite_stop line (143 within ENGINE_SHUTDOWN_TIMEOUT_S + slack).
+# stop(): the polite-stop bound per role (docker stop -t). Forwarder: exit 0, contract <= 1 s (RUN:465-472);
+# bridge: exit 0 within 10 s (RUN:1768-1770); engines: 15 s then kill is the escalation bound only; on jars with the
+# polite-stop fix the code and time are judged by the drills' engine_polite_stop line (143 within ENGINE_SHUTDOWN_TIMEOUT_S + slack).
 STOP_BOUND_S = {'forwarder': 3, 'bridge': 10, 'engine': 15, 'projector': 10}
 FORWARDER_STOP_CONTRACT_S = 1.0
-SESSION_WINDOW_S = 10.0          # the core's session timeout a killed forwarder's session outlives it by (F-S16-11)
-READY_AFTER_KILL_S = 5.0         # 20.1 line 7: the ready_after_kill bound, a setting (measured 1.12 s in DR-A05)
+SESSION_WINDOW_S = 10.0          # the core's session timeout a killed forwarder's session outlives it by
+READY_AFTER_KILL_S = 5.0         # The ready_after_kill bound, a setting (measured 1.12 s in DR-A05)
 REPLACE_READY_BOUND_S = 60       # stops a hung replacement wait; not a line
 REGENESIS_HEAL_BOUND_S = 900     # a stopped or fenced role stays a fault target across both regenesis scopes and the halt phase
 ENGINE_LIBS_DIR = '/artifacts/engine_libs'
-PROJECTOR_LIBS_DIR = '/artifacts/projector_libs'      # RC2 S17 W2
+PROJECTOR_LIBS_DIR = '/artifacts/projector_libs'
 ENGINE_DRIVER_PIDFILE = '/data/aeronmd.pid'
 DEFAULT_RISK = {'version': 1, 'min_qty': 1, 'max_qty': 10**6 * FP, 'collar_bps': 5000, 'per_sec': 1000, 'max_open': 5000,
                 'slippage_bps': 100}
@@ -85,8 +85,8 @@ def parse_prometheus(text):
 
 
 def check_genesis_order(phases, expected=GENESIS_PHASES):
-    """Contract 5.3: the empty snapshot and the tap come first; no deposit may precede either. ``expected`` is the phase
-    list of the life being checked (S16 5.1: LIFE2_CORE_PHASES for a core re-genesis on an already re-genesised ME)."""
+    """The empty snapshot and the tap come first; no deposit may precede either. ``expected`` is the phase
+    list of the life being checked (LIFE2_CORE_PHASES for a core re-genesis on an already re-genesised ME)."""
     for name in expected:
         if name not in phases:
             raise Violation('genesis phase missing: ' + name)
@@ -124,7 +124,7 @@ def partition_arguments(manifest, source, target, kind, action):
     """iptables arguments for a (src role, dst role, port kind) UDP drop, applied in the source's namespace.
 
     Engines are addressed per member (``ae1``) or as a whole cluster (``ae``). The rule sits on OUTPUT in
-    the source container, so only that client's packets to that port are lost (G10: forwarder -> ME,
+    the source container, so only that client's packets to that port are lost (forwarder -> ME,
     bridge -> AE, bridge -> ME journal archive partitions), never another process's.
     """
     if action not in {'add', 'delete'}:
@@ -161,11 +161,11 @@ class CoreFixture(Fixture):
     sleep = staticmethod(time.sleep)
 
     def __init__(self, manifest_path, attach=False, keyring=None, drill=False):
-        """``drill=True`` (the S15 drills) refuses an ME whose artifact does not enforce credentials; core-boot keeps both."""
+        """``drill=True`` (the core-topology drills) refuses an ME whose artifact does not enforce credentials; core-boot keeps both."""
         self.manifest_path = Path(manifest_path).absolute()
         self.m = json.loads(self.manifest_path.read_text())
         validate_core_manifest(self.m, self.manifest_path, require_me_enforced=drill)
-        # RC2 S16 5.2: the edk-cnctimeout control's switch, refused on every other manifest before the box is touched
+        # The edk-cnctimeout control's switch, refused on every other manifest before the box is touched
         self.engine_driver_skip = core_contracts.check_engine_driver_skip(self.m, self.manifest_path,
                                                                           os.environ.get('ENGINE_DRIVER_SKIP'))
         self.root = Path(self.m['state_root'])
@@ -249,9 +249,9 @@ class CoreFixture(Fixture):
             what = 'slot artifact changed while staging: ' + role
             self._stage(artifact['path'], target / 'bin', artifact['sha256'], what, 0o755)
             for name, lib in (artifact.get('libs') or {}).items():
-                # contract 3.2: only a lib with exec: true (aeronmd) gets the exec bit; the shared objects do not
+                # Only a lib with exec: true (aeronmd) gets the exec bit; the shared objects do not
                 self._stage(lib['path'], target / name, lib['sha256'], what, 0o755 if lib.get('exec') else 0o644)
-        # RC2 S16 5.3: the engine containers' staged aeronmd and its pinned properties; RC2 S17 W2: the projector's, the same set
+        # The engine containers' staged aeronmd and its pinned properties; the projector's, the same set
         for key in ('engine_libs', 'projector_libs'):
             libs = self.m.get(key) or {}
             if libs:
@@ -300,10 +300,10 @@ class CoreFixture(Fixture):
             raise Violation('unknown or duplicate fixture process')
         assert_production_timeouts(environment or {}, self.allowed_env())
         if any(core_contracts.JVM_TIMEOUT.search(str(a)) for a in command):
-            raise Violation('D20: refusing a JVM timeout override for ' + name)
-        # RC2 S17 W3: a seeded member (seed_state) or a slot replaced with keep_state starts on the dir already in place
+            raise Violation('refusing a JVM timeout override for ' + name)
+        # A seeded member (seed_state) or a slot replaced with keep_state starts on the dir already in place
         prepared = name in (self.registry.get('seeded') or {}) or name in (self.registry.get('kept_state') or {})
-        bound = (self.registry.get('bound_state') or {}).get(name)     # review V1: a member bound to another fixture's root
+        bound = (self.registry.get('bound_state') or {}).get(name)     # A member bound to another fixture's root
         state = self.root / 'state' / name
         if bound:
             state = Path(bound)
@@ -389,16 +389,16 @@ class CoreFixture(Fixture):
             env['ASSETS_NODE_PORT'] = str(self.m['ports']['ae_metrics'])
             env['ASSETS_AUTH_KEYS'] = self.keys.table('ae')
         if self.engine_driver() == 'external':
-            # RC2 S16 5.3: TC:84-91 / ATC:37-42 external mode attaches to the wrapper's aeronmd at AERON_DIR (TC:155, ATC:70)
+            # TC:84-91 / ATC:37-42 external mode attaches to the wrapper's aeronmd at AERON_DIR (TC:155, ATC:70)
             env.update(TRANSPORT_DRIVER_MODE='external', AERON_DIR=f'/dev/shm/aeron-{engine}{index}')
         return env
 
     def engine_driver(self):
-        """5.2: ``embedded`` (dev default, D-S15-4) or ``external`` (the staged aeronmd in the engine container, C13)."""
+        """``embedded`` (dev default) or ``external`` (the staged aeronmd in the engine container, C13)."""
         return self.m.get('engine_driver', 'embedded')
 
     def projector_driver(self):
-        """RC2 S17 W2 (W10, PO-11 (a)): ``embedded`` (the default; the projector's own Java driver) or ``external`` (the staged
+        """``embedded`` (the default; the projector's own Java driver) or ``external`` (the staged
         aeronmd in the projector container, attached through PROJECTOR_DRIVER_MODE=external and AERON_DIR)."""
         return self.m.get('projector_driver', 'embedded')
 
@@ -425,11 +425,11 @@ class CoreFixture(Fixture):
         return self._driver_wrapper('projector', PROJECTOR_LIBS_DIR, jar)
 
     def engine_command(self, engine, index):
-        """5.3: embedded engines run ``java -jar`` as before; external engines run through the S15 wrapper shape (CF:347-356):
+        """Embedded engines run ``java -jar`` as before; external engines run through the wrapper shape (CF:347-356):
         a fresh driver dir, the staged aeronmd on the pinned driver.properties plus the dev overlay in the background with its
         pid in /data (exec_kill), a 30 s wait for its cnc.dat with the driver alive, then ``exec java`` (the engine's own
         awaitExternalDriver is the second wait, TC:266-283, ATC:117-131). A member named by ENGINE_DRIVER_SKIP (control
-        edk-cnctimeout only, 5.2) starts java with no driver at all."""
+        edk-cnctimeout only) starts java with no driver at all."""
         role = engine + str(index)
         jar = JAVA + ['-jar', f'/artifacts/{engine}.jar']
         if self.engine_driver() != 'external':
@@ -440,7 +440,7 @@ class CoreFixture(Fixture):
         return self._driver_wrapper(role, ENGINE_LIBS_DIR, jar)
 
     def engine_driver_pidfile(self, role):
-        """5.1: the pid file the engine wrapper writes, so exec_kill can kill an engine's staged aeronmd."""
+        """The pid file the engine wrapper writes, so exec_kill can kill an engine's staged aeronmd."""
         if role == 'projector':
             if self.projector_driver() != 'external':
                 raise Violation(f'projector runs no staged driver (projector_driver {self.projector_driver()})')
@@ -458,7 +458,7 @@ class CoreFixture(Fixture):
         return env
 
     def t1_env(self):
-        """Environment of the pinned T1 drivers (PROBE_ENV): the probe principals' credentials, 5 ME markets (PO-7)."""
+        """Environment of the pinned T1 drivers (PROBE_ENV): the probe principals' credentials, 5 ME markets."""
         cred = self.keys.credential
         return {'T1_ADMIN_KEY': cred('probe-admin', 'ae'), 'T1_TOOL_KEY': cred('probe-tool', 'ae'),
                 'T1_GATEWAY_KEY': cred('probe-gateway', 'ae'), 'T1_ME_ADMIN_KEY': cred('probe-admin', 'me'),
@@ -472,7 +472,7 @@ class CoreFixture(Fixture):
                 **self.projector_driver_env()}
 
     def projector_driver_env(self):
-        """RC2 S17 W2: no key in the manifest = the S16 env unchanged; embedded never sets AERON_DIR (ProjectorDriver refuses
+        """No key in the manifest = the base env unchanged; embedded never sets AERON_DIR (ProjectorDriver refuses
         it); external names the staged driver's dir."""
         if 'projector_driver' not in self.m:
             return {}
@@ -481,7 +481,7 @@ class CoreFixture(Fixture):
         return {'PROJECTOR_DRIVER_MODE': 'embedded'}
 
     def probe_command(self):
-        """The probe idles; with pinned probe_libs it also runs the aeronmd the T1 drivers attach to (contract 3.3)."""
+        """The probe idles; with pinned probe_libs it also runs the aeronmd the T1 drivers attach to."""
         if not (self.m.get('probe_libs') or {}).get('aeronmd'):
             return ['sleep', 'infinity']
         d = PROBE_AERON_DIR
@@ -492,8 +492,8 @@ class CoreFixture(Fixture):
         return ['sh', '-c', script]
 
     def genesis_id(self, life=1):
-        """The ME/core genesis identity, odd and distinct per life (S16 5.1). RC2 S17 W3 (coordinator): derived from the run_id
-        at run time (core_contracts.derive_genesis_id), not from the kind's constant seed, so RC2 step 7 sees a distinct id per
+        """The ME/core genesis identity, odd and distinct per life. Derived from the run_id
+        at run time (core_contracts.derive_genesis_id), not from the kind's constant seed, so activation step 7 sees a distinct id per
         genesis run; the rule is recorded with the genesis (genesis_derivation)."""
         return core_contracts.derive_genesis_id(self.run_id, life)
 
@@ -501,7 +501,7 @@ class CoreFixture(Fixture):
         return {'rule': core_contracts.GENESIS_DERIVATION, 'run_id': self.run_id}
 
     def life(self, scope='core'):
-        """The newest life whose ``scope`` (me | core) genesis has started (S16 5.1); 1 before any genesis record."""
+        """The newest life whose ``scope`` (me | core) genesis has started; 1 before any genesis record."""
         lives = self.registry.get('lives') or {}
         started = [int(n) for n, record in lives.items() if scope in record]
         return max(started) if started else 1
@@ -542,7 +542,7 @@ class CoreFixture(Fixture):
         return json.loads([l for l in r.stdout.splitlines() if l.startswith('{')][-1])['legs']
 
     def me_open_legs_unauthenticated(self):
-        """core-boot control: an S6 ME refuses a session that presents no credential."""
+        """core-boot control: an authenticating ME refuses a session that presents no credential."""
         ingress = ','.join(f'{i}={self.m["nodes"][f"me{i}"]}:{self.m["ports"]["me_base"] + i * self.m["ports"]["stride"] + 2}'
                            for i in range(3))
         argv = JAVA + ['-cp', '/artifacts/journal-probe.jar:/artifacts/me.jar', 'JournalProbe', 'open-legs',
@@ -550,14 +550,14 @@ class CoreFixture(Fixture):
         return self.execute('probe', argv, timeout=90, check=False, accepted=(0, 1))
 
     def tap_paths(self, life=1):
-        """S16 5.1: one tap per life, ``tap-life<n>.jsonl/.out/.err/.sessions.jsonl`` in the probe's /data (host: state/probe)."""
+        """One tap per life, ``tap-life<n>.jsonl/.out/.err/.sessions.jsonl`` in the probe's /data (host: state/probe)."""
         stem = f'tap-life{int(life)}'
         host = self.root / 'state' / 'probe'
         return {k: host / (stem + suffix) for k, suffix in
                 (('rows', '.jsonl'), ('out', '.out'), ('err', '.err'), ('sessions', '.sessions.jsonl'))}
 
     def start_tap(self, duration_ms, life=1):
-        """Independent dispatch/order/admission witness (TOOL session, harness Q4), in the background, on per-life files."""
+        """Independent dispatch/order/admission witness (TOOL session), in the background, on per-life files."""
         cid = self.registry['containers']['probe']; self.inspect('container', cid)
         command = ['docker', 'exec', '-d']
         environment = self.probe_env('probe-tool')
@@ -570,7 +570,7 @@ class CoreFixture(Fixture):
         return self.tap_paths(life)['rows']
 
     def start_story(self, kv, name='story'):
-        """S15 6: one ``CoreProbe story`` JVM in the background on the GATEWAY principal. Returns the host paths of its
+        """One ``CoreProbe story`` JVM in the background on the GATEWAY principal. Returns the host paths of its
         request log, markers, stdout and exit file (the probe's /data is the host's state/probe)."""
         cid = self.registry['containers']['probe']; self.inspect('container', cid)
         environment = self.probe_env('probe-gateway')
@@ -589,7 +589,7 @@ class CoreFixture(Fixture):
         return paths
 
     def funding_plan(self, script, users, seed):
-        """The deposit table of ``CoreProbe story script=funding`` (no cluster), one owner of the amounts (section 6)."""
+        """The deposit table of ``CoreProbe story script=funding`` (no cluster), one owner of the amounts."""
         meaning, reply = self.core('story', None, script='funding', seed=seed, users=','.join(map(str, users)),
                                    out='/data/funding-plan.jsonl', **{'for': script})
         if meaning != 'ANSWERED':
@@ -598,9 +598,9 @@ class CoreFixture(Fixture):
         return [{'request': r['request'], 'user': r['user'], 'asset': r['asset'], 'amount': r['amount']} for r in rows]
 
     def read_tap_summary(self, life=None):
-        """CoreProbe tap's exit lines: ``TAP first= last= rows= gaps=`` and the JSON summary (5.7 rule 1), plus its
+        """CoreProbe tap's exit lines: ``TAP first= last= rows= gaps=`` and the JSON summary, plus its
         session-transition sidecar. Inconclusive while the tap JVM has not printed them (it is still running or died).
-        ``life`` defaults to the current core life (S16 5.1)."""
+        ``life`` defaults to the current core life."""
         out = self.tap_paths(life or self.life('core'))['out']
         lines = out.read_text().splitlines() if out.exists() else []
         line = next((l for l in lines if l.startswith('TAP first=')), None)
@@ -642,11 +642,11 @@ class CoreFixture(Fixture):
         return parse_prometheus(response['body'])
 
     def start(self, plan=None, before_engines=None):
-        """Boot the topology. ``plan=None`` is the S14 boot (empty core, slots up; core-boot). A ``plan`` runs the
-        contract 5.3 genesis phases and leaves a funded, OPEN core with bridges and forwarders ready."""
+        """Boot the topology. ``plan=None`` is the bare boot (empty core, slots up; core-boot). A ``plan`` runs the
+        genesis phases and leaves a funded, OPEN core with bridges and forwarders ready."""
         self.check_image(); self.stage_artifacts(); self.start_network(); self.start_database()
         self.spawn('probe', self.probe_command())
-        if before_engines is not None:          # RC2 S17 review V1: the X-R precheck, with the projection database up
+        if before_engines is not None:          # The X-R precheck, with the projection database up
             before_engines()
         boot = {'started_ns': time.time_ns(), 'phases': {}}
         self.registry['boot'] = boot
@@ -656,7 +656,7 @@ class CoreFixture(Fixture):
         for engine, port in [('ae', self.m['ports']['ae_metrics']), ('me', self.m['ports']['me_metrics'])]:
             for i in range(3): self.wait_http(engine + str(i), port, '/ready')
         if self.engine_driver() == 'external':
-            # S16 5.1 (F-S16-7): every external engine's driver is registered, so restart() demands a NEW driver
+            # Every external engine's driver is registered, so restart() demands a NEW driver
             for role in ENGINES:
                 if role not in getattr(self, 'engine_driver_skip', ()):
                     self.registry.setdefault('driver_identity', {})[role] = self.driver_identity(role)
@@ -667,7 +667,7 @@ class CoreFixture(Fixture):
             cut = str(self.m.get('manifest_kind', '')).startswith('s17')
             for slot in sorted(SLOTS):
                 if cut and slot == 'fwd0':
-                    # RC2 S17 W3 (coordinator): the cut forwarder waits for the ME epoch (not ready on a bare ME), so the
+                    # The cut forwarder waits for the ME epoch (not ready on a bare ME), so the
                     # cut's core-boot binds the epoch (the ME genesis, behaviour 2) before the forwarder slots
                     self.registry['lives'] = {'1': {'me': {'genesis_id': self.genesis_id(1)}}}
                     self.me_genesis({})
@@ -679,10 +679,10 @@ class CoreFixture(Fixture):
         self.registry['slots'] = self.slots; self.registry['boot'] = boot
         self.registry['startup_complete'] = True; self.save()
 
-    # ---------------------------------------------------------------- genesis (contract 5.3)
+    # ---------------------------------------------------------------- genesis
 
     def genesis(self, plan):
-        """Phases 2..11 of 5.3, in this order, with a timestamp per phase. ``plan``: {users, funding: [{user, asset,
+        """Phases 2..11, in this order, with a timestamp per phase. ``plan``: {users, funding: [{user, asset,
         amount}], risk: {...}, markets: [1..5], ledger_capacity, tap_ms}."""
         phases = self.registry['boot']['phases']
         gid = self.genesis_id(1)
@@ -695,22 +695,22 @@ class CoreFixture(Fixture):
         self.audit_genesis()
 
     def audit_genesis(self, life=1):
-        """Contract 7.2 / review V10: right after every s17 genesis the audit (3.5) is taken into ``audit.json`` of the state
-        root (``audit-life<n>.json`` for a later core life, W6 fix round item 4); runner.py turns it and the run's evidence into
+        """Right after every s17 genesis the audit is taken into ``audit.json`` of the state
+        root (``audit-life<n>.json`` for a later core life); runner.py turns it and the run's evidence into
         the activation record of that life. Never fatal: the record judges it."""
         if not str(self.m.get('manifest_kind', '')).startswith('s17'):
             return None
-        import r10_cut
+        import release_cut
         path = self.root / ('audit.json' if life == 1 else f'audit-life{life}.json')
         try:
-            return r10_cut.audit_fixture(self, path)
+            return release_cut.audit_fixture(self, path)
         except Exception as error:
             path.write_text(json.dumps({'status': 'ERROR', 'error': str(error)[:500], 'findings':
                                         [str(error)[:300]], 'stopped': [], 'members_up': {}}) + '\n')
             return None
 
     def evidence_marks(self):
-        """W6 fix round item 4: the row counts of the two evidence logs the activation record reads; a regenesis records them
+        """The row counts of the two evidence logs the activation record reads; a regenesis records them
         where its life begins, so each life's record reads its own rows only."""
         def rows(name):
             path = self.root / name
@@ -718,14 +718,14 @@ class CoreFixture(Fixture):
         return {'commands': rows('commands.jsonl'), 'core_requests': rows('core-requests.jsonl')}
 
     def capture_core_genesis(self, life):
-        """W6 fix round item 4: the core's recorded genesisId of ``life`` is in the AE log recordings that regenesis('core')
-        is about to wipe; the reader output (r10_cut.genesis_reader) is kept in the state root with its sha256 first. s17 kinds
+        """The core's recorded genesisId of ``life`` is in the AE log recordings that regenesis('core')
+        is about to wipe; the reader output (release_cut.genesis_reader) is kept in the state root with its sha256 first. s17 kinds
         (the ones that issue activation records); an error is recorded as the capture, so the record cannot read OK."""
         if not str(self.m.get('manifest_kind', '')).startswith('s17'):
             return None
-        import r10_cut
+        import release_cut
         try:
-            reader = r10_cut.genesis_reader(self.root, r10_cut.load_money_schema(self.m['artifacts']['ae']['path']))
+            reader = release_cut.genesis_reader(self.root, release_cut.load_money_schema(self.m['artifacts']['ae']['path']))
         except Exception as error:
             reader = {'status': 'not observable', 'genesis_id': None, 'error': str(error)[:300], 'members': {}}
         path = self.root / f'core-genesis-life{life}.json'
@@ -765,7 +765,7 @@ class CoreFixture(Fixture):
         started_ns = time.time_ns()
         path = self.start_tap(duration, life=life)
         sessions = self.tap_paths(life)['sessions']
-        # S16 5.1: registry['tap'] is the current life's tap; every life's record stays under lives[n]
+        # registry['tap'] is the current life's tap; every life's record stays under lives[n]
         self.registry['tap'] = {'path': str(path), 'started_ns': started_ns, 'duration_ms': duration, 'life': life,
                                 'sessions': str(sessions)}
         self.registry.setdefault('lives', {}).setdefault(str(life), {})['tap'] = self.registry['tap']
@@ -775,7 +775,7 @@ class CoreFixture(Fixture):
         self.save()
 
     def wait_tap_registered(self, path, started_ns, bound_s=TAP_REGISTER_BOUND_S, sessions=None):
-        """Review F5: the tap's own 'registered' transition (its sessions sidecar, CoreProbe 5.7) is observed before any
+        """The tap's own 'registered' transition (its sessions sidecar) is observed before any
         gate change; a fixed sleep was not evidence (a late registration loses [SUSPENDED, GENESIS] and O12 would FAIL on
         a host cause). Not seen within the bound: INCONCLUSIVE, never a guess."""
         sessions = Path(sessions) if sessions is not None else path.with_name(path.name + '.sessions.jsonl')
@@ -792,7 +792,7 @@ class CoreFixture(Fixture):
             if time.monotonic() > deadline:
                 err = path.with_suffix('.err')
                 tail = err.read_text()[-300:] if err.exists() else ''
-                raise Inconclusive(f'the tap did not register within {bound_s} s (5.3 step 3): {tail}')
+                raise Inconclusive(f'the tap did not register within {bound_s} s: {tail}')
             self.sleep(0.2)
 
     def tap_gate(self, market=0, life=None):
@@ -824,7 +824,7 @@ class CoreFixture(Fixture):
         return ','.join(f'{i}={nodes[f"{engine}{i}"]}:{ports[engine + "_base"] + i * ports["stride"] + 2}' for i in range(3))
 
     def me_genesis(self, plan):
-        """Step 4: EngineConfig FRESH through T1MeDriver (D-S15-2); markets 2..5 exist at the ME (PO-7)."""
+        """Step 4: EngineConfig FRESH through T1MeDriver; markets 2..5 exist at the ME."""
         self._driver('t1_me_driver', 'T1MeDriver', 'genesis', PROBE_AERON_DIR, self._ingress('me'),
                      self.genesis_id(self.life('me')), plan.get('ledger_capacity', 100_000))
 
@@ -834,14 +834,14 @@ class CoreFixture(Fixture):
             raise Inconclusive('money journal could not be armed through the core probe: ' + meaning)
 
     def start_projector(self, plan):
-        if 'projector' in self.registry['containers']:      # S16 5.1: a second life restarts the same container, never spawns
+        if 'projector' in self.registry['containers']:      # A second life restarts the same container, never spawns
             self.restart('projector')
             return
         self.spawn('projector', self.projector_command(), self.projector_env())
         self.wait_http('projector', self.m['ports']['projector_http'], '/health')
 
     def start_or_restart_slot(self, slot):
-        """start_slot on the first life; restart() of the same container on a later one (regenesis, S16 5.1)."""
+        """start_slot on the first life; restart() of the same container on a later one (regenesis)."""
         if slot not in self.registry['containers']:
             return self.start_slot(slot)
         witness = self.restart(slot)
@@ -863,13 +863,13 @@ class CoreFixture(Fixture):
                      self.genesis_id(self.life('core')), plan.get('ledger_capacity', 100_000), 0, 'via-bridge')
 
     def t1_market(self):
-        """W5 item 3: the market rows of the pinned T1CoreDriver genesis, read from its source (the W3 constant had maxPrice
+        """The market rows of the pinned T1CoreDriver genesis, read from its source (an earlier constant had maxPrice
         10^18, the driver sends 1_000_000_000_000_000L = 10^15: the tables differed, so the driver's re-run met STALE at
         CoreConfig 1, CoreConfigStateMachine.java:94-98 at eb559a7)."""
         return t1_market_rows(Path(self.m['t1_core_driver']['source_path']).read_text())
 
     def core_config(self, version, genesis_id=None):
-        """RC2 S17 W3 (5.2 (iii)): one CoreConfig through ``CoreProbe core-config`` on the ADMIN principal, with the values the
+        """One CoreConfig through ``CoreProbe core-config`` on the ADMIN principal, with the values the
         genesis driver sends (configVersion = behaviorVersion = version, the genesisId, its market rows), so a later driver run
         meets an equal record (DUPLICATE). Returns [version, AdminAck result name]."""
         gid = genesis_id or self.genesis_id(self.life('core'))
@@ -880,8 +880,8 @@ class CoreFixture(Fixture):
         return [version, acks[-1]['result']]
 
     def core_genesis_partial(self, plan, stop_after, genesis_id=None):
-        """X-A2: the core genesis stopped after CoreConfig ``stop_after`` (1 or 2): the W0 scratch switch ``-Dt1.maxv=k`` as a
-        harness option (the driver's three frames leave within 70 ms, so an outside kill cannot stop it, 20.1 line 12)."""
+        """X-A2: the core genesis stopped after CoreConfig ``stop_after`` (1 or 2): the driver switch ``-Dt1.maxv=k`` as a
+        harness option (the driver's three frames leave within 70 ms, so an outside kill cannot stop it)."""
         if stop_after not in (1, 2):
             raise Violation('a partial genesis stops after CoreConfig 1 or 2, got ' + repr(stop_after))
         results = [self.core_config(v, genesis_id) for v in range(1, stop_after + 1)]
@@ -890,7 +890,7 @@ class CoreFixture(Fixture):
         return row
 
     def core_genesis_finish(self, plan, genesis_id=None):
-        """X-A2 recovery: CoreConfig 3 only (5.2 (iii)), measured."""
+        """X-A2 recovery: CoreConfig 3 only, measured."""
         row = {'genesis_id': genesis_id or self.genesis_id(self.life('core')), 'results': [self.core_config(3, genesis_id)]}
         self.registry['finish_genesis'] = row; self.save()
         return row
@@ -904,7 +904,7 @@ class CoreFixture(Fixture):
 
     def fund(self, plan):
         """Step 9: ACKed deposits on the TOOL principal, each recorded with its gate state (CO:18-28). A plan that names
-        ``funding_for`` takes the story's own deposit table (``CoreProbe story script=funding``, section 6)."""
+        ``funding_for`` takes the story's own deposit table (``CoreProbe story script=funding``)."""
         rows = []
         funding = plan.get('funding') or []
         if plan.get('funding_for'):
@@ -923,7 +923,7 @@ class CoreFixture(Fixture):
         self.registry['funding'] = rows; self.save()
 
     def fund_rows(self, rows):
-        """S16 5.1: drill-time funding on the TOOL principal (A04's halt-time deposits and withdrawals), appended to
+        """drill-time funding on the TOOL principal (A04's halt-time deposits and withdrawals), appended to
         registry['funding'] with the tap's GLOBAL gate row at send time, exactly as fund() records them, so M9 judges them.
         The outcome is recorded as answered (ACK, REJECT, UNKNOWN), never raised: the oracle judges it."""
         out = []
@@ -959,7 +959,7 @@ class CoreFixture(Fixture):
         if global_gate is None or global_gate['state'] != 'OPEN':
             raise Violation(f'GLOBAL gate is not OPEN after genesis: {global_gate}')
         profile = journal_decode.load_profile(self.m['me_journal_profile'])
-        # RC2 S17 W3 (5.2 (ii), 20.1 line 11): a member a scenario stopped (a registered fault target, not Running) is skipped
+        # A member a scenario stopped (a registered fault target, not Running) is skipped
         # and named; any other stopped member is still dumped (and fails loudly), and two members are the minimum witness
         members, skipped = self.members_up('me')
         if len(members) < 2:
@@ -971,7 +971,7 @@ class CoreFixture(Fixture):
                 raise Violation(f'{member} journal is not a clean genesis: {[e["type"] for e in events]}')
 
     def members_up(self, engine):
-        """RC2 S17 W3 (5.2 (ii)): (members to read, members skipped) of an engine. Skipped: a registered fault target whose
+        """(members to read, members skipped) of an engine. Skipped: a registered fault target whose
         container is not Running (X-A1's killed leader, X-A4's late members); every other member is read."""
         targets = self.registry.get('fault_targets') or {}
         members, skipped = [], []
@@ -989,7 +989,7 @@ class CoreFixture(Fixture):
             self.slots[slot] = self.start_slot(slot)
 
     def bind_member_states(self, state_dir, members=ENGINES):
-        """RC2 S17 review V1 (X-R, 6.9 step 3: "the forward order on the same state roots"): the members' /data are the dirs of
+        """The members' /data are the dirs of
         ``state_dir`` (another fixture's state, wiped by the precheck's list), linked as ``state/<member>`` so every reader of
         this fixture's state root sees them. Each dir must exist and be empty; a member already started is refused."""
         for member in members:
@@ -1009,7 +1009,7 @@ class CoreFixture(Fixture):
         self.save()
         return dict(self.registry['bound_state'])
 
-    # ---------------------------------------------------------------- seeds (RC2 S17 W3, contract 5.2)
+    # ---------------------------------------------------------------- seeds
 
     def seed_state(self, role, src, recorded_sha256, witness=None, parts=None):
         """Copy a member's state dir from a stopped earlier run into ``state/<role>`` before the member starts. Refused: a
@@ -1046,7 +1046,7 @@ class CoreFixture(Fixture):
     # ---------------------------------------------------------------- slots
 
     def slot_artifact(self, slot):
-        """The artifact a slot runs: the manifest's, or the one replace_slot swapped in (S16 R7, witnessed)."""
+        """The artifact a slot runs: the manifest's, or the one replace_slot swapped in (witnessed)."""
         return ((getattr(self, 'registry', None) or {}).get('slot_override') or {}).get(slot, self.m['slot_artifacts'][slot])
 
     def slot_binary(self, slot):
@@ -1120,7 +1120,7 @@ class CoreFixture(Fixture):
 
     def ready_target(self, role):
         """(port, path) whose 200 means the role is back. A Running container is not a heal. ``readiness_override``
-        is set only by the RED-1 drill (8.1: the nc forwarders may answer /ready 503 STALLED; liveness is /health)."""
+        is set only by the RED-1 drill (the nc forwarders may answer /ready 503 STALLED; liveness is /health)."""
         ports = self.m['ports']
         if role in self.readiness_override:
             return (ports['forwarder_http'] if role.startswith('fwd') else ports['bridge_http']), self.readiness_override[role]
@@ -1138,13 +1138,13 @@ class CoreFixture(Fixture):
         artifact_name = self.slot_artifact(slot)
         if slot == 'shadow0':
             if artifact_name is not None:
-                raise Inconclusive('shadow0 is reserved for RCS S9; this fixture does not start a shadow replica')
-            return {'state': 'RESERVED', 'reason': 'RCS S9 fills the shadow replica role'}
+                raise Inconclusive('shadow0 is reserved for the shadow replica; this fixture does not start one')
+            return {'state': 'RESERVED', 'reason': 'reserved for the shadow replica role'}
         artifact = self.m['artifacts'][artifact_name] if artifact_name else None
         if artifact is None:
             return {'state': 'SKIPPED_ABSENT', 'artifact': artifact_name,
-                    'reason': 'no pinned binary for this slot yet (C++ ' + ('forwarder RC2 S12' if slot.startswith('fwd')
-                                                                           else 'bridge RC2 S9/S10') + ')'}
+                    'reason': 'no pinned binary for this slot yet (C++ ' + ('forwarder' if slot.startswith('fwd')
+                                                                           else 'bridge') + ')'}
         self.spawn(slot, self.slot_command(slot), self.slot_process_env(slot))
         port, path = self.ready_target(slot)
         self.wait_http(slot, port, path)
@@ -1166,7 +1166,7 @@ class CoreFixture(Fixture):
 
     def driver_identity(self, role):
         """cnc.dat mtime (ns) of the role's staged aeronmd plus the container's StartedAt. Inside a container the aeronmd
-        pid is always 9 and the inode always 6 (W0 answer 5), so neither can tell two drivers apart."""
+        pid is always 9 and the inode always 6, so neither can tell two drivers apart."""
         out = self.execute(role, ['stat', '-c', '%.9Y', f'/dev/shm/aeron-{role}/cnc.dat'], timeout=15)
         started = self.inspect('container', self.registry['containers'][role])['State']['StartedAt']
         return {'cnc_mtime': out.stdout.strip(), 'started_at': started}
@@ -1174,7 +1174,7 @@ class CoreFixture(Fixture):
     # ---------------------------------------------------------------- faults
 
     def open_fault(self, role, duration_s, heal_bound_s=60, reason=None):
-        """Register ``role`` as a deliberate fault target (F-S15-17) for its duration plus the heal bound."""
+        """Register ``role`` as a deliberate fault target for its duration plus the heal bound."""
         row_id = self.registry['fault_seq'] = self.registry.get('fault_seq', 0) + 1
         row = {'row_id': row_id, 'until_ns': time.time_ns() + int((duration_s + heal_bound_s) * 1e9)}
         if reason:
@@ -1249,7 +1249,7 @@ class CoreFixture(Fixture):
 
     def wait_exit(self, name, code, bound_s):
         """Wait for the container to exit with ``code`` (an int, or 'nonzero': C13 asserts non-zero and records the value).
-        S16 5.1 (F-S16-7): an engine's exit is recorded in last_kill, so restart()'s 12.5 s AE rule fires after a driver death."""
+        An engine's exit is recorded in last_kill, so restart()'s 12.5 s AE rule fires after a driver death."""
         cid = self._fault_target(name)
         started = deadline = self.clock(); deadline += bound_s
         while True:
@@ -1269,7 +1269,7 @@ class CoreFixture(Fixture):
 
     def restart(self, name, ready_timeout=60, readiness=None):
         """``docker start`` a killed or exited container (same state dir, same env) and return once /ready answers 200.
-        An AE member is not started before 12.5 s after its kill (W0 answer 2: earlier it hangs on the old archive mark
+        An AE member is not started before 12.5 s after its kill (measured: earlier it hangs on the old archive mark
         file with the container Up). An external slot must come back on a NEW driver."""
         cid = self._fault_target(name)
         before = self.inspect('container', cid)['State']
@@ -1300,12 +1300,12 @@ class CoreFixture(Fixture):
         self.close_fault(name)
         return self.record_fault(witness)
 
-    # ---------------------------------------------------------------- lifecycle helpers (RC2 S16 5.1)
+    # ---------------------------------------------------------------- lifecycle helpers
 
     def stop(self, name, signal='TERM', heal_bound_s=KILL_HEAL_BOUND_S):
         """A polite stop: ``docker kill --signal=TERM`` then ``docker stop -t <bound>`` (which kills at the bound). Forwarder
         and bridge must exit 0 (else INCONCLUSIVE "polite stop exited N", the witness recorded first); an engine's code is
-        recorded (20.1 line 4: 137 at 15 s before W9; on the W9 jars 143 in 0.17-0.29 s, judged by the drills'
+        recorded (137 at 15 s before the polite-stop fix; with it 143 in 0.17-0.29 s, judged by the drills'
         engine_polite_stop line). An escalated stop is a kill and sets last_kill.
         Opens a fault row: the stopped role is a deliberate target until it is restarted or replaced."""
         if signal not in {'TERM', 'INT'}:
@@ -1337,15 +1337,15 @@ class CoreFixture(Fixture):
                                                                'cause': 'stop escalated'}
         self.record_fault(witness)
         if kind in ('forwarder', 'bridge') and code != 0:
-            raise Inconclusive(f'polite stop exited {code}: {name} (contract 5.1)')
+            raise Inconclusive(f'polite stop exited {code}: {name}')
         return witness
 
     def replace_slot(self, slot, artifact, after_kill=False, keep_state=False):
-        """R7: the only way a slot's binary changes. The slot must be stopped or exited; its state dir is kept as
+        """The only way a slot's binary changes. The slot must be stopped or exited; its state dir is kept as
         ``state/<slot>.gen<n>`` and its log as ``logs/<slot>.gen<n>.log``, the container is removed, the slot restarts from
         ``artifact`` (same env, key id and IP). ``after_kill``: a replacement that exits 78 (F7_REJECTED) inside the 10 s
-        session window is witnessed and started once more after the window (F-S16-11). The fault row closes on /ready 200.
-        ``keep_state`` (RC2 S17 W3, A05-keep): the slot's state dir stays in place for the new binary, as a production unit
+        session window is witnessed and started once more after the window. The fault row closes on /ready 200.
+        ``keep_state`` (A05-keep): the slot's state dir stays in place for the new binary, as a production unit
         restart does; the old container's log is still kept as evidence. In embedded mode the driver dir lives in the removed
         container's own /dev/shm tmpfs and cannot survive the replacement in this rig (recorded in the witness)."""
         if slot not in ('fwd0', 'fwd1', 'bridge0', 'bridge1'):
@@ -1436,9 +1436,9 @@ class CoreFixture(Fixture):
 
     def wipe_engine(self, role, projection_dump_required=True, reason=None):
         """Empty the member's bind-mounted state dir on the host (CF:243, 261), keeping the directory. The member must not be
-        Running; the witness carries the byte count removed and the listing before. S16 fix round V6: an AE member is the
+        Running; the witness carries the byte count removed and the listing before. An AE member is the
         source of the life's money state, so its wipe needs that core life's projection dump on disk with the digest
-        reset_projection recorded (a precondition, never a fallback: no dump, no wipe). RC2 S17 W3: the X runs' recovery line
+        reset_projection recorded (a precondition, never a fallback: no dump, no wipe). The X runs' recovery line
         wipes members that ran on a foreign seed in a fixture where no money ever moved; ``projection_dump_required=False``
         names that with a ``reason`` (required), recorded in the witness."""
         if role not in ENGINES:
@@ -1480,7 +1480,7 @@ class CoreFixture(Fixture):
 
     def reset_projection(self, out_dir=None):
         """Stop the projector, dump every table of the run's money database to ``<out>/life-<n>/money_journal.pg.jsonl``
-        (F-S16-9: life-1 rows are evidence), then drop and recreate the database with the projector's packaged migrations,
+        (life-1 rows are evidence), then drop and recreate the database with the projector's packaged migrations,
         as start_database did. The projector comes back through restart() in the next life's genesis."""
         life = self.life('core')
         cid = self.registry['containers'].get('projector')
@@ -1539,11 +1539,11 @@ class CoreFixture(Fixture):
         return self.record_fault({'kind': 'start_members', 'engine': engine, 'ready': True, 'drivers': drivers})
 
     def regenesis(self, plan, scope):
-        """S16 5.1 (F-REGEN, H:266). ``me``: stop me0-2, wipe their state, start a fresh ME, ME genesis with the next life's
+        """``me``: stop me0-2, wipe their state, start a fresh ME, ME genesis with the next life's
         genesis id; the core stays bound to the old epoch (A04 life 1 is judged on it). ``core``: stop the forwarders (if
         still Running; in A04 they fenced themselves), the bridges and ae0-2, wipe the AE, reset the projection, start a
         fresh AE and run the life-2 genesis phases; projector, bridges and forwarders come back through restart(). The
-        projection is dumped before the AE wipe (V6; wipe_engine refuses an AE member without that dump)."""
+        projection is dumped before the AE wipe (wipe_engine refuses an AE member without that dump)."""
         if scope not in ('me', 'core'):
             raise Violation('regenesis scope is me or core, got ' + repr(scope))
         lives = self.registry.setdefault('lives', {})
@@ -1553,10 +1553,10 @@ class CoreFixture(Fixture):
             life = self.life('me') + 1
             gid = self.genesis_id(life)
             lives[str(life)] = {'me': {'genesis_id': gid, 'ledger_capacity': plan.get('ledger_capacity', 100_000)},
-                                'evidence_from': {'me': self.evidence_marks()}}      # W6 item 4: where life n's ME rows begin
+                                'evidence_from': {'me': self.evidence_marks()}}      # Where life n's ME rows begin
             phases = boot_lives.setdefault(str(life), {}).setdefault('me_phases', {})
             phases['started_ns'] = time.time_ns()
-            for fwd in ('fwd0', 'fwd1'):      # 20.1 line 6: they exit 78 (F8_EPOCH) a few seconds after the first ME start
+            for fwd in ('fwd0', 'fwd1'):      # They exit 78 (F8_EPOCH) a few seconds after the first ME start
                 if fwd in containers:
                     self.open_fault(fwd, 0, REGENESIS_HEAL_BOUND_S, reason='regenesis me: F8 epoch fence expected')
             stops = [self.stop(f'me{i}', heal_bound_s=REGENESIS_HEAL_BOUND_S) for i in range(3)]
@@ -1575,7 +1575,7 @@ class CoreFixture(Fixture):
         if 'me' not in lives.get(str(life), {}):
             raise Violation(f'regenesis core needs the ME re-genesis of life {life} first (regenesis(plan, "me"))')
         gid = self.genesis_id(life)
-        lives[str(life)].setdefault('evidence_from', {})['core'] = self.evidence_marks()   # W6 item 4: life n's core rows
+        lives[str(life)].setdefault('evidence_from', {})['core'] = self.evidence_marks()   # Life n's core rows
         lives.setdefault(str(life - 1), {})['records'] = copy.deepcopy(
             {k: self.registry.get(k) for k in ('tap', 'funding', 'genesis', 'genesis_snapshot', 'risk', 'slots')})
         exited, stops = {}, []
@@ -1591,8 +1591,8 @@ class CoreFixture(Fixture):
         for role in ('bridge0', 'bridge1', 'ae0', 'ae1', 'ae2'):
             if role in containers and self.inspect('container', containers[role])['State']['Running']:
                 stops.append(self.stop(role, heal_bound_s=REGENESIS_HEAL_BOUND_S))
-        self.reset_projection()        # V6: the life's projection is dumped BEFORE the AE (its source) is wiped
-        self.capture_core_genesis(life - 1)      # W6 item 4: the life's core genesisId, read before its AE log is wiped
+        self.reset_projection()        # The life's projection is dumped BEFORE the AE (its source) is wiped
+        self.capture_core_genesis(life - 1)      # The life's core genesisId, read before its AE log is wiped
         wipes = [self.wipe_engine(f'ae{i}') for i in range(3)]
         self.start_members('ae')
         lives[str(life)]['core'] = {'genesis_id': gid}
@@ -1600,7 +1600,7 @@ class CoreFixture(Fixture):
         phases = boot_lives.setdefault(str(life), {}).setdefault('phases', {})
         self.run_genesis_steps(plan, LIFE2_CORE_ORDER, phases)
         self.registry['genesis'] = {'genesis_id': gid, 'ledger_capacity': plan.get('ledger_capacity', 100_000), 'life': life,
-                                    'derivation': self.genesis_derivation()}       # W6 item 4: the life-2 record checks it
+                                    'derivation': self.genesis_derivation()}       # The life-2 record checks it
         lives[str(life)]['core'].update(ledger_capacity=self.registry['genesis']['ledger_capacity'])
         self.save()
         check_genesis_order(phases, expected=LIFE2_CORE_PHASES)
@@ -1611,7 +1611,7 @@ class CoreFixture(Fixture):
                                   'wiped_bytes': [(w or {}).get('bytes_removed') for w in wipes]})
 
     def partition(self, source, target, kind, action):
-        """G10: drop one client's UDP path to an engine port, inside that owned client's namespace."""
+        """Drop one client's UDP path to an engine port, inside that owned client's namespace."""
         if source not in self.registry['containers']:
             raise Inconclusive('partition source is not running in this fixture: ' + source)
         outputs = []

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""RC2 S15 W2: CoreProbe story and tap against a reply stub (contract 5.7, 6, 6.1). No cluster.
+"""CoreProbe story and tap against a reply stub. No cluster.
 
 The cases live in java/CoreProbeTest.java (they drive the story and the egress listener in the probe's own
 JVM, on the AE jar it runs with). This module compiles CoreProbe.java with them, runs them, and then reads the
 request logs they wrote through the real oracle model, so the story's rows are checked against the reader
-that judges them. Needs a JDK 21 (javac, java) and the S13 AE jar named by CORE_PROBE_AE_JAR; without them the
+that judges them. Needs a JDK 21 (javac, java) and the AE jar named by CORE_PROBE_AE_JAR; without them the
 whole class is SKIPPED with that reason (never a silent pass).
 """
 import json
@@ -56,11 +56,11 @@ def model_sample(lists):
     """The smallest sample oracle_model.Model reads the request rows from (markets 1..5 of Market.ALL)."""
     return {'markets': {str(m): {'base': m, 'quote': 0} for m in range(1, 6)}, 'declared': {}, 'me_journal': [],
             'core': {'live_orders': []}, 'creates': lists['creates'], 'amends': lists['amends'],
-            'cancels': lists['cancels'], 'dispatch_tap': [], 'core_events': []}   # core_events: the W3 Model reads tap continuity
+            'cancels': lists['cancels'], 'dispatch_tap': [], 'core_events': []}   # core_events: the Model reads tap continuity
 
 
 @unittest.skipUnless(AE_JAR and Path(AE_JAR).is_file() and shutil.which('javac') and shutil.which('java'),
-                     'set CORE_PROBE_AE_JAR to the S13 assets-cluster.jar (and put a JDK 21 on PATH) to run the W2 cases')
+                     'set CORE_PROBE_AE_JAR to an assets-cluster.jar (and put a JDK 21 on PATH) to run the story cases')
 class StoryTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -120,9 +120,9 @@ class StoryTest(unittest.TestCase):
         model = oracle_model.Model(model_sample(lists))
         order_oracle.o1(model)
 
-    def test_resolved_log_is_judged_after_w3(self):
-        """6.1 rule 2 (W3): the story's resolved UNKNOWN originals are judged as their re-send's verdict. W2 pinned the
-        c781b4c reading here (O1 INCONCLUSIVE "create outcome unknown"); W3 turns it."""
+    def test_resolved_log_is_judged_after_the_resend(self):
+        """The story's resolved UNKNOWN originals are judged as their re-send's verdict. The c781b4c reading here was
+        O1 INCONCLUSIVE "create outcome unknown"; the resolution turns it."""
         lists = load(self.out / 'a01-resolved.jsonl')
         unknown = [r for r in lists['creates'] if r['reply']['outcome'] == 'UNKNOWN']
         self.assertEqual(len(unknown), 3)

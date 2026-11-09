@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fixed-block SBE layouts read from the schema XML itself.
 
-The ME journal decoder is driven by the pinned schema file, not by hand-copied offsets: when RC2 S1
+The ME journal decoder is driven by the pinned schema file, not by hand-copied offsets: when the ME journal
 freezes journal schema 4 its XML drops into ``schemas/`` and this module computes the layout. Only
 what a journal record may contain is supported (primitives, fixed char arrays, enums, sets and
 composites of those). A group or var-data field is refused loudly: a journal record is one
 unfragmented fixed-length frame.
 
-RC2 S15 (contract 5.4): one flat repeating group per message is supported, because the ME journal's
+One flat repeating group per message is supported, because the ME journal's
 CommandRelease (template 4) carries the ``releases`` group. A group is the dimension header
 (``groupSizeEncoding``: blockLength uint16 + numInGroup uint16) and ``numInGroup`` fixed entries of
 ``blockLength`` bytes; the total frame length must equal ``HEADER + block + 4 + n * entryBlock`` exactly.

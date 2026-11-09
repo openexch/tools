@@ -1,5 +1,5 @@
 {
- "note": "RC2 S17 5.4 / 7.1 default plan, fixed order (RED-1, RED-2 on s17-red1 / s17-red2 and A05-keep added by W3).",
+ "note": "Default nightly plan on the cut, fixed order (RED-1, RED-2 on s17-red1 / s17-red2, and A05-keep).",
  "entries": [
   {
    "kind": "s17",

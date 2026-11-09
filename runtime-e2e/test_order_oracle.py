@@ -154,13 +154,13 @@ class OrderOracleTest(unittest.TestCase):
     def test_o11_counters_disagree_with_duplicates(self):
         self.assertRule(variant(clean_sample(), lambda s: s['counters'].update(stale_outcomes=1)), 'O11')
 
-    def test_o11_missing_g6_export_is_inconclusive(self):
+    def test_o11_missing_counter_export_is_inconclusive(self):
         self.assertRule(variant(clean_sample(), lambda s: s.pop('counters')), 'O11', 'INCONCLUSIVE')
 
     def test_o11_unexpected_quarantine(self):
         self.assertRule(variant(clean_sample(), lambda s: s['faults'].update(quarantined=1)), 'O11')
 
-    # ---- S15 W5: three rule corrections found by the first full-rule T2 runs (evidence/w5/findings.txt)
+    # ---- three rule corrections found by the first full-rule core-topology runs
 
     def test_o3_triggered_stop_child_starts_at_attempt_one(self):
         def edit(s):
@@ -185,7 +185,7 @@ class OrderOracleTest(unittest.TestCase):
     def test_o10_lost_cancel_of_an_order_the_me_ended_is_moot(self):
         result = order_oracle.judge(variant(clean_sample(), self._lost_cancel(1001)))
         self.assertEqual(result['rules']['O10']['status'], 'PASS', result)
-        self.assertEqual(result['rules']['O10']['moot_excused'], 1)      # review FIX-1: the count is recorded per run
+        self.assertEqual(result['rules']['O10']['moot_excused'], 1)      # The count is recorded per run
 
     def test_o10_lost_cancel_of_a_live_order_still_fails(self):
         self.assertRule(variant(clean_sample(), self._lost_cancel(1003)), 'O10')

@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""RC2 S15 W3: oracle rule changes (5.7, 6.1, 7, L8 item 4, F-S15-25) and the drill logic (4, 8, 9), on recorded and
+"""Oracle rule changes and the drill logic, on recorded and
 synthesized samples. Each RED names the text the c781b4c rule set gives on the same sample.
 
-"Recorded" here: the S14 clean lifecycle sample (oracle_samples, sealed like a barrier) and the W2 story rows (the
-resolved-UNKNOWN shape of evidence/w2/sample-a01-resolved). No drill has run yet (W5/W6), so every non-vacuity line is
-proven on witnesses synthesized from those samples (contract 8.4 allows it until W5; the README must say so).
+"Recorded" here: the clean lifecycle sample (oracle_samples, sealed like a barrier) and the story rows (the
+resolved-UNKNOWN shape). Lines without a recorded run are proven on witnesses synthesized from those samples.
 """
 import copy
 import json
@@ -38,13 +37,13 @@ def outcome_index(sample, order, low):
 
 
 def with_ids(sample):
-    """Give the request rows story ids, as CoreProbe story writes them (W2)."""
+    """Give the request rows story ids, as CoreProbe story writes them."""
     for n, row in enumerate(sample['creates'] + sample['amends'] + sample['cancels'], start=1):
         row['id'] = n
     return sample
 
 
-# ------------------------------------------------------------------ 6.1 UNKNOWN resolution
+# ------------------------------------------------------------------ UNKNOWN resolution
 
 
 class ResolutionTest(unittest.TestCase):
@@ -61,7 +60,7 @@ class ResolutionTest(unittest.TestCase):
         return variant(clean_sample(), edit)
 
     def test_resolved_unknown_create_is_judged_not_inconclusive(self):
-        """RED c781b4c: O1 INCONCLUSIVE "create outcome unknown". After W3 the re-send's fresh ACK is the verdict."""
+        """RED c781b4c: O1 INCONCLUSIVE "create outcome unknown". With the resolution pass the re-send's fresh ACK is the verdict."""
         money, order = judge(self._unknown(duplicate=False))
         self.assertEqual(order['status'], 'PASS', order)
         self.assertEqual(money['status'], 'PASS', money)
@@ -75,7 +74,7 @@ class ResolutionTest(unittest.TestCase):
         self.assertEqual(model.orders[1003]['reply']['source'], 'replay')
 
     def test_replayed_create_with_a_gone_hold_block_is_not_a_hold_asset_violation(self):
-        """S15 W5: the duplicate ACK of a re-sent UNKNOWN reports the CURRENT hold block, (0, 0) once the hold is gone."""
+        """The duplicate ACK of a re-sent UNKNOWN reports the CURRENT hold block, (0, 0) once the hold is gone."""
         def edit(s):
             with_ids(s)
             original = next(c for c in s['creates'] if c['reply']['order'] == 1001)
@@ -111,7 +110,7 @@ class ResolutionTest(unittest.TestCase):
         self.assertEqual(order['status'], 'INCONCLUSIVE', order)
 
     def test_w2_recorded_rows_resolve(self):
-        """The W2 shape (evidence/w2/sample-a01-resolved): three UNKNOWN originals, two duplicate re-sends, one fresh."""
+        """The resolved shape: three UNKNOWN originals, two duplicate re-sends, one fresh."""
         rows = [
             {'id': 3, 'request': [1, 3], 'reply': {'outcome': 'UNKNOWN'}, 'resolved_by': 13},
             {'id': 5, 'request': [1, 5], 'reply': {'outcome': 'UNKNOWN'}, 'resolved_by': 14},
@@ -127,7 +126,7 @@ class ResolutionTest(unittest.TestCase):
         self.assertTrue(all(not r['reply']['duplicate'] for r in effective))
 
     def test_amend_resolved_by_duplicate_counts_as_the_accepted_amend(self):
-        """W0 answer 11: amends dedupe by requestId too. RED c781b4c: M5 INCONCLUSIVE "0 accepted amends but 1 AMEND"."""
+        """Amends dedupe by requestId too. RED c781b4c: M5 INCONCLUSIVE "0 accepted amends but 1 AMEND"."""
         def edit(s):
             with_ids(s)
             amend = s['amends'][0]
@@ -139,12 +138,12 @@ class ResolutionTest(unittest.TestCase):
         self.assertEqual((money['status'], order['status']), ('PASS', 'PASS'), (money, order))
 
 
-# ------------------------------------------------------------------ F-S15-25 and L8 item 4
+# ------------------------------------------------------------------ dispatch tap and RELEASED copies
 
 
 class KindAndReleaseTest(unittest.TestCase):
     def test_release_id_dispatch_is_not_a_second_dispatch(self):
-        """A12 / W0 F-S15-25. RED c781b4c: FAIL "dispatch tap saw command id twice as a new dispatch"."""
+        """A12. RED c781b4c: FAIL "dispatch tap saw command id twice as a new dispatch"."""
         def edit(s):
             create = next(r for r in s['dispatch_tap'] if r['seq'] == 3)
             s['dispatch_tap'].append(dict(create, seq=11, kind='RELEASE_ID'))
@@ -171,7 +170,7 @@ class KindAndReleaseTest(unittest.TestCase):
         return variant(clean_sample(), edit)
 
     def test_o2_released_repeat_creates_nothing(self):
-        """L8 item 4. RED c781b4c: O2 FAIL "repeat outcome differs from the first"."""
+        """RED c781b4c: O2 FAIL "repeat outcome differs from the first"."""
         sample = self._released()
         order = order_oracle.judge(sample)
         self.assertEqual(order['status'], 'PASS', order)
@@ -186,7 +185,7 @@ class KindAndReleaseTest(unittest.TestCase):
         self.assertIn('without an earlier release', result['error'])
 
 
-# ------------------------------------------------------------------ 5.7 tap continuity and backfill
+# ------------------------------------------------------------------ tap continuity and backfill
 
 
 def holed(seq):
@@ -229,7 +228,7 @@ class TapContinuityTest(unittest.TestCase):
         self.assertEqual(order['status'], 'PASS', order)
 
     def test_missing_tail_against_the_core_head_is_a_gap(self):
-        """A11 / W0 answer 12: the T1 capture went blind as a TAIL and still printed "dense"."""
+        """A11: the T1 capture went blind as a TAIL and still printed "dense"."""
         sample = variant(clean_sample(), lambda s: s['core']['pending_dispatch'].update(head=12))
         detail = rule(order_oracle.judge(sample), 'O3')['detail']
         self.assertIn('tap gap [11, 12] not closed', detail)
@@ -310,7 +309,7 @@ class OrderingExceptionTest(unittest.TestCase):
         return variant(schema4_sample(), edit)
 
     def test_inversion_inside_the_window_is_counted_outside_is_fail(self):
-        """F-S15-23 / D9: inside (seq 8 <= until_seq 8, first-applied at journalSeq >= 12) recorded; outside FAIL."""
+        """Inside (seq 8 <= until_seq 8, first-applied at journalSeq >= 12) recorded; outside FAIL."""
         inside = rule(order_oracle.judge(self._inverted({'me_term': 2, 'until_seq': 8, 'from_journal_seq': 12})), 'O9')
         self.assertEqual(inside['status'], 'PASS', inside)
         self.assertEqual(inside['o9_exception_inversions'], 1)
@@ -323,7 +322,7 @@ class OrderingExceptionTest(unittest.TestCase):
         self.assertEqual(rule(order_oracle.judge(self._inverted(None)), 'O9')['status'], 'FAIL')
 
 
-# ------------------------------------------------------------------ ledger, declared block, C4
+# ------------------------------------------------------------------ ledger, declared block, cycles
 
 
 def fwdrestart_witness(second_heal=True):
@@ -345,7 +344,7 @@ def witness(ledger, **kw):
 
 class FaultOpenTest(unittest.TestCase):
     def test_fault_open_resets_twice(self):
-        """C4: two kill/restart cycles, each closed by an observed heal: fault_open false, the drill can PASS."""
+        """Two kill/restart cycles, each closed by an observed heal: fault_open false, the drill can PASS."""
         ledger = fwdrestart_witness()
         declared = cd.declared_block(ledger, 0x77)
         self.assertIs(declared['fault_open'], False)
@@ -358,7 +357,7 @@ class FaultOpenTest(unittest.TestCase):
         self.assertEqual(v['status'], 'PASS', v)
 
     def test_fault_open_second_heal_missing_is_inconclusive_not_pass(self):
-        """C4 sibling: the second restart was never observed ready: fault_open true, INCONCLUSIVE, never PASS."""
+        """Sibling: the second restart was never observed ready: fault_open true, INCONCLUSIVE, never PASS."""
         ledger = fwdrestart_witness(second_heal=False)
         declared = cd.declared_block(ledger, 0x77)
         self.assertIs(declared['fault_open'], True)
@@ -394,7 +393,7 @@ class FaultOpenTest(unittest.TestCase):
         self.assertEqual(d['ordering_exception'], {'me_term': 2, 'until_seq': 9})
 
 
-# ------------------------------------------------------------------ 8.4 non-vacuity lines, each with its control
+# ------------------------------------------------------------------ non-vacuity lines, each with its control
 
 
 def scrape(**roles):
@@ -438,7 +437,7 @@ class LinesTest(unittest.TestCase):
         late = ('A', {'exit_code': 70, 'exit_after_thaw_s': 9.0, 'resync_delta': 1})
         self.assertFalse(cd.line_pause_branches(self._pauses([a, late]))['holds'])
         self.assertFalse(cd.line_pause_branches(self._pauses([a, ('none', {})]))['holds'])        # pause 3 s control
-        self.assertFalse(cd.line_pause_branches(self._pauses([a]))['holds'])                       # one pause is not C4
+        self.assertFalse(cd.line_pause_branches(self._pauses([a]))['holds'])                       # one pause is not two cycles
         half = ('B', {'reconnect_delta_by_cluster': {'core': 1, 'me': 0}, 'resync_delta': 2})
         self.assertFalse(cd.line_pause_branches(self._pauses([a, half]))['holds'])
 
@@ -450,7 +449,7 @@ class LinesTest(unittest.TestCase):
         self.assertFalse(cd.line_released_outcome(witness(cd.Ledger(), released_repeats=0, released_after_thaw=[0, 0], snaps=snaps))['holds'])
         self.assertFalse(cd.line_released_outcome(witness(cd.Ledger(), released_repeats=1, released_after_thaw=[1],
                                                           snaps={'before': before, 'after': before}))['holds'])
-        # review FIX-5: repeats outside the pause window (a no-pause run has them too) do not hold the line
+        # Repeats outside the pause window (a no-pause run has them too) do not hold the line
         self.assertFalse(cd.line_released_outcome(witness(cd.Ledger(), released_repeats=9, released_after_thaw=[0, 0], snaps=snaps))['holds'])
         self.assertFalse(cd.line_released_outcome(witness(cd.Ledger(), released_repeats=9, snaps=snaps))['holds'])
 
@@ -511,7 +510,7 @@ class LinesTest(unittest.TestCase):
     def test_member_caught_up_tolerates_idle_log_growth_between_sequential_reads(self):
         ledger = cd.Ledger()
         ledger.heal(ledger.open('kill', 'ae0', {'was_leader': True}), 'restart', {'ready': True})
-        # the first S15 coreleader run: ae0 restarted, leader ae2, three sequential reads of a growing idle log
+        # the first coreleader run: ae0 restarted, leader ae2, three sequential reads of a growing idle log
         run = witness(ledger, ae_leader_after='ae2', ae_commit_positions={'ae0': 12528576, 'ae1': 12529216, 'ae2': 12529984},
                       ae_commit_leader_window=[12528512, 12530112])
         self.assertTrue(cd.line_member_caught_up(run)['holds'])
@@ -529,7 +528,7 @@ class LinesTest(unittest.TestCase):
         self.assertTrue(cd.line_fwd_restarts(witness(fwdrestart_witness()))['holds'])
         skipped = cd.Ledger()
         for fwd in cd.FORWARDERS:
-            skipped.skip('kill', fwd, 'control fwdrestart-nokill (8.4)')
+            skipped.skip('kill', fwd, 'control fwdrestart-nokill')
         self.assertFalse(cd.line_fwd_restarts(witness(skipped))['holds'])
         peer = cd.Ledger()
         for fwd in cd.FORWARDERS:
@@ -539,8 +538,8 @@ class LinesTest(unittest.TestCase):
     def test_partition_lines_and_the_drop_skipped_control(self):
         samples = [{'t': 0.0, 'me_seq': 10, 'core_head': 5}, {'t': 2.0, 'me_seq': 10, 'core_head': 40},
                    {'t': 4.0, 'me_seq': 10, 'core_head': 90}, {'t': 4.5, 'me_seq': 30, 'core_head': 95}]
-        self.assertEqual(cd.me_stall(samples), 4.0)     # FIX-4: lower bound, first to last read at the stalled seq
-        self.assertEqual(cd.me_stall(samples, upper=True), 4.5)     # review B1: the outer bracket
+        self.assertEqual(cd.me_stall(samples), 4.0)     # Lower bound, first to last read at the stalled seq
+        self.assertEqual(cd.me_stall(samples, upper=True), 4.5)     # the outer bracket
         self.assertEqual(cd.me_stall([dict(s, me_seq=10 + i) for i, s in enumerate(samples)]), 0.0)
         phase2 = {'fwd0': {'reconnect_core': 1, 'new_leader_core': 0}, 'fwd1': {'reconnect_core': 0, 'new_leader_core': 1}}
         held = witness(cd.Ledger(), partition={'me_stall_s': 4.0, 'phase2': phase2})
@@ -600,7 +599,7 @@ PASS = {'status': 'PASS', 'rules': {}}
 
 
 class PartitionPhase1Test(unittest.TestCase):
-    """Review B1: phase 1's witness covers the heal. A stall measured only inside the 3 s drop cannot exceed 3 s by the
+    """Phase 1's witness covers the heal. A stall measured only inside the 3 s drop cannot exceed 3 s by the
     property (only by scrape overhead); bracketed through the heal, a 3 s drop gives a gap > 3 s, and the nodrop control
     stays far below it."""
 
@@ -612,7 +611,7 @@ class PartitionPhase1Test(unittest.TestCase):
         through = self.reads([(0.0, 'pre', 100, 50), (0.3, 'drop', 105, 52), (1.0, 'drop', 105, 60), (2.0, 'drop', 105, 70),
                               (3.0, 'drop', 105, 80), (3.4, 'heal', 105, 82), (4.2, 'heal', 130, 84)])
         self.assertEqual(cd.me_stall(through, upper=True), 4.25)    # 0.0 (the read before the stand-still) to 4.25 (t1 of the 4.2 read)
-        self.assertEqual(cd.me_stall(through), 3.05)    # FIX-4: t0 3.4 of the last stalled read minus t1 0.35 of the first
+        self.assertEqual(cd.me_stall(through), 3.05)    # t0 3.4 of the last stalled read minus t1 0.35 of the first
         self.assertTrue(cd.line_partition_phase1(witness(cd.Ledger(), partition={'me_stall_s': cd.me_stall(through)}))['holds'])
         stopped = [r for r in through if r['phase'] != 'heal']   # c781b4c's window: the drop only
         self.assertEqual(cd.me_stall(stopped), 0.0)
@@ -625,7 +624,7 @@ class PartitionPhase1Test(unittest.TestCase):
         self.assertEqual(cd.me_stall(once), 0.0)                  # one read is no stand-still
 
     def test_core_pending_rise_counts_as_the_core_moving_when_the_forwarder_head_freezes(self):
-        """First S15 partition run: the cut forwarders' own core_head froze (2121) for the whole drop while the ME seq
+        """First partition run: the cut forwarders' own core_head froze (2121) for the whole drop while the ME seq
         stood still; the AE leader's pending-command gauge rose, which is the core side of the witness."""
         def read(t0, t1, phase, seq, head, pending):
             return {'t0': t0, 't1': t1, 'phase': phase, 'me_seq': seq, 'core_head': head, 'core_pending': pending}
@@ -692,7 +691,7 @@ class PartitionPhase1Test(unittest.TestCase):
 
 
 class BridgeWatchTest(unittest.TestCase):
-    """Review F1: RED-2's 'ready and not halted throughout' is watched during the load (post_load), not only after it."""
+    """RED-2's 'ready and not halted throughout' is watched during the load (post_load), not only after it."""
 
     def test_post_load_watches_the_bridges_while_the_story_runs(self):
         run = cd.DrillRun.__new__(cd.DrillRun)
@@ -735,7 +734,7 @@ class BridgeWatchTest(unittest.TestCase):
 
 
 class BridgeReadyThroughoutTest(unittest.TestCase):
-    """S15 W5 (F-S15-32): the real ct-bridge flaps /ready 503 no_source_attached for single rows."""
+    """The real ct-bridge flaps /ready 503 no_source_attached for single rows."""
 
     @staticmethod
     def row(b0=(200, 0.0, ''), b1=(200, 0.0, '')):
@@ -764,7 +763,7 @@ class BridgeReadyThroughoutTest(unittest.TestCase):
 
 
 class MemberLivesTest(unittest.TestCase):
-    """S15 W5 (F-S15-31): a restarted ME member journals the replayed log again into a new recording."""
+    """A restarted ME member journals the replayed log again into a new recording."""
 
     @staticmethod
     def event(seq, recording, **more):
@@ -793,7 +792,7 @@ class MemberLivesTest(unittest.TestCase):
 
 
 class Red2StoryBoundTest(unittest.TestCase):
-    """W5: with the outcome records dropped every a02 await runs its full 30 s, so only the red2 builds get a longer story."""
+    """With the outcome records dropped every a02 await runs its full 30 s, so only the red2 builds get a longer story."""
 
     def test_only_red2_runs_get_extra_story_time(self):
         self.assertEqual(cd.story_extra_s(None), 0)
@@ -847,14 +846,14 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual((green['status'], green['red']), ('FAIL', 'GREEN'))
 
     def test_red2_needs_the_trade_path_and_an_outcome_rule(self):
-        """8.2: an extra ME resting leg the core does not list (O4 "ME only") with M7/M8 PASS is RED-2."""
+        """An extra ME resting leg the core does not list (O4 "ME only") with M7/M8 PASS is RED-2."""
         sample = variant(clean_sample(), lambda s: s['me_open_legs'].append({'leg': 5999, 'order': 1004, 'user': SELLER, 'market': 1}))
         money, order = judge(sample)
         v = cd.red_verdict('red2', money, order, {'settle_rows': True, 'bridges_ready_and_not_halted_throughout': True})
         self.assertEqual((v['status'], v['named']), ('PASS', ['O4']), v)
         halted = cd.red_verdict('red2', money, order, {'settle_rows': True, 'bridges_ready_and_not_halted_throughout': False})
         self.assertEqual(halted['status'], 'INCONCLUSIVE')
-        # negctl (W0 answer 8): the trade translation never ran, M8 FAILs: not an accepted RED-2
+        # negctl: the trade translation never ran, M8 FAILs: not an accepted RED-2
         no_settle = variant(sample, lambda s: s.__setitem__('money_journal', [r for r in s['money_journal'] if r['kind'] != 'settle']))
         m2, o2 = judge(no_settle)
         self.assertNotEqual(cd.red_verdict('red2', m2, o2, {'settle_rows': False, 'bridges_ready_and_not_halted_throughout': True})['status'], 'PASS')
@@ -895,7 +894,7 @@ class StubFixture:
 class TableTest(unittest.TestCase):
     def test_every_drill_has_a_schedule_and_known_lines(self):
         self.assertTrue({'lostack', 'coreleader', 'meleader', 'fwdrestart', 'fwdpause', 'partition', 'driverkill', 'lifecycle',
-                         'lifecycle-faults'} <= set(cd.DRILLS))           # S16 adds its nine (S16TableTest)
+                         'lifecycle-faults'} <= set(cd.DRILLS))           # the base kinds add nine (BaseKindTableTest)
         for name, spec in cd.DRILLS.items():
             self.assertTrue(hasattr(cd.DrillRun, 'faults_' + spec['faults']), name)
             for line in spec['lines']:
@@ -913,7 +912,7 @@ class TableTest(unittest.TestCase):
         for name, spec in cd.DRILLS.items():
             story = spec['story']
             plan = cd.plan_for(spec, 1)
-            self.assertEqual(plan['funding_for'], cd.funding_script(story))     # S16: a03-fill funds as a01-mix
+            self.assertEqual(plan['funding_for'], cd.funding_script(story))     # a03-fill funds as a01-mix
             if story['script'] == 'a01-mix':
                 requests = (story['rate'] + story['rate'] // 5) * story['seconds']
                 self.assertLessEqual(requests / len(story['users']), 256, name)    # A7 RequestTable.PER_USER_CAP
@@ -952,7 +951,7 @@ class TableTest(unittest.TestCase):
         self.assertEqual(cd.leader_of(scrape(ae0={'assets_cluster_role': 1.0}, ae1={'assets_cluster_role': 2.0}), 'ae'), 'ae1')
 
 
-# ------------------------------------------------------------------ the heal observer on a stub fixture (5.5, 8.4)
+# ------------------------------------------------------------------ the heal observer on a stub fixture
 
 
 class BranchObserverTest(unittest.TestCase):
@@ -1056,20 +1055,20 @@ class BranchObserverTest(unittest.TestCase):
         self.assertEqual(run.extra['heal_not_observed'], ['fwd0'])
 
 
-# ------------------------------------------------------------------ the recorded forwarder run (W3 smoke, 2026-11-02)
+# ------------------------------------------------------------------ the recorded forwarder run (smoke, 2026-11-02)
 
-RECORDED = Path(__file__).with_name('samples') / 'w3-smoke-a01-n2.json'
+RECORDED = Path(__file__).with_name('samples') / 'forwarder-smoke-a01-n2.json'
 
 
 def recorded():
     """A real barrier sample: fixture v3 genesis, ct-forwarder x2 and ct-bridge x2 external, a 3 s a01-mix story at 10/s,
-    no fault (W3 wiring smoke). 30 creates, 5 cancels, 78 dispatches (43 of them RELEASE_ID), 12 trades."""
+    no fault (wiring smoke). 30 creates, 5 cancels, 78 dispatches (43 of them RELEASE_ID), 12 trades."""
     return json.loads(RECORDED.read_text())
 
 
 class RecordedRunTest(unittest.TestCase):
     def test_recorded_forwarder_run_passes_both_oracles(self):
-        """RED c781b4c on this sample: FAIL "dispatch tap saw command id twice as a new dispatch: (1, 0)" (F-S15-25);
+        """RED c781b4c on this sample: FAIL "dispatch tap saw command id twice as a new dispatch: (1, 0)";
         with that fixed alone, M8 FAIL (settle rows carry no meEpoch), O1 FAIL "dispatch for order 0" (RELEASE_ID rows
         carry order 0) and O11 FAIL "stale + redundant outcomes 15 != duplicate ME outcome records 0"."""
         money, order = judge(recorded())
@@ -1101,9 +1100,9 @@ class RecordedRunTest(unittest.TestCase):
         self.assertEqual(rule(core_oracle.judge(sample), 'M8')['status'], 'INCONCLUSIVE')
 
 
-# ================================================================== RC2 S16 W3: the nine drills, lines, REDs (contract 5.4, 7, 8, 9)
-# No S16 drill has run yet (W5/W6): every line is proven on synthesized witnesses with the shapes of the W0 dry-run
-# evidence (S16/evidence/dry-run/), each with its control (the same witness with the fault switched off).
+# ================================================================== the nine scheduled drills, lines, REDs
+# Every line is proven on synthesized witnesses with the shapes of the dry-run evidence, each with its control
+# (the same witness with the fault switched off).
 
 
 def S(t, **roles):
@@ -1120,7 +1119,7 @@ def release_event(seq, entries, epoch=7):
             'releases': [dict({'scope': 'UP_TO', 'result': 'APPLIED', 'removed': 1}, **e) for e in entries]}
 
 
-class DeclaredS16Test(unittest.TestCase):
+class DeclaredBaseKindTest(unittest.TestCase):
     def test_declared_blocks_per_drill_section_7(self):
         """RED 6380b01: declared_block takes no gate_sequence / halt / order_fault (one constant block, CD:182-186)."""
         g = cd.GATE_SEQUENCE
@@ -1142,7 +1141,7 @@ class DeclaredS16Test(unittest.TestCase):
         self.assertEqual((d['halt'], d['order_fault'], d['epochs']), (True, 1, [0x99]))
 
     def test_two_lives_each_reset_the_declared_block(self):
-        """C4: a life-1 ledger with a healed regenesis row and a fresh life-2 ledger: each life declares from its own
+        """A life-1 ledger with a healed regenesis row and a fresh life-2 ledger: each life declares from its own
         ledger and its own genesis id, never the other life's."""
         one, two = cd.Ledger(), cd.Ledger()
         row = one.open('regenesis', 'me')
@@ -1155,7 +1154,7 @@ class DeclaredS16Test(unittest.TestCase):
 
 
 class LatencyTest(unittest.TestCase):
-    """5.4 / 20.1 line 9: per-id first apply from the dispatch's cluster ms to the ME record-3 timestamp."""
+    """Per-id first apply from the dispatch's cluster ms to the ME record-3 timestamp."""
 
     def journal(self):
         return [{'type': 'outcome', 'journal_seq': 1, 'command_id_high': 1, 'command_id_low': 0, 'timestamp': 1005},
@@ -1164,7 +1163,7 @@ class LatencyTest(unittest.TestCase):
 
     def test_first_apply_skips_release_rows_and_backfilled_rows(self):
         """RED 6380b01: no latency_table. A RELEASE_ID row repeats its create's id after the outcome; matching it gives the
-        negative values W0 saw (answers-14.2 item 6: 41 percent), so it never enters the table; backfill rows (seq null)
+        negative values a dry run saw (41 percent), so it never enters the table; backfill rows (seq null)
         have no dispatch time."""
         tap = [{'seq': 1, 'id_high': 1, 'id_low': 0, 'kind': 'CREATE', 'at_ms': 1001},
                {'seq': 2, 'id_high': 2, 'id_low': 0, 'kind': 'CREATE', 'at_ms': 1002},
@@ -1248,7 +1247,7 @@ class A03LinesTest(unittest.TestCase):
         self.assertFalse(cd.line_release_once(cap)['holds'])
 
     def test_empty_sampler_series_is_inconclusive_never_fail(self):
-        """V4. RED f42a1c6: capacity_cycle and release_once FAILed on a sampler that never answered."""
+        """RED f42a1c6: capacity_cycle and release_once FAILed on a sampler that never answered."""
         dead = [S(100 + i, ae1={'unavailable': 'refused'}, me0={'unavailable': 'refused'}) for i in range(5)]
         for name in ('capacity_cycle', 'release_once'):
             line = cd.LINES[name](self.w(samples=dead))
@@ -1263,7 +1262,7 @@ class A03LinesTest(unittest.TestCase):
                                                       for i in range(3)])])     # a03-nokill: relayed live, inside W
         self.assertFalse(cd.line_release_resent(live)['holds'])
         first = self.w(me_journal=[release_event(500, [{'commandIdHigh': 100 + i, 'idLowFloor': 0, 'removed': 1} for i in range(3)])])
-        self.assertTrue(cd.line_release_resent(first)['holds'])    # W5: swap_me_seq is the NEXT seq, so the first record after the swap is AT it
+        self.assertTrue(cd.line_release_resent(first)['holds'])    # swap_me_seq is the NEXT seq, so the first record after the swap is AT it
         before = self.w(me_journal=[release_event(499, [{'commandIdHigh': 100 + i, 'idLowFloor': 0, 'removed': 1} for i in range(3)])])
         self.assertFalse(cd.line_release_resent(before)['holds'])
         none = cd.line_release_resent(self.w(tap_dispatch=[]))
@@ -1279,17 +1278,17 @@ class A03LinesTest(unittest.TestCase):
 
 
 class A04LinesTest(unittest.TestCase):
-    G1 = 15112027
+    EPOCH1 = 15112027
 
     def health(self, reason='SOURCE_SCHEMA', status=503, epoch=None):
-        return (status, {'halted': reason != 'NONE', 'haltReason': reason, 'meEpoch': epoch or self.G1})
+        return (status, {'halted': reason != 'NONE', 'haltReason': reason, 'meEpoch': epoch or self.EPOCH1})
 
     def w(self, **kw):
-        base = {'g1': self.G1,
+        base = {'g1': self.EPOCH1,
                 'bridge_health': {b: self.health() for b in cd.BRIDGES},
                 'halt_scrape': scrape(bridge0={'bridge_halt_reason': 3.0}, bridge1={'bridge_halt_reason': 3.0},
                                       ae0=dict(lead('ae'), assets_feed_latch_reason=3.0)),
-                'core': {'feed_halted': True, 'halt_reason': 'SOURCE_SCHEMA', 'bound_me_epoch': self.G1},
+                'core': {'feed_halted': True, 'halt_reason': 'SOURCE_SCHEMA', 'bound_me_epoch': self.EPOCH1},
                 'settle_rejected': 0,
                 'open_gate': {'meaning': 'REFUSED', 'reply': {'replies': [{'t': 'AdminAck', 'result': 'REJECTED', 'reason': 40}]}},
                 'life2_gate_open': True,
@@ -1306,7 +1305,7 @@ class A04LinesTest(unittest.TestCase):
         red = self.w(bridge_health={b: self.health('NONE', 200) for b in cd.BRIDGES},
                      halt_scrape=scrape(bridge0={'bridge_halt_reason': 0.0}, bridge1={'bridge_halt_reason': 0.0},
                                         ae0=dict(lead('ae'), assets_feed_latch_reason=0.0)),
-                     core={'feed_halted': False, 'halt_reason': 'NONE', 'bound_me_epoch': self.G1})
+                     core={'feed_halted': False, 'halt_reason': 'NONE', 'bound_me_epoch': self.EPOCH1})
         self.assertFalse(cd.line_halt_local(red)['holds'])
         mismatch = self.w(halt_scrape=scrape(bridge0={'bridge_halt_reason': 2.0}, bridge1={'bridge_halt_reason': 3.0},
                                              ae0=dict(lead('ae'), assets_feed_latch_reason=3.0)))
@@ -1327,23 +1326,23 @@ class A04LinesTest(unittest.TestCase):
         self.assertFalse(cd.line_fenced_forwarders(late)['holds'])
 
     def test_second_life_exact(self):
-        g2 = self.G1 + 2
+        g2 = self.EPOCH1 + 2
         good = {'life2': {'money': {'status': 'PASS'}, 'order': {'status': 'PASS'}, 'epochs': [g2], 'g2': g2,
                           'bound_me_epoch': g2, 'last_applied_trade_id': 40, 'max_epoch2_trade': 40}}
         self.assertTrue(cd.line_second_life_exact(good)['holds'])
-        self.assertFalse(cd.line_second_life_exact({'life2': dict(good['life2'], bound_me_epoch=self.G1)})['holds'])
+        self.assertFalse(cd.line_second_life_exact({'life2': dict(good['life2'], bound_me_epoch=self.EPOCH1)})['holds'])
         self.assertTrue(cd.line_second_life_exact({'life2': None}).get('inconclusive'))
-        # V8: the epochs are observed in the life-2 journal; a g1 record in it FAILs, none observed is INCONCLUSIVE
-        self.assertFalse(cd.line_second_life_exact({'life2': dict(good['life2'], epochs=[self.G1, g2])})['holds'])
+        # The epochs are observed in the life-2 journal; a g1 record in it FAILs, none observed is INCONCLUSIVE
+        self.assertFalse(cd.line_second_life_exact({'life2': dict(good['life2'], epochs=[self.EPOCH1, g2])})['holds'])
         self.assertTrue(cd.line_second_life_exact({'life2': dict(good['life2'], epochs=[])}).get('inconclusive'))
 
-    # W5 w5-a04-one-bridge-halt: kill seq 7592, bridge0's sync cursor 9871 = skipped 9871, read at STREAMING last 10152
+    # a04-one-bridge-halt run: kill seq 7592, bridge0's sync cursor 9871 = skipped 9871, read at STREAMING last 10152
     GREEN = {'me_seq_at_kill': 7592.0, 'peer_cursor_at_restart': 9604, 'restart_after_kill_s': 5.492, 'skipped_delta': 9871.0,
              'health_first': {'cursor': 9871, 'expected': 9890, 'last': 9889, 'state': 'STREAMING'},
              'health_after': {'cursor': 9871, 'expected': 10153, 'last': 10152, 'state': 'STREAMING'}}
 
     def test_cold_restart_skips_reads_the_sync_cursor_not_the_live_position(self):
-        """S16 fix round V5. RED f42a1c6: the W5 GREEN run FAILs (expected 10153 != cursor 9871 + 1): the report's C is
+        """RED f42a1c6: the GREEN run FAILs (expected 10153 != cursor 9871 + 1): the report's C is
         the sync cursor, the bridge's live position ran on under load. The first forward is judged at the sync."""
         line = cd.line_cold_restart_skips({'cold': self.GREEN})
         self.assertTrue(line['holds'], line)
@@ -1357,7 +1356,7 @@ class A04LinesTest(unittest.TestCase):
         self.assertTrue(missing.get('inconclusive'))
 
     def test_earlyrestart_control_fails_clause_a_for_its_named_reason(self):
-        """S16 fix round V2. W5 w5-ctl-a04-earlyrestart (no peer freeze): bridge1 streamed live, so bridge0's sync cursor
+        """ctl-a04-earlyrestart run (no peer freeze): bridge1 streamed live, so bridge0's sync cursor
         9530 was 1938 past the kill seq after a 1.08 s restart: the redefined line HOLDS on it (an early restart alone
         does not show that timing matters). The control now freezes bridge1: the sync cursor sits at about the kill seq,
         bridge0 forwards the backlog itself, clause (a) FAILs with its reason."""
@@ -1380,10 +1379,10 @@ class A04LinesTest(unittest.TestCase):
         self.assertFalse(cd.line_bridge_never_halted(halted)['holds'])
         self.assertTrue(cd.line_bridge_never_halted({'samples': rows})['holds'])
         empty = cd.line_bridge_never_halted({'samples': [S(1, bridge0={'unavailable': 0})]})
-        self.assertTrue(empty.get('inconclusive'))                      # V4: no row is no witness, never a FAIL
+        self.assertTrue(empty.get('inconclusive'))                      # no row is no witness, never a FAIL
 
     def test_open_refused_needs_the_life2_open(self):
-        """V7. RED f42a1c6: life2_gate_open None held the line."""
+        """RED f42a1c6: life2_gate_open None held the line."""
         self.assertTrue(cd.line_open_refused(self.w())['holds'])
         pending = cd.line_open_refused(self.w(life2_gate_open=None))
         self.assertFalse(pending['holds']); self.assertTrue(pending.get('inconclusive'))
@@ -1393,11 +1392,11 @@ class A04LinesTest(unittest.TestCase):
                                               life2_gate_open=None))
         self.assertFalse(noregen['holds']); self.assertFalse(noregen.get('inconclusive'))   # the control still FAILs
 
-    def test_engine_polite_stop_after_w9(self):
-        """Post-W9 polite stop (20.1 line 4, verifier note). W5: SIGTERM -> 143 in 0.17-0.29 s on all six engines."""
+    def test_engine_polite_stop_after_the_stop_fix(self):
+        """Polite stop after the stop fix. SIGTERM -> 143 in 0.17-0.29 s on all six engines."""
         stops = [{'kind': 'stop', 'target': f'me{i}', 'exit_code': 143, 'elapsed_s': t} for i, t in enumerate((0.286, 0.212, 0.283))]
         self.assertTrue(cd.line_engine_polite_stop({'engine_stops': stops})['holds'])
-        hung = stops[:2] + [dict(stops[2], exit_code=137, elapsed_s=15.0)]     # pre-W9: escalated at the 15 s bound
+        hung = stops[:2] + [dict(stops[2], exit_code=137, elapsed_s=15.0)]     # before the polite-stop fix: escalated at the 15 s bound
         self.assertFalse(cd.line_engine_polite_stop({'engine_stops': hung})['holds'])
         slow = stops[:2] + [dict(stops[2], elapsed_s=cd.SETTINGS['ENGINE_SHUTDOWN_TIMEOUT_S'] + cd.SETTINGS['ENGINE_STOP_SLACK_S'] + 0.1)]
         self.assertFalse(cd.line_engine_polite_stop({'engine_stops': slow})['holds'])
@@ -1446,10 +1445,10 @@ class A05LinesTest(unittest.TestCase):
         self.assertFalse(cd.line_build_witness(self.w(swaps=self.swaps()[:1]))['holds'])
 
     def test_build_witness_judges_the_reverse_direction(self):
-        """RC2 S17 W6 fix round item 3. RED 5d0339f: entries 22/23 (s17-a05-reverse, cut -> build A) FAIL build_witness 9/9:
+        """RED 5d0339f: entries 22/23 (s17-a05-reverse, cut -> build A) FAIL build_witness 9/9:
         the line wanted 'no build before, build B after', but there the swapped-out cut binary reports its source sha and the
         swapped-in build A (ct 2be3a19) has no /health build field. Each side is judged by what its binary reports."""
-        A = '2be3a1999ca193c0f37db7f6e460edd652c55fa1'                       # build A, ct 2be3a19 (S15 bin-s15)
+        A = '2be3a1999ca193c0f37db7f6e460edd652c55fa1'                       # build A, ct 2be3a19
         a_fwd = next(iter(core_contracts.HEALTH_BUILD_ABSENT))
         cut, cut_sha = 'e' * 40, 'f' * 64
 
@@ -1499,8 +1498,8 @@ class A05LinesTest(unittest.TestCase):
         self.assertFalse(cd.line_dup_outcomes(n1)['holds'])          # N = 1 after the stop: no duplicates
 
     def test_dup_outcomes_slack_default_and_an_unsampled_edge(self):
-        """13: W5 measured duplicates - dispatches = -1 (2059 vs 2060, 3129 vs 3130); the default slack is 10, a setting.
-        V4: a window edge with no sampler row is INCONCLUSIVE, never FAIL."""
+        """Measured duplicates - dispatches = -1 (2059 vs 2060, 3129 vs 3130); the default slack is 10, a setting.
+        A window edge with no sampler row is INCONCLUSIVE, never FAIL."""
         self.assertEqual(cd.SETTINGS['A05_DUP_EDGE_SLACK'], 10)
         t0 = 1_000_000
         tap = [{'seq': i + 1, 'id_high': i + 1, 'id_low': 0, 'kind': 'CREATE', 'at_ms': t0 + i * 20} for i in range(5000)]
@@ -1512,7 +1511,7 @@ class A05LinesTest(unittest.TestCase):
         self.assertFalse(cd.line_dup_outcomes(self.w(tap_dispatch=tap, samples=off))['holds'])   # 15 off > 10
 
     def test_n1_hold_makes_the_controls_gap_exceed_the_slack(self):
-        """V3 / fix round: W5 n1 windows were 1.08-1.3 s (survivor gap 0.76 s < 1.0 s; settle lag 51 vs 5 + 40). With the
+        """The n1 windows were 1.08-1.3 s (survivor gap 0.76 s < 1.0 s; settle lag 51 vs 5 + 40). With the
         single slot held A05_N1_HOLD_S the window is >= 5 s: no progress for 5 s FAILs survivor_delivered and the lag of a
         5 s settlement stop FAILs settle_no_gap by far more than the slack."""
         hold = cd.SETTINGS['A05_N1_HOLD_S']
@@ -1595,7 +1594,7 @@ class A06LinesTest(unittest.TestCase):
         self.assertTrue(cd.line_tick_conservation(unscraped).get('inconclusive'))
 
     def test_tick_conservation_bounds_offers_made_between_the_last_scrape_and_the_kill(self):
-        """Fix round, W5 w5-ctl-a06-n1: fwd0 alone; t29 299, prekill 300, after the restart 147: offered 447; the core
+        """ctl-a06-n1 run: fwd0 alone; t29 299, prekill 300, after the restart 147: offered 447; the core
         applied 449 (fwd0 offered 2 more between its pre-kill scrape and the SIGKILL). RED f42a1c6: 449 > 447 + 1 FAIL.
         The AE leader read 300 just before the pre-kill scrape and 302 a settle after the kill: the bound is 2."""
         def fwd(n):
@@ -1626,7 +1625,7 @@ class A06LinesTest(unittest.TestCase):
         self.assertFalse(cd.line_tick_end_state(wrong)['holds'])
 
     def test_tick_survivor_counts_rises_inside_the_dead_window_only(self):
-        """Fix round, W5 w5-ctl-a06-n1 (applied: 296 at 29.6, 302 at 30.6 then flat, 304 at 45.6 as the restarted fwd0
+        """ctl-a06-n1 run (applied: 296 at 29.6, 302 at 30.6 then flat, 304 at 45.6 as the restarted fwd0
         offered before its /ready returned at 46.158): RED f42a1c6 counted 2 rises in [kill, restart_s] with no survivor.
         The window is [kill + TICK_SETTLE_S, restart issued] and a rise needs two rows inside it."""
         series = [(25.584, 256), (26.584, 266), (27.592, 276), (28.586, 286), (29.592, 296), (30.585, 302)] + \
@@ -1637,11 +1636,11 @@ class A06LinesTest(unittest.TestCase):
         self.assertFalse(line['holds'], line)
         self.assertEqual(line['detail']['applied_rises_while_fwd0_down'], 0)
         old = cd.progress(cd.series(samples, 'ae', 'assets_ticks_applied_total'), 1030.298, 1046.158)[0]
-        self.assertEqual(len(old), 2)                                    # what W5 counted: the pre-kill commit and the restart
+        self.assertEqual(len(old), 2)                                    # what the run counted: the pre-kill commit and the restart
         unbracketed = cd.line_tick_survivor(self.w(kill_window={'kill_s': 30.0, 'restart_s': 45.0}))
         self.assertTrue(unbracketed.get('inconclusive'))
         empty = cd.line_tick_survivor(self.w(samples=[]))
-        self.assertTrue(empty.get('inconclusive'))                       # V4
+        self.assertTrue(empty.get('inconclusive'))
 
     def test_book_lines_parse(self):
         out = 'BOOK market=1 version=3185472 bid=8057000000 ask=9787000000 bids=3 asks=7 blocks=20/20\nBOOK market=2 none\n'
@@ -1654,7 +1653,7 @@ class FwdringLinesTest(unittest.TestCase):
         for n, (lo, hi) in enumerate(((100, 400), (900, 1300))):
             witness = {'me_seq_pause': lo, 'me_seq_thaw': hi, 'last_sent_before': 1000 * (n + 1), 'thaw_ms': 2000 + n * 10_000}
             if not pause:
-                ledger.skip('pause', 'fwd0', 'control fwdring-nopause (8.4)', witness=witness)
+                ledger.skip('pause', 'fwd0', 'control fwdring-nopause', witness=witness)
                 continue
             row = ledger.open('pause', 'fwd0', witness)
             ledger.heal(row, branch, {'reconnect_delta_by_cluster': {'core': reconnect, 'me': reconnect},
@@ -1697,11 +1696,11 @@ class EngineDriverLinesTest(unittest.TestCase):
         return rows
 
     def test_driver_death_loud_and_exit_zero_is_a_fail(self):
-        """RED 6380b01: no line_driver_death_loud. 20.1 line 5: W9 makes driver death exit 1; DR-0 saw the AE exit 0."""
+        """RED 6380b01: no line_driver_death_loud. The fix makes driver death exit 1; a dry run saw the AE exit 0."""
         self.assertTrue(cd.line_driver_death_loud({'kills': self.kills()})['holds'])
         zero = cd.line_driver_death_loud({'kills': self.kills(codes=(0, 1, 1))})
         self.assertFalse(zero['holds'])
-        self.assertIn('X6', json.dumps(zero['detail']))
+        self.assertIn('a finding', json.dumps(zero['detail']))
         self.assertFalse(cd.line_driver_death_loud({'kills': self.kills(after=(14.2, 19.0, 15.1))})['holds'])
         self.assertFalse(cd.line_driver_death_loud({'kills': self.kills()[:2]})['holds'])            # edk-nokill: fewer kills
         rows = self.kills(); rows[1]['identity_before'] = {'cnc_mtime': 'stale'}
@@ -1716,18 +1715,18 @@ class EngineDriverLinesTest(unittest.TestCase):
         self.assertFalse(cd.line_cluster_served(dict(w, samples=stalled))['holds'])
         self.assertFalse(cd.line_cluster_served(dict(w, kills=[]))['holds'])                        # edk-nokill
         unsampled = cd.line_cluster_served(dict(w, samples=[]))
-        self.assertFalse(unsampled['holds']); self.assertTrue(unsampled.get('inconclusive'))          # V4
+        self.assertFalse(unsampled['holds']); self.assertTrue(unsampled.get('inconclusive'))
 
     def test_cnc_timeout_loud(self):
         good = {'cnc': {m: {'exit_code': 1, 'exit_after_s': 31.0, 'ready_200_seen': False} for m in ('ae0', 'me0')}}
         self.assertTrue(cd.line_cnc_timeout_loud(good)['holds'])
         hang = {'cnc': {m: {'exit_code': None, 'exit_after_s': None, 'ready_200_seen': False} for m in ('ae0', 'me0')}}
-        self.assertFalse(cd.line_cnc_timeout_loud(hang)['holds'])                  # 20.1 line 5: a hang before W9
+        self.assertFalse(cd.line_cnc_timeout_loud(hang)['holds'])                  # A hang before the fix
         untimed = {'cnc': {'ae0': {'exit_code': 1, 'exit_after_s': None, 'ready_200_seen': False}}}
         self.assertTrue(cd.line_cnc_timeout_loud(untimed).get('inconclusive'))
 
     def test_cnc_exit_timing_counts_from_the_engine_driver_wait(self):
-        """V10. RED f42a1c6: W5 measured from the harness's spawn loop (35.9 s and 34.8 s against 35): the container
+        """RED f42a1c6: a run measured from the harness's spawn loop (35.9 s and 34.8 s against 35): the container
         create, the JVM start and the 0.5 s polling were inside the bound. Now FinishedAt minus the docker timestamp of
         the engine's own 'Driver mode EXTERNAL: connecting' line; the process start if the line is absent."""
         logs = ('2026-11-03T11:00:00.100000000Z starting\n'
@@ -1740,7 +1739,7 @@ class EngineDriverLinesTest(unittest.TestCase):
         self.assertEqual(cd.SETTINGS['CNC_TIMEOUT_BOUND_S'], 35)
 
 
-class S16RedVerdictTest(unittest.TestCase):
+class BaseKindRedVerdictTest(unittest.TestCase):
     def order(self, detail, status='FAIL'):
         return {'status': status, 'rules': {'O12': {'status': status, 'detail': detail}}}
 
@@ -1772,7 +1771,7 @@ class S16RedVerdictTest(unittest.TestCase):
 
 
 class ObserveLife1Test(unittest.TestCase):
-    """5.4 / R6: life 1's ME evidence comes from the pre-wipe freeze; the fresh ME is never asked."""
+    """Life 1's ME evidence comes from the pre-wipe freeze; the fresh ME is never asked."""
 
     def fixture(self):
         calls = []
@@ -1812,7 +1811,7 @@ class ObserveLife1Test(unittest.TestCase):
 
 class MemberEpochsTest(unittest.TestCase):
     def test_two_lives_with_overlapping_seqs_stay_apart(self):
-        """5.4: the merge keys on (me_epoch, journal_seq). RED 6380b01: Violation "journalSeq 1 differs between two
+        """The merge keys on (me_epoch, journal_seq). RED 6380b01: Violation "journalSeq 1 differs between two
         recordings" (a life-2 seq 1 merged onto life 1's seq 1)."""
         events = [{'type': 'engine_config', 'journal_seq': 1, 'me_epoch': 11, 'recording': 0},
                   {'type': 'outcome', 'journal_seq': 2, 'me_epoch': 11, 'recording': 0},
@@ -1836,7 +1835,7 @@ class SamplerTest(unittest.TestCase):
 
 
 class RunA04OrderTest(unittest.TestCase):
-    """V1: life 1's evidence is written when life 1 ends (before regenesis('core')), then overwritten by the final verdict.
+    """Life 1's evidence is written when life 1 ends (before regenesis('core')), then overwritten by the final verdict.
     RED f42a1c6: the only life-1 write came after life 2 (finish_life(life1) after judge_life(2))."""
 
     def test_life1_evidence_is_on_disk_before_the_core_is_wiped(self):
@@ -1903,7 +1902,7 @@ class RunA04OrderTest(unittest.TestCase):
 
 class SamplerWatcherTest(unittest.TestCase):
     def test_a_watcher_exception_is_recorded_and_makes_a_pass_inconclusive(self):
-        """V13. RED f42a1c6: the GateWatcher's exception went to the sampler's generic errors and the run PASSed."""
+        """RED f42a1c6: the GateWatcher's exception went to the sampler's generic errors and the run PASSed."""
         def boom(row):
             raise KeyError('state')
         sampler = cd.Sampler.__new__(cd.Sampler)
@@ -1920,25 +1919,25 @@ class SamplerWatcherTest(unittest.TestCase):
         self.assertEqual(cd.with_watcher_errors({'status': 'PASS', 'reasons': []}, []), {'status': 'PASS', 'reasons': []})
 
 
-class S16TableTest(unittest.TestCase):
-    S16 = {'a03-lifetime', 'a04-regenesis', 'a04-one-bridge-halt', 'a05-fwd-upgrade', 'a05-fwd-kill', 'a05-bridge-upgrade',
+class BaseKindTableTest(unittest.TestCase):
+    SCHEDULED = {'a03-lifetime', 'a04-regenesis', 'a04-one-bridge-halt', 'a05-fwd-upgrade', 'a05-fwd-kill', 'a05-bridge-upgrade',
            'a06-two-forwarders-ticks', 'a01-fwdring', 'c13-enginedriverkill'}
 
     def test_s16_drills_controls_and_reds_are_tabled(self):
-        self.assertTrue(self.S16 <= set(cd.DRILLS))
-        self.assertEqual({c for c in cd.CONTROLS if cd.CONTROLS[c][0] in self.S16} | {'edk-cnctimeout'},
+        self.assertTrue(self.SCHEDULED <= set(cd.DRILLS))
+        self.assertEqual({c for c in cd.CONTROLS if cd.CONTROLS[c][0] in self.SCHEDULED} | {'edk-cnctimeout'},
                          {'a03-cap100k', 'a03-nokill', 'a04-noregen', 'a04-earlyrestart', 'a05-fwd-upgrade-n1',
                           'a05-bridge-upgrade-n1', 'a06-n1', 'fwdring-pause15', 'fwdring-nopause', 'edk-nokill',
                           'edk-cnctimeout'})
         self.assertEqual((cd.REDS['red-a03']['drill'], cd.REDS['red-a04']['drill']), ('a03-lifetime', 'a04-regenesis'))
-        for name in self.S16:
+        for name in self.SCHEDULED:
             spec = cd.DRILLS[name]
             self.assertTrue(hasattr(cd.DrillRun, 'faults_' + spec['faults']), name)
             for line in spec['lines']:
                 self.assertIn(line, cd.LINES, (name, line))
 
     def test_plans_fit_the_per_user_cap_and_size_the_tap(self):
-        for name in self.S16:
+        for name in self.SCHEDULED:
             spec = cd.DRILLS[name]
             story = spec['story']
             if story['script'] == 'a01-mix':
@@ -1949,8 +1948,8 @@ class S16TableTest(unittest.TestCase):
         self.assertEqual(cd.plan_for(cd.DRILLS['a03-lifetime'], 1)['ledger_capacity'], 2000)
         self.assertEqual(cd.plan_for(cd.DRILLS['a03-lifetime'], 1, variant={'ledger_capacity': 100_000})['ledger_capacity'], 100_000)
         life1 = cd.plan_for(cd.DRILLS['a04-regenesis'], 1)['tap_ms'] / 1000
-        self.assertGreaterEqual(life1, 40 + cd.A04_HALT_PHASE_S + cd.PRE_BARRIER_S)     # W1 item 3: life-1 tap ends on its duration
-        # V9: the halt phase is a setting, default 60 s (W5: halt ~5 s, funding done ~12 s after the ME restart)
+        self.assertGreaterEqual(life1, 40 + cd.A04_HALT_PHASE_S + cd.PRE_BARRIER_S)     # life-1 tap ends on its duration
+        # The halt phase is a setting, default 60 s (measured: halt ~5 s, funding done ~12 s after the ME restart)
         self.assertEqual(cd.SETTINGS['A04_HALT_PHASE_S'], 60)
         life2 = cd.plan_for(cd.DRILLS['a04-regenesis'], 1, life=2)['tap_ms'] / 1000
         self.assertEqual(life1 - life2, 60)
@@ -1958,7 +1957,7 @@ class S16TableTest(unittest.TestCase):
             self.assertEqual(cd.plan_for(cd.DRILLS['a04-regenesis'], 1)['tap_ms'] / 1000 - life2, 200)
 
     def test_a03_scenarios_may_stage_the_norelease_build_in_both_slots(self):
-        """W1 open item 1. RED 6380b01: 'GREEN drills run the real binaries only' for core-drill-a03-lifetime on s16-a03."""
+        """RED 6380b01: 'GREEN drills run the real binaries only' for core-drill-a03-lifetime on s16-a03."""
         a03 = StubFixture(slots={'fwd0': 'forwarder_b', 'fwd1': 'forwarder_b', 'bridge0': 'bridge', 'bridge1': 'bridge'},
                           artifacts={'forwarder_b': {'driver': 'external', 'target': 'ct_forwarder_nc_norelease'},
                                      'forwarder': {'driver': 'external', 'target': 'ct-forwarder'}, 'bridge_b': None})
@@ -1974,8 +1973,8 @@ class S16TableTest(unittest.TestCase):
                 cd.scenario(a03, 'core-drill-a05-fwd-upgrade', '/nonexistent')
 
     def test_s17_a03_kinds_run_the_declared_phase_1_exception_and_nothing_else(self):
-        """RC2 S17 W6 fix round item 1. RED 5d0339f: entries 09/20 (s17-a03, s17-a03-embedded) refused before running,
-        'fwd0 stages forwarder_b: GREEN drills run the real binaries only (8.3)'. S16 20.1 line 2 (PO): A03 phase 1 runs
+        """RED 5d0339f: entries 09/20 (s17-a03, s17-a03-embedded) refused before running,
+        'fwd0 stages forwarder_b: GREEN drills run the real binaries only'. A03 phase 1 runs
         ct_forwarder_nc_norelease in both forwarder slots, build A as forwarder for the swap, on an A03 kind only."""
         def a03(kind, target='ct_forwarder_nc_norelease', slots=None, bridge_b=None):
             f = StubFixture(slots=slots or {'fwd0': 'forwarder_b', 'fwd1': 'forwarder_b', 'bridge0': 'bridge', 'bridge1': 'bridge'},
@@ -2014,8 +2013,8 @@ class S16TableTest(unittest.TestCase):
         self.assertEqual(cd.control_verdict(money, order, lines, ['x'])['status'], 'INCONCLUSIVE')
 
 
-class S16ScheduleTest(unittest.TestCase):
-    """The section 9 schedules on a stub fixture (no docker): the order of acts and what each records."""
+class ScheduleDrillsTest(unittest.TestCase):
+    """The fault schedules on a stub fixture (no docker): the order of acts and what each records."""
 
     def run_for(self, drill, variant=None, **f):
         calls = []
@@ -2138,7 +2137,7 @@ class S16ScheduleTest(unittest.TestCase):
         self.assertFalse(run.ledger.fault_open())
 
     def test_earlyrestart_control_freezes_the_peer_across_the_restart(self):
-        """V2: bridge1 paused before the kill, thawed after bridge0's sync witness, its branch observed."""
+        """Bridge1 paused before the kill, thawed after bridge0's sync witness, its branch observed."""
         run, calls = self.one_bridge_halt(early=True)
         names = [c[:2] for c in calls]
         self.assertEqual(names[:6], [('pause', 'bridge1'), ('kill', 'bridge0'), ('restart', 'bridge0'), ('health', 'bridge0'),
@@ -2188,7 +2187,7 @@ class S16ScheduleTest(unittest.TestCase):
 
 
 class A05KeepTest(unittest.TestCase):
-    """RC2 S17 W3 (7.1, row 47): A05-keep swaps one forwarder and one bridge with keep_state=True."""
+    """A05-keep swaps one forwarder and one bridge with keep_state=True."""
 
     def test_the_drill_is_declared(self):
         spec = cd.DRILLS['a05-keep']

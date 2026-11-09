@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fixture v2 contracts (H0 RED list, G10, G15/D20, G31, D18) without Docker."""
+"""Fixture v2 contracts without Docker."""
 import copy
 import hashlib
 import json
@@ -93,18 +93,18 @@ class CoreManifestTest(unittest.TestCase):
         self.bad(lambda m: m['credentials']['me'].update(mode='maybe'), text='ME credential mode')
         self.bad(lambda m: m['credentials']['me'].update(keys_env=''), text='environment names')
 
-    def test_d20_timeouts_stay_production(self):
-        self.bad(lambda m: m.update(timeouts='relaxed'), text='D20')
-        self.bad(lambda m: m.update(engine_env={'AERON_CLUSTER_ELECTION_TIMEOUT': '5s'}), text='D20')
+    def test_timeouts_stay_production(self):
+        self.bad(lambda m: m.update(timeouts='relaxed'), text='production election/heartbeat/session timeouts')
+        self.bad(lambda m: m.update(engine_env={'AERON_CLUSTER_ELECTION_TIMEOUT': '5s'}), text='manifest keys are an allowlist')
 
-    def test_d20_engines_pinned_to_disjoint_cpusets(self):
+    def test_engines_pinned_to_disjoint_cpusets(self):
         self.bad(lambda m: m['limits']['cpu_set_by_role'].pop('ae1'), text='pinned')
         self.bad(lambda m: m['limits']['cpu_set_by_role'].update(ae1=[0]), text='disjoint')
         self.bad(lambda m: m['limits']['cpu_set_by_role'].update(probe=[0]), text='probe CPUs')
         self.bad(lambda m: m['limits']['cpu_quota_by_role'].update(ae0=3), text='quota')
 
-    def test_d18_network_internal_only(self):
-        self.bad(lambda m: m['network'].update(internal=False), text='D18')
+    def test_network_internal_only(self):
+        self.bad(lambda m: m['network'].update(internal=False), text='no archive port leaves it')
 
     def test_slots_skip_cleanly_or_name_a_compatible_artifact(self):
         self.bad(lambda m: m['artifacts'].pop('forwarder'), text='declared explicitly')
@@ -171,7 +171,7 @@ class CredentialsTest(unittest.TestCase):
         self.assertEqual({e.split(':')[1] for e in ae}, {'GATEWAY', 'ADMIN', 'TOOL', 'FORWARDER', 'BRIDGE'})
         self.assertEqual({e.split(':')[1] for e in ring.table('me').split(';')}, {'FORWARDER', 'ADMIN'})
         self.assertTrue(all(len(e.split(':')[2]) == 64 for e in ae))
-        # RC2 S6 (A16): every key carries the explicit any-user scope; a missing users field fails the load
+        # Every key carries the explicit any-user scope; a missing users field fails the load
         self.assertTrue(all(e.endswith('::users=*') for e in ae + ring.table('me').split(';')))
         self.assertTrue(ring.credential('bridge0', 'ae').startswith('31:BRIDGE:'))
         self.assertTrue(ring.credential('fwd1', 'me').startswith('122:FORWARDER:'))
@@ -244,7 +244,7 @@ class FaultAndMetricsTest(unittest.TestCase):
 
 
 # ======================================================================================================
-# RC2 S15 W1 (contract 5): fixture v3. Everything below runs without Docker, on stubbed seams.
+# Fixture v3. Everything below runs without Docker, on stubbed seams.
 # ======================================================================================================
 
 import core_fixture
@@ -383,7 +383,7 @@ class SlotEnvTest(unittest.TestCase):
                 for i in range(3):
                     names |= set(f.engine_env(engine, i))
             names |= set(f.projector_env())
-            for mode in ('embedded', 'external'):      # RC2 S17 W2: the projector_driver key
+            for mode in ('embedded', 'external'):      # The projector_driver key
                 names |= set(fixture_for(dict(f.m, projector_driver=mode), self.dir).projector_env())
             for slot in ('fwd0', 'fwd1', 'bridge0', 'bridge1'):
                 names |= set(f.slot_process_env(slot))
@@ -403,7 +403,7 @@ class SlotEnvTest(unittest.TestCase):
     def test_probe_driver_names_are_allowed_for_the_probe_only(self):
         f = self.fx()
         for slot in ('fwd0', 'bridge0'):
-            with self.subTest(slot=slot), self.assertRaisesRegex(Violation, 'D20: environment names are an allowlist; refusing T1_ADMIN_KEY'):
+            with self.subTest(slot=slot), self.assertRaisesRegex(Violation, 'environment names are an allowlist; refusing T1_ADMIN_KEY'):
                 f.spawn(slot, ['true'], {'T1_ADMIN_KEY': 'x'})
         docker = Docker(f, ['probe', 'fwd0'])
         f.execute = types.MethodType(CoreFixture.execute, f)       # the real guard, over the stubbed command
@@ -632,7 +632,7 @@ class FaultHelperTest(unittest.TestCase):
         self.assertEqual(self.f.registry['last_kill']['ae0']['at'], self.now)
 
     def test_restart_witness_requires_a_new_driver_pid(self):
-        # W0 answer 5 / amendment A4: inside a container the aeronmd pid is always 9 and the cnc.dat inode always 6, so
+        # Inside a container the aeronmd pid is always 9 and the cnc.dat inode always 6, so
         # the witness is the cnc.dat mtime plus the container StartedAt.
         self.docker.state['c-fwd0'].update(Running=False, ExitCode=70, StartedAt='S0')
         self.docker.stat = {'S0': '100.5', 'S2': '106.7'}
@@ -696,7 +696,7 @@ class FaultHelperTest(unittest.TestCase):
 
 
 class FaultTargetWaitTest(unittest.TestCase):
-    """F-S15-17: wait_http used to abort on ANY non-Running registered container."""
+    """wait_http used to abort on ANY non-Running registered container."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -790,7 +790,7 @@ class TapRegistrationAndFundingGateTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.f = fixture_for(slot_manifest(self.temp.name), self.temp.name)
         self.probe = self.f.root / 'state' / 'probe'; self.probe.mkdir(parents=True)
-        self.tap = self.probe / 'tap-life1.jsonl'                 # S16 5.1: per-life tap files
+        self.tap = self.probe / 'tap-life1.jsonl'                 # per-life tap files
         self.sessions = self.probe / 'tap-life1.sessions.jsonl'
 
     def tearDown(self):
@@ -857,7 +857,7 @@ class BarrierCountersTest(unittest.TestCase):
         if role == 'ae1':
             base.update(assets_cluster_role=2.0, assets_order_stale_outcomes_total=5.0, assets_order_redundant_outcomes_total=16.0,
                         assets_order_stale_terminals_total=16.0, assets_order_conflicts_total=0.0,
-                        assets_released_late_total=2.0)   # W3: Table D U1 joins sample.counters (O11)
+                        assets_released_late_total=2.0)   # Table D U1 joins sample.counters (O11)
         return base
 
     def stub(self, leaderless=False):
@@ -930,12 +930,12 @@ class BuildProbesCtDirTest(unittest.TestCase):
 
 
 # ======================================================================================================
-# RC2 S16 W1 (contract 5.1, 5.2, 5.3 and the 20.1 amendments): fixture v4. Each test was RED on a693555 first.
+# Fixture v4. Each test was RED on a693555 first.
 # ======================================================================================================
 
 import zipfile
 
-# the pinned production keys of me/deploy/media-driver/driver.properties at c53dd20 (contract 5.3)
+# the pinned production keys of me/deploy/media-driver/driver.properties at c53dd20
 DP_TEXT = '''# external driver tuning (test copy of the pinned keys)
 aeron.dir.delete.on.start=true
 aeron.dir.delete.on.shutdown=true
@@ -1040,7 +1040,7 @@ class Docker4(Docker):
         return super().execute(name, argv, **kw)
 
 
-class V4Base(unittest.TestCase):
+class LifecycleBase(unittest.TestCase):
     ROLES = ('probe', 'fwd0', 'fwd1', 'bridge0', 'bridge1', 'projector', 'ae0', 'ae1', 'ae2', 'me0', 'me1', 'me2')
 
     def setUp(self):
@@ -1062,7 +1062,7 @@ class V4Base(unittest.TestCase):
         return f
 
 
-class StopTest(V4Base):
+class StopTest(LifecycleBase):
     def test_stop_bounds_and_exit_codes_per_role(self):
         f = self.fx()
         self.docker.polite.update(fwd0=(0, 0.2), fwd1=(143, 0.1), bridge0=(0, 0.15), ae0=(0, 2.0))
@@ -1079,7 +1079,7 @@ class StopTest(V4Base):
         with self.assertRaisesRegex(Inconclusive, 'polite stop exited 137'):
             f.stop('bridge1')                                                # never exits on SIGTERM: killed at 10 s
         self.assertEqual(f.registry['faults'][-1]['elapsed_s'], 10)
-        w = f.stop('me0')                                                    # 20.1 line 4: 15 s bound, then kill, 137 kept
+        w = f.stop('me0')                                                    # 15 s bound, then kill, 137 kept
         self.assertEqual((w['exit_code'], w['bound_s'], w['escalated_to_kill']), (137, 15, True))
         self.assertIn('me0', f.registry['last_kill'])                        # the 12.5 s AE rule sees an escalated stop
         self.assertEqual(f.stop('ae0')['exit_code'], 0)
@@ -1091,7 +1091,7 @@ class StopTest(V4Base):
                 f.stop(*bad)
 
 
-class ReplaceSlotTest(V4Base):
+class ReplaceSlotTest(LifecycleBase):
     def test_replace_slot_records_both_shas_refuses_same_binary_and_closes_the_fault_row(self):
         f = self.fx()
         f.slots['fwd0'] = {'state': 'STARTED', 'artifact': 'forwarder'}
@@ -1131,7 +1131,7 @@ class ReplaceSlotTest(V4Base):
     def test_replace_slot_after_kill_restarts_once_after_the_session_window(self):
         f = self.fx()
         f.kill('fwd1'); killed_at = self.clock.now
-        self.docker.start_exits['fwd1'] = [78, None]                        # F-S16-11: REJECTED registration, exit 78
+        self.docker.start_exits['fwd1'] = [78, None]                        # REJECTED registration, exit 78
         w = f.replace_slot('fwd1', 'forwarder_b', after_kill=True)
         self.assertEqual(w['f7_rejected'], 1)
         starts = [c for c in self.docker.calls if c[:2] == ['docker', 'start'] and c[2] == 'c-fwd1']
@@ -1153,7 +1153,7 @@ class ReplaceSlotTest(V4Base):
             f.replace_slot('fwd0', 'forwarder_b')
 
 
-class WipeEngineTest(V4Base):
+class WipeEngineTest(LifecycleBase):
     def test_wipe_engine_refuses_a_running_member(self):
         f = self.fx()
         state = f.root / 'state' / 'me0'
@@ -1172,7 +1172,7 @@ class WipeEngineTest(V4Base):
             f.wipe_engine('fwd0')
 
     def test_wipe_engine_refuses_an_ae_member_without_its_life_projection_dump(self):
-        """S16 fix round V6: the AE is the life's money source; its wipe needs that life's PG dump (precondition).
+        """The AE is the life's money source; its wipe needs that life's PG dump (precondition).
         RED f42a1c6: wipe_engine('ae0') wiped with no dump."""
         f = self.fx()
         state = f.root / 'state' / 'ae0'
@@ -1197,7 +1197,7 @@ class WipeEngineTest(V4Base):
             f.wipe_engine('ae0')
 
 
-class ResetProjectionTest(V4Base):
+class ResetProjectionTest(LifecycleBase):
     def test_reset_projection_dumps_before_drop(self):
         m = ext_manifest(self.dir)
         jar = Path(self.dir) / 'projector-mig.jar'
@@ -1230,13 +1230,10 @@ class ResetProjectionTest(V4Base):
         self.assertIn('CREATE TABLE money_journal', sqls[-1])               # packaged migrations re-applied
         self.assertEqual((w['kind'], w['life'], w['tables']), ('reset_projection', 1, {'money_journal': 2, 'money_journal_leg': 1}))
         self.assertEqual(json.loads(dump.read_text().splitlines()[0]), {'table': 'money_journal', 'row': {'journal_seq': 1}})
-        self.assertEqual(f.registry['projection_dumps']['1'],                    # V6: the wipe precondition's record
+        self.assertEqual(f.registry['projection_dumps']['1'],                    # the wipe precondition's record
                          {'dump': str(dump), 'sha256': hashlib.sha256(dump.read_bytes()).hexdigest()})
         stop = [c for c in self.docker.calls if c[:3] == ['docker', 'stop', '-t']][-1]
         self.assertEqual(stop[-1], 'c-projector')
-
-
-G1 = hex(1 | 1)
 
 
 def life1(f):
@@ -1249,7 +1246,7 @@ def life1(f):
     return g1
 
 
-class RegenesisTest(V4Base):
+class RegenesisTest(LifecycleBase):
     CORE_STEPS = ['snapshot_genesis', 'start_tap_witness', 'arm_money_journal', 'start_projector', 'start_bridges',
                   'core_genesis', 'configure_risk', 'fund', 'verify_funded', 'start_forwarders']
 
@@ -1297,7 +1294,7 @@ class RegenesisTest(V4Base):
         calls = self.recorded(f, ['stop', 'wipe_engine', 'reset_projection', 'start_members'] + self.CORE_STEPS)
         w = f.regenesis({'users': [1]}, 'core')
         names = [c[:2] if c[0] in ('stop', 'wipe_engine', 'start_members') else c[:1] for c in calls]
-        # V6: the projection is dumped before the AE is wiped (RED f42a1c6: the three wipes came first)
+        # The projection is dumped before the AE is wiped (RED f42a1c6: the three wipes came first)
         self.assertEqual(names, [('stop', 'bridge0'), ('stop', 'bridge1'), ('stop', 'ae0'), ('stop', 'ae1'), ('stop', 'ae2'),
                                  ('reset_projection',), ('wipe_engine', 'ae0'), ('wipe_engine', 'ae1'), ('wipe_engine', 'ae2'),
                                  ('start_members', 'ae')] + [(s,) for s in self.CORE_STEPS])
@@ -1315,7 +1312,7 @@ class RegenesisTest(V4Base):
         self.assertEqual([c[1] for c in calls if c[0] == 'stop'][:2], ['fwd0', 'fwd1'])
 
     def test_regenesis_keeps_each_lifes_evidence_for_its_record(self):
-        """RC2 S17 W6 fix round item 4. RED 5d0339f: regenesis('core') replaced registry.genesis by life 2's WITHOUT its
+        """RED 5d0339f: regenesis('core') replaced registry.genesis by life 2's WITHOUT its
         derivation and took no audit, and the AE wipe erased life 1's CoreConfig frames, so no record of life 1 or life 2
         could be read from its own evidence. Now: each regenesis scope records where its life's rows begin
         (commands.jsonl, core-requests.jsonl), life 1's core genesis reader is captured before the AE wipe, life 2's
@@ -1347,9 +1344,9 @@ class RegenesisTest(V4Base):
         f = self.fx()
         f.m['manifest_kind'] = 's17-ext'
         fake = {'status': 'observed', 'genesis_id': 7, 'members': {}}
-        import r10_cut
-        with mock.patch.object(r10_cut, 'genesis_reader', lambda root, schema: fake), \
-                mock.patch.object(r10_cut, 'load_money_schema', lambda jar: 'schema'):
+        import release_cut
+        with mock.patch.object(release_cut, 'genesis_reader', lambda root, schema: fake), \
+                mock.patch.object(release_cut, 'load_money_schema', lambda jar: 'schema'):
             f.capture_core_genesis(1)
         entry = f.registry['lives']['1']['core_genesis_reader']
         self.assertEqual(json.loads(Path(entry['path']).read_text()), fake)
@@ -1384,7 +1381,7 @@ class RegenesisTest(V4Base):
             core_fixture.check_genesis_order(dict(life2, first_deposit_ns=0), expected=core_fixture.LIFE2_CORE_PHASES)
 
 
-class PerLifeTapTest(V4Base):
+class PerLifeTapTest(LifecycleBase):
     def test_tap_files_are_per_life(self):
         f = self.fx()
         path = f.start_tap(1000, life=2)
@@ -1419,7 +1416,7 @@ class PerLifeTapTest(V4Base):
         self.assertEqual(note['leader'], 2)
 
 
-class FundRowsTest(V4Base):
+class FundRowsTest(LifecycleBase):
     def test_fund_rows_records_gate_state_for_m9(self):
         f = self.fx()
         tap = f.root / 'state' / 'probe' / 'tap-life1.jsonl'
@@ -1448,7 +1445,7 @@ class FundRowsTest(V4Base):
             f.fund_rows([{'kind': 'transfer', 'user': 1, 'asset': 0, 'amount': 1}])
 
 
-class EngineRestartRuleTest(V4Base):
+class EngineRestartRuleTest(LifecycleBase):
     def test_ae_restart_waits_after_driver_death_exit(self):
         f = self.fx()
         self.docker.state['c-ae0'].update(Running=False, ExitCode=1)
@@ -1497,7 +1494,7 @@ class EngineRestartRuleTest(V4Base):
             self.fx(ext_manifest(self.dir, engines='embedded')).engine_driver_pidfile('ae1')
 
 
-class EngineExternalProfileTest(V4Base):
+class EngineExternalProfileTest(LifecycleBase):
     def test_engine_wrapper_in_external_mode_starts_aeronmd_with_the_pinned_properties_before_java(self):
         f = self.fx(roles=())
         f.registry['network_id'] = 'net'
@@ -1523,7 +1520,7 @@ class EngineExternalProfileTest(V4Base):
                 self.assertIn('-jar /artifacts/%s.jar' % role[:2], script)
                 env = {a.split('=', 1)[0]: a.split('=', 1)[1] for a, p in zip(argv[1:], argv) if p == '--env'}
                 self.assertEqual((env['TRANSPORT_DRIVER_MODE'], env['AERON_DIR']), ('external', d))
-        # the dev profile keeps the plain embedded engines (D-S15-4)
+        # the dev profile keeps the plain embedded engines
         f2 = self.fx(ext_manifest(self.dir, engines='embedded'), roles=())
         self.assertEqual(f2.engine_command('me', 1), core_fixture.JAVA + ['-jar', '/artifacts/me.jar'])
         self.assertEqual(f2.engine_env('me', 1)['TRANSPORT_DRIVER_MODE'], 'embedded')
@@ -1578,7 +1575,7 @@ class EngineExternalProfileTest(V4Base):
         self.assertEqual((f.root / 'artifacts' / 'engine_libs' / 'driver.properties').read_text(), DP_TEXT)
 
 
-class FaultTargetsV4Test(V4Base):
+class FaultTargetsV4Test(LifecycleBase):
     def test_stopped_wiped_and_replaced_roles_do_not_abort_other_waits(self):
         f = self.fx()
         f.wait_http = types.MethodType(fixture_module.Fixture.wait_http, f)
@@ -1605,7 +1602,7 @@ if __name__ == '__main__':
 
 
 def projector_manifest(directory, mode='external', engines='external'):
-    """RC2 S17 W2 (W10, PO-11 (a)): the fixture key ``projector_driver`` beside ``engine_driver``; external mode stages the
+    """The fixture key ``projector_driver`` beside ``engine_driver``; external mode stages the
     same pinned driver set as the engines (``projector_libs``)."""
     m = ext_manifest(directory, engines=engines)
     m['projector_driver'] = mode
@@ -1615,7 +1612,7 @@ def projector_manifest(directory, mode='external', engines='external'):
     return m
 
 
-class ProjectorDriverFixtureTest(V4Base):
+class ProjectorDriverFixtureTest(LifecycleBase):
     def test_embedded_projector_never_sets_aeron_dir(self):
         for m in (ext_manifest(self.dir), projector_manifest(self.dir, 'embedded')):
             f = self.fx(m, roles=())
@@ -1664,7 +1661,7 @@ class ProjectorDriverFixtureTest(V4Base):
         self.assertEqual(spawned[0][2]['PROJECTOR_DRIVER_MODE'], 'external')
 
 
-# ------------------------------------------------------------------ RC2 S17 W3 (contract 5.2): seeds, keep_state, member-aware
+# ------------------------------------------------------------------ seeds, keep_state, member-aware
 # verify_funded, partial genesis and finish, the AE wipe of a foreign state
 
 import legacy_tag
@@ -1678,7 +1675,7 @@ def seed_tree(directory, name='me0', files=None):
     return src
 
 
-class SeedStateTest(V4Base):
+class SeedStateTest(LifecycleBase):
     ROLES = ('probe',)
 
     def test_seed_copies_the_tree_before_the_member_starts_and_records_the_hash(self):
@@ -1716,7 +1713,7 @@ class SeedStateTest(V4Base):
         self.assertFalse((f.root / 'state' / 'me2' / 'state').exists())
 
 
-class ReplaceSlotKeepStateTest(V4Base):
+class ReplaceSlotKeepStateTest(LifecycleBase):
     def test_keep_state_leaves_the_state_dir_for_the_new_binary(self):
         f = self.fx()
         (f.root / 'state' / 'fwd0' / 'checkpoint').write_text('kept')
@@ -1739,7 +1736,7 @@ class ReplaceSlotKeepStateTest(V4Base):
         self.assertTrue((f.root / 'state' / 'fwd0.gen1').is_dir())
 
 
-class VerifyFundedMemberAwareTest(V4Base):
+class VerifyFundedMemberAwareTest(LifecycleBase):
     def fx_verify(self):
         f = self.fx()
         f._ok = lambda verb, principal, **kv: {'journalEnabled': True, 'balances': [], 'holds': []}
@@ -1774,10 +1771,10 @@ class VerifyFundedMemberAwareTest(V4Base):
             f.verify_funded({})
 
 
-class PartialGenesisTest(V4Base):
+class PartialGenesisTest(LifecycleBase):
     def fx_core(self, results=None):
         f = self.fx()
-        src = Path(self.dir) / 'T1CoreDriver.java'          # W5 item 3: the rows come from the pinned driver source
+        src = Path(self.dir) / 'T1CoreDriver.java'          # The rows come from the pinned driver source
         src.write_text('.quoteAssetId(d.quoteAsset().id()).tickSize(1).minPrice(1).maxPrice(1_000_000_000_000_000L).lotSize(0);')
         f.m['t1_core_driver'] = {'path': str(src), 'sha256': '0' * 64, 'source_path': str(src), 'source_sha256': '0' * 64}
         self.sent = []
@@ -1817,7 +1814,7 @@ class PartialGenesisTest(V4Base):
         self.assertEqual(self.sent[0][2]['genesis'], f.genesis_id(2))
 
 
-class ForeignWipeTest(V4Base):
+class ForeignWipeTest(LifecycleBase):
     def test_an_ae_member_on_a_foreign_seed_wipes_without_a_projection_dump_and_says_why(self):
         f = self.fx()
         self.docker.state['c-ae1'].update(Running=False, ExitCode=1)
@@ -1831,9 +1828,9 @@ class ForeignWipeTest(V4Base):
             f.wipe_engine('ae1', projection_dump_required=False)
 
 
-class CutBootMeGenesisTest(V4Base):
-    """RC2 S17 W3 (coordinator): on the cut the forwarder waits for the ME epoch, so a bare-ME core-boot never reaches fwd0
-    /ready; core-boot on an s17 kind runs the ME genesis (epoch) before the forwarder slots; S16 kinds keep the S14 boot."""
+class CutBootMeGenesisTest(LifecycleBase):
+    """On the cut the forwarder waits for the ME epoch, so a bare-ME core-boot never reaches fwd0
+    /ready; core-boot on an s17 kind runs the ME genesis (epoch) before the forwarder slots; base kinds keep the bare boot."""
 
     def boot(self, kind):
         f = self.fx(roles=('probe',))
@@ -1864,8 +1861,8 @@ class CutBootMeGenesisTest(V4Base):
 
 
 class GenesisIdDerivationTest(unittest.TestCase):
-    """RC2 S17 W3 (coordinator, PO list item 1): the genesisId is derived per run from the run_id (never the kind's constant
-    seed), so siblings of one kind still differ only in run_id and RC2 step 7 sees a distinct id per genesis run."""
+    """The genesisId is derived per run from the run_id (never the kind's constant
+    seed), so siblings of one kind still differ only in run_id and activation step 7 sees a distinct id per genesis run."""
 
     def test_two_runs_of_one_kind_differ_and_one_run_is_stable(self):
         a, b = core_contracts.derive_genesis_id('rc2-0123456789ab'), core_contracts.derive_genesis_id('rc2-0123456789ac')

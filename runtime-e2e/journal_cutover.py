@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""R02 W6: OMS journal-consumer recovery and fill visibility latency.
+"""OMS journal-consumer recovery and fill visibility latency.
 
 The C++ projector is frozen so trades commit in the ME while the OMS cannot see them; the OMS is
 then SIGKILLed, the projector commits those trades while the OMS is down, and the restarted OMS
@@ -118,7 +118,7 @@ def wait_admission(fixture, want, timeout):
 
 def journal_oms_restart(fixture, latency_pairs=20, outage_pairs=6):
     if not fixture.m.get('journal_cutover'):
-        raise Inconclusive('W6 requires the journal cutover topology')
+        raise Inconclusive('the OMS journal-consumer scenario requires the journal cutover topology')
     evidence = {'latency_pairs': latency_pairs, 'outage_pairs': outage_pairs}
     save = lambda: (fixture.root / 'journal-oms-restart.json').write_text(json.dumps(evidence, indent=2) + '\n')
     initial, funding = fund(fixture)

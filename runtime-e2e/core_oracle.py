@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Money oracle v2 for the core topology (rc2-rcs-harness.md 2.5, rules M1-M14).
+"""Money oracle v2 for the core topology (rules M1-M14).
 
 Replaces ``contracts.reconcile`` for the core topology. Exact integer units, fail closed: an
 unexplained row is FAIL, missing evidence is INCONCLUSIVE. Each rule reports separately so a
@@ -121,7 +121,7 @@ def m4(m):
 
 
 def expected_create_hold(m, oid):
-    """The create hold recomputed from the intent (OrderEngine.create, S6 contract section 1).
+    """The create hold recomputed from the intent (OrderEngine.create).
 
     SELL locks the base quantity. BUY locks the quote notional: a priced type (LIMIT, LIMIT_MAKER,
     ICEBERG, STOP_LIMIT) price x quantity; a price-less type (MARKET, STOP_LOSS, TRAILING_STOP) its
@@ -153,14 +153,14 @@ def _create_hold(m, oid):
     create = m.orders[oid]
     reply = create['reply']
     replay = reply.get('source') == 'replay'
-    # S15 W5: a replayed create (6.1: the duplicate ACK of a re-sent UNKNOWN) reports the order's CURRENT hold block, which is
+    # A replayed create (the duplicate ACK of a re-sent UNKNOWN) reports the order's CURRENT hold block, which is
     # (asset 0, amount 0) once the order's hold is gone (first coreleader run: a filled SELL replied hold_asset 0). Only a
     # first reply states the create-time asset; a live replayed order's hold asset is still judged against the core's holds.
     if not replay and reply['hold_asset'] != m.hold_asset(create):
         raise Violation(f'order {oid}: hold asset {reply["hold_asset"]} is not the side\'s asset')
     expected = expected_create_hold(m, oid)
     if replay:
-        return expected   # S15 6.1: a replayed create reports the order's current hold, not the create-time one
+        return expected   # A replayed create reports the order's current hold, not the create-time one
     if integer(reply['hold_amount']) != expected:
         raise Violation(f'order {oid}: {create["side"]} {create["type"]} create hold {reply["hold_amount"]} '
                         f'!= recomputed from the intent {expected}')
@@ -177,7 +177,7 @@ def residual(m, oid):
     pending = [link for link in chain if not link['resolved']]
     top_up = 0
     if pending:
-        # Contract 3.4 / LifecycleInvariants.expectedResidual: while REPLACE_PENDING the hold already
+        # LifecycleInvariants.expectedResidual: while REPLACE_PENDING the hold already
         # carries the positive top-up of the one open amend; any other unresolved shape is unjudgeable.
         if len(pending) != 1 or pending[0] is not chain[-1] or m.live[oid]['status'] != 'PENDING_REPLACE':
             raise Inconclusive(f'order {oid}: amend outcome not resolved at the barrier')
@@ -223,8 +223,8 @@ def m6(m):
 
 
 def settle_epoch(m, row):
-    """The money projection carries no meEpoch column (projector V-schema, S15 W3 smoke): with exactly one declared epoch
-    every settle row belongs to it; with more, the per-epoch match needs the epoch on the row (S16 A04)."""
+    """The money projection carries no meEpoch column (projector V-schema): with exactly one declared epoch
+    every settle row belongs to it; with more, the per-epoch match needs the epoch on the row (A04)."""
     if row.get('me_epoch') is not None:
         return row['me_epoch']
     declared = m.declared.get('epochs') or [None]
@@ -287,9 +287,9 @@ def m9(m):
 
 
 def m10(m):
-    """The core's trade cursor equals the max ME trade id of the epoch it is bound to (RC2 S16 5.4, D-S16-6: the
+    """The core's trade cursor equals the max ME trade id of the epoch it is bound to (the
     sample's ``core.bound_me_epoch`` from money-dump v7); with no trade of that epoch the cursor is 0. Samples without
-    the bound epoch (S14/S15) keep the old rule: the last journal epoch."""
+    the bound epoch keep the old rule: the last journal epoch."""
     bound = m.s['core'].get('bound_me_epoch')
     if bound is not None:
         ids = [t['trade_id'] for t in m.trades if t['me_epoch'] == bound]

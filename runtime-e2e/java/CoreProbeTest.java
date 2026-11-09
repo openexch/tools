@@ -17,7 +17,7 @@ import java.util.Set;
 import java.util.function.Function;
 
 /**
- * RC2 S15 W2 unit tests of {@code CoreProbe story} and {@code CoreProbe tap} (contract 5.7, 6, 6.1): no cluster, a
+ * Unit tests of {@code CoreProbe story} and {@code CoreProbe tap}: no cluster, a
  * reply stub and a fake clock. Compiled with CoreProbe.java against the AE jar (the same class path the probe
  * runs with) and driven by {@code test_story.py}. Prints {@code PASS <name>} or {@code FAIL <name>: why} per case,
  * exit 0 only when every case passed. Argument: a directory the sample logs are written to (the Python side
@@ -95,7 +95,7 @@ public final class CoreProbeTest {
             now += 1_000_000L;
         }
 
-        /** S16 W3: a file present in [from, to) spans (a deleted and re-created marker). */
+        /** A file present in [from, to) spans (a deleted and re-created marker). */
         final Map<String, long[]> fileSpans = new HashMap<>();
 
         public boolean exists(final String path) {
@@ -322,7 +322,7 @@ public final class CoreProbeTest {
         final List<CoreProbe.StoryRow> creates = new ArrayList<>();
         for (final CoreProbe.StoryRow row : list(r, "creates")) {
             if (row.resolves == null) {
-                creates.add(row);   // the 6.1 pass re-sends every UNKNOWN once: those rows are not the load
+                creates.add(row);   // the resolution pass re-sends every UNKNOWN once: those rows are not the load
             }
         }
         check(creates.size() == 60, "a silent core stopped the story at " + creates.size() + " of 60 creates");
@@ -499,7 +499,7 @@ public final class CoreProbeTest {
         refusal("rate must be > 0", () -> cfg("script=a01-mix", "seed=1", "seconds=1", "rate=0", "users=1,2"));
         refusal("PER_USER_CAP", () -> new CoreProbe.Story(cfg("script=a01-mix", "seed=1", "seconds=60", "rate=100",
                 "users=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20"), new FakeClock(), null, m -> { }));
-        // 7,200 requests over 40 users is 180 each: the plan W0 answer 14b sized is accepted
+        // 7,200 requests over 40 users is 180 each: the planned size is accepted
         final StringBuilder forty = new StringBuilder();
         for (int u = 1; u <= 40; u++) {
             forty.append(u == 1 ? "" : ",").append(u);
@@ -637,7 +637,7 @@ public final class CoreProbeTest {
         check(p.rows.isEmpty(), "reset() must still clear the rows of a new verb");
     }
 
-    // ------------------------------------------------------------------ S16 W2 cases
+    // ------------------------------------------------------------------ marker and funding cases
 
     private static final String SIG = "/sig";
 
@@ -664,7 +664,7 @@ public final class CoreProbeTest {
         clock.filesAt.put(SIG + "/capacity_open", t0 + 4_000_000_000L);
         final Result r = story(cfg("script=a03-fill", "seed=3", "rate=20", "fill_s=2", "reopen_s=1", "marker_timeout_s=10",
                 "users=1,2,3,4", "signal_dir=" + SIG), StubPort.Mode.ACK_ALL, p -> p, clock);
-        check(list(r, "cancels").isEmpty() && list(r, "amends").isEmpty(), "a03-fill sent a cancel or an amend (20.1 line 3: no cancel wave)");
+        check(list(r, "cancels").isEmpty() && list(r, "amends").isEmpty(), "a03-fill sent a cancel or an amend (the A03 drain has no cancel wave)");
         int fill = 0;
         int reopen = 0;
         for (final CoreProbe.StoryRow c : list(r, "creates")) {
@@ -761,7 +761,7 @@ public final class CoreProbeTest {
         refusal("does not take signal_dir=", () -> cfg("script=a01-mix", "seed=1", "seconds=1", "rate=1", "users=1,2", "signal_dir=/x"));
         refusal("does not take ioc_burst_on=", () -> cfg(concat(base, "ioc_burst_on=/m")));
         refusal("does not take ioc_burst_on=", () -> cfg("script=a02-lifecycle", "seed=1", "seconds=0", "rate=1", "users=1,2", "ioc_burst_on=/m"));
-        // defaults of contract 5.5: 100/s, fill_s 30, reopen_s 10, marker_timeout_s 60
+        // defaults: 100/s, fill_s 30, reopen_s 10, marker_timeout_s 60
         final CoreProbe.StoryConfig d = cfg("script=a03-fill", "seed=1", "users=" + users(40), "signal_dir=" + SIG);
         check(d.rate == 100 && d.fillS == 30 && d.reopenS == 10 && d.markerTimeoutS == 60,
                 "a03 defaults " + d.rate + "/" + d.fillS + "/" + d.reopenS + "/" + d.markerTimeoutS);
@@ -820,7 +820,7 @@ public final class CoreProbeTest {
         check(never.log.equals(plain.log) && markersNamed(never, "ioc_burst_started").isEmpty(), "a burst marker that never appears changed the story");
     }
 
-    /** S16 W3: fwdring pauses twice; the drill deletes the marker after the first burst and writes it again. A marker
+    /** Fwdring pauses twice; the drill deletes the marker after the first burst and writes it again. A marker
      *  that stays only ever gives one burst (iocBurst above); a deleted and re-created one gives a second, numbered n=2. */
     private static void iocBurstRearm() {
         final String[] kv = {"script=a01-mix", "seed=5", "seconds=10", "rate=20", "users=1,2,3,4"};
