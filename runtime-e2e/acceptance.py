@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""R02 functional acceptance scenarios (A04-A09) on the journal cutover topology."""
+"""Functional acceptance scenarios (A04-A09) on the journal cutover topology."""
 import json
 import time
 
@@ -25,7 +25,7 @@ def _rejected_without_effect(fixture, client):
 
 
 def oms_recovery_admission(fixture):
-    """R02-A09: admission is closed while the projection is unverified or risk recovery failed."""
+    """Admission is closed while the projection is unverified or risk recovery failed."""
     if not fixture.m.get('journal_cutover'):
         raise Inconclusive('A09 requires the journal cutover topology')
     evidence, save = _evidence(fixture, 'oms-recovery-admission')
@@ -86,7 +86,7 @@ def oms_recovery_admission(fixture):
             'stale_close_ms': evidence['stale_close_ms'], 'fresh_open_ms': evidence['fresh_open_ms'],
             'failed_read': evidence['failed_read'], 'recovered_open_ms': evidence['recovered_open_ms'],
             'failure_domain': fixture.m['failure_domain'],
-            'scope': 'R02-A09 admission gate: stale projection, failed risk read, recovery'}
+            'scope': 'A09 admission gate: stale projection, failed risk read, recovery'}
 
 
 # Runs inside the probe container: the same request from several threads released together.
@@ -125,7 +125,7 @@ def _reply(response):
 
 
 def oms_durable_request_id(fixture, threads=8):
-    """R02-A08: one durable outcome per requestId across concurrency, restart and payload change."""
+    """One durable outcome per requestId across concurrency, restart and payload change."""
     from journal_cutover import SELLER
     if not fixture.m.get('journal_cutover'):
         raise Inconclusive('A08 requires the journal cutover topology')
@@ -190,7 +190,7 @@ def oms_durable_request_id(fixture, threads=8):
             'child_exit_codes': [0], 'money': counts, 'fault': evidence['fault'],
             'concurrent': evidence['concurrent'], 'changed_payload_status': evidence['changed_payload']['status'],
             'failure_domain': fixture.m['failure_domain'],
-            'scope': 'R02-A08 durable requestId: concurrency, changed payload, retry after OMS SIGKILL'}
+            'scope': 'A08 durable requestId: concurrency, changed payload, retry after OMS SIGKILL'}
 
 
 def _projector_last_trade(fixture):
@@ -208,7 +208,7 @@ def _wait_projector(fixture, trades, timeout=60):
 
 
 def execution_projector_replay_crash(fixture, rounds=(0.0, 0.02, 0.1), batch=6):
-    """R02-A05: the projector loses or doubles nothing across SIGKILL mid catch-up and a dropped DB session."""
+    """The projector loses or doubles nothing across SIGKILL mid catch-up and a dropped DB session."""
     if not fixture.m.get('journal_cutover'):
         raise Inconclusive('A05 requires the journal cutover topology')
     evidence, save = _evidence(fixture, 'execution-projector-replay-crash')
@@ -270,11 +270,11 @@ def execution_projector_replay_crash(fixture, rounds=(0.0, 0.02, 0.1), batch=6):
     return {'status': 'PASS', 'assertions': 4 + len(evidence['faults']), 'processed': counts['trades'], 'skipped': 0,
             'child_exit_codes': [0], 'money': counts, 'fault': evidence['faults'][0]['proof'],
             'faults': evidence['faults'], 'failure_domain': fixture.m['failure_domain'],
-            'scope': 'R02-A05 C++ projector: SIGKILL during catch-up x3, database session loss'}
+            'scope': 'A05 C++ projector: SIGKILL during catch-up x3, database session loss'}
 
 
 def oms_hold_release_authority(fixture, resting=3):
-    """R02-A07: lost acks, an OMS restart and a reconcile sweep release no hold; only a terminal does."""
+    """Lost acks, an OMS restart and a reconcile sweep release no hold; only a terminal does."""
     from journal_cutover import SELLER
     from scenarios import request
     if not fixture.m.get('journal_cutover'):
@@ -333,4 +333,4 @@ def oms_hold_release_authority(fixture, resting=3):
             'child_exit_codes': [0], 'money': counts, 'fault': evidence['fault'],
             'unacknowledged_commands': evidence['unacknowledged_commands'], 'me_commands': commands,
             'failure_domain': fixture.m['failure_domain'],
-            'scope': 'R02-A07 hold release authority: frozen ME, lost acks, OMS SIGKILL, reconcile sweep'}
+            'scope': 'A07 hold release authority: frozen ME, lost acks, OMS SIGKILL, reconcile sweep'}

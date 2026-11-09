@@ -161,7 +161,7 @@ class JournalDecodeTest(unittest.TestCase):
                                + bytes(self.orders.messages[27].block_length))
 
 
-# ---------------------------------------------------------------- RC2 S15 W1, contract 5.4: profile 4 and group support
+# ---------------------------------------------------------------- profile 4 and group support
 
 PINNED_SCHEMA4 = 'a7c58d87e4f1cfaa642014e4c92f46492c5fe20d36bd6b1d127dd7fa05a3541a'
 
@@ -292,7 +292,7 @@ class Profile4Test(unittest.TestCase):
 
 
 class TimestampMappingTest(unittest.TestCase):
-    """RC2 S16 5.4 / F-S16-17: records 1-3 of the active profile carry the ME cluster ``timestamp`` (the A05 latency
+    """Records 1-3 of the active profile carry the ME cluster ``timestamp`` (the A05 latency
     table's first-apply clock). RED 6380b01: KeyError 'timestamp' (the profile maps no timestamp)."""
 
     def test_records_1_to_3_decode_their_timestamp(self):

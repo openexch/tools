@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""RC2 S17 legacy tag profile (contract 3.2, 5.2 (i), 20.1 lines 3, 5, 21; D-S17-25). The frozen R02 fixture (``fixture.py``) runs
-the v0.5.0-beta jars only with W0's two adaptations (S17/evidence/dry-run/legacy_patch.py), now harness code:
+"""Legacy tag profile. The frozen v0.5 fixture (``fixture.py``) runs
+the v0.5.0-beta jars only with two adaptations, now harness code:
 
  1. host drift, not a tag property: the timescaledb loader package is 2.31.0 while ``timescaledb-2-postgresql-16`` is held at
     2.28.2, so ``CREATE EXTENSION timescaledb`` is pinned to ``TIMESCALEDB_VERSION`` (a setting; align the host packages instead
@@ -12,8 +12,13 @@ Plus the tag-engine settings: ``shm_mb`` / ``memory_mb`` 4096 (a tag snapshot ne
 TRANSPORT_SNAPSHOT_TERM_LENGTH), the engines stopped by SIGKILL (they ignore SIGTERM, exit 137), and the snapshot trigger
 ``ClusterTool <clusterDir> snapshot`` by ``docker exec`` on the leader read from ``list-members``, witnessed by ``recording-log``.
 
-Used for seed production and X-R only: no X run puts a tag jar under test (0.1). The manifest takes only the jars pinned in
-``R10/old-artifacts.sha256`` (W1).
+Used for seed production and X-R only: no X run puts a tag jar under test. The manifest takes only the jars pinned in
+the old-artifact pins.
+
+Environment (host paths, no machine default; a manifest build that needs one stops with a message naming it):
+  LEGACY_TEMPLATE  a legacy (schema v1) fixture manifest the legacy manifests are derived from
+  LEGACY_JARS      the directory holding the pinned v0.5.0-beta tag jars
+  CUT_OLD_PINS     the old-artifact pins file the tag jars must be pinned in (shared with ``release_cut.py``)
 """
 import copy
 import hashlib
@@ -27,19 +32,19 @@ import time
 from contracts import Inconclusive, Violation
 import fixture
 from fixture import JAVA
+from machine_paths import env_path
 
-TIMESCALEDB_VERSION = '2.28.2'          # setting: the host's held extension package (20.1 line 3)
+TIMESCALEDB_VERSION = '2.28.2'          # setting: the host's held extension package
 MARKERS = {'me': 'SERVICE onStart complete', 'ae': 'Money journal writer started'}
 MARKER_SETTLE_S = 3
-SHM_MB = 4096                           # settings, not acceptance limits (PO 2026-11-03)
+SHM_MB = 4096                           # settings, not acceptance limits
 MEMORY_MB = 4096
-SNAPSHOT_BOUND_S = 40                   # the recording.log SNAPSHOT entry appeared 1 to 30 s after the trigger (W0)
+SNAPSHOT_BOUND_S = 40                   # the recording.log SNAPSHOT entry appeared 1 to 30 s after the trigger
 CLUSTER_TOOL = ['java', '--add-opens', 'java.base/jdk.internal.misc=ALL-UNNAMED', '-cp']
 CLUSTER_DIR = '/data/state/cluster'
-B0 = Path('/home/emre/Apps/openexchange/.runtime-handoff/20260927-r00')
-TEMPLATE = B0 / 'workspace/notebook/reports/runtime-handoff-execution/R02-closure/a05-01/manifest.json'
-PINS = B0 / 'workspace/notebook/reports/runtime-handoff-execution/R10/old-artifacts.sha256'
-JARS = B0 / 'r10-old/w1/jars'
+TEMPLATE = env_path('LEGACY_TEMPLATE', 'a legacy (schema v1) fixture manifest the legacy manifests are derived from')
+PINS = env_path('CUT_OLD_PINS', 'the old-artifact pins file (old-artifacts.sha256)')
+JARS = env_path('LEGACY_JARS', 'the directory holding the pinned v0.5.0-beta tag jars')
 # fixture role -> (tag jar file, repo); the six frozen roles of the legacy fixture (LCT:85, 3.2)
 TAG_JARS = {'me': ('match-cluster.jar', 'match'), 'market': ('match-gateway.jar', 'match'), 'ae': ('assets-cluster.jar', 'assets'),
             'bridge': ('assets-bridge.jar', 'assets'), 'projector': ('assets-projector.jar', 'assets'), 'oms': ('oms-app.jar', 'oms')}
@@ -52,7 +57,7 @@ def sha256_file(path):
 
 
 def tree_hash(root):
-    """sha256 over the sorted relative paths and file sha256 (5.2 seed_state); symlinks are not followed."""
+    """sha256 over the sorted relative paths and file sha256 (seed_state); symlinks are not followed."""
     h, files, size = hashlib.sha256(), 0, 0
     root = Path(root)
     for p in sorted(root.rglob('*')):
@@ -73,8 +78,8 @@ def _pins(path):
 
 
 def legacy_manifest(name, octet, runs, jars=JARS, pins=PINS, template=TEMPLATE, shm_mb=SHM_MB, memory_mb=MEMORY_MB):
-    """A legacy (schema v1) manifest on the pinned v0.5.0-beta jars, derived from the R02 template (only artifacts, identity,
-    subnet and the tag settings change; mk_legacy.py of W0). Writes ``<runs>/<name>/manifest.json``; returns (path, manifest)."""
+    """A legacy (schema v1) manifest on the pinned v0.5.0-beta jars, derived from the v0.5 template (only artifacts, identity,
+    subnet and the tag settings change). Writes ``<runs>/<name>/manifest.json``; returns (path, manifest)."""
     if not re.fullmatch(r'[a-z0-9-]{1,40}', name) or not 2 <= octet <= 254:
         raise Violation('legacy manifest: a short name and a /24 octet')
     pinned = _pins(pins)
@@ -102,7 +107,7 @@ def legacy_manifest(name, octet, runs, jars=JARS, pins=PINS, template=TEMPLATE, 
     m.pop('test_helper', None); m.pop('benchmark_helper', None)
     m['postgres_port'] = 55600 + octet
     m['legacy_tag_profile'] = {'timescaledb_version': TIMESCALEDB_VERSION, 'markers': dict(MARKERS), 'settle_s': MARKER_SETTLE_S,
-                               'engine_stop': 'SIGKILL', 'note': 'RC2 S17 legacy tag profile (5.2 (i)); seed production and X-R only'}
+                               'engine_stop': 'SIGKILL', 'note': 'legacy tag profile; seed production and X-R only'}
     root.mkdir(parents=True, exist_ok=True)
     out = root / 'manifest.json'
     out.write_text(json.dumps(m, indent=1) + '\n')
@@ -110,7 +115,7 @@ def legacy_manifest(name, octet, runs, jars=JARS, pins=PINS, template=TEMPLATE, 
 
 
 class LegacyTagFixture(fixture.Fixture):
-    """The R02 fixture with the legacy tag profile."""
+    """The v0.5 fixture with the legacy tag profile."""
     sleep = staticmethod(time.sleep)
 
     def psql(self, database, sql):
@@ -171,7 +176,7 @@ class LegacyTagFixture(fixture.Fixture):
         return self.cluster_tool(node, 'recording-log')
 
 
-# ------------------------------------------------------------------ X-R dumps (6.9 step 1; 20.1 line 21)
+# ------------------------------------------------------------------ X-R dumps
 
 DATABASES = ['r01_oms', 'r01_money', 'r01_market']
 
@@ -204,7 +209,7 @@ def pg_dump(f, db):
 
 
 def dump_d(f, keep=None):
-    """D0/D1 of 6.9: sha256 over the sorted INSERT lines of each database plus the tag AE balances, holds and lastAppliedTradeId
+    """D0/D1: sha256 over the sorted INSERT lines of each database plus the tag AE balances, holds and lastAppliedTradeId
     read with ``bridge.jar dump`` (the tag AE's query path)."""
     from observe import ae_dump
     d = {}

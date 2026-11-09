@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Synthetic core samples for the oracle unit tests and the cross-language mirror (H1).
+"""Synthetic core samples for the oracle unit tests and the Java mirror (which reads them as JSON).
 
 ``clean_sample()`` is one self-consistent lifecycle: funding while the gate is still at GENESIS,
 a price-improved taker fill, a resting partial, an amend with hold top-up, a cancel, an iceberg

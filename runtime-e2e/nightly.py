@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""T2 nightly on the dev box (critic D20; RC2 S17 carry X5, contract 5.4): a local systemd timer runs this, never a GitHub runner.
+"""Core-topology fixture nightly on a dev box: a local systemd timer runs this, never a GitHub runner.
 
 usage: nightly.py --plan nightly-cut.json --evidence-root DIR [--harness-commit SHA] [--tools-repo DIR] [--ct-repo DIR] [settings]
-       nightly.py --template core-template.json --evidence-root DIR [--scenario S ...]    the pre-S17 path (core-smoke)
+       nightly.py --template core-template.json --evidence-root DIR [--scenario S ...]    the template path (core-smoke)
 
 A plan lists entries ``{kind, scenario}``; every entry derives its OWN manifest from the cut (``mk_manifests.build_from_cut``, so one
-night runs A04 on ``s17-ext`` and A05 on ``s17-a05``) and runs ``runner.py`` on it. Behaviour (each is a nightly control of 8.3):
+night runs A04 on ``s17-ext`` and A05 on ``s17-a05``) and runs ``runner.py`` on it. Behaviour (each is a nightly control):
   * pinned harness: this file re-executes itself from ``git archive <harness_commit>`` unpacked once into ``<root>/harness-<sha>/``
     and checked blob by blob against the commit; a modified or extra file refuses the night before any run (``nightly-dirty``);
   * one heavy-job lock, taken without waiting: a held lock ends the night ``SKIPPED_BUSY`` (exit 75), nothing starts
@@ -17,7 +17,12 @@ night runs A04 on ``s17-ext`` and A05 on ``s17-a05``) and runs ``runner.py`` on 
   * the night bound ``NIGHTLY_BOUND_S`` (default 5 h) is enforced here, not by systemd: an entry running at the bound is stopped
     and it and every later entry are recorded ``INCONCLUSIVE``;
   * the night directory ends with ``SHA256SUMS`` over every file in it (written last, SHA-256 only).
-Settings come from the environment (``NIGHTLY_*``), a command-line flag wins. Nothing is pushed or published.
+Settings come from the environment (``NIGHTLY_*``), a command-line flag wins. Nothing is pushed or published. The host paths have
+no machine default; a night stops with a message naming the variable when one it needs is unset:
+  NIGHTLY_LOCK     the heavy-job lock file (``--lock``)
+  NIGHTLY_CUT      the cut manifest a ``--plan`` night derives from (``--cut``)
+  NIGHTLY_CT_REPO  the cluster-tools git work tree (``--ct-repo``; ``CUT_CT_REPO`` when unset)
+The derived manifests read the ``MK_*`` settings of ``mk_manifests.py`` and the ``CUT_*`` settings of ``release_cut.py``.
 """
 import argparse
 from dataclasses import dataclass
@@ -37,15 +42,14 @@ import tempfile
 from contracts import Violation
 import core_contracts
 from core_contracts import child_manifest, validate_core_manifest
-import r10_cut
+import release_cut
 
 DEFAULT_SCENARIOS = ['core-boots-10', 'core-smoke']
 FIXTURE_LABEL = 'org.openexchange.runtime-fixture'
 NIGHT_NAME = re.compile(r'\d{8}T\d{6}Z')
 EXIT = {'PASS': 0, 'FAIL': 1, 'INCONCLUSIVE': 2, 'SKIPPED_BUSY': 75, 'INTERRUPTED': 0}
 DEFAULT_BOUND_S = 5 * 3600.0
-DEFAULT_CUT = (Path('/home/emre/Apps/openexchange/.runtime-handoff/20260927-r00/workspace/notebook/reports/'
-                    'runtime-handoff-execution/R10/rc2-cut-manifest.json'))
+
 
 
 class NightTerminated(BaseException):
@@ -56,18 +60,18 @@ class NightTerminated(BaseException):
 
 @dataclass
 class Settings:
-    lock: str = r10_cut.HEAVY_LOCK
+    lock: str = None                  # NIGHTLY_LOCK: the heavy-job lock file (required)
     bound_s: float = DEFAULT_BOUND_S
     after_interrupt: str = 'run'
     load_max: float = 6.0
     harness_commit: str = None
-    cut: str = str(DEFAULT_CUT)
-    template: str = None              # the pre-S17 path: derive every entry from this one template manifest
+    cut: str = None                   # NIGHTLY_CUT: the cut manifest a --plan night derives from
+    template: str = None              # the template path: derive every entry from this one template manifest
     keep_state: bool = False          # keep the state root of a PASSing entry (a failing entry's is always kept)
-    stop_grace_s: float = 180         # RC2 S17 review V17: the runner's SIGTERM-to-SIGKILL grace, a setting
-    cut_sha256: str = None            # review V13 (c): the cut the night derives from, by sha256 and id
+    stop_grace_s: float = 180         # The runner's SIGTERM-to-SIGKILL grace, a setting
+    cut_sha256: str = None            # The cut the night derives from, by sha256 and id
     cut_id: str = None
-    repos: dict = None                # W6 fix round item 5: the tools and cluster-tools repos the cut checker reads
+    repos: dict = None                # The tools and cluster-tools repos the cut checker reads
 
     def record(self):
         return {'lock': self.lock, 'bound_s': self.bound_s, 'after_interrupt': self.after_interrupt, 'load_max': self.load_max,
@@ -90,9 +94,9 @@ def settings_from_env(env=None):
     after = env.get('NIGHTLY_AFTER_INTERRUPT', 'run')
     if after not in ('run', 'skip'):
         raise Violation(f'NIGHTLY_AFTER_INTERRUPT is run or skip, got {after!r}')
-    return Settings(lock=env.get('NIGHTLY_LOCK', r10_cut.HEAVY_LOCK), bound_s=_number(env, 'NIGHTLY_BOUND_S', DEFAULT_BOUND_S),
+    return Settings(lock=env.get('NIGHTLY_LOCK') or None, bound_s=_number(env, 'NIGHTLY_BOUND_S', DEFAULT_BOUND_S),
                     after_interrupt=after, load_max=_number(env, 'NIGHTLY_LOAD_MAX', 6.0),
-                    harness_commit=env.get('NIGHTLY_HARNESS_COMMIT') or None, cut=env.get('NIGHTLY_CUT', str(DEFAULT_CUT)),
+                    harness_commit=env.get('NIGHTLY_HARNESS_COMMIT') or None, cut=env.get('NIGHTLY_CUT') or None,
                     keep_state=env.get('NIGHTLY_KEEP_STATE', '') in ('1', 'true', 'yes'),
                     stop_grace_s=_number(env, 'NIGHTLY_STOP_GRACE_S', 180))
 
@@ -101,7 +105,7 @@ def settings_from_env(env=None):
 
 def known_kinds():
     import mk_manifests
-    return set(mk_manifests.KINDS17)
+    return set(mk_manifests.CUT_KINDS)
 
 
 def scenario_known(scenario):
@@ -113,10 +117,10 @@ def scenario_known(scenario):
         return 1 <= int(m.group(1)) <= 20           # runner.py's bound
     if scenario == 'core-control-edk-cnctimeout':        # run_cnc_timeout, outside the CONTROLS table
         return True
-    if scenario.startswith(('core-xver-', 'core-act-', 'core-rollback-')):    # RC2 S17 W3: xver.scenario
+    if scenario.startswith(('core-xver-', 'core-act-', 'core-rollback-')):    # Xver.scenario
         import xver
         return scenario in xver.SCENARIO_NAMES
-    if scenario.startswith('core-red-'):                  # core_drills.scenario: S15 red1/red2(-negctl), S16 red-a03/red-a04
+    if scenario.startswith('core-red-'):                  # core_drills.scenario: red1/red2(-negctl), red-a03/red-a04
         suffix = scenario[len('core-red-'):]
         return 'red' + suffix in core_drills.REDS or 'red-' + suffix in core_drills.REDS
     for prefix, table in (('core-drill-', core_drills.DRILLS), ('core-control-', core_drills.CONTROLS)):
@@ -142,14 +146,14 @@ def parse_plan(obj, kinds=None):
 
 
 def derive(template, template_path, scenario):
-    """A fresh run identity from the template; the child file keeps the template's kind in its name (20.1 line 20)."""
+    """A fresh run identity from the template; the child file keeps the template's kind in its name."""
     path, _ = child_manifest(template, Path(template_path).absolute().parent, scenario)
     return path
 
 
 def entry_env(entry, env):
-    """RC2 S17 W6 fix round item 2: the per-entry settings of the runner's environment. ENGINE_DRIVER_SKIP=1 (5.2) only for the
-    edk-cnctimeout control on its own kind (as S16's driver script did, ``S16/evidence/w6/run1.sh:6``); every other entry runs
+    """The per-entry settings of the runner's environment. ENGINE_DRIVER_SKIP=1 only for the
+    edk-cnctimeout control on its own kind (as the earlier driver script did); every other entry runs
     without it (``Host.run_entry`` strips an inherited value), and ``core_contracts.check_engine_driver_skip`` still refuses it on
     any other manifest."""
     if entry.get('scenario') == 'core-control-edk-cnctimeout' and entry.get('kind') in core_contracts.EDK_CNCTIMEOUT_KINDS:
@@ -166,11 +170,11 @@ def git_repo(path, what):
 
 
 def use_repos(tools_repo, ct_repo):
-    """RC2 S17 W6 fix round item 5: the night from ``harness-<sha>/`` is no git repo, so ``r10_cut.REPO_PATHS`` (read by the
+    """The night from ``harness-<sha>/`` is no git repo, so ``release_cut.REPO_PATHS`` (read by the
     cut checker at every derivation, in this process and in each runner child) is set from the night's own flags."""
     tools, ct = git_repo(tools_repo, '--tools-repo'), git_repo(ct_repo, '--ct-repo')
-    os.environ['R10_TOOLS_REPO'], os.environ['R10_CT_REPO'] = str(tools), str(ct)
-    r10_cut.REPO_PATHS.update({'tools': tools, 'cluster-tools': ct})
+    os.environ['CUT_TOOLS_REPO'], os.environ['CUT_CT_REPO'] = str(tools), str(ct)
+    release_cut.REPO_PATHS.update({'tools': tools, 'cluster-tools': ct})
     return tools, ct
 
 
@@ -467,7 +471,7 @@ def _run_locked(plan, night, unfinished, work_root, settings, host, summary, sta
 
 
 def _records(night, summary, status):
-    """RC2 step 7 (review V10): the night's activation records, checked as a set (no repeated genesisId, equal invariants,
+    """The night's activation records, checked as a set (no repeated genesisId, equal invariants,
     each OK); a refused set makes the night FAIL."""
     paths, records = [], []
     for p in sorted(night.rglob('rc2-activation-record*.json')):
@@ -477,14 +481,14 @@ def _records(night, summary, status):
             r = {'status': 'UNREADABLE'}
         if r.get('record_kind', 'final') == 'final':            # rc2-cut-4: intermediate (pre-recovery) records stay out
             paths.append(p); records.append(r)
-    refusals = r10_cut.check_record_set(records) + [f'{p.relative_to(night)}: status {r.get("status")}'
+    refusals = release_cut.check_record_set(records) + [f'{p.relative_to(night)}: status {r.get("status")}'
                                                     for p, r in zip(paths, records) if r.get('status') != 'OK']
     summary['activation_records'] = {'files': [str(p.relative_to(night)) for p in paths], 'refusals': refusals}
     return 'FAIL' if refusals and status == 'PASS' else status
 
 
 def cut_identity(cut, commit):
-    """Review V2/V13 (c): the cut by sha256 and cut_id; its harness_commit must be the night's pinned commit."""
+    """The cut by sha256 and cut_id; its harness_commit must be the night's pinned commit."""
     data = Path(cut).read_bytes()
     m = json.loads(data)
     if m.get('harness_commit') != commit:
@@ -494,7 +498,7 @@ def cut_identity(cut, commit):
 
 
 def pinned_plan(plan, harness_dir):
-    """Review V13 (b): the plan the night runs is the one at the pinned commit (``<harness>/runtime-e2e/<name>``), byte-equal."""
+    """The plan the night runs is the one at the pinned commit (``<harness>/runtime-e2e/<name>``), byte-equal."""
     plan, pinned = Path(plan), Path(harness_dir) / Path(plan).name
     if not pinned.is_file() or pinned.read_bytes() != plan.read_bytes():
         raise Violation(f'{plan} is not the plan at the pinned commit ({pinned}): edit the plan by commit, not in the working tree')
@@ -526,7 +530,8 @@ def main_with(argv, host=None):
     parser.add_argument('--evidence-root', required=True, type=Path)
     parser.add_argument('--scenario', action='append', help='with --template: the scenarios (default core-boots-10, core-smoke)')
     parser.add_argument('--tools-repo', type=Path, default=Path(__file__).resolve().parent.parent)
-    parser.add_argument('--ct-repo', type=Path, default=Path(os.environ.get('NIGHTLY_CT_REPO') or r10_cut.REPO_PATHS['cluster-tools']),
+    ct_default = os.environ.get('NIGHTLY_CT_REPO') or os.environ.get('CUT_CT_REPO')
+    parser.add_argument('--ct-repo', type=Path, default=Path(ct_default) if ct_default else None,
                         help='the cluster-tools repo the cut checker reads the T1 driver sources from (setting NIGHTLY_CT_REPO)')
     parser.add_argument('--harness-commit', default=env.harness_commit)
     parser.add_argument('--harness-root', type=Path, help='where harness-<sha>/ is unpacked (default: next to the evidence root)')
@@ -539,9 +544,11 @@ def main_with(argv, host=None):
     parser.add_argument('--keep-state', action='store_true', default=env.keep_state)
     args = parser.parse_args(argv)
     if args.plan is not None and not args.harness_commit:
-        # review V13 (a): an unset NIGHTLY_HARNESS_COMMIT expands to "" in ExecStart; a night never falls back to HEAD
+        # An unset NIGHTLY_HARNESS_COMMIT expands to "" in ExecStart; a night never falls back to HEAD
         raise Violation('an empty harness commit: --plan nights run only on a pinned NIGHTLY_HARNESS_COMMIT')
     commit = args.harness_commit or _git(args.tools_repo, 'rev-parse', 'HEAD').stdout.decode().strip()
+    if args.ct_repo is None:
+        raise Violation('NIGHTLY_CT_REPO is not set: set it (or pass --ct-repo) to the cluster-tools git work tree')
     tools_repo, ct_repo = use_repos(args.tools_repo, args.ct_repo)
     harness_root = args.harness_root or args.evidence_root.resolve().parent / 'harness'
     harness = prepare_harness(args.tools_repo, commit, harness_root)        # refuses a dirty harness before anything else
@@ -551,7 +558,7 @@ def main_with(argv, host=None):
         if '--harness-commit' not in flags:
             flags += ['--harness-commit', commit]
         for flag, repo in (('--tools-repo', tools_repo), ('--ct-repo', ct_repo)):
-            if flag in flags:                       # review V13 (d): always the real repo, absolute, never harness-<sha>
+            if flag in flags:                       # Always the real repo, absolute, never harness-<sha>
                 flags[flags.index(flag) + 1] = str(repo)
             else:
                 flags += [flag, str(repo)]
@@ -571,6 +578,8 @@ def main_with(argv, host=None):
     else:
         plan_path = pinned_plan(args.plan, harness / 'runtime-e2e')
         plan = parse_plan(json.loads(plan_path.read_text()))
+        if not args.cut:
+            raise Violation('NIGHTLY_CUT is not set: set it (or pass --cut) to the cut manifest the plan derives from')
         ident = cut_identity(args.cut, commit)
         settings.cut_sha256, settings.cut_id = ident['sha256'], ident['cut_id']
     work_root = args.work_root or args.evidence_root.resolve().parent / 'work'
@@ -579,6 +588,8 @@ def main_with(argv, host=None):
     if host is None:
         host = Host()
         host.stop_grace_s = settings.stop_grace_s
+    if not settings.lock:
+        raise Violation('NIGHTLY_LOCK is not set: set it (or pass --lock) to the heavy-job lock file the night takes')
     code, summary = run_night(plan, args.evidence_root, work_root, settings, host)
     print(json.dumps({k: summary[k] for k in ('night', 'status', 'lock', 'wall_s')} | {
         'entries': [{k: e.get(k) for k in ('scenario', 'kind', 'status', 'wall_s')} for e in summary['entries']]}))

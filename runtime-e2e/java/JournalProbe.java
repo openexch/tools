@@ -19,17 +19,17 @@ import java.util.HexFormat;
 import java.util.List;
 
 /**
- * RC2 S14 ME-side probe, compiled separately against the frozen ME jar. It never decodes journal
+ * ME-side probe, compiled separately against the frozen ME jar. It never decodes journal
  * records itself: {@code dump} copies every frame of every journal recording verbatim (hex) with its
  * recording and position, and the Python profile decoder (journal_decode.py, pinned schema XML) judges
- * them. That keeps this probe valid across the RC2 S1 journal schema change.
+ * them. That keeps this probe valid across the ME journal schema 4 change.
  *
  * <pre>
  * dump      archive=host:port local=ip control_stream=4010 stream=4001 replay_port=19820 source=me0
  * open-legs ingress=0=h:p,1=h:p,2=h:p local=ip     (OpenOrdersSnapshot 27 via the ME cluster)
  * </pre>
  * Optional ME_AUTH_CREDENTIAL (keyId:CLASS:secretHex) is presented on the ME session once the ME
- * authenticator exists (RC2 S6); without it the session presents nothing, as today's ME expects.
+ * authenticator exists; without it the session presents nothing, as today's ME expects.
  * Exit codes: 0 complete; 3 deadline; 64 usage. Output: JSON lines on stdout.
  */
 public final class JournalProbe {

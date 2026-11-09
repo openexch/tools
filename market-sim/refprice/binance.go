@@ -15,8 +15,7 @@ import (
 
 // BinanceSource follows real Binance public streams (@bookTicker for mid
 // moves, @trade for taker flow) and converts them to reference returns.
-// Ported from tools/binance-replay/websocket.go with the same reconnect
-// discipline; drops rather than blocks on a slow consumer.
+// It reconnects on failure and drops rather than blocks on a slow consumer.
 type BinanceSource struct {
 	baseURL string // wss://stream.binance.com:9443/ws
 	markets []BinanceMarket

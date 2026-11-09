@@ -1,28 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
-# T2 core-topology fixture nightly on the cut (RC2 critic D20; S17 contract 5.4). User unit; install by hand (NOT installed by the repo):
+# Core-topology fixture nightly on the cut. User unit; install by hand (NOT installed by the repo):
 #   cp runtime-e2e-nightly.{service,timer} ~/.config/systemd/user/
 #   mkdir -p ~/.config/systemd/user/runtime-e2e-nightly.service.d && cp runtime-e2e-nightly.service.d/timeout.conf there
-#   edit RUNTIME_E2E_* / NIGHTLY_* below, then: systemctl --user daemon-reload && systemctl --user enable --now runtime-e2e-nightly.timer
+#   edit RUNTIME_E2E_* / NIGHTLY_* / MK_* / CUT_* below, then: systemctl --user daemon-reload && systemctl --user enable --now runtime-e2e-nightly.timer
 # Production timeouts are part of every derived manifest and are not overridable here.
 # The night's wall bound is NIGHTLY_BOUND_S, enforced inside nightly.py (an expiry records the rest of the plan INCONCLUSIVE). systemd does
 # not expand Environment= values in TimeoutStartSec (only in Exec* lines), so the outer guard is a literal in the drop-in timeout.conf.
 # NIGHTLY_HARNESS_COMMIT pins the tools commit: the night runs from `git archive` of it, never from the working tree.
 [Unit]
-Description=Open Exchange runtime-e2e core fixture nightly (T2, S17 plan)
+Description=Open Exchange runtime-e2e core fixture nightly
 After=docker.service
 
 [Service]
 Type=oneshot
 Environment=RUNTIME_E2E_REPO=%h/Apps/openexchange/tools
 Environment=RUNTIME_E2E_PLAN=%h/Apps/openexchange/tools/runtime-e2e/nightly-cut.json
-Environment=RUNTIME_E2E_EVIDENCE=%h/Apps/openexchange/.runtime-handoff/nightly/evidence
+Environment=RUNTIME_E2E_EVIDENCE=%h/runtime-e2e-nightly/evidence
 # the cluster-tools repo (a git work tree) the cut checker reads the T1 driver sources from; the tools repo is RUNTIME_E2E_REPO.
-# nightly.py hands both to the archived night as R10_TOOLS_REPO / R10_CT_REPO (harness-<sha>/ is no git repo).
+# nightly.py hands both to the archived night as CUT_TOOLS_REPO / CUT_CT_REPO (harness-<sha>/ is no git repo).
 Environment=NIGHTLY_CT_REPO=%h/Apps/openexchange/cluster-tools
 Environment=NIGHTLY_HARNESS_COMMIT=REPLACE_WITH_THE_PINNED_TOOLS_COMMIT
+# Host paths, no defaults (a night stops naming the first one it needs and does not find):
+Environment=NIGHTLY_LOCK=REPLACE_WITH_THE_HEAVY_JOB_LOCK_FILE
+Environment=NIGHTLY_CUT=REPLACE_WITH_THE_CUT_MANIFEST
+Environment=CUT_OLD_PINS=REPLACE_WITH_THE_OLD_ARTIFACT_PINS_FILE
+Environment=MK_BIN_A=REPLACE_WITH_THE_BUILD_A_DIRECTORY
+Environment=MK_CUT_NC_DIR=REPLACE_WITH_THE_TEST_CONFIG_BUILD_OF_THE_CUT
+Environment=MK_NETFILTER_HELPER=REPLACE_WITH_THE_NETFILTER_HELPER_DIRECTORY
+# the ME tree's deploy/media-driver/driver.properties (pinned by sha256; the external-engine-driver kinds stage it)
+Environment=MK_DRIVER_PROPERTIES=REPLACE_WITH_THE_ME_DRIVER_PROPERTIES_FILE
 Environment=NIGHTLY_BOUND_S=18000
 Environment=NIGHTLY_AFTER_INTERRUPT=run
 Environment=NIGHTLY_LOAD_MAX=6
+# Optional, shown at their defaults: keep the state root of a PASSing entry (1) and the runner's SIGTERM-to-SIGKILL grace.
+Environment=NIGHTLY_KEEP_STATE=0
+Environment=NIGHTLY_STOP_GRACE_S=180
 ExecStart=/usr/bin/python3 ${RUNTIME_E2E_REPO}/runtime-e2e/nightly.py --tools-repo ${RUNTIME_E2E_REPO} --ct-repo ${NIGHTLY_CT_REPO} --plan ${RUNTIME_E2E_PLAN} --evidence-root ${RUNTIME_E2E_EVIDENCE} --harness-commit ${NIGHTLY_HARNESS_COMMIT}
 # A held heavy lock or foreign load exits 75 (SKIPPED_BUSY): a skipped night is not a failed unit.
 SuccessExitStatus=75

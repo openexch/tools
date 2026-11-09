@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""RC2 S17 W2/W4 (contract 5.4, 20.1 line 20): child manifests are written under the names mk_manifests.py produces,
-``<kind>--<tag>.json``, so the S16 kind rule (``validate_build_b``) accepts a child of a kinded manifest. No Docker."""
+"""Child manifests are written under the names mk_manifests.py produces,
+``<kind>--<tag>.json``, so the kind rule (``validate_build_b``) accepts a child of a kinded manifest. No Docker."""
 import fcntl
 import hashlib
 import json
@@ -35,7 +35,7 @@ class ChildManifestNameTest(unittest.TestCase):
 
     def accepted(self, path):
         child = json.loads(Path(path).read_text())
-        core_contracts.validate_build_b(child, path)          # the kind rule: raises on <run_id>-manifest.json (W0)
+        core_contracts.validate_build_b(child, path)          # the kind rule: raises on <run_id>-manifest.json
         self.assertEqual(Path(child['state_root']), Path(path).parent / 'fixtures' / child['run_id'])
         return child
 
@@ -71,7 +71,7 @@ class ChildManifestNameTest(unittest.TestCase):
             self.accepted(path)
 
 
-# ------------------------------------------------------------------ RC2 S17 W4 (contract 5.4, 8.3): the plan nightly
+# ------------------------------------------------------------------ the plan nightly
 
 class FakeHost(nightly.Host):
     """No docker, no runner, no clock: records what the night would have done."""
@@ -129,7 +129,7 @@ class PlanTest(unittest.TestCase):
     def test_default_plan_is_valid_and_ends_with_boots(self):
         plan = nightly.parse_plan(json.loads((Path(__file__).with_name('nightly-cut.json')).read_text()))
         self.assertEqual(plan[-1], {'kind': 's17', 'scenario': 'core-boots-10'})
-        self.assertGreaterEqual(len(plan), 18 + 4)           # contract 7.1: 18 drills and the embedded repeats at least
+        self.assertGreaterEqual(len(plan), 18 + 4)           # 18 drills and the embedded repeats at least
         self.assertEqual(len({(e['kind'], e['scenario']) for e in plan}), len(plan))
 
 
@@ -164,7 +164,7 @@ class LockTest(NightBase):
         self.assertEqual(host.started, []); self.assertEqual(host.removed, [])
         self.assertEqual(summary['lock'], str(self.lock))
         self.assertEqual(summary['entries'], [])
-        # the lock is per night and released on exit: the same test then runs a normal night (C4)
+        # the lock is per night and released on exit: the same test then runs a normal night
         fcntl.flock(holder, fcntl.LOCK_UN); holder.close()
         code, summary = self.night(host)
         self.assertEqual((code, summary['status']), (0, 'PASS'))
@@ -190,7 +190,7 @@ class PreflightTest(NightBase):
         for name in ('20200101T000000Z', '20200102T000000Z'):
             old = self.summary(name)
             self.assertEqual(old['status'], 'INTERRUPTED')
-        code, second = self.night(host)                  # recorded once: the second night finds nothing unfinished (C4)
+        code, second = self.night(host)                  # recorded once: the second night finds nothing unfinished
         self.assertNotIn('interrupted', second)
 
     def test_stale_fixture_container_is_removed_and_after_interrupt_skip(self):   # nightly-stale (container half)
@@ -250,7 +250,39 @@ class BoundTest(NightBase):
         with self.assertRaises(Violation): nightly.settings_from_env({'NIGHTLY_AFTER_INTERRUPT': 'maybe'})
         s = nightly.settings_from_env({})
         self.assertEqual((s.after_interrupt, s.load_max), ('run', 6.0))
-        self.assertTrue(s.lock.endswith('/scratchpad/heavy.lock'))
+        self.assertIsNone(s.lock)
+        self.assertEqual(nightly.settings_from_env({'NIGHTLY_LOCK': '/x/heavy.lock'}).lock, '/x/heavy.lock')
+
+
+class UnsetHostPathTest(NightBase):
+    """A host path variable missing for one entry records that entry INCONCLUSIVE, names the variable, and the night finishes."""
+
+    class Host(FakeHost):
+        def make_manifest(self, entry, index, work, settings):
+            if entry['kind'] == 's17-ext':                      # the external-engine-driver kinds stage driver.properties
+                import mk_manifests
+                env = {k: v for k, v in os.environ.items() if k != 'MK_DRIVER_PROPERTIES'}
+                with mock.patch.dict(os.environ, env, clear=True):
+                    mk_manifests._engine_libs(mk_manifests.Config(runs=work))
+            return super().make_manifest(entry, index, work, settings)
+
+    def test_unset_path_refuses_with_a_violation_naming_the_variable(self):
+        from machine_paths import env_path
+        with self.assertRaisesRegex(Violation, 'MK_DRIVER_PROPERTIES is not set'):
+            str(env_path('MK_DRIVER_PROPERTIES', 'driver.properties', env={}))
+
+    def test_missing_variable_is_inconclusive_for_its_entry_and_the_night_finishes(self):
+        plan = nightly.parse_plan(plan2() + [{'kind': 's17', 'scenario': 'core-smoke'}])
+        host = self.Host()
+        code, summary = self.night(host, plan)
+        by = {e['scenario']: e for e in summary['entries']}
+        self.assertEqual(by['core-drill-a04-regenesis']['status'], 'INCONCLUSIVE')
+        self.assertIn('manifest not derived', by['core-drill-a04-regenesis']['error'])
+        self.assertIn('MK_DRIVER_PROPERTIES is not set', by['core-drill-a04-regenesis']['error'])
+        self.assertEqual((by['core-boots-1']['status'], by['core-smoke']['status']), ('PASS', 'PASS'))
+        self.assertEqual(host.started, ['core-boots-1', 'core-smoke'])
+        self.assertEqual((code, summary['status']), (2, 'INCONCLUSIVE'))
+        self.assertEqual(self.summary(summary['night'])['status'], 'INCONCLUSIVE')    # summary.json written
 
 
 class SealTest(NightBase):
@@ -322,7 +354,8 @@ class HarnessTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as ev:
             with self.assertRaises(Violation):
                 nightly.main_with(['--plan', str(self.dir / 'p.json'), '--evidence-root', ev, '--tools-repo', str(self.repo),
-                                   '--harness-commit', self.sha, '--harness-root', str(self.root)], host=host)
+                                   '--ct-repo', str(self.repo), '--harness-commit', self.sha, '--harness-root', str(self.root)],
+                                  host=host)
         self.assertEqual(host.started, [])
 
 
@@ -349,11 +382,11 @@ class UnitFilesTest(unittest.TestCase):
 
 
 
-class S17ScenarioTableTest(unittest.TestCase):
-    """RC2 S17 W3 (coordinator): the xver/activation/rollback names and A05-keep are known; the default plan carries RED-1,
+class CutScenarioTableTest(unittest.TestCase):
+    """The xver/activation/rollback names and A05-keep are known; the default plan carries RED-1,
     RED-2 and A05-keep on their cut kinds."""
 
-    def test_every_w3_scenario_is_known(self):
+    def test_every_cross_version_scenario_is_known(self):
         import xver
         for name in xver.SCENARIO_NAMES + ['core-drill-a05-keep']:
             self.assertTrue(nightly.scenario_known(name), name)
@@ -366,9 +399,9 @@ class S17ScenarioTableTest(unittest.TestCase):
 
 
 class EntryEnvironmentTest(unittest.TestCase):
-    """RC2 S17 W6 fix round item 2. RED 5d0339f: entry 26 (s17-ctl-edk-cnctimeout) ran without ENGINE_DRIVER_SKIP=1 and was
-    INCONCLUSIVE 3/3 ('edk-cnctimeout needs ENGINE_DRIVER_SKIP=1 on its own manifest (5.2)'). S16 set it in its driver script
-    for that kind only (S16/evidence/w6/run1.sh:6); the night sets it for that kind and scenario only, and strips it elsewhere."""
+    """RED 5d0339f: entry 26 (s17-ctl-edk-cnctimeout) ran without ENGINE_DRIVER_SKIP=1 and was
+    INCONCLUSIVE 3/3 ('edk-cnctimeout needs ENGINE_DRIVER_SKIP=1 on its own manifest'). The earlier driver script set it
+    for that kind only; the night sets it for that kind and scenario only, and strips it elsewhere."""
 
     def env_of(self, entry, outer):
         seen = {}
@@ -401,9 +434,9 @@ class EntryEnvironmentTest(unittest.TestCase):
 
 
 class RepoPathsTest(unittest.TestCase):
-    """RC2 S17 W6 fix round item 5. RED 5d0339f: a night from the pinned archive read r10_cut.REPO_PATHS['tools'] as the
-    unpacked harness-<sha>/ (not a git repo), so the cut checker could not read the probe sources at harness_commit (W6
-    aborted-env/, every entry INCONCLUSIVE in 8 s); W6 needed R10_TOOLS_REPO / R10_CT_REPO by hand. The night passes both."""
+    """RED 5d0339f: a night from the pinned archive read release_cut.REPO_PATHS['tools'] as the
+    unpacked harness-<sha>/ (not a git repo), so the cut checker could not read the probe sources at harness_commit
+    (every entry INCONCLUSIVE in 8 s); the run needed CUT_TOOLS_REPO / CUT_CT_REPO by hand. The night passes both."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(); self.dir = Path(self.temp.name)
@@ -420,26 +453,26 @@ class RepoPathsTest(unittest.TestCase):
         with mock.patch.object(nightly, 'prepare_harness', lambda repo, commit, root: harness.parent), \
                 mock.patch.object(nightly.os, 'execv', lambda exe, argv: execs.append((argv, dict(os.environ)))), \
                 mock.patch.dict(os.environ, env or {}, clear=False), \
-                mock.patch.dict(nightly.r10_cut.REPO_PATHS, {}, clear=False):
+                mock.patch.dict(nightly.release_cut.REPO_PATHS, {}, clear=False):
             try:
                 nightly.main_with(['--plan', str(self.dir / 'p.json'), '--evidence-root', str(self.dir / 'e'),
                                    '--harness-commit', 'a' * 40, '--tools-repo', str(self.tools), *extra])
             except (Violation, OSError, ValueError):
                 pass
-            paths = dict(nightly.r10_cut.REPO_PATHS)
+            paths = dict(nightly.release_cut.REPO_PATHS)
         return execs, paths
 
     def test_the_launcher_passes_both_repos_to_the_archived_night(self):
-        execs, _ = self.launch('--ct-repo', str(self.ct), env={'R10_TOOLS_REPO': '/nowhere', 'R10_CT_REPO': '/nowhere'})
+        execs, _ = self.launch('--ct-repo', str(self.ct), env={'CUT_TOOLS_REPO': '/nowhere', 'CUT_CT_REPO': '/nowhere'})
         self.assertTrue(execs)
         argv, env = execs[0]
         self.assertEqual(argv[argv.index('--ct-repo') + 1], str(self.ct.resolve()))
-        self.assertEqual(env['R10_TOOLS_REPO'], str(self.tools.resolve()))
-        self.assertEqual(env['R10_CT_REPO'], str(self.ct.resolve()))
+        self.assertEqual(env['CUT_TOOLS_REPO'], str(self.tools.resolve()))
+        self.assertEqual(env['CUT_CT_REPO'], str(self.ct.resolve()))
 
     def test_the_ct_repo_default_is_a_setting_and_a_non_git_dir_is_refused(self):
         execs, _ = self.launch(env={'NIGHTLY_CT_REPO': str(self.ct)})
-        self.assertEqual(execs[0][1]['R10_CT_REPO'], str(self.ct.resolve()))
+        self.assertEqual(execs[0][1]['CUT_CT_REPO'], str(self.ct.resolve()))
         plain = self.dir / 'plain'; plain.mkdir()
         with mock.patch.object(nightly, 'prepare_harness', lambda repo, commit, root: self.dir), \
                 mock.patch.object(nightly.os, 'execv', lambda exe, argv: self.fail('a non-git ct repo must not launch')):
@@ -452,14 +485,14 @@ class RepoPathsTest(unittest.TestCase):
         with mock.patch.object(nightly, 'prepare_harness', lambda repo, commit, root: harness), \
                 mock.patch.object(nightly, '__file__', str(harness / 'runtime-e2e' / 'nightly.py')), \
                 mock.patch.object(nightly, 'pinned_plan', lambda plan, h: (_ for _ in ()).throw(Violation('stop here'))), \
-                mock.patch.dict(nightly.r10_cut.REPO_PATHS, {}, clear=False), mock.patch.dict(os.environ, {}, clear=False):
+                mock.patch.dict(nightly.release_cut.REPO_PATHS, {}, clear=False), mock.patch.dict(os.environ, {}, clear=False):
             (harness / 'runtime-e2e').mkdir(parents=True)
             with self.assertRaisesRegex(Violation, 'stop here'):
                 nightly.main_with(['--plan', str(self.dir / 'p.json'), '--evidence-root', str(self.dir / 'e'),
                                    '--harness-commit', 'a' * 40, '--tools-repo', str(self.tools), '--ct-repo', str(self.ct)])
-            self.assertEqual(nightly.r10_cut.REPO_PATHS['tools'], self.tools.resolve())
-            self.assertEqual(nightly.r10_cut.REPO_PATHS['cluster-tools'], self.ct.resolve())
-            self.assertEqual(os.environ['R10_TOOLS_REPO'], str(self.tools.resolve()))
+            self.assertEqual(nightly.release_cut.REPO_PATHS['tools'], self.tools.resolve())
+            self.assertEqual(nightly.release_cut.REPO_PATHS['cluster-tools'], self.ct.resolve())
+            self.assertEqual(os.environ['CUT_TOOLS_REPO'], str(self.tools.resolve()))
 
     def test_the_unit_template_names_both_repos(self):
         text = (Path(__file__).with_name('systemd') / 'runtime-e2e-nightly.service').read_text()

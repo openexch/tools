@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""RC2 S17 W2: the cut checker (contract 3.3, 5.1, 8.1). One RED per rule K1-K10, each refused with its rule and accepted with
-that rule switched off (the C6 seam); the K4 exemption refused in a product kind; the guarded-row REDs of 8.1 (rows 02, 11, 22,
+"""The cut checker. One RED per rule K1-K10, each refused with its rule and accepted with
+that rule switched off (the rules seam); the K4 exemption refused in a product kind; the guarded-row REDs (rows 02, 11, 22,
 24, 26, 41, 52); a passing cut. No Docker, no real artifact: every jar and binary is a small file in a temp tree."""
 import contextlib
 import copy
@@ -13,7 +13,7 @@ import unittest
 from unittest import mock
 import zipfile
 
-import r10_cut
+import release_cut
 
 SHAS = {'assets': 'a' * 40, 'match': 'b' * 40, 'cluster-kit': 'c' * 40, 'cluster-tools': 'd' * 40, 'tools': 'e' * 40}
 TAG = {'match': '1' * 40, 'assets': '2' * 40}
@@ -39,14 +39,14 @@ def jar_bytes(members):
 
 def engine_jar(name, kit=KIT_PIN, schema_text=SCHEMA_TEXT, marker=b'', aeron='1.53.1'):
     members = {'MANIFEST': b'jar ' + name.encode() + marker}
-    if aeron is not None:                                  # RC2 S17 review V4: K8 reads the version the jar carries
-        members[r10_cut.AERON_VERSION_CLASS] = b'\xca\xfe\x01\x00\x06' + aeron.encode() + b'\x01'
-    spec = r10_cut.PRODUCT[name]
+    if aeron is not None:                                  # K8 reads the version the jar carries
+        members[release_cut.AERON_VERSION_CLASS] = b'\xca\xfe\x01\x00\x06' + aeron.encode() + b'\x01'
+    spec = release_cut.PRODUCT[name]
     for schema, member in spec['schemas'].items():
         if schema in schema_text:
             members[member] = schema_text[schema]
     if kit is not None:
-        members[r10_cut.KIT_POM] = f'groupId=com.openexchange\nversion={kit}\n'.encode()
+        members[release_cut.KIT_POM] = f'groupId=com.openexchange\nversion={kit}\n'.encode()
     return jar_bytes(members)
 
 
@@ -60,7 +60,7 @@ class World:
         art = {}
         for name in ('match-cluster.jar', 'assets-cluster.jar', 'assets-projector.jar'):
             data = engine_jar(name)
-            repo = r10_cut.PRODUCT[name]['repo']
+            repo = release_cut.PRODUCT[name]['repo']
             p = self.put('artifacts/' + name, data)
             self.build(name, repo, SHAS[repo], data, 2)
             art[name] = self.entry(p, SHAS[repo], 'rebuild-equal')
@@ -85,23 +85,23 @@ class World:
             harness[key] = {'path': str(p), 'sha256': h(key.encode()), 'kind': 'harness', 'driver_mode': mode,
                             'source_path': str(src), 'source_sha256': h(src.read_bytes())}
         for key in ('probe_aeronmd', 'probe_libaeron_driver.so', 'probe_libaeron.so'):
-            p = self.put('harness/' + key, b'S16 probe ' + key.encode())
+            p = self.put('harness/' + key, b'old probe ' + key.encode())
             harness[key] = {'path': str(p), 'sha256': h(p.read_bytes()), 'kind': 'harness', 'driver_mode': 'external'}
         self.write_record()
         self.m = {
-            'schema': r10_cut.SCHEMA, 'class': 'product', 'cut_id': 'rc2-cut-1', 'created': '2026-11-04T00:00:00Z',
+            'schema': release_cut.SCHEMA, 'class': 'product', 'cut_id': 'rc2-cut-1', 'created': '2026-11-04T00:00:00Z',
             'harness_commit': SHAS['tools'], 'repos': dict(SHAS), 'schemas': dict(SCHEMAS),
-            'substrate': {'aeron': {k: '1.53.1' for k in r10_cut.SUBSTRATE_AERON}, 'kit_pin': KIT_PIN,
+            'substrate': {'aeron': {k: '1.53.1' for k in release_cut.SUBSTRATE_AERON}, 'kit_pin': KIT_PIN,
                           'kit_jar': {'path': str(kp), 'sha256': h(kit), 'source_sha': SHAS['cluster-kit'],
                                       'derivation': 'rebuild-equal', 'tree_dirty': False}, 'sbe': '1.40.1'},
             'artifacts': art, 'harness': harness,
             'genesis': {'me': {'configVersion': 1, 'behaviorVersion': 2, 'commandLedgerCapacity': 100000, 'maxWireVersion': 12,
                                'genesisId': 'per-genesis'},
                         'core': {'configVersions': [1, 2, 3], 'genesisId': 'per-genesis'}, 'order': ['me', 'bridges', 'core']},
-            'driver_profiles': {'prod': {p: 'external' for p in r10_cut.PROCESSES},
+            'driver_profiles': {'prod': {p: 'external' for p in release_cut.PROCESSES},
                                 'dev': {**{p: 'embedded' for p in ('me', 'ae', 'projector')}, 'forwarder': 'external',
                                         'bridge': 'external'}},
-            'retired': sorted(r10_cut.RETIRED) + ['rc1-tools'], 'excluded': ['oms-execution-projector'],
+            'retired': sorted(release_cut.RETIRED) + ['rc1-tools'], 'excluded': ['oms-execution-projector'],
             'build_record': self.record_ref(),
         }
 
@@ -113,12 +113,12 @@ class World:
 
     def build(self, name, repo, source, data, times, tag=''):
         for i in range(times):
-            p = self.put(f'builds/b{i}{tag}-{source[:4]}/{name}', data)      # one build root per build (review V3)
+            p = self.put(f'builds/b{i}{tag}-{source[:4]}/{name}', data)      # one build root per build
             self.record.setdefault(name, []).append({'repo': repo, 'source_sha': source, 'path': str(p), 'sha256': h(data)})
 
     def blob(self, repo, commit, rel):
-        """The git seam of review V2: the harness source at the cut's commit is the source file the World wrote."""
-        name = {v[1]: k for k, v in r10_cut.HARNESS_SOURCES.items()}.get(rel)
+        """The git seam: the harness source at the cut's commit is the source file the World wrote."""
+        name = {v[1]: k for k, v in release_cut.HARNESS_SOURCES.items()}.get(rel)
         want = self.m['harness_commit'] if repo == 'tools' else self.m['repos']['cluster-tools']
         if name is None or commit != want:
             return None
@@ -145,7 +145,7 @@ class World:
         self.pins[h(Path(path).read_bytes())] = {'name': name, 'source_sha': source, 'recipe': 'r', 'recipe_sha256': '0' * 64}
 
     def tag_jar(self, name, kit='0.1.2'):
-        repo = r10_cut.PRODUCT[name]['repo']
+        repo = release_cut.PRODUCT[name]['repo']
         p = self.put('old/' + name, engine_jar(name, kit=kit, schema_text={**SCHEMA_TEXT, **OLD_SCHEMA_TEXT}, marker=b' tag'))
         self.pin(p, TAG[repo], name)
         return p, TAG[repo]
@@ -155,23 +155,23 @@ class CheckerBase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.w = World(self.temp.name)
-        patch = mock.patch.object(r10_cut, 'git_blob', self.w.blob); patch.start(); self.addCleanup(patch.stop)
+        patch = mock.patch.object(release_cut, 'git_blob', self.w.blob); patch.start(); self.addCleanup(patch.stop)
 
     def tearDown(self):
         self.temp.cleanup()
 
-    def check(self, m, rules=r10_cut.RULES, cls=None):
-        return r10_cut.check(m, cls=cls, rules=rules, old_pins=self.w.pins)
+    def check(self, m, rules=release_cut.RULES, cls=None):
+        return release_cut.check(m, cls=cls, rules=rules, old_pins=self.w.pins)
 
     def refused(self, m, expected, cls=None, exact=True):
-        """``expected`` rules refuse ``m``; with exactly those switched off it passes (C6: the RED is the rule's)."""
+        """``expected`` rules refuse ``m``; with exactly those switched off it passes (the RED is the rule's)."""
         found = self.check(m, cls=cls)
         rules = set(found.by_rule())
         if exact:
             self.assertEqual(rules, set(expected), found.items)
         else:
             self.assertTrue(set(expected) <= rules, found.items)
-        off = self.check(m, rules=tuple(r for r in r10_cut.RULES if r not in rules), cls=cls)
+        off = self.check(m, rules=tuple(r for r in release_cut.RULES if r not in rules), cls=cls)
         self.assertEqual(off.items, [], 'passes with the refusing rules switched off')
         return found
 
@@ -185,10 +185,10 @@ class PassingCutTest(CheckerBase):
         pins = self.w.put('pins.txt', b'')
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(r10_cut.main(['check', str(good), '--old-pins', str(pins)]), 0)
+            self.assertEqual(release_cut.main(['check', str(good), '--old-pins', str(pins)]), 0)
             bad = copy.deepcopy(self.w.m); bad['genesis']['me']['behaviorVersion'] = 1
             badp = self.w.put('bad.json', json.dumps(bad).encode())
-            self.assertEqual(r10_cut.main(['check', str(badp), '--old-pins', str(pins)]), 1)
+            self.assertEqual(release_cut.main(['check', str(badp), '--old-pins', str(pins)]), 1)
         self.assertIn('K6 genesis.me.behaviorVersion must be 2', out.getvalue())
 
 
@@ -269,11 +269,11 @@ class RuleRedTest(CheckerBase):
         self.refused(m, {'K7'})
 
     def test_k8_mixed_aeron(self):
-        m = copy.deepcopy(self.w.m); m['substrate']['aeron']['ae'] = '1.53.0'   # the S16 W9b set (8.1 vii)
+        m = copy.deepcopy(self.w.m); m['substrate']['aeron']['ae'] = '1.53.0'   # the older Aeron set
         self.refused(m, {'K8'})
 
     def test_k9_unknown_missing_and_short(self):
-        for edit in (lambda m: m['substrate'].update(aeron_mixed=True),          # 8.1 (vii): no exception key exists
+        for edit in (lambda m: m['substrate'].update(aeron_mixed=True),          # No exception key exists
                      lambda m: m['driver_profiles'].update(projector_embedded=True),
                      lambda m: m.pop('genesis'),
                      lambda m: m['repos'].update(match='c356895'),
@@ -294,7 +294,7 @@ class RuleRedTest(CheckerBase):
 
 
 class GuardedRowRedTest(CheckerBase):
-    """8.1: each GUARDED row's manifest is refused by the checker (rows 02, 11, 22, 24, 26, 41, 52)."""
+    """Each GUARDED row's manifest is refused by the checker (rows 02, 11, 22, 24, 26, 41, 52)."""
 
     def swap(self, name, path, source, derivation='rebuild-equal'):
         m = copy.deepcopy(self.w.m)
@@ -344,21 +344,21 @@ class GuardedRowRedTest(CheckerBase):
         m['artifacts']['assets-cluster.jar@ae2'] = World.entry(p, src, 'rebuild-equal')
         self.refused(m, {'K9', 'K4'})
 
-    def test_row_52_pre_w12_match_jar_in_an_s17_cut(self):
-        w11 = '4' * 40          # match cd3d79e (W11), built and labelled honestly, beside the cut assets jar
-        data = engine_jar('match-cluster.jar', kit='0.1.11-runtime.20261104.rc2s17.g80502de', marker=b' w11')
-        p = self.w.put('old/match-cluster-w11.jar', data)
-        m = self.swap('match-cluster.jar', p, w11)
-        self.w.build('match-cluster.jar', 'match', w11, data, 2, tag='w11'); self.w.refresh_record(m)
+    def test_row_52_older_match_jar_in_an_s17_cut(self):
+        older = '4' * 40        # match cd3d79e, built and labelled honestly, beside the cut assets jar
+        data = engine_jar('match-cluster.jar', kit='0.1.11-runtime.20261104.rc2s17.g80502de', marker=b' older')
+        p = self.w.put('old/match-cluster-older.jar', data)
+        m = self.swap('match-cluster.jar', p, older)
+        self.w.build('match-cluster.jar', 'match', older, data, 2, tag='older'); self.w.refresh_record(m)
         found = self.refused(m, {'K4'}, exact=False)
         self.assertIn('K10', found.by_rule())
         m = copy.deepcopy(self.w.m)
-        m['artifacts']['match-cluster.jar@me1'] = World.entry(p, w11, 'rebuild-equal')
+        m['artifacts']['match-cluster.jar@me1'] = World.entry(p, older, 'rebuild-equal')
         self.refused(m, {'K9', 'K4'})
 
 
 class FixtureManifestTest(CheckerBase):
-    """5.3 / 8.1 (i): a fixture manifest is checked against its cut; a ``*_b`` stage is refused in a product kind."""
+    """A fixture manifest is checked against its cut; a ``*_b`` stage is refused in a product kind."""
 
     def fixture(self, b=False):
         a = self.w.m['artifacts']
@@ -379,18 +379,18 @@ class FixtureManifestTest(CheckerBase):
                                                                                     't1_me_driver', 't1_core_driver')}}
 
     def test_derived_rig_manifest_passes(self):
-        self.assertEqual(r10_cut.check(self.fixture(), self.w.m, 'rig', old_pins=self.w.pins).items, [])
+        self.assertEqual(release_cut.check(self.fixture(), self.w.m, 'rig', old_pins=self.w.pins).items, [])
 
     def test_a_b_stage_is_refused_in_a_product_kind(self):
-        found = r10_cut.check(self.fixture(b=True), self.w.m, 'product', old_pins=self.w.pins)
+        found = release_cut.check(self.fixture(b=True), self.w.m, 'product', old_pins=self.w.pins)
         self.assertEqual(found.by_rule(), ['K3'])
-        self.assertEqual(r10_cut.check(self.fixture(b=True), self.w.m, 'rig', old_pins=self.w.pins).items, [])
+        self.assertEqual(release_cut.check(self.fixture(b=True), self.w.m, 'rig', old_pins=self.w.pins).items, [])
 
     def test_bytes_outside_the_cut_are_refused(self):
         m = self.fixture()
         p = self.w.put('foreign.jar', b'foreign')
         m['artifacts']['ae'] = {'path': str(p), 'sha256': h(b'foreign'), 'source_sha': SHAS['assets']}
-        self.assertEqual(r10_cut.check(m, self.w.m, 'rig', old_pins=self.w.pins).by_rule(), ['K4'])
+        self.assertEqual(release_cut.check(m, self.w.m, 'rig', old_pins=self.w.pins).by_rule(), ['K4'])
 
     def a03(self, kind, target='ct_forwarder_nc_norelease', slots=None):
         """An A03-shaped rig manifest: ``forwarder_b`` a negative target of the cut's ct commit (its stamp inside)."""
@@ -404,29 +404,29 @@ class FixtureManifestTest(CheckerBase):
         return m
 
     def test_the_declared_a03_phase_1_exception_and_nowhere_else(self):
-        """RC2 S17 W6 fix round item 1 (S16 20.1 line 2, PO): a negative target in a GREEN rig kind is refused (K3); the A03
+        """A negative target in a GREEN rig kind is refused; the A03
         kinds stage ct_forwarder_nc_norelease in both forwarder slots with build A as forwarder; the RED kinds stage theirs.
         RED 5d0339f: the checker accepted the A03 negative staging on any rig kind (s17 included)."""
         for kind in ('s17-a03', 's17-a03-embedded'):
             with self.subTest(kind=kind):
-                self.assertEqual(r10_cut.check(self.a03(kind), self.w.m, 'rig', old_pins=self.w.pins).items, [])
+                self.assertEqual(release_cut.check(self.a03(kind), self.w.m, 'rig', old_pins=self.w.pins).items, [])
         red = self.a03('s17-red-a03'); red['artifacts']['forwarder'] = None
-        self.assertEqual(r10_cut.check(red, self.w.m, 'rig', old_pins=self.w.pins).items, [])
+        self.assertEqual(release_cut.check(red, self.w.m, 'rig', old_pins=self.w.pins).items, [])
         for why, m in {'GREEN kind': self.a03('s17'), 'A05 kind': self.a03('s17-a05'),
                        'other nc target': self.a03('s17-a03', target='ct_forwarder_nc_noresync'),
                        'one slot only': self.a03('s17-a03', slots={'fwd0': 'forwarder_b', 'fwd1': 'forwarder',
                                                                    'bridge0': 'bridge', 'bridge1': 'bridge', 'shadow0': None})}.items():
             with self.subTest(refused=why):
-                found = r10_cut.check(m, self.w.m, 'rig', old_pins=self.w.pins)
+                found = release_cut.check(m, self.w.m, 'rig', old_pins=self.w.pins)
                 self.assertEqual(found.by_rule(), ['K3'], found.items)
-                self.assertIn('S16 20.1 line 2', ' '.join(t for _, t in found.items))
+                self.assertIn('the declared A03 phase 1', ' '.join(t for _, t in found.items))
 
     def test_a_fixture_manifest_needs_its_cut(self):
-        self.assertEqual(r10_cut.check(self.fixture(), None).by_rule(), ['K9'])
+        self.assertEqual(release_cut.check(self.fixture(), None).by_rule(), ['K9'])
 
 
 
-# ------------------------------------------------------------------ RC2 S17 W3: log reader, audit, precheck, activation record
+# ------------------------------------------------------------------ log reader, audit, precheck, activation record
 
 import struct
 import shutil
@@ -449,7 +449,7 @@ MONEY_SCHEMA = b"""<?xml version="1.0" encoding="UTF-8"?>
 </sbe:messageSchema>
 """
 import core_contracts
-GID = int(core_contracts.derive_genesis_id('rc2-000000000001'), 16)     # review V12: the run's derived id
+GID = int(core_contracts.derive_genesis_id('rc2-000000000001'), 16)     # The run's derived id
 
 
 def log_entry(recording_id, term_id, position, kind, service_id=-1):
@@ -492,19 +492,19 @@ class LogReaderTest(unittest.TestCase):
     def test_recording_log_entries_are_parsed(self):
         path = self.root / 'recording.log'
         path.write_bytes(log_entry(0, 0, -1, 0) + log_entry(1, 1, 13088, 1, 0) + log_entry(2, 1, 13088, 1 | (1 << 31), -1))
-        entries = r10_cut.recording_log(path)
+        entries = release_cut.recording_log(path)
         self.assertEqual([e['type'] for e in entries], ['TERM', 'SNAPSHOT', 'SNAPSHOT'])
         self.assertEqual([e['valid'] for e in entries], [True, True, False])
         self.assertEqual(entries[1]['log_position'], 13088)
-        self.assertEqual(r10_cut.snapshot_count(path), 1)
+        self.assertEqual(release_cut.snapshot_count(path), 1)
         path.write_bytes(b'\0' * 65)
         with self.assertRaisesRegex(ValueError, 'not a whole number of 64-byte entries'):
-            r10_cut.recording_log(path)
+            release_cut.recording_log(path)
 
     def test_genesis_reader_walks_the_log_recording_of_every_member(self):
         for m in ('ae0', 'ae1', 'ae2'):
             write_ae_member(self.root, m, [b'\0' * 40] + [core_config_payload(v, GID) for v in (1, 2, 3)], snapshot=True)
-        out = r10_cut.genesis_reader(self.root, self.schema)
+        out = release_cut.genesis_reader(self.root, self.schema)
         self.assertEqual(out['genesis_id'], GID)
         self.assertTrue(out['equal'])
         self.assertEqual([f['configVersion'] for f in out['members']['ae1']['frames']], [1, 2, 3])
@@ -517,14 +517,14 @@ class LogReaderTest(unittest.TestCase):
         for m in ('ae0', 'ae1', 'ae2'):
             write_ae_member(self.root, m, [])
             (self.root / 'state' / m / 'state' / 'archive' / '0-0.rec').write_bytes(frames)
-        out = r10_cut.genesis_reader(self.root, self.schema)
+        out = release_cut.genesis_reader(self.root, self.schema)
         self.assertEqual(out['genesis_id'], GID)                          # the first CoreConfig 1 recorded the id
         self.assertEqual(out['other_ids_in_log'], [GID + 2])
 
     def test_genesis_reader_without_frames_is_not_observable(self):
         for m in ('ae0', 'ae1', 'ae2'):
             write_ae_member(self.root, m, [b'\0' * 40])
-        out = r10_cut.genesis_reader(self.root, self.schema)
+        out = release_cut.genesis_reader(self.root, self.schema)
         self.assertIsNone(out['genesis_id'])
         self.assertEqual(out['status'], 'not observable')
 
@@ -532,7 +532,7 @@ class LogReaderTest(unittest.TestCase):
         write_ae_member(self.root, 'ae0', [core_config_payload(1, GID)])
         write_ae_member(self.root, 'ae1', [core_config_payload(1, GID)])
         write_ae_member(self.root, 'ae2', [core_config_payload(1, GID + 4)])
-        out = r10_cut.genesis_reader(self.root, self.schema)
+        out = release_cut.genesis_reader(self.root, self.schema)
         self.assertFalse(out['equal'])
         self.assertIsNone(out['genesis_id'])
 
@@ -555,8 +555,8 @@ def audit_manifest(directory):
 
 
 def listing_for(m, overrides=None, drop=(), extra=()):
-    """A recorded process listing equal to the manifest (the unit-test input of the audit, 3.5)."""
-    expected = r10_cut.audit_expected(m)
+    """A recorded process listing equal to the manifest (the unit-test input of the audit)."""
+    expected = release_cut.audit_expected(m)
     procs = []
     for role, files in sorted(expected.items()):
         if role in drop:
@@ -583,7 +583,7 @@ class AuditTest(unittest.TestCase):
         self.temp.cleanup()
 
     def audit(self, listing, **kw):
-        return r10_cut.audit_check(listing, self.m, aeron_version='1.53.1', **kw)
+        return release_cut.audit_check(listing, self.m, aeron_version='1.53.1', **kw)
 
     def test_a_listing_equal_to_the_manifest_passes(self):
         report = self.audit(listing_for(self.m))
@@ -605,10 +605,10 @@ class AuditTest(unittest.TestCase):
         row = next(p for p in listing2['processes'] if p['role'] == 'fwd0')
         row['files'] = {'/artifacts/forwarder_b/bin': self.m['artifacts']['forwarder_b']['sha256'],
                         '/artifacts/forwarder_b/aeronmd': h(b'md')}
-        self.assertEqual(r10_cut.audit_check(listing2, self.m, registry=reg, aeron_version='1.53.1')['status'], 'OK')
+        self.assertEqual(release_cut.audit_check(listing2, self.m, registry=reg, aeron_version='1.53.1')['status'], 'OK')
 
     def test_build_a_without_a_health_build_field_is_judged_by_its_bytes(self):
-        """RC2 S17 W6 fix round item 4. RED 5d0339f: the genesis audit of every A05 kind (slots on build A, ct 2be3a19) was
+        """RED 5d0339f: the genesis audit of every A05 kind (slots on build A, ct 2be3a19) was
         REFUSED, 'fwd0: /health.build None is not the source sha 2be3a1999ca1' x4, so the final records of entries 12, 13, 14,
         21, 27 read REFUSED in all three passes. Build A predates the field; its identity is its pinned sha256. Only those
         bytes may answer no build; build A answering one, or any other binary answering none, is still refused."""
@@ -619,7 +619,7 @@ class AuditTest(unittest.TestCase):
         absent = {a['forwarder']['sha256']: 'ct-2be3a19/ct-forwarder', a['bridge']['sha256']: 'ct-2be3a19/ct-bridge'}
         listing = listing_for(self.m)
         for row in listing['processes']:
-            if row['role'] in r10_cut.SLOT_ROLES:
+            if row['role'] in release_cut.SLOT_ROLES:
                 row.pop('build', None)
         self.assertEqual(self.audit(listing)['status'], 'REFUSED')                  # not pinned as build-field-absent
         with mock.patch.dict(core_contracts.HEALTH_BUILD_ABSENT, absent):
@@ -701,7 +701,7 @@ class PrecheckTest(unittest.TestCase):
         self.temp.cleanup()
 
     def test_empty_roots_pass_and_list_what_the_forward_order_wipes(self):
-        report = r10_cut.precheck([self.root], pg_rows={})
+        report = release_cut.precheck([self.root], pg_rows={})
         self.assertEqual(report['status'], 'CLEAN', report['refusals'])
         labels = {w['label'] for w in report['wipe_list']}
         self.assertEqual(labels, {'ME state', 'ME journal archive', 'AE state', 'AE archive (money journal)',
@@ -709,31 +709,31 @@ class PrecheckTest(unittest.TestCase):
 
     def test_red_a_non_empty_me_journal_archive(self):
         p = self.root / 'state/me1/journal/node0/archive'; p.mkdir(parents=True); (p / '0-0.rec').write_bytes(b'x' * 10)
-        report = r10_cut.precheck([self.root], pg_rows={})
+        report = release_cut.precheck([self.root], pg_rows={})
         self.assertEqual(report['status'], 'REFUSED')
         self.assertIn(f'ME journal archive not empty: {self.root}/state/me1/journal (1 file(s), 10 byte(s))', report['refusals'])
 
     def test_red_a_row_in_the_projection_database(self):
-        report = r10_cut.precheck([self.root], pg_rows={'money_journal_events': 1, 'empty': 0})
+        report = release_cut.precheck([self.root], pg_rows={'money_journal_events': 1, 'empty': 0})
         self.assertIn('projection database holds 1 row(s) in money_journal_events', report['refusals'])
-        self.assertEqual(r10_cut.precheck([self.root])['status'], 'REFUSED')      # the database is never assumed empty
+        self.assertEqual(release_cut.precheck([self.root])['status'], 'REFUSED')      # the database is never assumed empty
 
-    def test_red_an_s16_root_with_a_bare_rc2_snapshot(self):
+    def test_red_a_root_with_an_older_bare_snapshot(self):
         c = self.root / 'state/me0/state/cluster'; c.mkdir(parents=True)
         (c / 'recording.log').write_bytes(log_entry(0, 0, -1, 0) + log_entry(1, 0, 96, 1, 0))
-        report = r10_cut.precheck([self.root], pg_rows={})
+        report = release_cut.precheck([self.root], pg_rows={})
         self.assertEqual(report['status'], 'REFUSED')
-        self.assertIn(f'{self.root}/state/me0: recording.log lists 1 snapshot(s); an S16-era bare RC2 snapshot (row 51) is '
+        self.assertIn(f'{self.root}/state/me0: recording.log lists 1 snapshot(s); an older bare snapshot (row 51) is '
                       'unsupported: archive it and wipe', report['refusals'])
 
     def test_a_fresh_root_is_clean_and_a_missing_one_refused(self):
         fresh = Path(self.temp.name) / 'fresh'; fresh.mkdir()
-        self.assertEqual(r10_cut.precheck([fresh], pg_rows={})['status'], 'CLEAN')
-        self.assertIn(f'{fresh}x: state root not found', r10_cut.precheck([Path(str(fresh) + 'x')], pg_rows={})['refusals'])
+        self.assertEqual(release_cut.precheck([fresh], pg_rows={})['status'], 'CLEAN')
+        self.assertIn(f'{fresh}x: state root not found', release_cut.precheck([Path(str(fresh) + 'x')], pg_rows={})['refusals'])
 
     def test_red_a_non_empty_host_aeronmd_dir(self):
         d = Path(self.temp.name) / 'aeron'; d.mkdir(); (d / 'cnc.dat').write_bytes(b'c')
-        report = r10_cut.precheck([self.root], pg_rows={}, aeron_dirs=[d])
+        report = release_cut.precheck([self.root], pg_rows={}, aeron_dirs=[d])
         self.assertIn(f'host aeronmd dir not empty: {d}', report['refusals'])
 
 
@@ -750,7 +750,7 @@ def record5(gid, behavior=2, source='me0', capacity=100000, wire=12):
 
 
 class RunDir:
-    """A minimal genesis run dir with the layout of a real S16/S17 run (result.json -> state_root, owner.json, commands.jsonl
+    """A minimal genesis run dir with the layout of a real core run (result.json -> state_root, owner.json, commands.jsonl
     and its logs, core-requests.jsonl, the tap rows, the AE archive recordings) plus the audit report."""
 
     def __init__(self, root, gid=GID):
@@ -810,7 +810,7 @@ class ActivationRecordTest(unittest.TestCase):
         self.temp.cleanup()
 
     def record(self):
-        return r10_cut.activation_record(self.d.run, journal_schema=ME_JOURNAL)
+        return release_cut.activation_record(self.d.run, journal_schema=ME_JOURNAL)
 
     def refused(self, text, status='REFUSED'):
         rec = self.record()
@@ -831,7 +831,7 @@ class ActivationRecordTest(unittest.TestCase):
         self.assertEqual(rec['gate'], [['SUSPENDED', 'GENESIS', 6304], ['OPEN', 'ADMIN', 90912]])
         self.assertEqual(rec['members_up'], {'me': 3, 'ae': 3})
         with contextlib.redirect_stdout(io.StringIO()):
-            out = r10_cut.main(['activation-record', str(self.d.run), '--journal-schema', str(ME_JOURNAL)])
+            out = release_cut.main(['activation-record', str(self.d.run), '--journal-schema', str(ME_JOURNAL)])
         self.assertEqual(out, 0)
         self.assertEqual(json.loads((self.d.run / 'rc2-activation-record.json').read_text())['status'], 'OK')
 
@@ -871,14 +871,14 @@ class ActivationRecordTest(unittest.TestCase):
         self.refused('members_up me 2/3 but the audit names no stopped me member')
         self.d.audit['stopped'] = [{'role': 'me0', 'registered_fault_target': True}]; self.d.write()
         rec = self.record()
-        self.assertEqual(rec['status'], 'OK', rec['refusals'])          # the X-A1 shape (20.1 line 11)
+        self.assertEqual(rec['status'], 'OK', rec['refusals'])          # the X-A1 shape
         self.assertEqual(rec['members_up'], {'me': 2, 'ae': 3})
 
     def test_red_9_core_genesis_id_from_the_same_source_as_the_me(self):
         rec = self.record()
         rec['sources']['core_genesis_id'] = rec['sources']['me_genesis_id']
         self.assertIn('core genesisId and ME genesisId read from one source (' + rec['sources']['me_genesis_id'] + ')',
-                      r10_cut.check_record(rec))
+                      release_cut.check_record(rec))
 
     def test_no_core_frame_reads_not_observable_and_never_ok(self):
         for m in ('ae0', 'ae1', 'ae2'):
@@ -893,16 +893,16 @@ class ActivationRecordTest(unittest.TestCase):
         gid = int(core_contracts.derive_genesis_id(rid), 16)
         d = RunDir(Path(self.temp.name) / 'derived', gid=gid)
         d.owner['genesis']['derivation'] = {'rule': core_contracts.GENESIS_DERIVATION, 'run_id': rid}; d.write()
-        rec = r10_cut.activation_record(d.run, journal_schema=ME_JOURNAL)
+        rec = release_cut.activation_record(d.run, journal_schema=ME_JOURNAL)
         self.assertEqual(rec['status'], 'OK', rec['refusals'])
         self.assertEqual(rec['genesis_id_derivation'], {'rule': core_contracts.GENESIS_DERIVATION, 'run_id': rid,
                                                         'derived': gid, 'equal': True})
         d.owner['genesis']['derivation']['run_id'] = 'rc2-ffffffffffff'; d.write()
-        rec = r10_cut.activation_record(d.run, journal_schema=ME_JOURNAL)
+        rec = release_cut.activation_record(d.run, journal_schema=ME_JOURNAL)
         self.assertIn(f'the run_id rc2-ffffffffffff is not the run\'s {rid}', ' '.join(rec['refusals']))
         d.owner['genesis']['derivation']['run_id'] = rid; d.write()
         (d.run / 'manifest.json').write_text(json.dumps(dict(d.manifest, run_id='rc2-000000000002')))
-        rec = r10_cut.activation_record(d.run, journal_schema=ME_JOURNAL)
+        rec = release_cut.activation_record(d.run, journal_schema=ME_JOURNAL)
         self.assertEqual(rec['status'], 'REFUSED')
 
     def two_lives(self, d, gid2=None, capture=True, boundary=True):
@@ -925,7 +925,7 @@ class ActivationRecordTest(unittest.TestCase):
         lives['1']['records'] = {'genesis': copy.deepcopy(d.owner['genesis']), 'tap': copy.deepcopy(d.owner['tap'])}
         lives['1']['tap'] = copy.deepcopy(d.owner['tap'])
         if capture:
-            reader = r10_cut.genesis_reader(d.state, r10_cut.load_money_schema(d.manifest['artifacts']['ae']['path']))
+            reader = release_cut.genesis_reader(d.state, release_cut.load_money_schema(d.manifest['artifacts']['ae']['path']))
             path = d.state / 'core-genesis-life1.json'; path.write_text(json.dumps(reader))
             lives['1']['core_genesis_reader'] = {'path': str(path), 'sha256': h(path.read_bytes())}
         for m in ('ae0', 'ae1', 'ae2'):                    # the AE wipe: life 2's frames only
@@ -951,17 +951,17 @@ class ActivationRecordTest(unittest.TestCase):
         return gid1, gid2
 
     def test_a_regenesis_run_gets_one_final_record_per_life(self):
-        """RC2 S17 W6 fix round item 4. RED 5d0339f: entry 10 (s17-ext a04-regenesis) wrote ONE record, life 1, REFUSED 3/3:
+        """RED 5d0339f: entry 10 (s17-ext a04-regenesis) wrote ONE record, life 1, REFUSED 3/3:
         'genesisId derivation missing' (owner.genesis was life 2's, written without the derivation) and 'core genesisId
         ...141 != ME genesisId ...139' (the core id read from the life-2 AE, the ME id from the first, life-1, dump). A04 has
         two lives with two ids by design: one final record per life, each from that life's evidence."""
         rid = 'rc2-000000000001'
         d = RunDir(Path(self.temp.name) / 'regen', gid=int(core_contracts.derive_genesis_id(rid, 1), 16))
         gid1, gid2 = self.two_lives(d)
-        life1 = r10_cut.activation_record(d.run, journal_schema=ME_JOURNAL)        # the W6 call: life 1, from the run dir
+        life1 = release_cut.activation_record(d.run, journal_schema=ME_JOURNAL)        # the nightly call: life 1, from the run dir
         self.assertEqual(life1['status'], 'OK', life1['refusals'])
         self.assertEqual(life1['core']['genesisId'], gid1)
-        recs = r10_cut.write_activation_records(d.run, journal_schema=ME_JOURNAL)
+        recs = release_cut.write_activation_records(d.run, journal_schema=ME_JOURNAL)
         self.assertEqual([(r['life'], p.name) for r, p in recs],
                          [(1, 'rc2-activation-record.json'), (2, 'rc2-activation-record-life2.json')])
         for rec, _ in recs:
@@ -971,7 +971,7 @@ class ActivationRecordTest(unittest.TestCase):
         self.assertEqual((r1['me']['genesisId'], r1['core']['genesisId'], r1['core']['bound_epoch']), (gid1, gid1, gid1))
         self.assertEqual((r2['me']['genesisId'], r2['core']['genesisId'], r2['core']['bound_epoch']), (gid2, gid2, gid2))
         self.assertEqual(r2['core']['config_sequence'], [[1, 'ACCEPTED'], [2, 'ACCEPTED'], [3, 'ACCEPTED']])
-        self.assertEqual(r10_cut.check_record_set([r1, r2]), [])
+        self.assertEqual(release_cut.check_record_set([r1, r2]), [])
         self.assertTrue((d.run / 'rc2-activation-record-life2.json').is_file())
 
     def test_a_regenesis_without_its_life_evidence_is_refused(self):
@@ -986,21 +986,21 @@ class ActivationRecordTest(unittest.TestCase):
             with self.subTest(why=why):
                 d = RunDir(Path(self.temp.name) / why.replace(' ', '-'), gid=g1)
                 self.two_lives(d, **kw)
-                recs = [r for r, _ in r10_cut.write_activation_records(d.run, journal_schema=ME_JOURNAL)]
+                recs = [r for r, _ in release_cut.write_activation_records(d.run, journal_schema=ME_JOURNAL)]
                 bad = [r for r in recs if r['status'] != 'OK']
                 self.assertTrue(bad, [r['refusals'] for r in recs])
                 self.assertTrue(any(texts[why] in t for r in bad for t in r['refusals']), [r['refusals'] for r in recs])
                 if why == 'life 2 reuses the life 1 id':
-                    self.assertIn('repeats across genesis runs', ' '.join(r10_cut.check_record_set(recs)))
+                    self.assertIn('repeats across genesis runs', ' '.join(release_cut.check_record_set(recs)))
 
     def test_a_single_life_run_keeps_one_record(self):
-        recs = r10_cut.write_activation_records(self.d.run, journal_schema=ME_JOURNAL)
+        recs = release_cut.write_activation_records(self.d.run, journal_schema=ME_JOURNAL)
         self.assertEqual([(r['life'], r['status'], p.name) for r, p in recs], [(1, 'OK', 'rc2-activation-record.json')])
 
     def test_a_repeated_genesis_id_across_records_is_refused(self):
         rec = self.record()
-        self.assertEqual(r10_cut.check_record_set([rec]), [])
-        self.assertIn(f'genesisId {GID} repeats across genesis runs', ' '.join(r10_cut.check_record_set([rec, dict(rec)])))
+        self.assertEqual(release_cut.check_record_set([rec]), [])
+        self.assertIn(f'genesisId {GID} repeats across genesis runs', ' '.join(release_cut.check_record_set([rec, dict(rec)])))
 
 
 if __name__ == '__main__':

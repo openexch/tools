@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""RC2 S16 W1: the manifest builder promoted from S15 evidence (contract 3.1, 3.2, 5.2, 5.3, 15 W1; 20.1 lines 2, 11).
+"""The manifest builder.
 No Docker: every pinned input is a small file in a temp tree."""
 import hashlib
 import json
@@ -53,7 +53,7 @@ class ManifestBuilderTest(unittest.TestCase):
 
     def test_every_s16_kind_builds_and_validates(self):
         self.assertEqual(len(mk_manifests.KINDS), 11)
-        self.assertEqual(set(mk_manifests.KINDS), core_contracts.S16_KINDS)
+        self.assertEqual(set(mk_manifests.KINDS), core_contracts.BASE_KINDS)
         for kind in sorted(mk_manifests.KINDS):
             with self.subTest(kind=kind):
                 path, m = self.built(kind)
@@ -62,7 +62,7 @@ class ManifestBuilderTest(unittest.TestCase):
                 self.assertEqual(m['state_root'], str(path.parent / 'fixtures' / m['run_id']))
                 self.assertEqual(m['harness_commit'], 'd' * 40)
 
-    def test_resource_sizes_are_the_s15_settings_and_overridable(self):
+    def test_resource_sizes_are_settings_and_overridable(self):
         _, m = self.built('s16')
         shm, mem = m['limits']['shm_mb_by_role'], m['limits']['memory_mb_by_role']
         for role in core_contracts.ENGINES:
@@ -125,16 +125,16 @@ if __name__ == '__main__':
 
 
 class CutManifestBuilderTest(unittest.TestCase):
-    """RC2 S17 W2 (contract 5.3): ``mk_manifests.py --cut`` derives the s17 kinds from the cut manifest and refuses to emit a
+    """``mk_manifests.py --cut`` derives the s17 kinds from the cut manifest and refuses to emit a
     manifest the checker refuses."""
 
     def setUp(self):
-        import test_r10_cut
+        import test_release_cut
         self.temp = tempfile.TemporaryDirectory(); root = self.root = Path(self.temp.name)
-        self.world = test_r10_cut.World(root / 'cut')
+        self.world = test_release_cut.World(root / 'cut')
         self.cut_path = root / 'rc2-cut-manifest.json'
         self.cut_path.write_text(json.dumps(self.world.m))
-        patch = mock.patch.object(mk_manifests.r10_cut, 'git_blob', self.world.blob); patch.start(); self.addCleanup(patch.stop)
+        patch = mock.patch.object(mk_manifests.release_cut, 'git_blob', self.world.blob); patch.start(); self.addCleanup(patch.stop)
         def put(rel, data):
             path = root / rel; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(data); return path
         self.bin_a = root / 'bin-s15'
@@ -161,10 +161,10 @@ class CutManifestBuilderTest(unittest.TestCase):
         return path, m
 
     def test_every_s17_kind_builds_validates_and_passes_the_checker(self):
-        import r10_cut
-        self.assertEqual(set(mk_manifests.KINDS17), core_contracts.S17_KINDS)
+        import release_cut
+        self.assertEqual(set(mk_manifests.CUT_KINDS), core_contracts.CUT_KINDS)
         cut = self.world.m['artifacts']
-        for kind in sorted(mk_manifests.KINDS17):
+        for kind in sorted(mk_manifests.CUT_KINDS):
             with self.subTest(kind=kind):
                 path, m = self.built(kind)
                 self.assertEqual(path.name, kind + '--r1.json')
@@ -172,7 +172,7 @@ class CutManifestBuilderTest(unittest.TestCase):
                 for role, name in (('me', 'match-cluster.jar'), ('ae', 'assets-cluster.jar'), ('projector', 'assets-projector.jar')):
                     self.assertEqual(m['artifacts'][role]['sha256'], cut[name]['sha256'], (kind, role))
                 cls = mk_manifests.cut_class(kind)
-                self.assertEqual(r10_cut.check(m, self.world.m, cls, old_pins=self.world.pins).items, [], kind)
+                self.assertEqual(release_cut.check(m, self.world.m, cls, old_pins=self.world.pins).items, [], kind)
                 self.assertEqual(m['core_probe']['sha256'], self.world.m['harness']['core_probe']['sha256'])
                 self.assertEqual(m['probe_libs']['aeronmd']['sha256'], self.world.m['harness']['probe_aeronmd']['sha256'])
 
@@ -209,7 +209,7 @@ class CutManifestBuilderTest(unittest.TestCase):
             self.built('s17-red-a04')
 
     def test_xver_kinds_take_the_legacy_member_addresses(self):
-        """RC2 S17 W3 (W0 mk_dr --legacy-ips): a seeded state meets the member addresses it was written with (the legacy
+        """A seeded state meets the member addresses it was written with (the legacy
         fixture's me .10-.12, ae .13-.15); every other kind keeps the sorted layout."""
         for kind in ('s17-xver', 's17-xver-ext', 's17-rollback'):
             with self.subTest(kind=kind):
@@ -224,7 +224,7 @@ class CutManifestBuilderTest(unittest.TestCase):
         self.assertEqual(m['nodes']['ae0'].rsplit('.', 1)[1], '10')
 
     def test_red1_and_red2_on_the_cut(self):
-        """RC2 S17 W3 (coordinator): the S15 RED-1 / RED-2 on the cut: the nc target of the cut's ct commit in both slots."""
+        """RED-1 / RED-2 on the cut: the nc target of the cut's ct commit in both slots."""
         _, m = self.built('s17-red1')
         self.assertEqual((m['artifacts']['forwarder_b']['target'], m['slot_artifacts']['fwd0'], m['slot_artifacts']['fwd1']),
                          ('ct_forwarder_nc_noresync', 'forwarder_b', 'forwarder_b'))
@@ -237,7 +237,7 @@ class CutManifestBuilderTest(unittest.TestCase):
 
     def test_build_a_must_be_pinned(self):
         self.world.pins.clear()
-        with self.assertRaisesRegex(Violation, 'K4 .*not pinned in R10/old-artifacts.sha256'):
+        with self.assertRaisesRegex(Violation, 'K4 .*not pinned in the old-artifact pins'):
             self.built('s17-a05')
         self.built('s17-ext')           # a kind without build A needs no pin
 
@@ -252,6 +252,6 @@ class CutManifestBuilderTest(unittest.TestCase):
         import contextlib, io
         out = io.StringIO()
         with contextlib.redirect_stdout(out), mock.patch.object(mk_manifests, 'Config', lambda **kw: self.cfg), \
-                mock.patch.object(mk_manifests.r10_cut, 'load_old_pins', lambda path: self.world.pins):
+                mock.patch.object(mk_manifests.release_cut, 'load_old_pins', lambda path: self.world.pins):
             mk_manifests.main(['s17-ext', 'r1', '--cut', str(self.cut_path)])
         self.assertTrue(out.getvalue().strip().endswith('s17-ext--r1.json'))

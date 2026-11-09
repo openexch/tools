@@ -28,19 +28,12 @@ The previous v0.5 stack (`oms`, `admin-gateway`, `trading-ui`) still runs the de
 | [`market-sim/`](market-sim/README.md) | Agent-based market simulator and demo canary with a health endpoint | v0.5 OMS REST API | Go |
 | [`money-check/`](money-check/README.md) | Read-only money invariant checker (conservation, locked equals open holds, non-negativity) | v0.5 Redis ledger or the Assets Engine via `AeDump` | Python |
 | `tb-bench/` | TigerBeetle two-phase benchmark driver kept from the ledger evaluation | a TigerBeetle cluster | Java |
-| `binance-replay/` | Replays a Binance-like order flow over HTTP | legacy `POST /order` endpoint | Go |
-| `loadgen/` | HTTP order load generator | legacy `POST /order` endpoint | Go |
-| `chaos/` | Chaos test script (leader kills, snapshot storms) through the old admin API | legacy `POST /order` and `/api/admin/*` | Python |
-
-`binance-replay`, `loadgen` and `chaos` post to `/order`, which neither the v0.5 OMS (`/api/v1/orders`) nor v1 serves. They do not work against a current stack without changes.
 
 ## Build and test
 
 ```bash
 # Go tools (market-sim needs Go 1.23+, see each go.mod)
 (cd market-sim && go build -o market-sim . && go test ./...)
-(cd binance-replay && go build)
-(cd loadgen && go build)
 
 # Python tools: standard library only
 python3 -m unittest discover -s runtime-e2e -p 'test_*.py'

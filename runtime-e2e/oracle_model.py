@@ -34,15 +34,15 @@ user other than the creating user is a FAIL (M2, O4). Holds are recomputed from 
                      "trade","buyer","seller","market","price","quantity", "me_epoch" (optional)}]
   money_journal_legs [{"seq","user","asset" or null,"role" or null,"balance_after"}]
   faults           {"settle_fault", "settle_rejected", "order_fault", "quarantined"}  observed counts
-  counters         optional {"stale_outcomes","redundant_outcomes","stale_terminals","conflicts"} (G6 export)
+  counters         optional {"stale_outcomes","redundant_outcomes","stale_terminals","conflicts"} (the AE counter export)
   declared         {"settle_fault","settle_rejected","order_fault","quarantined","halt","fault_open",
                     "forwarder_absent","gate_sequence": [[state, reason], ...] | null, "epochs": [e, ...],
-                    "ordering_exception": null | {"me_term", "until_seq", "from_journal_seq" (optional)}}  (S15 7)
-  tap_continuity   optional (S15 5.7) {"transitions": [CoreProbe tap session notes], "summary": {...}}; the dispatch
+                    "ordering_exception": null | {"me_term", "until_seq", "from_journal_seq" (optional)}} 
+  tap_continuity   optional {"transitions": [CoreProbe tap session notes], "summary": {...}}; the dispatch
                    density is computed from the rows themselves against core.pending_dispatch.head
-  story rows       (S15 6.1) request rows may carry "id", "resolves" and "resolved_by": an UNKNOWN original resolved by
+  story rows       request rows may carry "id", "resolves" and "resolved_by": an UNKNOWN original resolved by
                    a same-requestId re-send counts as the re-send's verdict (Model.creates/amends/cancels)
-  dispatch_tap rows of kind RELEASE_ID carry a create's command id again (W0 F-S15-25); rows with
+  dispatch_tap rows of kind RELEASE_ID carry a create's command id again; rows with
                    "source": "backfill" were rebuilt at the barrier from pending-dump (seq known) or from the ME journal
                    outcome (seq null)
   barrier          {"input_closed": true, "samples": [obs, obs]} with obs.<collection>_digest = fingerprint
@@ -53,7 +53,7 @@ from contracts import FP, Inconclusive, Violation, fingerprint, integer
 
 TERMINAL = {'FILLED', 'CANCELLED', 'REJECTED', 'EXPIRED'}
 RELEASE_KIND = 'RELEASE_ID'           # money-schema DispatchKind 3: forwarder-only, carries a create's command id again
-RESULT_RELEASED = 7                   # me-journal-schema CommandOutcome.result 7 RELEASED (L8 item 4)
+RESULT_RELEASED = 7                   # me-journal-schema CommandOutcome.result 7 RELEASED
 PENDING = {'PENDING_NEW', 'PENDING_CANCEL', 'PENDING_REPLACE'}
 KIND_CODES = {'CREATE': 0, 'CANCEL': 1, 'AMEND': 2}
 BARRIER_COLLECTIONS = ['core', 'core_events', 'dispatch_tap', 'me_journal', 'me_open_legs', 'money_journal',
@@ -96,7 +96,7 @@ def check_barrier(sample):
 
 
 def resolve_requests(rows):
-    """S15 6.1 rule 2. Returns (effective rows in submission order, unresolved UNKNOWN originals).
+    """Returns (effective rows in submission order, unresolved UNKNOWN originals).
 
     An UNKNOWN original whose same-requestId re-send got a duplicate ACK was committed at its own position: it stands as
     that ACK (``source: replay``, the replay reports the order's CURRENT hold, so M5 does not compare it with the
@@ -172,7 +172,7 @@ class Model:
             if oid in self.live:
                 raise Violation('core order snapshot repeats order ' + str(oid))
             self.live[oid] = row
-        # S15 6.1: UNKNOWN replies resolved by their same-requestId re-send; the rules read these, never the raw lists.
+        # UNKNOWN replies resolved by their same-requestId re-send; the rules read these, never the raw lists.
         self.creates, unresolved_creates = resolve_requests(sample['creates'])
         self.amends, unresolved_amends = resolve_requests(sample['amends'])
         self.cancels, unresolved_cancels = resolve_requests(sample['cancels'])
@@ -205,7 +205,7 @@ class Model:
                 self.quote[order] += quote(trade['price'], trade['quantity'])
                 self.trade_legs[order].add(leg)
                 self.trade_prices[order].append((integer(trade['price']), buy))
-        # The command dispatches, keyed by command id. RELEASE_ID rows repeat a create's id by design (W0 F-S15-25):
+        # The command dispatches, keyed by command id. RELEASE_ID rows repeat a create's id by design:
         # they are kept apart, keyed by (id, kind), and never count as a second dispatch of the command.
         self.tap, self.release_dispatches = {}, {}
         for row in sample['dispatch_tap']:
@@ -230,7 +230,7 @@ class Model:
                 continue
             key = (integer(event['command_id_high']), integer(event['command_id_low']))
             if key in self.first_outcome and event['result'] == RESULT_RELEASED:
-                # L8 item 4: a frame offered after its order was released journals RELEASED and creates nothing
+                # A frame offered after its order was released journals RELEASED and creates nothing
                 if event['leg']:
                     raise Violation(f'command {key}: RELEASED repeat carries leg {event["leg"]}')
                 if key[0] not in released_before:
@@ -241,7 +241,7 @@ class Model:
         self.continuity = self._continuity(sample)
 
     def _continuity(self, sample):
-        """S15 5.7: dispatch gaps (the tap's own rows against [1, core head]) and order-event loss windows."""
+        """Dispatch gaps (the tap's own rows against [1, core head]) and order-event loss windows."""
         tapped = [integer(r['seq']) for r in sample['dispatch_tap'] if r.get('source') != 'backfill']
         head = sample['core'].get('pending_dispatch', {}).get('head')
         high = max([head if type(head) is int else 0] + tapped) if tapped or type(head) is int else 0
@@ -291,7 +291,7 @@ class Model:
         return any(b is None or b > last_seen for a, b in self.continuity['event_windows'])
 
     def unaccounted(self, text):
-        """S15 6.1 rule 4: an order no accepted request created is a FAIL, unless a gateway reply is still unresolved
+        """An order no accepted request created is a FAIL, unless a gateway reply is still unresolved
         (that request may be the one that committed it): then the run is INCONCLUSIVE, never a false FAIL."""
         if self.unresolved:
             return Inconclusive(f'unresolved gateway reply ({len(self.unresolved)}): {text}')
@@ -334,7 +334,7 @@ class Model:
         """Resolved amends of one order in submission order: (new_price, new_qty, delta, applied, resolved)."""
         create = self.orders[oid]
         price, qty = create['price'], create['quantity']
-        # attempt order == mint order, and it is known for a backfilled row whose seq is not (S15 5.7 rule 3)
+        # attempt order == mint order, and it is known for a backfilled row whose seq is not
         dispatches = sorted((row for row in self.tap.values() if row['order'] == oid and row['kind'] == 'AMEND'), key=attempt)
         acked = [a for a in self.amends if a['order'] == oid and a['reply'].get('outcome') == 'ACK'
                  and not a['reply'].get('duplicate')]

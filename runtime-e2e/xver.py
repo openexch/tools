@@ -1,18 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
-"""RC2 S17 W3: cross-version (new side), activation and rollback scenarios (contract 5.2, 6, 8.2, 10; 20.1 lines 5-16, 21, 24-29).
+"""Cross-version (new side), activation and rollback scenarios.
 
 Scenarios (runner.py dispatches every ``core-xver-*``, ``core-act-*`` and ``core-rollback-*`` name here):
-  core-xver-me-new-on-old-{snaptail,snapquiet,log}   X-1a/b/c, RC2 ME jar on a v0.5.0-beta ME state   (s17-xver | s17-xver-ext)
-  core-xver-ae-new-on-old-{snaptail,log}             X-3a/b,   RC2 core jar on a v0.5.0-beta AE state (s17-xver | s17-xver-ext)
+  core-xver-me-new-on-old-{snaptail,snapquiet,log}   X-1a/b/c, v1 ME jar on a v0.5.0-beta ME state    (s17-xver | s17-xver-ext)
+  core-xver-ae-new-on-old-{snaptail,log}             X-3a/b,   v1 core jar on a v0.5.0-beta AE state  (s17-xver | s17-xver-ext)
   core-xver-bridge-on-old-archive                    X-7, the C++ bridge on a v0.5.0-beta ME journal archive (s17-xver[-ext])
   core-act-{leaderkill,toolkill,toolkill-2,nobridge,latemember,fwdfirst}   X-A1..X-A5 (toolkill = after CoreConfig 1,
                                                      toolkill-2 = after CoreConfig 1 and 2: the two runs of X-A2)     (s17-act)
   core-rollback-old-line                             X-R                                                              (s17-rollback)
-  controls (8.2): core-xver-ctl-{me-same,me-old-same,ae-same,ae-old-same,x7-wiped}, core-rollback-ctl-omit-{journal,pgdump}
+  controls: core-xver-ctl-{me-same,me-old-same,ae-same,ae-old-same,x7-wiped}, core-rollback-ctl-omit-{journal,pgdump}
 
-No scenario puts a tag jar under test (0.1): the tag jars run only to validate a seed (the old-same controls) and in X-R, through
+No scenario puts a tag jar under test: the tag jars run only to validate a seed (the old-same controls) and in X-R, through
 the legacy tag profile (legacy_tag.py). Every verdict is judged on observed exits, /ready answers, the active probe's answers and
-log lines (4), never on a timer expiring without an observation. Pass lines: 6.7 (X-7), 6.8 (X-A), 6.9 (X-R), 6.10 (X-1, X-3).
+log lines, never on a timer expiring without an observation.
+
+Environment (host paths, no machine default; a run that needs one stops with a message naming it):
+  XVER_SEEDS        the seed states directory, one subdirectory per seed shape
+  XVER_CUT          the cut manifest the run's manifest was derived from
+  XVER_LEGACY_RUNS  the runs root of the legacy tag fixtures (``legacy-ctl/``, ``legacy-xr/``)
+  plus the ``LEGACY_*`` settings of ``legacy_tag.py``; the timing sizes are the ``XVER_*`` settings below.
 """
 import copy
 import json
@@ -25,28 +31,28 @@ import threading
 import time
 
 from contracts import Inconclusive, Violation
-
-B0 = Path('/home/emre/Apps/openexchange/.runtime-handoff/20260927-r00')
+from machine_paths import env_path, recorded
 PREFIXES = ('core-xver-', 'core-act-', 'core-rollback-')
 DEFAULTS = {'XVER_BOUND_S': 150, 'XVER_STAGGER_S': 5, 'XVER_TAIL_MIN': 8, 'ENGINE_QUORUM_WAIT_MS': 120000,
             'XVER_SAMPLE_S': 60, 'XVER_LATE_JOIN_S': 30, 'XVER_FWD_WAIT_S': 30, 'XVER_PROBE_INFLIGHT': 2,
             'XVER_PROBE_INTERVAL_S': 1,
             'XVER_FATAL_GRACE_S': 5, 'XVER_LEGACY_OCTET': 187,
-            # review V5, V17: every timing size of the X harness is a setting with its W3 value as the default
+            # Every timing size of the X harness is a setting with its first measured value as the default
             'XVER_PROBE_MIN': 1, 'XVER_SERVE_HOLD_S': 15, 'XVER_PROBE_ATTEMPT_S': 20, 'XVER_PROBE_EXEC_S': 40,
             'XVER_PROBE_DRAIN_S': 45, 'XVER_RECOVERY_READY_S': 150, 'XVER_AE_QUIESCE_S': 120, 'XVER_FINISH_BIND_S': 60,
             'XVER_BIND_WAIT_S': 60, 'XVER_ENGINE_READY_S': 120, 'XVER_DRIVER_S': 150, 'XVER_ME_DRIVER_S': 120,
             'XVER_EPOCH_WAITS_MIN': 2, 'XVER_RESTART_READY_S': 120, 'XVER_FWD_READY_S': 90}
 _S = dict(DEFAULTS)                        # the run's settings (scenario() fills it), read by the helpers below
 X7_SAMPLE_MIN_S = 60                       # the 6.7 pass line (">= 60 s after the last FeedHalt ack"); XVER_SAMPLE_S may only raise it
-SEEDS = Path(os.environ.get('XVER_SEEDS', str(B0 / 'local-runs/s17/seeds-w1')))
-CUT = Path(os.environ.get('XVER_CUT', str(B0 / 'workspace/notebook/reports/runtime-handoff-execution/R10/rc2-cut-manifest.json')))
+SEEDS = env_path('XVER_SEEDS', 'the seed states directory (one subdirectory per seed shape)')
+CUT = env_path('XVER_CUT', 'the cut manifest the run was derived from')
+LEGACY_RUNS = env_path('XVER_LEGACY_RUNS', 'the runs root of the legacy tag fixtures (legacy-ctl/, legacy-xr/)')
 XVER_KINDS = ('s17-xver', 's17-xver-ext')
 MODE = {'s17-xver': 'emb', 's17-xver-ext': 'ext'}
 
 
 def settings(env=None):
-    """The X settings (4, PO-14): every value a setting with its default; XVER_BOUND_S must hold the quorum wait plus the fatal
+    """The X settings: every value a setting with its default; XVER_BOUND_S must hold the quorum wait plus the fatal
     grace plus the stagger, else a log-only case could never classify its late member."""
     env = os.environ if env is None else env
     out = {}
@@ -71,12 +77,12 @@ def settings(env=None):
 
 
 def check_engine_env(env):
-    """PO-14: the production quorum wait is used unchanged; the harness never shortens it."""
+    """The production quorum wait is used unchanged; the harness never shortens it."""
     if 'ENGINE_QUORUM_WAIT_MS' in env:
         raise Violation('the X runs use the engine default; the harness never sets ENGINE_QUORUM_WAIT_MS')
 
 
-# ------------------------------------------------------------------ cases (6, 6.10: 17 cases, 51 runs)
+# ------------------------------------------------------------------ cases (17 cases, 51 runs)
 
 def _state_case(row, engine, seed, variant, scenario, classes, sites):
     return {'row': row, 'engine': engine, 'seed': seed, 'variant': variant, 'scenario': scenario, 'classes': classes,
@@ -87,8 +93,8 @@ SNAP3 = {'replay-halted': 3, 'quorum-exited': 0, 'other': 0}
 LOG21 = {'replay-halted': 2, 'quorum-exited': 1, 'other': 0}
 CASES = {}
 for _mode in ('emb', 'ext'):
-    # W5 item 1 (coordinator): with the W12 always-envelope reader the tag snapshot is refused at the envelope check before
-    # any session restore; that is the X-1a refusal (6.1 (a) amended); the R0 restored-session text stays accepted
+    # With the always-envelope reader the tag snapshot is refused at the envelope check before
+    # any session restore; that is the X-1a refusal; the R0 restored-session text stays accepted
     CASES[f'X-1a-{_mode}'] = _state_case('01', 'me', 'A', 'snapshot-tail', 'core-xver-me-new-on-old-snaptail', SNAP3,
                                          ['me-envelope', 'me-r0-restored'])
     CASES[f'X-1b-{_mode}'] = _state_case('01', 'me', 'B', 'snapshot-quiet', 'core-xver-me-new-on-old-snapquiet', SNAP3,
@@ -108,13 +114,13 @@ CASES['X-R'] = {'row': '49', 'scenario': 'core-rollback-old-line', 'seed': 'R', 
 CONTROLS = {
     'core-xver-ctl-me-same': {'engine': 'me', 'under_test': 'rc2', 'kinds': XVER_KINDS, 'of': 'X-1'},
     'core-xver-ctl-ae-same': {'engine': 'ae', 'under_test': 'rc2', 'kinds': XVER_KINDS, 'of': 'X-3'},
-    # review V14: one seed-validity control per seed an X case uses (X-1a/b/c: A, B, C; X-3a/b: A, C; X-7: the C journal)
+    # One seed-validity control per seed an X case uses (X-1a/b/c: A, B, C; X-3a/b: A, C; X-7: the C journal)
     **{f'core-xver-ctl-me-old-same-{shape.lower()}': {'engine': 'me', 'under_test': 'tag-seed-validity', 'kinds': XVER_KINDS,
                                                        'of': 'X-1', 'seed': shape} for shape in ('A', 'B', 'C')},
     **{f'core-xver-ctl-ae-old-same-{shape.lower()}': {'engine': 'ae', 'under_test': 'tag-seed-validity', 'kinds': XVER_KINDS,
                                                        'of': 'X-3', 'seed': shape} for shape in ('A', 'C')},
     'core-xver-ctl-x7-wiped': {'under_test': 'rc2', 'kinds': XVER_KINDS, 'of': 'X-7'},
-    # W5 item 5: the tag AE's money journal archive (1-0.rec) is regenerated from the replayed cluster log (the writer re-emits
+    # The tag AE's money journal archive (1-0.rec) is regenerated from the replayed cluster log (the writer re-emits
     # journalSeq 1..16 into a new recording; the projector skips them against the restored rows), so omitting it cannot bite;
     # the control omits the AE cluster state the restore needs
     'core-rollback-ctl-omit-aestate': {'under_test': 'rollback-restore', 'kinds': ('s17-rollback',), 'of': 'X-R',
@@ -141,7 +147,7 @@ def case_for(scenario, kind):
     raise Inconclusive('unknown cross-version scenario: ' + scenario)
 
 
-# ------------------------------------------------------------------ the refusal-site table (5.2, 6.10; W12 at the cut commits)
+# ------------------------------------------------------------------ the refusal-site table (the envelope-reader texts at the cut commits)
 
 COMMITS = {'match': 'c35689577e8cd524d91692bce6d964c02b45daef', 'assets': 'eb559a7f9070296bae9c73a3087e49a01efb5852',
            'cluster-kit': '947fe50aa2161ae9f302a90c6e1a6bad7eb0eb32', 'cluster-tools': 'e56a4ce5b1118e9c57b975725be6c6010bfdb52d'}
@@ -151,7 +157,7 @@ ACS_ME = 'match-cluster/src/main/java/com/match/infrastructure/persistence/AppCl
 ACS_AE = 'assets-cluster/src/main/java/com/openexchange/assets/infrastructure/persistence/AssetsClusteredService.java'
 KIT_GATE = 'cluster-kit src/main/java/com/openexchange/cluster/auth/PrincipalGate.java:15,40-42'
 def check_sites(cut):
-    """Review V18: the refusal-site table was read at COMMITS; a cut on other commits makes every site citation stale."""
+    """The refusal-site table was read at COMMITS; a cut on other commits makes every site citation stale."""
     repos = (cut or {}).get('repos') or {}
     return [f'{repo}: the refusal-site table was read at {commit}, the cut is at {repos.get(repo)}'
             for repo, commit in sorted(COMMITS.items()) if repos.get(repo) != commit]
@@ -202,7 +208,7 @@ SITES = {
                      'reads': 'assets assets-cluster/src/main/java/com/openexchange/assets/application/engine/AssetsEngine.java:1828',
                      'prints': 'cluster-tools app/forwarder/it/T1CoreDriver.java:248', 'commit': COMMITS['assets']},
     'admin-ack-45': {'engine': 'driver', 're': r'ADMIN OPEN GLOBAL never accepted: last reason 45 HALT_HOLDER_PENDING', 'code': 45,
-                     'name': 'HALT_HOLDER_PENDING', 'layer': 'core admission (G1)',
+                     'name': 'HALT_HOLDER_PENDING', 'layer': 'core admission (halt holder)',
                      'reads': 'assets assets-cluster/src/main/java/com/openexchange/assets/application/engine/AssetsEngine.java:1836, '
                               'CoreRejectReason.java:66', 'prints': 'cluster-tools app/forwarder/it/T1CoreDriver.java:248',
                      'commit': COMMITS['assets']},
@@ -233,7 +239,7 @@ def match_site(text, engine):
 
 
 def classify_member(m, allowed):
-    """6.10: replay-halted (exit 1, a refusal text that maps to a site of this case), quorum-exited (exit 1, the kit watchdog
+    """Replay-halted (exit 1, a refusal text that maps to a site of this case), quorum-exited (exit 1, the kit watchdog
     text) or other (with the reason and, for an Aeron-level refusal, the layer: never written down as an application text)."""
     out = {'role': m['role'], 'exit_code': m.get('exit_code')}
     if m.get('running'):
@@ -270,7 +276,7 @@ DROP = 'INGRESS DROP'      # AssetsSbeDemuxer at eb559a7: (schema) :388, (unknow
 
 
 def capture_witness(m):
-    """X-3(b) (review V6): the member's one log holds the engine's start banner, then its CRITICAL line, with no restart of the
+    """X-3(b): the member's one log holds the engine's start banner, then its CRITICAL line, with no restart of the
     container (RestartCount 0) and no INGRESS DROP of any kind between them."""
     lines = (m.get('log') or '').splitlines()
     idx = next((i for i, l in enumerate(lines) if 'CRITICAL: principal-less session' in l), None)
@@ -297,7 +303,7 @@ def _covered(member, probes):
 
 
 def judge_state(case, members, probes, bound_s, quorum_wait_ms, probe_min=1):
-    """The REFUSED (state kind) pass line of 6.10 for X-1 and X-3; GUARDED-silent when anything served."""
+    """The REFUSED (state kind) pass line for X-1 and X-3; GUARDED-silent when anything served."""
     spec = CASES[case]
     reasons = []
     last_start = max(m['started_ns'] for m in members)
@@ -314,13 +320,13 @@ def judge_state(case, members, probes, bound_s, quorum_wait_ms, probe_min=1):
             reasons.append(f'{c["role"]} other: {c["reason"]}')
     if counts != spec['classes']:
         reasons.append(f'class counts {counts} != the stagger\'s prediction {spec["classes"]}')
-    # review V7: in a log-only case the quorum-exited member is the one started after its peers halted
+    # In a log-only case the quorum-exited member is the one started after its peers halted
     if spec['classes'].get('quorum-exited'):
         last = max(members, key=lambda m: m['started_ns'])['role']
         exited = [c['role'] for c in classes if c['class'] == 'quorum-exited']
         if exited and exited != [last]:
             reasons.append(f'the quorum-exited member is {exited}, not the last-started {last} (the stagger\'s prediction)')
-    # review V5 (a): "no probe attempt answered" needs attempts; each member's life is probed at least probe_min times
+    # "no probe attempt answered" needs attempts; each member's life is probed at least probe_min times
     for m in members:
         n = _covered(m, probes)
         if n < probe_min:
@@ -355,12 +361,12 @@ def judge_state(case, members, probes, bound_s, quorum_wait_ms, probe_min=1):
     return dict(out, verdict=verdict, reasons=reasons)
 
 
-# ------------------------------------------------------------------ seeds (5.2 seed_state witnesses)
+# ------------------------------------------------------------------ seeds (seed_state witnesses)
 
 def seed_witness(shape, root, role, tail_min):
     """The non-vacuity witness of one seeded member: snapshot recordings measured from its recording.log, the tail counts and the
-    recorded tree hash from the seed's witness.json (W1). A seed that contradicts its variant is refused."""
-    import r10_cut
+    recorded tree hash from the seed's witness.json. A seed that contradicts its variant is refused."""
+    import release_cut
     root = Path(root)
     witness_path = root / 'witness.json'
     if not witness_path.is_file():
@@ -370,7 +376,7 @@ def seed_witness(shape, root, role, tail_min):
     if not tree:
         raise Inconclusive(f'seed {shape} {role}: no recorded tree hash')
     log = root / role / 'state' / 'cluster' / 'recording.log'
-    snaps = r10_cut.snapshot_count(log) if log.is_file() else 0
+    snaps = release_cut.snapshot_count(log) if log.is_file() else 0
     tail, opens = int(w.get('tail_requests_after_snapshot') or 0), int(w.get('tail_session_opens') or 0)
     out = {'shape': shape, 'role': role, 'recorded_sha256': tree['sha256'], 'snapshot_recordings': snaps,
            'tail_requests_after_snapshot': tail, 'tail_session_opens': opens, 'witness_file': str(witness_path)}
@@ -386,7 +392,7 @@ def seed_witness(shape, root, role, tail_min):
     return out
 
 
-# ------------------------------------------------------------------ the X-7 pass line (6.7, 20.1 line 28)
+# ------------------------------------------------------------------ the X-7 pass line
 
 def _dedupe(rows):
     out = []
@@ -400,7 +406,7 @@ UNREACHABLE = re.compile(r'verdict source (\d+) e \S+ UNREACHABLE')
 
 
 def judge_x7(obs):
-    """The 6.7 pass line. Review V8: INCONCLUSIVE needs positive unreachability evidence (an ME member down in a sample, or an
+    """The X-7 pass line. INCONCLUSIVE needs positive unreachability evidence (an ME member down in a sample, or an
     UNREACHABLE source verdict in the bridge log); relistsSinceHalt must be present and 0; the window starts after the last
     FeedHalt AdminAck and lasts >= 60 s after it; the tap is alive at the end of the window."""
     reasons, fail = [], False
@@ -415,7 +421,7 @@ def judge_x7(obs):
             sources = sorted(set(UNREACHABLE.findall(text)))
             if sources:
                 return {'verdict': 'INCONCLUSIVE', 'reasons': [f'{b} haltDetail NONE and no WARN with source(s) {sources} '
-                                                               'UNREACHABLE in its log (C8)']}
+                                                               'UNREACHABLE in its log']}
             reasons.append(f'{b} haltDetail NONE and no foreign-head WARN with every source reachable: B1 did not classify '
                            'the foreign head')
             fail = True
@@ -426,7 +432,7 @@ def judge_x7(obs):
     for b in ('bridge0', 'bridge1'):
         ack = acks.get(b)
         if ack is None:
-            reasons.append(f'{b} logged no FeedHalt AdminAck: the window has no anchor (6.7)')
+            reasons.append(f'{b} logged no FeedHalt AdminAck: the window has no anchor')
         elif first < ack or last - ack < X7_SAMPLE_MIN_S * 1_000_000_000:
             reasons.append(f'{b}: the sampling must start after the last FeedHalt ack and last >= {X7_SAMPLE_MIN_S} s after it '
                            f'(ack {round((ack - first) / 1e9, 1)} s after the window start, '
@@ -466,7 +472,7 @@ def judge_x7(obs):
             reasons.append(f'core feedHalted {money.get("feedHalted")} haltReason {money.get("haltReason")}, want true SOURCE_SCHEMA')
             break
     # the per-OPEN acks (41 before the latch, 40 after) are judged through the admission rows and the unbound core: the driver
-    # prints its last reason only (review V8 (d)); a 45 would need a holder, which the never-bound core and these rows exclude
+    # prints its last reason only; a 45 would need a holder, which the never-bound core and these rows exclude
     gate = _dedupe(obs['gate_rows'])
     if gate != [['SUSPENDED', 'GENESIS'], ['SUSPENDED', 'BRIDGE_HALT']]:
         reasons.append(f'GLOBAL admission rows {gate}, want [SUSPENDED, GENESIS] then [SUSPENDED, BRIDGE_HALT]')
@@ -491,7 +497,7 @@ def judge_x7(obs):
 
 
 def judge_x7_wiped(obs):
-    """Control xver-x7-wiped (8.2): with the archives wiped the same run binds, OPEN(ADMIN) ACCEPTED, [OPEN, ADMIN]."""
+    """Control xver-x7-wiped: with the archives wiped the same run binds, OPEN(ADMIN) ACCEPTED, [OPEN, ADMIN]."""
     reasons = []
     gate = _dedupe(obs['gate_rows'])
     if ['OPEN', 'ADMIN'] not in gate:
@@ -503,7 +509,7 @@ def judge_x7_wiped(obs):
     return {'verdict': 'NOT-OPENED' if reasons else 'OPENED', 'reasons': reasons, 'gate': gate}
 
 
-# ------------------------------------------------------------------ the X-A judges (6.8)
+# ------------------------------------------------------------------ the X-A judges
 
 def _results(out):
     return {int(v): int(r) for v, r in re.findall(r'CoreConfig (\d) result (\d+)', out or '')}
@@ -533,7 +539,7 @@ def judge_a1(obs):
 
 
 def judge_a2(obs):
-    """6.8 X-A2 (review V15): the partial CoreConfig acks are ACCEPTED/ADOPTED; (a) the same-id re-run runs on the untouched
+    """6.8 X-A2: the partial CoreConfig acks are ACCEPTED/ADOPTED; (a) the same-id re-run runs on the untouched
     partial state BEFORE (b) the new-id run; (b) the core REJECTED (2) at CoreConfig 1 and the T1MeDriver FRESH with the new id
     did not answer its epoch; k = 2 records the gate after the finish and after the explicit OPEN separately."""
     reasons, out = [], {}
@@ -543,7 +549,7 @@ def judge_a2(obs):
     if [v for v, _ in partial] != list(range(1, obs['stop_after'] + 1)) or any(r not in ('ACCEPTED', 'ADOPTED') for _, r in partial):
         reasons.append(f'the partial genesis acks are {partial}, want CoreConfig 1..{obs["stop_after"]} ACCEPTED or ADOPTED')
     if obs.get('order') != ['same-id', 'new-id']:
-        reasons.append(f'run order {obs.get("order")}: 6.8 runs (a) the same genesisId first, then (b) a new one')
+        reasons.append(f'run order {obs.get("order")}: X-A runs (a) the same genesisId first, then (b) a new one')
     if obs['gate_after_partial'] != 'GENESIS':
         reasons.append(f'the gate after the partial genesis is {obs["gate_after_partial"]}, want [SUSPENDED, GENESIS]')
     if _results(obs['new_id_core'].get('out')).get(1) != 2 or obs['new_id_core'].get('exit') == 0:
@@ -572,7 +578,7 @@ def judge_a2(obs):
 
 
 def _final_ok(obs, reasons):
-    """rc2-cut-4: after a successful recovery the final activation record (RC2 step 7's deliverable) reads OK."""
+    """rc2-cut-4: after a successful recovery the final activation record (activation step 7's deliverable) reads OK."""
     if 'record_after' in obs and (obs.get('completion') or {}).get('steps'):
         status = (obs['record_after'] or {}).get('status')
         if status != 'OK':
@@ -632,7 +638,7 @@ def judge_a4(obs):
 
 
 def resync_after_bound(text):
-    """Review V16: RESYNC(0) lines after the forwarder's "ME epoch bound" line (ForwarderAgent.h:740, :595)."""
+    """RESYNC(0) lines after the forwarder's "ME epoch bound" line (ForwarderAgent.h:740, :595)."""
     lines = (text or '').splitlines()
     bound = next((i for i, l in enumerate(lines) if 'ME epoch bound' in l), None)
     return 0 if bound is None else sum(1 for l in lines[bound + 1:] if 'RESYNC(0)' in l)
@@ -661,14 +667,14 @@ def judge_a5(obs):
     return {'verdict': 'FAIL' if reasons else 'PASS', 'reasons': reasons}
 
 
-# ------------------------------------------------------------------ the X-R judge (6.9)
+# ------------------------------------------------------------------ the X-R judge
 
 OMIT_PART = {'ae-money-journal': ('ae', re.compile(r'\bae[0-2]\b')), 'ae-state': ('ae', re.compile(r'\bae[0-2]\b')),
              'pg-dump': ('r01_money', re.compile(r'r01_money|projector'))}
 
 
 def judge_rollback(d0, d1, post, omitted=None, error=None, smoke=None, error_phase=None):
-    """6.9 (review V9). Pass: the legacy smoke passed, D0 holds a real line (OMS and money rows, AE balances, applied trades),
+    """Pass: the legacy smoke passed, D0 holds a real line (OMS and money rows, AE balances, applied trades),
     D1 == D0 and the post-restore scenario passes. ``omitted`` (xr-omit): the control bites only on its own part (that part of
     D1 differs, the post-restore scenario fails, or the restored member of that part does not start); any other error or
     difference is INCONCLUSIVE, never a bite."""
@@ -713,17 +719,17 @@ def judge_rollback(d0, d1, post, omitted=None, error=None, smoke=None, error_pha
     return {'verdict': 'FAIL' if reasons else 'PASS', 'reasons': reasons}
 
 
-# ------------------------------------------------------------------ the active probe (5.2)
+# ------------------------------------------------------------------ the active probe
 
 def probe_answered(engine, code, stdout, meaning):
     """ME: JournalProbe open-legs (a session plus one request) answered; AE: a CoreProbe deposit answered (ACK or REJECT)."""
     if engine == 'me':
-        return code == 0          # review V5 (b): open-legs exits 0 only after a complete OpenOrdersSnapshot
+        return code == 0          # open-legs exits 0 only after a complete OpenOrdersSnapshot
     return meaning in ('ANSWERED', 'REFUSED')
 
 
 def probe_cadence(rows, s):
-    """The measured attempt rate (coordinator: ~0.3/s as measured on the cut, a recorded value, not a line)."""
+    """The measured attempt rate (~0.3/s as measured on the cut, a recorded value, not a line)."""
     if len(rows) < 2:
         return {'attempts': len(rows), 'per_s': None, 'interval_s': s['XVER_PROBE_INTERVAL_S'], 'inflight': s['XVER_PROBE_INFLIGHT']}
     span = (max(r['started_ns'] for r in rows) - min(r['started_ns'] for r in rows)) / 1e9
@@ -796,7 +802,7 @@ class ActiveProbe(threading.Thread):
 
 
 def not_started_by_steps(done):
-    """W5 item 2: the slots a genesis stopped after ``done`` has not started yet (the audit names them, never a finding)."""
+    """The slots a genesis stopped after ``done`` has not started yet (the audit names them, never a finding)."""
     out = []
     if 'start_bridges' not in done:
         out += ['bridge0', 'bridge1']
@@ -806,20 +812,20 @@ def not_started_by_steps(done):
 
 
 def require_probe_genesis(m):
-    """Review V2: X-A2's partial genesis sends ``CoreProbe core-config genesis=``; a staged CoreProbe without that argument
+    """X-A2's partial genesis sends ``CoreProbe core-config genesis=``; a staged CoreProbe without that argument
     leaves CoreConfig.genesisId unset. Refused before the box is touched."""
     src = Path(str((m.get('core_probe') or {}).get('source_path', '')))
     text = src.read_text() if src.is_file() else ''
     if 'arg("genesis")' not in text:
-        raise Inconclusive(f'stale CoreProbe: {src} has no core-config genesis= argument (X-A2 needs the W3 probe; regenerate the cut)')
+        raise Inconclusive(f'stale CoreProbe: {src} has no core-config genesis= argument (X-A2 needs a probe with genesis=; regenerate the cut)')
 
 
 def forward_precheck(f, roots):
-    """Review V1: runbook step 1 on the roots the forward order runs on, with the projection rows READ from the database the
+    """Runbook step 1 on the roots the forward order runs on, with the projection rows READ from the database the
     cut will use (never assumed empty)."""
-    import r10_cut
-    rows = r10_cut.projection_rows(f)
-    return dict(r10_cut.precheck(roots, pg_rows=rows), pg_rows=rows)
+    import release_cut
+    rows = release_cut.projection_rows(f)
+    return dict(release_cut.precheck(roots, pg_rows=rows), pg_rows=rows)
 
 
 # ------------------------------------------------------------------ scenario plumbing
@@ -854,9 +860,9 @@ def _cut_aeron():
 
 
 def _audit(f, out, name, started_only=False, not_started=()):
-    import r10_cut
+    import release_cut
     try:
-        return r10_cut.audit_fixture(f, Path(out) / name, aeron_version=_cut_aeron(), started_only=started_only,
+        return release_cut.audit_fixture(f, Path(out) / name, aeron_version=_cut_aeron(), started_only=started_only,
                                      not_started=not_started)
     except Exception as error:
         report = {'status': 'ERROR', 'error': str(error)[:500], 'findings': [str(error)[:300]], 'stopped': [], 'members_up': {}}
@@ -865,9 +871,9 @@ def _audit(f, out, name, started_only=False, not_started=()):
 
 
 def _record(f, out, audit, name='rc2-activation-record.json'):
-    import r10_cut
+    import release_cut
     kind = 'intermediate' if 'before-recovery' in name else 'final'
-    record, _ = r10_cut.write_activation_record(out, Path(out) / name, state_root=f.root, audit=audit, record_kind=kind)
+    record, _ = release_cut.write_activation_record(out, Path(out) / name, state_root=f.root, audit=audit, record_kind=kind)
     return record
 
 
@@ -957,7 +963,7 @@ def _members(f, roles, starts, ready):
 
 
 def _recovery_line(f, engine, out):
-    """C5: wipe the same containers and boot them clean on the run's intended jar: /ready 200 on every member."""
+    """Wipe the same containers and boot them clean on the run's intended jar: /ready 200 on every member."""
     roles = [f'{engine}{i}' for i in range(3)]
     for r in roles:
         if _state(f, r)['Running']:
@@ -981,7 +987,7 @@ def _seed_members(f, shape, roles, tail_min, parts=None):
 
 def _result(verdict, extra, fixtures, assertions):
     status = verdict_status(verdict['verdict'])
-    if fixtures and 'state_root' not in extra:          # W5 item 6: the activation-record CLI reads the run's state root
+    if fixtures and 'state_root' not in extra:          # The activation-record CLI reads the run's state root
         extra = dict(extra, state_root=str(fixtures[0].root))
     return dict(extra, status=status, xver_verdict=verdict['verdict'], verdict=verdict, assertions=assertions, processed=1,
                 skipped=0, child_exit_codes=_child_exits(fixtures))
@@ -1000,7 +1006,7 @@ def run_state_case(manifest, case, out, s, seed_override=None, control=None):
         _boot_base(f)
         if seed_override is not None:
             hashes = _hashes(seed_override)
-            seeds = {r: f.seed_state(r, seed_override / r, hashes[r], witness={'shape': 'RC2 state (control)'}) for r in roles}
+            seeds = {r: f.seed_state(r, seed_override / r, hashes[r], witness={'shape': 'new state (control)'}) for r in roles}
         else:
             seeds = _seed_members(f, spec['seed'], roles, s['XVER_TAIL_MIN'])
         probe = ActiveProbe(f, engine, Path(out) / 'probe.jsonl', inflight=s['XVER_PROBE_INFLIGHT'],
@@ -1043,7 +1049,7 @@ def run_state_case(manifest, case, out, s, seed_override=None, control=None):
             extra['recovery'] = rec
             if not rec['ready']:
                 verdict = dict(verdict, verdict='INCONCLUSIVE', reasons=verdict['reasons'] + [
-                    'the recovery line failed (C5): ' + rec.get('error', '')])
+                    'the recovery line failed: ' + rec.get('error', '')])
         (Path(out) / 'xver-verdict.json').write_text(json.dumps(verdict, indent=1, default=str) + '\n')
         return _result(verdict, extra, fixtures, len(members) + 2)
     finally:
@@ -1056,7 +1062,7 @@ def _hashes(root):
 
 
 def run_same_control(manifest, control, out, s):
-    """xver-me-same / xver-ae-same: the RC2 jar on an RC2 state seeded the same way must start and serve. The RC2 state comes
+    """xver-me-same / xver-ae-same: the new jar on a new state seeded the same way must start and serve. The new state comes
     from a first fixture (a child manifest): the members boot (the ME takes its behaviour-2 genesis), stop politely, and their
     state dirs are copied out."""
     import core_contracts
@@ -1093,7 +1099,7 @@ def run_old_same_control(manifest, control, out, s):
     engine, shape = spec['engine'], spec['seed']
     roles = [f'{engine}{i}' for i in range(3)]
     name = f'old-same-{engine}-{Path(out).name[-12:]}'.lower().replace('_', '-')[:40]
-    path, _ = legacy_tag.legacy_manifest(re.sub(r'[^a-z0-9-]', '-', name), s['XVER_LEGACY_OCTET'], B0 / 'local-runs/s17/legacy-ctl')
+    path, _ = legacy_tag.legacy_manifest(re.sub(r'[^a-z0-9-]', '-', name), s['XVER_LEGACY_OCTET'], LEGACY_RUNS / 'legacy-ctl')
     f = SeededLegacyFixture(path)
     try:
         f.stage_artifacts(); f.start_network()
@@ -1284,7 +1290,7 @@ def run_x7(manifest, out, s, wiped=False):
         gate_rows = _gate_rows(f)
         halt_at = next((g[2] for g in gate_rows if g[1] == 'BRIDGE_HALT'), None)
         money = [_money(f)]
-        sent_ms = time.time_ns() // 1_000_000        # review V23: the send time, taken before the send
+        sent_ms = time.time_ns() // 1_000_000        # The send time, taken before the send
         order_meaning, order_reply = f.core('create', 'probe-gateway', user=990002, market=1, side='BUY', type='LIMIT', tif='GTC',
                                             price=100, qty=1, budget=0, stop=0, delta=0, display=0, expires=0, rh=1, rl=1, ch=0,
                                             cl=1)
@@ -1309,7 +1315,7 @@ def run_x7(manifest, out, s, wiped=False):
         tap_alive = not (tap_out.exists() and 'TAP first=' in tap_out.read_text())
         money.append(_money(f))
         acks = {}
-        for b in ('bridge0', 'bridge1'):          # review V8 (c): the window's anchor, from the timestamped bridge log
+        for b in ('bridge0', 'bridge1'):          # The window's anchor, from the timestamped bridge log
             stamps = [l.split(' ', 1)[0] for l in _docker_logs(f, b).splitlines() if 'FeedHalt AdminAck' in l]
             acks[b] = _iso_ns(stamps[-1]) if stamps else None
         obs = {'samples': samples, 'sample_s': sample_s, 'money': money, 'gate_rows': [g[:2] for g in _gate_rows(f)],
@@ -1329,7 +1335,7 @@ def run_x7(manifest, out, s, wiped=False):
         f.close()
 
 
-# ------------------------------------------------------------------ X-A1..X-A5 (6.8)
+# ------------------------------------------------------------------ X-A1..X-A5
 
 ACT_PLAN = None
 
@@ -1347,13 +1353,13 @@ def _gate_now(f):
 
 
 def _journal_records(f, members):
-    import r10_cut
+    import release_cut
     import sbe_layout
-    schema = sbe_layout.load(r10_cut.ME_JOURNAL_SCHEMA)
+    schema = sbe_layout.load(release_cut.ME_JOURNAL_SCHEMA)
     out, counts = {}, {}
     for m in members:
         lines = f.journal_dump(m)
-        r5 = r10_cut._decode_record5(lines, schema.messages[5], schema.order)
+        r5 = release_cut._decode_record5(lines, schema.messages[5], schema.order)
         if r5:
             r5['recording'] = next((json.loads(l).get('recording') for l in lines if '"kind":"frame"' in l), None)
             out[m] = r5
@@ -1400,10 +1406,10 @@ def run_act(manifest, name, out, s):
             partial = f.core_genesis_partial(plan, k)
             time.sleep(3)
             gate_partial = _gate_now(f)
-            _journal_records(f, ['me0', 'me1', 'me2'])      # W5 item 2: record 5 dumped before the record (evidence)
+            _journal_records(f, ['me0', 'me1', 'me2'])      # Record 5 dumped before the record (evidence)
             audit = _audit(f, out, 'audit.json', not_started=not_started_by_steps(order[:order.index('core_genesis')]))
             before = _record(f, out, audit, 'rc2-activation-record.before-recovery.json')
-            # review V15 (a): 6.8 order: (a) the same genesisId on the untouched partial state, then (b) a new one
+            # X-A order: (a) the same genesisId on the untouched partial state, then (b) a new one
             same = _core_driver(f)
             time.sleep(3)
             gate_final = _gate_now(f)
@@ -1423,7 +1429,7 @@ def run_act(manifest, name, out, s):
                     if bound:
                         break
                     time.sleep(3)
-                gate_after_finish = _gate_now(f)          # review V15 (d): the finish and the explicit OPEN, separately
+                gate_after_finish = _gate_now(f)          # The finish and the explicit OPEN, separately
                 meaning, reply = f.core('gate', 'probe-admin', market=0, state='OPEN', reason='ADMIN')
                 time.sleep(3)
                 obs['recovery'] = {'finish': finish['results'], 'bound': bound, 'gate_after_finish': gate_after_finish,
@@ -1440,7 +1446,7 @@ def run_act(manifest, name, out, s):
             gate0 = _gate_now(f)
             meaning, reply = f.core('gate', 'probe-admin', market=0, state='OPEN', reason='ADMIN')
             ack = next((r for r in (reply or {}).get('replies') or [] if r.get('t') == 'AdminAck'), {})
-            _journal_records(f, ['me0', 'me1', 'me2'])      # W5 item 2
+            _journal_records(f, ['me0', 'me1', 'me2'])
             before = _record(f, out, _audit(f, out, 'audit.json', not_started=not_started_by_steps(order[:order.index('start_bridges')])),
                              'rc2-activation-record.before-recovery.json')
             t = time.time()
@@ -1565,7 +1571,7 @@ MEMBER_ROW = re.compile(r'ClusterMember\{id=(\d+), [^{}]*?isLeader=(true|false),
 
 def leader_view(text):
     """(leader id, {member id: logPosition}) from one ``list-members`` output when it is the leader's own (its memberId row
-    says isLeader=true), else None: a follower's view of its peers is stale (W5 X-A4: -1 or its election-time position)."""
+    says isLeader=true), else None: a follower's view of its peers is stale (X-A4: -1 or its election-time position)."""
     own = re.search(r'memberId=(\d+)', text)
     rows = {int(i): (lead == 'true', int(p)) for i, lead, p in MEMBER_ROW.findall(text)}
     if not own or int(own.group(1)) not in rows or not rows[int(own.group(1))][0]:
@@ -1574,7 +1580,7 @@ def leader_view(text):
 
 
 def caught_up(samples, late):
-    """W5 X-A4: the AE log advances under the engines' own timers, so exact equality "at quiescence" is never seen; the late
+    """X-A4: the AE log advances under the engines' own timers, so exact equality "at quiescence" is never seen; the late
     member has caught up when, in the leader's view, its logPosition reaches the leader's position of an EARLIER sample."""
     for earlier, later in zip(samples, samples[1:]):
         if later['positions'].get(late, -1) >= earlier['positions'][earlier['leader']]:
@@ -1605,7 +1611,7 @@ def _ae_catch_up(f, out, late=2, bound_s=None):
     return dict(caught_up(samples, late), samples=samples)
 
 
-# ------------------------------------------------------------------ X-R (6.9)
+# ------------------------------------------------------------------ X-R
 
 def _empty_dir(path):
     """Remove the contents of ``path`` (kept); returns (files, bytes) removed: the evidence of what was there."""
@@ -1622,9 +1628,9 @@ def _empty_dir(path):
 
 def _omit_money_journal(member_dir):
     """xr-omit run 1: drop the AE archive recordings other than the cluster log (the tag AE's money journal)."""
-    import r10_cut
+    import release_cut
     log = Path(member_dir) / 'state' / 'cluster' / 'recording.log'
-    keep = {e['recording_id'] for e in r10_cut.recording_log(log) if e['type'] == 'TERM'}
+    keep = {e['recording_id'] for e in release_cut.recording_log(log) if e['type'] == 'TERM'}
     dropped = []
     for rec in sorted((Path(member_dir) / 'state' / 'archive').glob('*.rec')):
         if int(rec.name.split('-')[0]) not in keep:
@@ -1634,7 +1640,7 @@ def _omit_money_journal(member_dir):
 
 
 def run_rollback(manifest, out, s, omit=None):
-    """6.9 on ONE set of state roots (review V1): the tag line's member dirs are archived, wiped per the precheck list, the cut
+    """6.9 on ONE set of state roots: the tag line's member dirs are archived, wiped per the precheck list, the cut
     runs ON THEM (its members' /data bound to those dirs; the precheck reads the cut's projection database), the cut is
     stopped, what it wrote is wiped, the archive is restored over the same dirs and the tag line starts on them again."""
     import legacy_tag
@@ -1645,7 +1651,7 @@ def run_rollback(manifest, out, s, omit=None):
     out = Path(out)
     archive = out / 'archive'
     tag = re.sub(r'[^a-z0-9-]', '', out.name.lower())[-10:] or 'x'
-    l1, _ = legacy_tag.legacy_manifest(f'xr-{tag}-l1', s['XVER_LEGACY_OCTET'], B0 / 'local-runs/s17/legacy-xr')
+    l1, _ = legacy_tag.legacy_manifest(f'xr-{tag}-l1', s['XVER_LEGACY_OCTET'], LEGACY_RUNS / 'legacy-xr')
     result = {'case': 'control:' + omit if omit else 'X-R', 'row': '49', 'omit': omit}
     fixtures = []
     # 1, 2: the tag line, D0, the archive
@@ -1698,7 +1704,7 @@ def run_rollback(manifest, out, s, omit=None):
             omitted_items[m] = _empty_dir(roots / m)
     result['omitted_items'] = omitted_items
     # 5: the tag line on the same roots (a new legacy fixture, the same addresses), D1, a post-restore scenario
-    l2_path, _ = legacy_tag.legacy_manifest(f'xr-{tag}-l2', s['XVER_LEGACY_OCTET'], B0 / 'local-runs/s17/legacy-xr')
+    l2_path, _ = legacy_tag.legacy_manifest(f'xr-{tag}-l2', s['XVER_LEGACY_OCTET'], LEGACY_RUNS / 'legacy-xr')
     l2 = json.loads(l2_path.read_text())
     l2['nodes'] = json.loads(Path(l1).read_text())['nodes']
     l2_path.write_text(json.dumps(l2, indent=1) + '\n')
@@ -1739,7 +1745,7 @@ def run_rollback(manifest, out, s, omit=None):
 class RestoredLegacyFixture(SeededLegacyFixture):
     """X-R step 5: the tag line on the restored roots (``roots``: the members' /data are those dirs, linked as state/<member>);
     the OMS/money dumps restored (``omit`` ``pg-dump`` drops the r01_money dump); r01_market rows reloaded after the market
-    gateway created its hypertable (20.1 line 21)."""
+    gateway created its hypertable."""
     archive, omit, roots = None, None, None
 
     def spawn(self, name, command, environment=None):
@@ -1788,7 +1794,7 @@ def scenario(manifest_path, name, out_dir):
         cut = json.loads(CUT.read_text())
     except (OSError, ValueError) as error:
         raise Inconclusive(f'the run\'s cut is unreadable ({CUT}): {error}')
-    stale = check_sites(cut)            # review V18: the site table cites the refusing binaries' own commits
+    stale = check_sites(cut)            # The site table cites the refusing binaries' own commits
     if stale:
         raise Inconclusive('refusal-site table stale for this cut: ' + '; '.join(stale))
     for role, name_ in (('me', 'match-cluster.jar'), ('ae', 'assets-cluster.jar')):
@@ -1798,7 +1804,7 @@ def scenario(manifest_path, name, out_dir):
         require_probe_genesis(m)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    (out / 'settings.json').write_text(json.dumps({'settings': s, 'seeds': str(SEEDS), 'cut': str(CUT), 'cut_id': cut.get('cut_id'),
+    (out / 'settings.json').write_text(json.dumps({'settings': s, 'seeds': recorded(SEEDS), 'cut': str(CUT), 'cut_id': cut.get('cut_id'),
                                                    'case': case, 'site_commits': COMMITS,
                                                    'harness_drift': m.get('harness_drift')}, indent=1))
     if case.startswith('control:'):

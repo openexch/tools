@@ -59,18 +59,18 @@ def main():
             import core_scenarios
             fixture = CoreFixture(args.manifest)
             result['state_root'] = str(fixture.root)
-            # core-boot checks the EMPTY genesis (S14 shape); core-smoke runs the contract 5.3 genesis phases (RC2 S15 W1)
+            # core-boot checks the EMPTY genesis; core-smoke runs the genesis phases
             fixture.start(core_scenarios.SMOKE_PLAN if args.scenario == 'core-smoke' else None)
             result.update({'core-boot': core_scenarios.core_boot, 'core-smoke': core_scenarios.core_smoke}[args.scenario](fixture))
         elif args.scenario.startswith(('core-drill-', 'core-control-', 'core-red-')):
-            # RC2 S15: the T2 drills, the 8.4 controls and the two REDs; drill=True refuses a non-enforced ME (5.1)
+            # The core-topology drills, the controls and the two REDs; drill=True refuses a non-enforced ME
             from core_fixture import CoreFixture
             import core_drills
             fixture = CoreFixture(args.manifest, drill=True)
             result['state_root'] = str(fixture.root)
             result.update(core_drills.scenario(fixture, args.scenario, args.output))
         elif args.scenario.startswith(('core-xver-', 'core-act-', 'core-rollback-')):
-            # RC2 S17 W3 (contract 5.2, 6): cross-version (new side), activation and rollback; each scenario owns and closes
+            # cross-version (new side), activation and rollback; each scenario owns and closes
             # its fixtures (the X runs boot members one by one, seed them, and X-R runs two legacy fixtures around the cut)
             import xver
             result.update(xver.scenario(args.manifest, args.scenario, args.output))
@@ -92,16 +92,16 @@ def main():
             if args.scenario == 'critical-path-smoke':
                 result.update(critical_path_smoke(fixture))
             elif args.scenario == 'oms-hold-release-authority':
-                from r02_acceptance import oms_hold_release_authority
+                from acceptance import oms_hold_release_authority
                 result.update(oms_hold_release_authority(fixture))
             elif args.scenario == 'execution-projector-replay-crash':
-                from r02_acceptance import execution_projector_replay_crash
+                from acceptance import execution_projector_replay_crash
                 result.update(execution_projector_replay_crash(fixture))
             elif args.scenario == 'oms-durable-request-id':
-                from r02_acceptance import oms_durable_request_id
+                from acceptance import oms_durable_request_id
                 result.update(oms_durable_request_id(fixture))
             elif args.scenario == 'oms-recovery-admission':
-                from r02_acceptance import oms_recovery_admission
+                from acceptance import oms_recovery_admission
                 result.update(oms_recovery_admission(fixture))
             elif args.scenario == 'journal-oms-restart':
                 from journal_cutover import journal_oms_restart
@@ -150,16 +150,16 @@ def main():
                 result['teardown'] = 'COMPLETE_OWNED_RESOURCES_ONLY'
             except Exception as error:
                 result.update(status='INCONCLUSIVE', teardown_error=str(error))
-            # RC2 S17 7.2 (review V10): an s17 genesis leaves its audit; the run dir gets the activation record (evidence only)
+            # An s17 genesis leaves its audit; the run dir gets the activation record (evidence only)
             if (fixture.root / 'audit.json').is_file() and not (args.output / 'rc2-activation-record.json').exists():
                 try:
-                    import r10_cut
+                    import release_cut
                     shutil.copyfile(fixture.root / 'audit.json', args.output / 'audit.json')
-                    for later in sorted(fixture.root.glob('audit-life*.json')):     # W6 item 4: a later core life's audit
+                    for later in sorted(fixture.root.glob('audit-life*.json')):     # A later core life's audit
                         shutil.copyfile(later, args.output / later.name)
-                    # W6 item 4: one final record per core life (A04 regenesis has two genesisIds by design)
-                    records = r10_cut.write_activation_records(args.output, state_root=fixture.root)
-                    record = max((r for r, _ in records), key=lambda r: r10_cut.STATUS_ORDER.index(r['status']))   # the worst life
+                    # One final record per core life (A04 regenesis has two genesisIds by design)
+                    records = release_cut.write_activation_records(args.output, state_root=fixture.root)
+                    record = max((r for r, _ in records), key=lambda r: release_cut.STATUS_ORDER.index(r['status']))   # the worst life
                     result['activation_record'] = {'status': record['status'], 'refusals': record['refusals'],
                                                    'life': record['life']}
                     result['activation_records'] = [{'life': r['life'], 'file': path.name, 'status': r['status'],

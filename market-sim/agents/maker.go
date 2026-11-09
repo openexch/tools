@@ -14,8 +14,8 @@ import (
 )
 
 // Maker quotes a small ladder on both sides of the anchor and keeps it
-// fresh with REAL cancels and re-posts (the gap that made binance-replay
-// books grow forever). Quote placement uses the ported research
+// fresh with REAL cancels and re-posts (without them the book grows
+// forever). Quote placement uses the research
 // distributions; the center skews against observed book imbalance.
 type Maker struct {
 	Bot    int64
@@ -217,7 +217,7 @@ func (m *Maker) reschedule() {
 func (m *Maker) ReconcileDue(now time.Time) bool { return now.After(m.nextRecAt) }
 
 // Reconcile syncs local intended state with the server (closing the drift
-// binance-replay never handled): cancel server-side orphans that carry our
+// between the two): cancel server-side orphans that carry our
 // clientOrderId prefix, drop local entries the server no longer has, refresh
 // inventory from balances, and rebalance runaway inventory with a reducing
 // order. Runs on the scheduler goroutine (same as Step).

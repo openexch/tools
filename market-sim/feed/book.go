@@ -1,6 +1,5 @@
 // Package feed consumes the match-gateway market-data plane (:8081) to give
-// agents a view of the REAL exchange book — the closed loop binance-replay
-// never had. The feed is lossy under backpressure (match#37 conflation), so
+// agents a view of the REAL exchange book, which closes the loop. The feed is lossy under backpressure (match#37 conflation), so
 // this view is eventually consistent: deltas are applied optimistically and
 // any doubt is resolved by requesting a fresh snapshot, never by trusting
 // accumulated state.

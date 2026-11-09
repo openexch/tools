@@ -40,7 +40,7 @@ Copy the program entries from the probe directory's `probe-manifest.json` into t
 Helper tools (each prints its own usage):
 
 - `mk_manifests.py <kind> <tag>`: builds a core manifest of a named kind; every manifest of one kind differs only in `run_id` and `state_root`.
-- `r10_cut.py check | audit | precheck | activation-record | genesis-ids | record-builds`: checks a release cut manifest and derived fixture manifests against the artifact rules (pinned sha256, clean source commit, no test builds in product kinds, matching schema identities), audits a live state root, and writes activation records.
+- `release_cut.py check | audit | precheck | activation-record | genesis-ids | record-builds`: checks a release cut manifest and derived fixture manifests against the artifact rules (pinned sha256, clean source commit, no test builds in product kinds, matching schema identities), audits a live state root, and writes activation records.
 - `oracle_samples.py <new dir>`: writes clean synthetic oracle samples.
 - `nightly.py`: the nightly runner (see below).
 
@@ -85,5 +85,17 @@ Known limits:
 ## Nightly
 
 `nightly.py --plan nightly-cut.json --evidence-root DIR --harness-commit SHA --tools-repo DIR --ct-repo DIR` runs a fixed plan of `{kind, scenario}` entries from a `git archive` of the pinned tools commit (a modified or extra file refuses the night). It takes a heavy-job lock without waiting (a held lock or foreign load ends the night `SKIPPED_BUSY`, exit 75), records stale earlier nights as `INTERRUPTED`, enforces `NIGHTLY_BOUND_S` (default 5 h) and writes `SHA256SUMS` last. Nothing is pushed or published.
+
+Paths are settings, never machine defaults. A night reads them from the environment, and an entry whose path is unset ends `INCONCLUSIVE` with a message naming the variable:
+
+| Variable | Used by | What it points at |
+|---|---|---|
+| `NIGHTLY_LOCK`, `NIGHTLY_CUT`, `NIGHTLY_CT_REPO` | `nightly.py` | heavy-job lock file, release cut manifest, cluster-tools checkout (falls back to `CUT_CT_REPO`) |
+| `CUT_TOOLS_REPO`, `CUT_CT_REPO`, `CUT_OLD_PINS` | `release_cut.py` | tools and cluster-tools checkouts, previous pin set |
+| `MK_RUNS`, `MK_BIN_A`, `MK_BUILD_B`, `MK_NC_DIR`, `MK_CUT_NC_DIR`, `MK_DRIVER_PROPERTIES`, `MK_AE_JAR`, `MK_ME_JAR`, `MK_PROJECTOR_JAR`, `MK_PROBE_MANIFEST`, `MK_NETFILTER_HELPER` | `mk_manifests.py` | run directory, C++ binaries and build trees, negative-control builds, external driver properties, engine and probe artifacts |
+| `LEGACY_TEMPLATE`, `LEGACY_JARS` | `legacy_tag.py` | v0.5.0-beta manifest template and jars |
+| `XVER_LEGACY_RUNS`, `XVER_SEEDS`, `XVER_CUT` | `xver.py` | cross-version run inputs |
+
+Each module's docstring lists the exact meaning of its variables.
 
 It runs from a local systemd user timer, not CI. `systemd/` holds the service, the timeout drop-in and the timer (daily at 03:17); install steps and the environment to edit are in the comments of `systemd/runtime-e2e-nightly.service`.

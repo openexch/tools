@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""RC2 S17 (contract 3.2, 5.2 (i), 20.1 lines 3 and 5): the legacy tag profile carries W0's two scratch adaptations
-(S17/evidence/dry-run/legacy_patch.py) into the harness, plus the tag-engine settings. No Docker."""
+"""The legacy tag profile carries the two adaptations a dry run of the old tag needed
+into the harness, plus the tag-engine settings. No Docker."""
 import hashlib
 import json
 from pathlib import Path
@@ -30,7 +30,7 @@ class PsqlPinTest(unittest.TestCase):
             f.psql('r01_market', 'CREATE EXTENSION timescaledb')
             f.psql('r01_oms', 'SELECT 1')
         self.assertEqual(seen, [('r01_market', "CREATE EXTENSION timescaledb VERSION '2.28.2'"), ('r01_oms', 'SELECT 1')])
-        self.assertEqual(legacy_tag.TIMESCALEDB_VERSION, '2.28.2')     # a setting (host drift, 20.1 line 3)
+        self.assertEqual(legacy_tag.TIMESCALEDB_VERSION, '2.28.2')     # a setting (the host's version may drift)
 
 
 class MarkerReadinessTest(unittest.TestCase):
@@ -114,7 +114,7 @@ class LegacyManifestTest(unittest.TestCase):
                                              template=self.template)
         self.assertEqual(set(m['artifacts']), set(legacy_tag.TAG_JARS))
         self.assertEqual(m['artifacts']['oms']['source_sha'], SRC['oms'])
-        self.assertEqual((m['limits']['shm_mb'], m['limits']['memory_mb']), (4096, 4096))       # settings (20.1 line 3)
+        self.assertEqual((m['limits']['shm_mb'], m['limits']['memory_mb']), (4096, 4096))       # settings
         self.assertNotIn('xprojector', m['nodes']); self.assertNotIn('journal_cutover', m)
         self.assertEqual(m['nodes']['me0'], '172.30.140.13')
         self.assertEqual(m['legacy_tag_profile']['timescaledb_version'], '2.28.2')

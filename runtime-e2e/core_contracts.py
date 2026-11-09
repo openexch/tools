@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Manifest schema v2: the core topology (RC2 S14, harness 2.7; critic G10, G15, G31, D18, D20).
+"""Manifest schema v2: the core topology.
 
 The legacy schema v1 (OMS order entry, PostgreSQL order truth) stays in contracts.py for the frozen
-R02 scenarios. v2 is the OMS + ledger core: ME x3, AE x3, two forwarder slots, two bridge slots, the
+v0.5 scenarios. v2 is the OMS + ledger core: ME x3, AE x3, two forwarder slots, two bridge slots, the
 money projector, a reserved shadow replica slot and the probe. Slots whose product does not exist
-yet (C++ forwarder and bridge, the RCS shadow) declare ``null`` and are skipped, never faked.
+yet (C++ forwarder and bridge, the shadow replica) declare ``null`` and are skipped, never faked.
 """
 import hashlib
 import ipaddress
@@ -28,7 +28,7 @@ PORT_PROFILE = {'me_base': 9000, 'ae_base': 19300, 'stride': 100, 'me_metrics': 
                 'bridge_http': 9600, 'projector_http': 9601, 'forwarder_http': 9700, 'journal_replay': 19820}
 AE_CREDENTIAL_ENV = {'keys_env': 'ASSETS_AUTH_KEYS', 'credential_env': 'AE_AUTH_CREDENTIAL'}
 ME_AUTH_MODES = {'enforced', 'not_enforced_by_artifact'}
-# D20: the drills are about elections, so the fixture keeps every production timeout. Everything is an
+# The drills are about elections, so the fixture keeps every production timeout. Everything is an
 # allowlist: the manifest's top-level keys, the environment names a fixture process may receive, and
 # the environment the pinned image itself carries. Anything else is refused, never filtered.
 MANIFEST_KEYS = {'schema_version', 'topology', 'run_id', 'timeouts', 'image', 'state_root', 'failure_domain',
@@ -36,13 +36,13 @@ MANIFEST_KEYS = {'schema_version', 'topology', 'run_id', 'timeouts', 'image', 's
                  'journal_probe', 'credentials', 'me_journal_profile', 'postgres_bin', 'postgres_port'}
 OPTIONAL_MANIFEST_KEYS = {'netfilter_helper', 'host_loss_acceptance', 'profile_note', 'measurement_purpose',
                           'harness_commit', 'harness_dirty',
-                          # RC2 S15 (contract 3.2, 3.3): the probe's own aeronmd and the two T1 drivers, hash-pinned
+                          # The probe's own aeronmd and the two T1 drivers, hash-pinned
                           'probe_libs', 't1_me_driver', 't1_core_driver',
-                          # RC2 S16 (contract 5.2, 5.3): the engines' driver profile and its staged driver; the builder's kind
+                          # The engines' driver profile and its staged driver; the builder's kind
                           'engine_driver', 'engine_libs', 'manifest_kind',
-                          # RC2 S17 W2 (W10, PO-11 (a)): the money projector's driver profile and its staged driver
+                          # The money projector's driver profile and its staged driver
                           'projector_driver', 'projector_libs', 'node_layout',
-                          # RC2 S17 review V2: a rig manifest's named waiver of the harness pin (smokes before a cut regeneration)
+                          # A rig manifest's named waiver of the harness pin (smokes before a cut regeneration)
                           'harness_drift'}
 DRIVER_MODES = {'embedded', 'external'}
 LIB_KEYS = {'path', 'sha256', 'exec'}
@@ -56,11 +56,11 @@ PROCESS_ENV = {
     'SNAPSHOT_INTERVAL_MINUTES', 'CLUSTER_NODE', 'CLUSTER_ADDRESSES', 'CLUSTER_PORT_BASE', 'METRICS_PORT',
     'SETTLEMENT_JOURNAL_ENABLED', 'SETTLEMENT_JOURNAL_DIR', 'SETTLEMENT_JOURNAL_ARCHIVE_BIND', 'ASSETS_NODE_PORT',
     'ASSETS_AUTH_KEYS', 'AE_AUTH_CREDENTIAL',
-    # RC2 S15: the ME builds its engine config from the replicated EngineConfig record, not from env knobs (RUN:158)
+    # The ME builds its engine config from the replicated EngineConfig record, not from env knobs (RUN:158)
     'MATCH_ENGINE_FROM_CONFIG',
     'PROJECTOR_POSTGRES_URL', 'PROJECTOR_POSTGRES_USER', 'PROJECTOR_POSTGRES_PASSWORD', 'PROJECTOR_AE_JOURNAL_ARCHIVES',
     'PROJECTOR_LOCAL_HOST', 'PROJECTOR_METRICS_PORT',
-    # RC2 S17 W2: assets c68d163 ProjectorDriver (PROJECTOR_DRIVER_MODE embedded|external, strict; external reads AERON_DIR)
+    # Assets c68d163 ProjectorDriver (PROJECTOR_DRIVER_MODE embedded|external, strict; external reads AERON_DIR)
     'PROJECTOR_DRIVER_MODE',
     # ct-forwarder strict env (FC:156-265). ME_AUTH_CREDENTIAL is NOT here: a manifest's credentials.me names reach
     # processes through allowed_env() (validate_core_manifest refuses a credentials.me name that is in this set).
@@ -71,27 +71,27 @@ PROCESS_ENV = {
     'BRIDGE_REPLAY_STREAM', 'BRIDGE_JOURNAL_MTU', 'BRIDGE_LOCAL_HOST', 'BRIDGE_DRIVER_MODE', 'BRIDGE_DRIVER_DIR',
     'BRIDGE_DRIVER_TIMEOUT_MS', 'BRIDGE_AE_CLUSTER_ADDRESSES', 'BRIDGE_AE_PORT_BASE', 'BRIDGE_AE_EGRESS_ENDPOINT',
     'BRIDGE_INSTANCE_ID', 'BRIDGE_HTTP_BIND',
-    # the staged aeronmd (contract 5.2): deleted on start and shutdown so a restart never attaches to a dead driver
+    # the staged aeronmd: deleted on start and shutdown so a restart never attaches to a dead driver
     'AERON_DIR_DELETE_ON_START', 'AERON_DIR_DELETE_ON_SHUTDOWN', 'LD_LIBRARY_PATH',
     'CORE_AE_ADDRESSES', 'CORE_AE_PORT_BASE', 'CORE_LOCAL_HOST'}
-# Only `execute` on the probe container may carry these (the pinned T1 drivers, contract 5.1). The values are
+# Only `execute` on the probe container may carry these (the pinned T1 drivers). The values are
 # session secrets except T1_ME_MARKETS and T1_LOCAL_HOST. T1_BRIDGE_KEY, T1_TAP_KEY and T1_ME_FORWARDER_KEY are
 # never set: the via-bridge genesis needs no bridge key and the capture/resend verbs are not run from the probe.
 PROBE_ENV = {'T1_ADMIN_KEY', 'T1_TOOL_KEY', 'T1_GATEWAY_KEY', 'T1_ME_ADMIN_KEY', 'T1_ME_MARKETS', 'T1_LOCAL_HOST'}
-# D-S15-11 / PO-8: the two names the C++ binaries require (no default, DT:28-35) and the one value the fixture
+# The two names the C++ binaries require (no default, DT:28-35) and the one value the fixture
 # passes. It is the client's liveness bound on its own media driver, not an election, heartbeat or session timeout.
 DRIVER_TIMEOUT_EXEMPT = {'FWD_DRIVER_TIMEOUT_MS': '5000', 'BRIDGE_DRIVER_TIMEOUT_MS': '5000'}
 IMAGE_ENV = {'PATH', 'JAVA_HOME', 'JAVA_VERSION', 'LANG', 'LANGUAGE', 'LC_ALL', 'HOME', 'TZ'}
 TIMEOUT_WORDS = re.compile(r'TIMEOUT|HEARTBEAT|ELECTION|LIVENESS', re.IGNORECASE)
 JVM_TIMEOUT = re.compile(r'-D\S*(timeout|heartbeat|election|liveness)', re.IGNORECASE)
 
-# RC2 S16 5.3: the engine container's staged driver. driver.properties is a byte copy of me/deploy/media-driver/driver.properties
+# The engine container's staged driver. driver.properties is a byte copy of me/deploy/media-driver/driver.properties
 # (c53dd20) and driver-dev.properties the overlay the launch-driver.sh dev profile applies (LD:19-20, SHARED threading and
-# backoff idles: the engine member has one CPU, 3.4). Nothing else, nothing missing.
+# backoff idles: the engine member has one CPU). Nothing else, nothing missing.
 ENGINE_LIBS = {'aeronmd', 'libaeron_driver.so', 'libaeron.so', 'driver.properties', 'driver-dev.properties'}
 # The embedded driver overrides the external driver must equal (MEC:221-236, ME AeronCluster.launchWithEmbeddedDriver; the AE
 # context AEC:205-214 sets the same values except the two untethered timeouts, which only the ME codes). driverTimeoutMs(500)
-# is a client setting and has no driver counterpart. sparse.file=false is DP's own pin (the contract 5.3 list).
+# is a client setting and has no driver counterpart. sparse.file=false is DP's own pin.
 ENGINE_DRIVER_PROPERTIES = {
     'aeron.mtu.length': '8192', 'aeron.term.buffer.length': '16m', 'aeron.ipc.term.buffer.length': '16m',
     'aeron.term.buffer.sparse.file': 'false', 'aeron.socket.so_sndbuf': '4m', 'aeron.socket.so_rcvbuf': '4m',
@@ -100,23 +100,23 @@ ENGINE_DRIVER_PROPERTIES = {
     'aeron.untethered.resting.timeout': '100ms'}
 DEV_OVERLAY_KEYS = {'aeron.threading.mode', 'aeron.conductor.idle.strategy', 'aeron.sender.idle.strategy',
                     'aeron.receiver.idle.strategy', 'aeron.shared.idle.strategy', 'aeron.sharednetwork.idle.strategy'}
-# The eleven S16 manifests (mk_manifests.py). The kind is pinned in the manifest and is the file name's prefix
+# The eleven base manifests (mk_manifests.py). The kind is pinned in the manifest and is the file name's prefix
 # ("<kind>--<tag>.json"), so a guard keyed on it cannot be satisfied by renaming a file.
-S16_KINDS = {'s16', 's16-ext', 's16-embedded', 's16-n1', 's16-a03', 's16-a03-embedded', 's16-a05', 's16-a05-embedded',
+BASE_KINDS = {'s16', 's16-ext', 's16-embedded', 's16-n1', 's16-a03', 's16-a03-embedded', 's16-a05', 's16-a05-embedded',
              's16-red-a03', 's16-red-a04', 's16-ctl-edk-cnctimeout'}
-# RC2 S17 W2 (contract 5.3): the s17 kinds, derived from the cut manifest by ``mk_manifests.py --cut``. The RED and A03 kinds
+# The s17 kinds, derived from the cut manifest by ``mk_manifests.py --cut``. The RED and A03 kinds
 # stage negative targets of a test-config build of the cut's cluster-tools commit.
-S17_KINDS = {'s17', 's17-ext', 's17-embedded', 's17-n1', 's17-xver', 's17-xver-ext', 's17-act', 's17-rollback', 's17-a05',
+CUT_KINDS = {'s17', 's17-ext', 's17-embedded', 's17-n1', 's17-xver', 's17-xver-ext', 's17-act', 's17-rollback', 's17-a05',
              's17-a05-embedded', 's17-a05-keep', 's17-a05-reverse', 's17-ctl-edk-cnctimeout',
              's17-a03', 's17-a03-embedded', 's17-red-a03', 's17-red-a04', 's17-red1', 's17-red2'}
-KINDS = S16_KINDS | S17_KINDS
+KINDS = BASE_KINDS | CUT_KINDS
 EDK_CNCTIMEOUT_KIND = 's16-ctl-edk-cnctimeout'
 EDK_CNCTIMEOUT_KINDS = {EDK_CNCTIMEOUT_KIND, 's17-ctl-edk-cnctimeout'}
-ENGINE_DRIVER_SKIP_MEMBERS = ('ae0', 'me0')          # 8.4 cnc_timeout_loud: one AE member and one ME member
+ENGINE_DRIVER_SKIP_MEMBERS = ('ae0', 'me0')          # cnc_timeout_loud: one AE member and one ME member
 NC_TARGET = re.compile(r'ct_(forwarder|bridge)_nc_[a-z0-9_]+')
 CMAKE_TARGET = re.compile(r'[A-Za-z0-9_.-]{1,64}')
-A03_NC_TARGET = 'ct_forwarder_nc_norelease'           # 20.1 line 2 (PO): A03 phase 1 only
-# RC2 S17 W6 fix round items 3/4: build A (ct 2be3a19, the sealed S15 bin-s15 pinned in R10/old-artifacts.sha256) predates the
+A03_NC_TARGET = 'ct_forwarder_nc_norelease'           # A03 phase 1 only
+# Build A (ct 2be3a19, pinned in the old-artifact pins) predates the
 # /health "build" field: its /health format strings have no "build" key (the cut's ct-forwarder/ct-bridge end in
 # ``"build":"%s"``). Its identity is its pinned sha256 alone. Keyed by those exact bytes, so no other binary may omit the field.
 HEALTH_BUILD_ABSENT = {
@@ -134,13 +134,13 @@ def health_build_expected(entry):
     return entry.get('source_sha')
 
 
-# S16 20.1 line 2 (PO), a dated exception to "negative builds never share a manifest with build B": the A03 kinds of S16 and
-# of the S17 cut (mk_manifests KINDS / KINDS17, slot plan A03). RC2 S17 W6 fix round item 1: the runner keyed it on 's16-a03'.
+# A dated exception to "negative builds never share a manifest with build B": the A03 kinds of the base set and
+# of the cut (mk_manifests KINDS / CUT_KINDS, slot plan A03). The runner keyed it on 's16-a03'.
 A03_KINDS = {'s16-a03', 's16-a03-embedded', 's17-a03', 's17-a03-embedded'}
 
 
 def a03_phase1_declared(manifest):
-    """True when ``manifest`` declares the A03 phase-1 swap of S16 20.1 line 2 and nothing more: an A03 kind, both forwarder
+    """True when ``manifest`` declares the A03 phase-1 swap and nothing more: an A03 kind, both forwarder
     slots on ``forwarder_b`` = ``ct_forwarder_nc_norelease``, build A (a real build) staged as ``forwarder`` for the
     ``replace_slot`` swap, both bridges on ``bridge`` and no ``bridge_b``."""
     if manifest.get('manifest_kind') not in A03_KINDS:
@@ -215,7 +215,7 @@ def parse_properties(text, what):
 
 
 def check_driver_properties(properties_text, overlay_text):
-    """5.2 / 5.3: the pinned external driver properties equal the embedded overrides (a drift is a Violation), and the dev
+    """The pinned external driver properties equal the embedded overrides (a drift is a Violation), and the dev
     overlay sets only threading and idle keys, SHARED threading, never a pinned value."""
     props = parse_properties(properties_text, 'driver.properties')
     drift = sorted(k for k, v in ENGINE_DRIVER_PROPERTIES.items() if k not in props or aeron_value(props[k]) != aeron_value(v))
@@ -227,7 +227,7 @@ def check_driver_properties(properties_text, overlay_text):
     if extra:
         raise Violation('driver-dev.properties may set only threading and idle keys; refused ' + ', '.join(extra))
     if overlay.get('aeron.threading.mode') != 'SHARED':
-        raise Violation('driver-dev.properties must set aeron.threading.mode=SHARED (the member has one CPU, 3.4)')
+        raise Violation('driver-dev.properties must set aeron.threading.mode=SHARED (the member has one CPU)')
     return props, overlay
 
 
@@ -257,7 +257,7 @@ def validate_engine_driver(manifest):
 
 
 def validate_projector_driver(manifest):
-    """RC2 S17 W2 (W10, PO-11 (a)): the money projector's driver mode, the same rules as the engines' (an external projector
+    """The money projector's driver mode, the same rules as the engines' (an external projector
     stages the pinned aeronmd set and attaches to it at AERON_DIR; an embedded one stages nothing and never sets AERON_DIR)."""
     _validate_driver_block(manifest, 'projector_driver', 'projector_libs', 'an embedded projector')
 
@@ -268,7 +268,7 @@ def _target(manifest, name):
 
 
 def validate_build_b(manifest, path):
-    """5.2 by manifest kind (S16 manifests carry ``manifest_kind``; older manifests have none and keep the S15 rules)."""
+    """Build B rules by manifest kind (kinded manifests carry ``manifest_kind``; older manifests have none and keep the old rules)."""
     for name in OPTIONAL_BINARIES:
         entry = manifest['artifacts'].get(name)
         if entry is not None and 'target' in entry and not CMAKE_TARGET.fullmatch(str(entry['target'])):
@@ -292,15 +292,15 @@ def validate_build_b(manifest, path):
         for name in staged:
             if NC_TARGET.fullmatch(_target(manifest, name)):
                 raise Violation(f'an A05 manifest stages the negative build {_target(manifest, name)} as {name}: build B is a '
-                                'real ct build (3.2)')
-    elif rest.startswith('red'):         # S16 red-a03/red-a04, S17 red1/red2
+                                'real ct build')
+    elif rest.startswith('red'):         # red-a03/red-a04, red1/red2
         for name in staged:
             if not NC_TARGET.fullmatch(_target(manifest, name)):
-                raise Violation(f'a RED manifest stages the real build {_target(manifest, name)} as {name} (8.1, 8.2)')
+                raise Violation(f'a RED manifest stages the real build {_target(manifest, name)} as {name}')
     elif rest.startswith('a03'):
         if staged != ['forwarder_b'] or _target(manifest, 'forwarder_b') != A03_NC_TARGET or manifest['artifacts'].get('forwarder') is None:
             raise Violation(f'an A03 manifest stages {A03_NC_TARGET} as forwarder_b and build A as forwarder, nothing else '
-                            '(20.1 line 2)')
+                            '(the A03 drain is the forwarder swap)')
     elif staged:
         raise Violation(f'manifest kind {kind} stages no build B: ' + ', '.join(staged))
 
@@ -314,21 +314,21 @@ def check_build_b(manifest, scenario_name):
         target = entry.get('target')
         if scenario_name.startswith('core-drill-a05-'):
             if target is None:
-                raise Violation(f'{name} needs a pinned CMake target for an A05 drill (5.2)')
+                raise Violation(f'{name} needs a pinned CMake target for an A05 drill')
             if NC_TARGET.fullmatch(target):
-                raise Violation(f'an A05 drill refuses the negative build {target} as {name} (5.2)')
+                raise Violation(f'an A05 drill refuses the negative build {target} as {name}')
         elif scenario_name.startswith('core-red-') and target is not None and not NC_TARGET.fullmatch(target):
-            raise Violation(f'a RED runs a negative build; refused the real build {target} as {name} (5.2)')
+            raise Violation(f'a RED runs a negative build; refused the real build {target} as {name}')
 
 
 def check_engine_driver_skip(manifest, path, value):
-    """5.2: ENGINE_DRIVER_SKIP=1 (the harness environment; the wrapper of the two members then starts no aeronmd) only on the
+    """ENGINE_DRIVER_SKIP=1 (the harness environment; the wrapper of the two members then starts no aeronmd) only on the
     edk-cnctimeout control manifest. Returns the members whose driver is skipped (empty when unset)."""
     if value is None or value == '':
         return ()
     kind = manifest.get('manifest_kind')
     if kind not in EDK_CNCTIMEOUT_KINDS or Path(path).name.split('--')[0].removesuffix('.json') != kind:
-        raise Violation(f'ENGINE_DRIVER_SKIP is refused outside {EDK_CNCTIMEOUT_KIND}.json (5.2); manifest {Path(path).name}')
+        raise Violation(f'ENGINE_DRIVER_SKIP is refused outside {EDK_CNCTIMEOUT_KIND}.json; manifest {Path(path).name}')
     if manifest.get('engine_driver') != 'external':
         raise Violation('ENGINE_DRIVER_SKIP needs engine_driver external')
     if value != '1':
@@ -350,12 +350,12 @@ def validate_cpus(manifest, cpu_count):
             raise Violation('invalid cpu set for ' + role)
     missing = [r for r in ENGINES if r not in by_role]
     if missing:
-        raise Violation('D20: every engine member must be pinned to its own cpuset: ' + ', '.join(missing))
+        raise Violation('every engine member must be pinned to its own cpuset: ' + ', '.join(missing))
     used = set()
     for role in ENGINES:
         cpus = set(by_role[role])
         if cpus & used:
-            raise Violation('D20: engine cpusets must be pairwise disjoint: ' + role)
+            raise Violation('engine cpusets must be pairwise disjoint: ' + role)
         if not cpus <= set(cpu_set):
             raise Violation('engine cpuset outside the fixture cpu_set: ' + role)
         used |= cpus
@@ -369,7 +369,7 @@ def validate_cpus(manifest, cpu_count):
 
 
 def validate_role_limits(limits):
-    """Optional per-role overrides of shm_mb / memory_mb (RC2 S15 amendment A6: an ME member needs 1.5 GiB of tmpfs)."""
+    """Optional per-role overrides of shm_mb / memory_mb (an ME member needs 1.5 GiB of tmpfs)."""
     for key in ('shm_mb_by_role', 'memory_mb_by_role'):
         for role, value in (limits.get(key) or {}).items():
             if role not in ROLES:
@@ -391,9 +391,9 @@ def validate_core_manifest(manifest, manifest_path, cpu_count=None, profiles=jou
             raise Inconclusive('incomplete core manifest: ' + ', '.join(sorted(missing)))
         unknown = set(manifest) - MANIFEST_KEYS - OPTIONAL_MANIFEST_KEYS
         if unknown:
-            raise Violation('D20: manifest keys are an allowlist; refused ' + ', '.join(sorted(unknown)))
+            raise Violation('manifest keys are an allowlist; refused ' + ', '.join(sorted(unknown)))
         if manifest['timeouts'] != 'production':
-            raise Violation('D20: the core fixture runs production election/heartbeat/session timeouts only')
+            raise Violation('the core fixture runs production election/heartbeat/session timeouts only')
         if not re.fullmatch(r'sha256:[0-9a-f]{64}', manifest['image']):
             raise Violation('runtime image must be immutable')
         path = Path(manifest_path).absolute()
@@ -404,10 +404,10 @@ def validate_core_manifest(manifest, manifest_path, cpu_count=None, profiles=jou
             raise Violation('single-host containers cannot prove host HA')
         net = ipaddress.ip_network(manifest['network']['subnet'])
         private = [ipaddress.ip_network(n) for n in ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']]
-        # D18: archive control ports (AE and ME journal) are reachable only inside this internal network.
+        # Archive control ports (AE and ME journal) are reachable only inside this internal network.
         if (net.version != 4 or net.prefixlen != 24 or not any(net.subnet_of(n) for n in private)
                 or manifest['network']['internal'] is not True):
-            raise Violation('fixture needs its own internal RFC1918 /24 network (D18: no archive port leaves it)')
+            raise Violation('fixture needs its own internal RFC1918 /24 network: no archive port leaves it')
         nodes = manifest['nodes']
         legacy = LEGACY_ROLES & set(nodes)
         if legacy:
@@ -472,18 +472,18 @@ def validate_core_manifest(manifest, manifest_path, cpu_count=None, profiles=jou
             _lib(lib, 'probe_libs ' + name, changed='probe input changed: probe_libs ' + name)
         drivers = [k for k in ('t1_me_driver', 't1_core_driver') if k in manifest]
         if drivers and not (manifest.get('probe_libs') or {}).get('aeronmd'):
-            # review F8: the T1 drivers attach to the probe's own aeronmd (3.3); without it the probe would idle and the
+            # The T1 drivers attach to the probe's own aeronmd; without it the probe would idle and the
             # drivers fail at me_genesis with an opaque Aeron error, after every container started
             raise Violation(f'{" and ".join(drivers)} pinned without probe_libs.aeronmd: the T1 drivers need the probe\'s '
-                            'staged media driver (contract 3.3)')
+                            'staged media driver')
         credentials = manifest['credentials']
         if credentials.get('ae') != AE_CREDENTIAL_ENV:
-            raise Violation('AE credentials must use ASSETS_AUTH_KEYS / AE_AUTH_CREDENTIAL (RC1 K6)')
+            raise Violation('AE credentials must use ASSETS_AUTH_KEYS / AE_AUTH_CREDENTIAL')
         me = credentials.get('me') or {}
         if me.get('mode') not in ME_AUTH_MODES:
             raise Violation('ME credential mode must be declared: enforced | not_enforced_by_artifact')
         if require_me_enforced and me['mode'] != 'enforced':
-            raise Violation('ME credential mode must be enforced for drills: an S6 ME refuses a credential-less session')
+            raise Violation('ME credential mode must be enforced for drills: an authenticating ME refuses a credential-less session')
         for key in ['keys_env', 'credential_env']:
             if not re.fullmatch(r'[A-Z][A-Z0-9_]{2,63}', me.get(key) or ''):
                 raise Violation('ME credential environment names must be explicit')
@@ -504,26 +504,26 @@ def validate_core_manifest(manifest, manifest_path, cpu_count=None, profiles=jou
 
 
 def assert_production_timeouts(environment, allowed=PROCESS_ENV):
-    """Fixture-side guard (D20): a process receives only allowlisted names, and no value carries a timeout."""
+    """Fixture-side guard: a process receives only allowlisted names, and no value carries a timeout."""
     for key, value in environment.items():
         if key not in allowed:
-            raise Violation('D20: environment names are an allowlist; refusing ' + key)
+            raise Violation('environment names are an allowlist; refusing ' + key)
         exempt = key in DRIVER_TIMEOUT_EXEMPT and type(value) is str and value == DRIVER_TIMEOUT_EXEMPT[key]
         if (TIMEOUT_WORDS.search(key) and not exempt) or JVM_TIMEOUT.search(str(value)):
-            raise Violation('D20: refusing to pass a timeout setting to a fixture process: ' + key)
+            raise Violation('refusing to pass a timeout setting to a fixture process: ' + key)
 
 
 
 def check_image_config(config):
-    """D20 for the pinned image itself: its Env names are allowlisted and nothing in Env, Entrypoint or
+    """The same allowlist for the pinned image itself: its Env names are allowlisted and nothing in Env, Entrypoint or
     Cmd carries a JVM timeout override. Returns the env NAMES for the ownership record."""
     env = dict(entry.split('=', 1) for entry in config.get('Env') or [])
     unknown = set(env) - IMAGE_ENV
     if unknown:
-        raise Violation('D20: pinned image carries non-allowlisted environment ' + ', '.join(sorted(unknown)))
+        raise Violation('pinned image carries non-allowlisted environment ' + ', '.join(sorted(unknown)))
     for text in list(env.values()) + list(config.get('Entrypoint') or []) + list(config.get('Cmd') or []):
         if JVM_TIMEOUT.search(text):
-            raise Violation('D20: pinned image carries a timeout override: ' + text)
+            raise Violation('pinned image carries a timeout override: ' + text)
     return sorted(env)
 
 
@@ -531,7 +531,7 @@ GENESIS_DERIVATION = 'per-run: odd(sha256(run_id) mod 2^61 + life - 1), in [1, 2
 
 
 def derive_genesis_id(run_id, life=1):
-    """RC2 S17 W3 (coordinator): the ME/core genesisId of one run, derived from its run_id at run time (deterministic, odd,
+    """The ME/core genesisId of one run, derived from its run_id at run time (deterministic, odd,
     in [1, 2^62), distinct per life), so two runs of one kind (siblings that differ only in run_id) never repeat an id."""
     import hashlib
     if type(life) is not int or life < 1:
@@ -541,7 +541,7 @@ def derive_genesis_id(run_id, life=1):
 
 
 def child_manifest(manifest, parent, tag):
-    """RC2 S17 (contract 5.4, 20.1 line 20): a child of ``manifest`` with a fresh run identity, written under ``parent`` as
+    """A child of ``manifest`` with a fresh run identity, written under ``parent`` as
     ``<kind>--<run_id>-<tag>.json`` when the manifest carries a kind (the name ``validate_build_b`` checks against
     ``manifest_kind``, as mk_manifests.py writes them), else ``<run_id>-<tag>-manifest.json`` as before. Returns (path, child)."""
     import uuid

@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Explicit core-topology probe preparation (RC2 S14, S15). Never called by run.sh; never rebuilds product jars.
+"""Explicit core-topology probe preparation. Never called by run.sh; never rebuilds product jars.
 
 CoreProbe compiles against the frozen AE jar, JournalProbe against the frozen ME jar. Both run in the
 probe container with that same frozen jar on the class path, so the probe jar carries only its own
 classes. Copy the objects from probe-manifest.json into the core manifest (``core_probe``,
 ``journal_probe``).
 
-RC2 S15 (contract 3.3): ``--ct-dir <cluster-tools>`` also compiles the two T1 drivers, T1MeDriver (against the ME
+``--ct-dir <cluster-tools>`` also compiles the two T1 drivers, T1MeDriver (against the ME
 jar) and T1CoreDriver (against the AE jar), FROM ``<ct>/app/forwarder/it/`` and never copies them into tools; the
 manifest keys ``t1_me_driver`` / ``t1_core_driver`` pin each source file's sha256, and ``ct_head`` records the
-cluster-tools commit the sources came from. ``--ct-dir`` is optional so the S14 call keeps working.
+cluster-tools commit the sources came from. ``--ct-dir`` is optional so the probe-only call keeps working.
 """
 import argparse
 import hashlib

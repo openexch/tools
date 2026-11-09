@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Per-run session keys for the core topology (harness 2.7 item 2, critic G2/G31).
+"""Per-run session keys for the core topology.
 
-Every run mints fresh 32-byte secrets. Both tables use the K6 v1 key spec of the cluster-kit
-authenticator (RC2 S6): ``keyId:CLASS:secretHex::users=*`` entries joined by ``;``. Decision A16: the users
+Every run mints fresh 32-byte secrets. Both tables use the v1 key spec of the cluster-kit
+authenticator: ``keyId:CLASS:secretHex::users=*`` entries joined by ``;``. The users
 field is mandatory and ``users=*`` is the only any-user form (a key with no users field fails the load);
 every fixture principal is any-user. Clients receive one ``keyId:CLASS:secretHex`` credential (unchanged).
-The ME table holds classes FORWARDER and ADMIN (RC2 L5). Evidence carries key ids and classes
+The ME table holds classes FORWARDER and ADMIN. Evidence carries key ids and classes
 only; ``secrets()`` is what the fixture redacts from every retained log.
 """
 import secrets
@@ -15,7 +15,7 @@ ME_CLASSES = {'FORWARDER', 'ADMIN'}
 
 # (principal, cluster, class, keyId). keyIds are fixed per principal so evidence is comparable across
 # runs; only the secrets change. shadow0 is a reserved slot: SessionClass.REPLICA (7) arrives with the
-# RC2 S1 wire freeze, and an AE table naming an unknown class refuses to load, so no key is minted.
+# ME journal schema 4 wire freeze, and an AE table naming an unknown class refuses to load, so no key is minted.
 PRINCIPALS = [
     ('probe-gateway', 'ae', 'GATEWAY', 11), ('probe-admin', 'ae', 'ADMIN', 12), ('probe-tool', 'ae', 'TOOL', 13),
     ('probe-forwarder', 'ae', 'FORWARDER', 14),
@@ -23,7 +23,7 @@ PRINCIPALS = [
     ('bridge0', 'ae', 'BRIDGE', 31), ('bridge1', 'ae', 'BRIDGE', 32),
     ('fwd0', 'me', 'FORWARDER', 121), ('fwd1', 'me', 'FORWARDER', 122), ('probe-admin', 'me', 'ADMIN', 112),
 ]
-RESERVED = {'shadow0': 'REPLICA class (7) does not exist before money-schema v7 (RC2 S1); RCS S9 provisions it'}
+RESERVED = {'shadow0': 'REPLICA class (7) does not exist before money-schema v7; a later release provisions it'}
 
 
 class KeyRing:

@@ -39,7 +39,7 @@ import java.util.function.Consumer;
 import java.util.function.Predicate;
 
 /**
- * RC2 S14 core probe: the fixture's only client of the OMS + ledger core (money-schema v6, RC1 a9a865d).
+ * Core probe: the fixture's only client of the OMS + ledger core (money-schema v6, assets a9a865d).
  * Compiled separately against the frozen AE jar and run with it on the class path; never linked into a
  * product artifact. One verb per process, one authenticated session, one JSON line on stdout (the LAST
  * line starting with '{' is the verb's answer; other lines are human-readable summaries).
@@ -49,10 +49,10 @@ import java.util.function.Predicate;
  * The credential's class must be one the verb allows; the core checks it again. {@code story script=funding}
  * talks to no cluster and needs none of them.</p>
  *
- * <p>RC2 S15 (contract sections 5.7, 6, 6.1): {@code story} is the seeded functional story driver (one GATEWAY
+ * <p>{@code story} is the seeded functional story driver (one GATEWAY
  * session for the whole load, open loop, paced by wall clock, the UNKNOWN resolution pass); {@code tap} keeps
  * its TOOL session across leader changes and session loss and reports the dispatchSeq density; {@code
- * order-dump} keeps every page (F-S15-24 / W0 amendment A13).</p>
+ * order-dump} keeps every page.</p>
  *
  * <p>Exit codes: 0 answered; 3 no answer before the deadline (outcome UNKNOWN), or a story whose every request
  * stayed UNKNOWN (setup failure); 4 the core refused (the JSON says why); 5 a negative control was NOT refused;
@@ -288,7 +288,7 @@ public final class CoreProbe {
     private int unauthenticated() {
         final CoreCredentials good = CoreCredentials.fromSpec(env("AE_AUTH_CREDENTIAL"));
         final byte[] secret = good.secret();
-        // legacy_none: what every pre-RC1 client (OMS, legacy bridge, today's v1 fixture) presents: nothing.
+        // legacy_none: what every older client (OMS, legacy bridge, the v1 fixture) presents: nothing.
         final io.aeron.security.CredentialsSupplier presented = arg("mode").equals("legacy_none")
                 ? new io.aeron.security.NullCredentialsSupplier() : (switch (arg("mode")) {
             case "unknown_key" -> new CoreCredentials(good.sessionClass(), 999_999, secret);
@@ -365,7 +365,7 @@ public final class CoreProbe {
     }
 
     /**
-     * One step of a long-lived session (tap, story): polls egress and heals the session (S15 5.7 rule 1): a
+     * One step of a long-lived session (tap, story): polls egress and heals the session: a
      * NewLeaderEvent re-registers the egress mask on the new leader; a closed session is reconnected (same
      * credentials, same driver) and re-registered. Every transition is a {@link Continuity} row with its time.
      */
@@ -435,7 +435,7 @@ public final class CoreProbe {
     private int coreConfig() {
         final CoreConfigEncoder e = new CoreConfigEncoder().wrapAndApplyHeader(buffer, 0, headerEncoder)
                 .correlationId(listener.expectCorrelation = corr()).configVersion(num("version")).behaviorVersion(num("behavior"))
-                // RC2 S17 W3 (5.2 (iii)): the genesisId is explicit (the partial-genesis and finish options send the
+                // The genesisId is explicit (the partial-genesis and finish options send the
                 // driver's id); before, the field was left unset
                 .genesisId(Long.decode(arg("genesis")));
         final CoreConfigEncoder.MarketsEncoder m = e.marketsCount(Market.ALL.length);
@@ -517,7 +517,7 @@ public final class CoreProbe {
         int pages = 0;
         listener.reset();
         do {
-            listener.nextPage();   // F-S15-24: rows accumulate over pages; reset() cleared them, so only the last page was printed
+            listener.nextPage();   // Rows accumulate over pages; reset() cleared them, so only the last page was printed
             offer(HEADER + new RequestOrderSnapshotEncoder().wrapAndApplyHeader(buffer, 0, headerEncoder)
                     .correlationId(listener.expectCorrelation = corr()).userId(0).fromOrderId(from).encodedLength());
             await(t -> t == OrderSnapshotEndDecoder.TEMPLATE_ID || t == OrderRejectDecoder.TEMPLATE_ID);
@@ -545,7 +545,7 @@ public final class CoreProbe {
     }
 
     /**
-     * The money-dump answer. S16 W2 (contract 3.3): the four v7 FeedPositionReport fields the decoder already reads past
+     * The money-dump answer. The four v7 FeedPositionReport fields the decoder already reads past
      * are exported as {@code meEpoch} (the ME epoch the core is bound to), {@code lastAppliedJournalSeq} (the feed
      * cursor), {@code feedHalted} and {@code haltReason} (the FeedHaltReason name); the fixture maps them to
      * {@code core.bound_me_epoch / feed_cursor / feed_halted / halt_reason}.
@@ -574,11 +574,11 @@ public final class CoreProbe {
     }
 
     /**
-     * The TOOL witness (S15 5.7). Rows go to {@code out} as before (tap kinds dispatch, order_event, admission,
+     * The TOOL witness. Rows go to {@code out} as before (tap kinds dispatch, order_event, admission,
      * order_fault: the sample's read_tap shape is unchanged); session transitions go to {@code sessions}
      * (default {@code <out>.sessions.jsonl}, named in the summary). At exit: one line
      * {@code TAP first=F last=L rows=N gaps=[[a,b],...]} over the dispatchSeq values seen, then the JSON summary.
-     * The density cannot see a missing TAIL (W0 answer 12): the drill compares {@code last} with the core head
+     * The density cannot see a missing TAIL: the drill compares {@code last} with the core head
      * ({@code pending-dump}), which a TOOL session cannot read.
      */
     private int tap() {
@@ -609,7 +609,7 @@ public final class CoreProbe {
         return 0;
     }
 
-    // ------------------------------------------------------------------ story (S15 section 6)
+    // ------------------------------------------------------------------ story
 
     private int funding(final StoryConfig cfg) throws IllegalArgumentException {
         final List<Map<String, Object>> plan = Story.fundingPlan(cfg);
@@ -746,14 +746,14 @@ public final class CoreProbe {
         void onEvent(long orderId, String kind, String status, long filled);
     }
 
-    /** Arguments of {@code story}, refused when ambiguous (contract C7: unknown script, non-integer seed). */
+    /** Arguments of {@code story}, refused when ambiguous (unknown script, non-integer seed). */
     static final class StoryConfig {
         static final List<String> SCRIPTS = List.of("a01-mix", "a02-lifecycle", "funding", "a03-fill");
         static final List<String> MOMENTS = List.of("iceberg", "replace", "maker_replace", "stop", "ioc_fok", "gtd", "markets");
         static final List<String> HOLDS = List.of("slice1_exhausting_fill", "replace_open:1", "replace_open:2", "replace_open:3");
         static final Set<String> STORY_KEYS = Set.of("script", "seed", "seconds", "rate", "users", "out", "markers", "without",
                 "hold", "gate_dir", "hold_ms", "resolve_gate", "resolve_gate_ms", "ioc_burst_on");
-        /** S16 W2 (contract 5.5, 20.1 lines 2, 3): a03-fill is a rate / fill_s / reopen_s story with no cancels and no seconds=. */
+        /** a03-fill is a rate / fill_s / reopen_s story with no cancels and no seconds=. */
         static final Set<String> A03_KEYS = Set.of("script", "seed", "users", "out", "markers", "rate", "fill_s", "reopen_s",
                 "marker_timeout_s", "signal_dir");
         static final int A03_DEFAULT_RATE = 100;
@@ -761,7 +761,7 @@ public final class CoreProbe {
         static final int A03_DEFAULT_REOPEN_S = 10;
         static final int A03_DEFAULT_MARKER_TIMEOUT_S = 60;
         static final Set<String> FUNDING_KEYS = Set.of("script", "seed", "users", "out", "for");
-        /** Section 0: a functional story stays at or under 200 commands/s; a02 at or under 50/s (section 4). */
+        /** Section 0: a functional story stays at or under 200 commands/s; a02 at or under 50/s. */
         static final int A01_MAX_COMMANDS_PER_S = 200;
         static final int A02_MAX_RATE = 50;
 
@@ -1045,7 +1045,7 @@ public final class CoreProbe {
     }
 
     /**
-     * The seeded story (contract 6, 6.1). Pure scheduling logic: the transport is a {@link StoryPort}, the clock a
+     * The seeded story. Pure scheduling logic: the transport is a {@link StoryPort}, the clock a
      * {@link StoryClock}, so the unit tests run it against a reply stub with a fake clock and no cluster.
      *
      * <p>Open loop: timed rows (every a01 row, the a02 market filler) are queued when due and offered without
@@ -1143,7 +1143,7 @@ public final class CoreProbe {
             checkPerUserCap();
         }
 
-        /** requestId high word: (15 << 40) | script << 32 | seed; the low word is the row id (unique per JVM, W0 answer 11). */
+        /** requestId high word: (15 << 40) | script << 32 | seed; the low word is the row id (unique per JVM). */
         static long requestHigh(final StoryConfig cfg) {
             return (15L << 40) | ((long) (StoryConfig.SCRIPTS.indexOf(cfg.script) + 1) << 32) | cfg.seed;
         }
@@ -1232,7 +1232,7 @@ public final class CoreProbe {
             }
         }
 
-        // ---------------------------------------------------------- a03-fill (S16 W2, contract 5.5 and 20.1 lines 2, 3)
+        // ---------------------------------------------------------- a03-fill
 
         static final int PHASE_NONE = 0;      // not an a03 story: nothing waits
         static final int PHASE_FILL = 1;      // phase 1: non-crossing creates, both forwarders on the no-release build
@@ -1305,7 +1305,7 @@ public final class CoreProbe {
             }
             final boolean beat = signalPoll(now);
             if (cfg.iocBurstOn != null && burstEnded && beat && !clock.exists(cfg.iocBurstOn)) {
-                // S16 W3 (fwdring pauses twice, 20.1 line 12): a marker file deleted after its burst re-arms the next one
+                // A marker file deleted after its burst re-arms the next one
                 burstEnded = false;
                 burstStartNs = -1;
             }
@@ -1432,7 +1432,7 @@ public final class CoreProbe {
 
         /**
          * a02-lifecycle (6, items 1-7). Moments run in order on market 1, each priced in its own band so a leftover of
-         * one cannot trade with the next (all inside the ME band 0.01..100.00 and the 50 % collar, W0 answer 7);
+         * one cannot trade with the next (all inside the ME band 0.01..100.00 and the 50 % collar);
          * every moment cancels what it left resting. The seed shifts every market-1 price by 0..9 cents and prices
          * the filler. Users: A = users[0] buys, B = users[1] sells.
          */
@@ -1487,7 +1487,7 @@ public final class CoreProbe {
                 final int maker = send(create(m, a, 1, "BUY", "LIMIT_MAKER", "GTC", 8700 * CENT + o, 2 * ONE));
                 await(m, maker, "ack_new", 1);
                 hold(m, "replace_open:3", maker);
-                // the new LIMIT_MAKER leg would cross the ask: REPLACED with ME_REJECTED, old leg kept (W0 answer 7, A8)
+                // the new LIMIT_MAKER leg would cross the ask: REPLACED with ME_REJECTED, old leg kept
                 amend(m, maker, 8800 * CENT + o, 2 * ONE, map("marker", "replace_open", "index", 3));
                 await(m, maker, "replaced", 1);
                 cancel(m, maker);
@@ -1502,12 +1502,12 @@ public final class CoreProbe {
                 // a BUY stop is refused while bestAsk >= stop (OrderEngine.java:397-398): stop above the 95 ask
                 final StoryRow stop = create(m, a, 1, "BUY", "STOP_LOSS", "GTC", 0, ONE);
                 stop.stopPrice = 9600 * CENT + o;
-                stop.budget = 100 * ONE;   // explicit budget (S14 DEFECT-3): the child fills at 98 under it
+                stop.budget = 100 * ONE;   // explicit budget: the child fills at 98 under it
                 final int s = send(stop);
                 await(m, s, "acked", 0);
                 final int high = send(create(m, b, 1, "SELL", "LIMIT", "GTC", 9800 * CENT + o, ONE));
                 await(m, high, "ack_new", 1);
-                // taking the 95 ask moves bestAsk to 98 >= stop: the forwarder's MarketTick fires the stop (S13)
+                // taking the 95 ask moves bestAsk to 98 >= stop: the forwarder's MarketTick fires the stop
                 final StoryRow trigger = create(m, a, 1, "BUY", "LIMIT", "GTC", 9500 * CENT + o, ONE);
                 trigger.markerOnSend = map("marker", "stop_trigger_sent");
                 final int t = send(trigger);
@@ -1559,7 +1559,7 @@ public final class CoreProbe {
             }
         }
 
-        /** RequestTable.PER_USER_CAP (256 retained requests per user, TTL 15 min, W0 F-S15-28): refused before sending. */
+        /** RequestTable.PER_USER_CAP (256 retained requests per user, TTL 15 min): refused before sending. */
         private void checkPerUserCap() {
             final Map<Long, Integer> perUser = new TreeMap<>();
             for (final Timed t : timeline) {
@@ -2062,7 +2062,7 @@ public final class CoreProbe {
         }
     }
 
-    // ------------------------------------------------------------------ continuity (S15 5.7)
+    // ------------------------------------------------------------------ continuity
 
     /** dispatchSeq (or eventSeq) values seen by a tap; density over [first, last], duplicates counted, kept once. */
     static final class SeqDensity {
@@ -2145,7 +2145,7 @@ public final class CoreProbe {
         long balanceCorr, holdCorr;
         boolean balancesEnd, holdsEnd, positionSeen, journalEnabled;
         long consumePosition, lastAppliedTradeId;
-        /** v7 FeedPositionReport (S16 W2): the bound ME epoch, the feed cursor and the halt latch. */
+        /** v7 FeedPositionReport: the bound ME epoch, the feed cursor and the halt latch. */
         long meEpoch, lastAppliedJournalSeq;
         boolean feedHalted;
         String haltReason = "NONE";
@@ -2178,7 +2178,7 @@ public final class CoreProbe {
 
         public void onNewLeader(final long clusterSessionId, final long leadershipTermId, final int leaderMemberId,
                                 final String ingressEndpoints) {
-            reregister = true;   // 5.7 rule 1: the egress mask is registered again on the new leader
+            reregister = true;   // the egress mask is registered again on the new leader
             continuity.note("new_leader", map("session", clusterSessionId, "term", leadershipTermId, "leader", leaderMemberId));
         }
 

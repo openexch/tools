@@ -1,6 +1,5 @@
-// Package dist holds the research-based order-flow distributions, ported
-// from tools/binance-replay/distributions.go (kept in sync by copy; the
-// originals cite Gopikrishnan et al. 2000, Bouchaud et al. 2002,
+// Package dist holds the research-based order-flow distributions (they
+// follow Gopikrishnan et al. 2000, Bouchaud et al. 2002,
 // Maslov & Mills 2001, Avellaneda-Stoikov).
 package dist
 
