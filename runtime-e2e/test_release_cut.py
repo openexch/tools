@@ -15,8 +15,10 @@ import zipfile
 
 import release_cut
 
-SHAS = {'assets': 'a' * 40, 'match': 'b' * 40, 'cluster-kit': 'c' * 40, 'cluster-tools': 'd' * 40, 'tools': 'e' * 40}
-TAG = {'match': '1' * 40, 'assets': '2' * 40}
+SHAS = {'core': 'a' * 40, 'match': 'b' * 40, 'cluster-kit': 'c' * 40, 'cluster-tools': 'd' * 40, 'tools': 'e' * 40}
+TAG = {'match': '1' * 40, 'core': '2' * 40}
+CLUSTER, PROJECTOR = 'core-cluster.jar', 'core-projector.jar'      # the core jars of a current (rc2-cut/2) cut
+OLD_SCHEMA = 'rc2-cut/1'        # cuts written before the rename: repo key assets, assets-* jars
 SCHEMA_TEXT = {'money': b'<money v7/>', 'order': b'<order v12/>', 'me_journal': b'<journal v1/>'}
 OLD_SCHEMA_TEXT = {'money': b'<money v4/>', 'order': b'<order v7/>'}
 KIT_PIN = '0.1.12-runtime.20261104.rc2s17w12.g43847fb'
@@ -41,7 +43,7 @@ def engine_jar(name, kit=KIT_PIN, schema_text=SCHEMA_TEXT, marker=b'', aeron='1.
     members = {'MANIFEST': b'jar ' + name.encode() + marker}
     if aeron is not None:                                  # K8 reads the version the jar carries
         members[release_cut.AERON_VERSION_CLASS] = b'\xca\xfe\x01\x00\x06' + aeron.encode() + b'\x01'
-    spec = release_cut.PRODUCT[name]
+    spec = {**release_cut.product(OLD_SCHEMA), **release_cut.PRODUCT}[name]
     for schema, member in spec['schemas'].items():
         if schema in schema_text:
             members[member] = schema_text[schema]
@@ -53,17 +55,19 @@ def engine_jar(name, kit=KIT_PIN, schema_text=SCHEMA_TEXT, marker=b'', aeron='1.
 class World:
     """A cut with every product artifact, its build record (two builds of each jar), the harness and the pins."""
 
-    def __init__(self, root):
+    def __init__(self, root, schema=release_cut.SCHEMA):
         self.root = Path(root)
         self.pins = {}
         self.record = {}
         art = {}
-        for name in ('match-cluster.jar', 'assets-cluster.jar', 'assets-projector.jar'):
+        lay = release_cut.layout(schema)
+        shas = {**{k: v for k, v in SHAS.items() if k != 'core'}, lay['repo']: SHAS['core']}
+        for name in ('match-cluster.jar', lay['cluster'], lay['projector']):
             data = engine_jar(name)
-            repo = release_cut.PRODUCT[name]['repo']
+            repo = release_cut.product(schema)[name]['repo']
             p = self.put('artifacts/' + name, data)
-            self.build(name, repo, SHAS[repo], data, 2)
-            art[name] = self.entry(p, SHAS[repo], 'rebuild-equal')
+            self.build(name, repo, shas[repo], data, 2)
+            art[name] = self.entry(p, shas[repo], 'rebuild-equal')
         ct = SHAS['cluster-tools']
         for name, schemas in (('ct-forwarder', ('money', 'order')), ('ct-bridge', ('money', 'me_journal'))):
             data = b'ELF ' + name.encode() + b' ' + ct.encode() + b' ' + b' '.join(SCHEMAS[s].encode() for s in schemas)
@@ -89,8 +93,8 @@ class World:
             harness[key] = {'path': str(p), 'sha256': h(p.read_bytes()), 'kind': 'harness', 'driver_mode': 'external'}
         self.write_record()
         self.m = {
-            'schema': release_cut.SCHEMA, 'class': 'product', 'cut_id': 'rc2-cut-1', 'created': '2026-11-04T00:00:00Z',
-            'harness_commit': SHAS['tools'], 'repos': dict(SHAS), 'schemas': dict(SCHEMAS),
+            'schema': schema, 'class': 'product', 'cut_id': 'rc2-cut-1', 'created': '2026-11-04T00:00:00Z',
+            'harness_commit': SHAS['tools'], 'repos': shas, 'schemas': dict(SCHEMAS),
             'substrate': {'aeron': {k: '1.53.1' for k in release_cut.SUBSTRATE_AERON}, 'kit_pin': KIT_PIN,
                           'kit_jar': {'path': str(kp), 'sha256': h(kit), 'source_sha': SHAS['cluster-kit'],
                                       'derivation': 'rebuild-equal', 'tree_dirty': False}, 'sbe': '1.40.1'},
@@ -192,6 +196,64 @@ class PassingCutTest(CheckerBase):
         self.assertIn('K6 genesis.me.behaviorVersion must be 2', out.getvalue())
 
 
+class CutLayoutTest(CheckerBase):
+    """A new cut declares rc2-cut/2 with repo key core and core-* jars; a cut written before the rename (rc2-cut/1, repo key
+    assets, assets-* jars) stays readable as written. Mixing the two is refused."""
+
+    def old_world(self):
+        w = World(Path(self.temp.name) / 'old', OLD_SCHEMA)
+        patch = mock.patch.object(release_cut, 'git_blob', w.blob); patch.start(); self.addCleanup(patch.stop)
+        return w
+
+    def test_a_new_cut_is_rc2_cut_2_with_repo_key_core(self):
+        self.assertEqual(release_cut.SCHEMA, 'rc2-cut/2')
+        self.assertEqual(self.w.m['schema'], 'rc2-cut/2')
+        self.assertIn('core', self.w.m['repos']); self.assertNotIn('assets', self.w.m['repos'])
+        self.assertLessEqual({CLUSTER, PROJECTOR}, set(self.w.m['artifacts']))
+        self.assertEqual(self.check(self.w.m).items, [])
+
+    def test_an_old_cut_is_still_accepted(self):
+        w = self.old_world()
+        self.assertEqual(w.m['schema'], OLD_SCHEMA)
+        self.assertIn('assets', w.m['repos'])
+        self.assertLessEqual({'assets-cluster.jar', 'assets-projector.jar'}, set(w.m['artifacts']))
+        self.assertEqual(release_cut.check(w.m, old_pins=w.pins).items, [])
+
+    def test_an_old_cut_with_the_new_repo_key_or_jar_names_is_refused(self):
+        w = self.old_world()
+        m = copy.deepcopy(w.m); m['repos']['core'] = m['repos'].pop('assets')
+        found = release_cut.check(m, old_pins=w.pins)
+        self.assertIn('K9', found.by_rule())
+        self.assertTrue(any('core' in t for r, t in found.items if r == 'K9' and t.startswith('repos')), found.items)
+        m = copy.deepcopy(w.m); m['schema'] = release_cut.SCHEMA            # assets-* jars under the new schema
+        found = release_cut.check(m, old_pins=w.pins)
+        self.assertIn('K9', found.by_rule())
+        self.assertTrue(any('artifacts: missing' in t and 'core-cluster.jar' in t for _, t in found.items), found.items)
+
+    def test_a_new_cut_with_the_old_repo_key_is_refused(self):
+        m = copy.deepcopy(self.w.m); m['repos']['assets'] = m['repos'].pop('core')
+        self.assertIn('K9', self.check(m).by_rule())
+
+    def test_an_unknown_schema_is_refused(self):
+        m = copy.deepcopy(self.w.m); m['schema'] = 'rc2-cut/3'
+        found = release_cut.check_cut(m, old_pins=self.w.pins)
+        self.assertIn(('K9', "schema must be one of rc2-cut/1, rc2-cut/2, got 'rc2-cut/3'"), found.items)
+
+    def test_core_bridge_is_retired_in_a_new_cut_and_assets_bridge_stays_retired(self):
+        for name in ('core-bridge', 'assets-bridge'):
+            with self.subTest(name=name):
+                m = copy.deepcopy(self.w.m)
+                p = self.w.put(f'old/{name}.jar', name.encode()); self.w.pin(p, TAG['core'], name + '.jar')
+                m['artifacts'][name] = World.entry(p, TAG['core'], 'attested')
+                self.refused(m, {'K5'})
+        m = copy.deepcopy(self.w.m); m['retired'] = [r for r in m['retired'] if r != 'core-bridge']
+        self.assertIn(('K9', 'retired: must list core-bridge, match-gateway, oms-app'), self.check(m).items)
+
+    def test_the_core_repo_of_either_layout(self):
+        self.assertEqual(release_cut.core_repo(self.w.m), SHAS['core'])
+        self.assertEqual(release_cut.core_repo(self.old_world().m), SHAS['core'])
+
+
 class RuleRedTest(CheckerBase):
     def test_k1_rehash_dirty_tree_and_missing_source(self):
         m = copy.deepcopy(self.w.m)
@@ -204,12 +266,12 @@ class RuleRedTest(CheckerBase):
         m = copy.deepcopy(self.w.m); m['schemas']['me_journal'] = '9' * 64      # the C++ bridge and the ME jar both disagree
         self.refused(m, {'K2'})
         m = copy.deepcopy(self.w.m)
-        data = engine_jar('assets-cluster.jar', schema_text={**SCHEMA_TEXT, 'money': b'<money v6/>'})
-        p = self.w.put('artifacts/assets-cluster-v6.jar', data)
-        self.w.record['assets-cluster.jar'] = []
-        self.w.build('assets-cluster.jar', 'assets', SHAS['assets'], data, 2, tag='v6')
+        data = engine_jar(CLUSTER, schema_text={**SCHEMA_TEXT, 'money': b'<money v6/>'})
+        p = self.w.put('artifacts/core-cluster-v6.jar', data)
+        self.w.record[CLUSTER] = []
+        self.w.build(CLUSTER, 'core', SHAS['core'], data, 2, tag='v6')
         self.w.refresh_record(m)
-        m['artifacts']['assets-cluster.jar'] = World.entry(p, SHAS['assets'], 'rebuild-equal')
+        m['artifacts'][CLUSTER] = World.entry(p, SHAS['core'], 'rebuild-equal')
         self.refused(m, {'K2'})
 
     def test_k3_negative_build_in_a_product_kind(self):
@@ -242,7 +304,7 @@ class RuleRedTest(CheckerBase):
     def test_k5_retired_artifact(self):
         m = copy.deepcopy(self.w.m)
         p = self.w.put('artifacts/oms-app.jar', b'oms')
-        m['artifacts']['oms-app'] = World.entry(p, SHAS['assets'], 'attested')
+        m['artifacts']['oms-app'] = World.entry(p, SHAS['core'], 'attested')
         self.refused(m, {'K5'})
 
     def test_k6_genesis_block(self):
@@ -284,12 +346,12 @@ class RuleRedTest(CheckerBase):
 
     def test_k10_kit_pins(self):
         m = copy.deepcopy(self.w.m)
-        data = engine_jar('assets-projector.jar', kit='0.1.11-runtime.20261104.rc2s17.g80502de')
-        p = self.w.put('artifacts/assets-projector-k11.jar', data)
-        self.w.record['assets-projector.jar'] = []
-        self.w.build('assets-projector.jar', 'assets', SHAS['assets'], data, 2, tag='k11')
+        data = engine_jar(PROJECTOR, kit='0.1.11-runtime.20261104.rc2s17.g80502de')
+        p = self.w.put('artifacts/core-projector-k11.jar', data)
+        self.w.record[PROJECTOR] = []
+        self.w.build(PROJECTOR, 'core', SHAS['core'], data, 2, tag='k11')
         self.w.refresh_record(m)
-        m['artifacts']['assets-projector.jar'] = World.entry(p, SHAS['assets'], 'rebuild-equal')
+        m['artifacts'][PROJECTOR] = World.entry(p, SHAS['core'], 'rebuild-equal')
         self.refused(m, {'K10'})
 
 
@@ -310,19 +372,19 @@ class GuardedRowRedTest(CheckerBase):
         self.refused(m, {'K4'})                               # the same jar under old_artifacts in a product kind
 
     def test_row_11_tag_ae_jar_in_a_product_cut(self):
-        p, src = self.w.tag_jar('assets-cluster.jar')
-        self.refused(self.swap('assets-cluster.jar', p, src), {'K2', 'K4'}, exact=False)
+        p, src = self.w.tag_jar(CLUSTER)
+        self.refused(self.swap(CLUSTER, p, src), {'K2', 'K4'}, exact=False)
         m = copy.deepcopy(self.w.m)
-        m['old_artifacts'] = {'assets-cluster.jar': {'path': str(p), 'sha256': h(p.read_bytes()), 'source_sha': src}}
+        m['old_artifacts'] = {CLUSTER: {'path': str(p), 'sha256': h(p.read_bytes()), 'source_sha': src}}
         self.refused(m, {'K4'})
 
     def test_row_22_assets_bridge_in_a_core_manifest(self):
         m = copy.deepcopy(self.w.m)
-        p = self.w.put('old/assets-bridge.jar', b'bridge'); self.w.pin(p, TAG['assets'], 'assets-bridge.jar')
-        m['artifacts']['assets-bridge'] = World.entry(p, TAG['assets'], 'attested')
+        p = self.w.put('old/assets-bridge.jar', b'bridge'); self.w.pin(p, TAG['core'], 'assets-bridge.jar')
+        m['artifacts']['assets-bridge'] = World.entry(p, TAG['core'], 'attested')
         self.refused(m, {'K5'})
         m = copy.deepcopy(self.w.m)                            # nor as the upgrade source of a rig manifest
-        m['upgrade_from'] = {'bridge': {'path': str(p), 'sha256': h(p.read_bytes()), 'source_sha': TAG['assets']}}
+        m['upgrade_from'] = {'bridge': {'path': str(p), 'sha256': h(p.read_bytes()), 'source_sha': TAG['core']}}
         self.assertEqual(self.check(m, cls='rig').by_rule(), ['K5'])
 
     def test_row_24_oms_app_in_a_core_manifest(self):
@@ -332,20 +394,20 @@ class GuardedRowRedTest(CheckerBase):
         self.refused(m, {'K5'})
 
     def test_row_26_tag_projector_jar_in_a_product_cut(self):
-        p, src = self.w.tag_jar('assets-projector.jar', kit=None)      # the tag projector carries no kit pom
-        self.refused(self.swap('assets-projector.jar', p, src), {'K2', 'K4'}, exact=False)
+        p, src = self.w.tag_jar(PROJECTOR, kit=None)      # the tag projector carries no kit pom
+        self.refused(self.swap(PROJECTOR, p, src), {'K2', 'K4'}, exact=False)
 
     def test_row_41_a_second_jar_for_one_engine_member(self):
-        p, src = self.w.tag_jar('assets-cluster.jar')
+        p, src = self.w.tag_jar(CLUSTER)
         m = copy.deepcopy(self.w.m)
         m['members'] = {'ae2': {'artifact': {'path': str(p), 'sha256': h(p.read_bytes()), 'source_sha': src}}}
         self.refused(m, {'K9', 'K4'})
         m = copy.deepcopy(self.w.m)
-        m['artifacts']['assets-cluster.jar@ae2'] = World.entry(p, src, 'rebuild-equal')
+        m['artifacts'][CLUSTER + '@ae2'] = World.entry(p, src, 'rebuild-equal')
         self.refused(m, {'K9', 'K4'})
 
     def test_row_52_older_match_jar_in_an_s17_cut(self):
-        older = '4' * 40        # match cd3d79e, built and labelled honestly, beside the cut assets jar
+        older = '4' * 40        # match cd3d79e, built and labelled honestly, beside the cut core jar
         data = engine_jar('match-cluster.jar', kit='0.1.11-runtime.20261104.rc2s17.g80502de', marker=b' older')
         p = self.w.put('old/match-cluster-older.jar', data)
         m = self.swap('match-cluster.jar', p, older)
@@ -366,8 +428,8 @@ class FixtureManifestTest(CheckerBase):
         slot = lambda n, key: {'path': a[n]['path'], 'sha256': a[n]['sha256'], 'source_sha': a[n]['source_sha'],
                                'driver': 'external', 'target': n, 'libs': libs}
         art = {'me': {k: a['match-cluster.jar'][k] for k in ('path', 'sha256', 'source_sha')},
-               'ae': {k: a['assets-cluster.jar'][k] for k in ('path', 'sha256', 'source_sha')},
-               'projector': {k: a['assets-projector.jar'][k] for k in ('path', 'sha256', 'source_sha')},
+               'ae': {k: a[CLUSTER][k] for k in ('path', 'sha256', 'source_sha')},
+               'projector': {k: a[PROJECTOR][k] for k in ('path', 'sha256', 'source_sha')},
                'forwarder': slot('ct-forwarder', 'forwarder'), 'bridge': slot('ct-bridge', 'bridge'),
                'forwarder_b': slot('ct-forwarder', 'forwarder_b') if b else None,
                'bridge_b': slot('ct-bridge', 'bridge_b') if b else None, 'shadow': None}
@@ -389,7 +451,7 @@ class FixtureManifestTest(CheckerBase):
     def test_bytes_outside_the_cut_are_refused(self):
         m = self.fixture()
         p = self.w.put('foreign.jar', b'foreign')
-        m['artifacts']['ae'] = {'path': str(p), 'sha256': h(b'foreign'), 'source_sha': SHAS['assets']}
+        m['artifacts']['ae'] = {'path': str(p), 'sha256': h(b'foreign'), 'source_sha': SHAS['core']}
         self.assertEqual(release_cut.check(m, self.w.m, 'rig', old_pins=self.w.pins).by_rule(), ['K4'])
 
     def a03(self, kind, target='ct_forwarder_nc_norelease', slots=None):

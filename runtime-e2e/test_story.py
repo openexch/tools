@@ -2,10 +2,10 @@
 """CoreProbe story and tap against a reply stub. No cluster.
 
 The cases live in java/CoreProbeTest.java (they drive the story and the egress listener in the probe's own
-JVM, on the AE jar it runs with). This module compiles CoreProbe.java with them, runs them, and then reads the
+JVM, on the core jar it runs with). This module compiles CoreProbe.java with them, runs them, and then reads the
 request logs they wrote through the real oracle model, so the story's rows are checked against the reader
-that judges them. Needs a JDK 21 (javac, java) and the AE jar named by CORE_PROBE_AE_JAR; without them the
-whole class is SKIPPED with that reason (never a silent pass).
+that judges them. Needs a JDK 21 (javac, java) and the core jar named by CORE_PROBE_CORE_JAR; without them the
+whole class is SKIPPED with that reason (never a silent pass). The retired name CORE_PROBE_AE_JAR refuses the module.
 """
 import json
 import os
@@ -19,7 +19,20 @@ import oracle_model
 import order_oracle
 
 HERE = Path(__file__).resolve().parent
-AE_JAR = os.environ.get('CORE_PROBE_AE_JAR')
+RETIRED_JAR_ENV = {'CORE_PROBE_AE_JAR': 'CORE_PROBE_CORE_JAR'}
+
+
+def core_jar(environ):
+    """The core jar the story cases compile and run against (CORE_PROBE_CORE_JAR), or None. A retired name that is still
+    set, empty included, is refused naming the new one; it is never read."""
+    for old, new in RETIRED_JAR_ENV.items():
+        if old in environ:
+            raise RuntimeError(f'the environment variable {old} is retired; it is now {new} (rename the setting; the old '
+                               'name is never read)')
+    return environ.get('CORE_PROBE_CORE_JAR')
+
+
+CORE_JAR = core_jar(os.environ)
 JAVA_FLAGS = ['--add-opens', 'java.base/jdk.internal.misc=ALL-UNNAMED', '--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED',
               '--add-opens', 'java.base/java.nio=ALL-UNNAMED']
 CASES = ['a01_request_log_is_a_function_of_the_seed', 'a02_request_log_is_a_function_of_the_seed',
@@ -33,7 +46,7 @@ CASES = ['a01_request_log_is_a_function_of_the_seed', 'a02_request_log_is_a_func
          'a03_refuses_ambiguous_arguments', 'a01_ioc_burst_follows_the_marker_for_two_seconds',
          'a01_takes_120_users_and_funding_covers_them', 'money_dump_exports_the_v7_halt_fields',
          'listener_routes_story_replies_by_correlation', 'tap_reports_dispatch_gaps_and_new_leader',
-         'tap_dense_run_reports_no_gap', 'order_dump_keeps_every_page']
+         'tap_dense_run_reports_no_gap', 'order_dump_keeps_every_page', 'retired_environment_names_are_refused']
 # the sample's request rows (oracle_model docstring; core_scenarios._create writes the same create keys)
 CREATE_KEYS = {'request', 'user', 'market', 'side', 'type', 'tif', 'price', 'quantity', 'budget', 'stop_price', 'display_qty',
                'reply'}
@@ -59,8 +72,8 @@ def model_sample(lists):
             'cancels': lists['cancels'], 'dispatch_tap': [], 'core_events': []}   # core_events: the Model reads tap continuity
 
 
-@unittest.skipUnless(AE_JAR and Path(AE_JAR).is_file() and shutil.which('javac') and shutil.which('java'),
-                     'set CORE_PROBE_AE_JAR to an assets-cluster.jar (and put a JDK 21 on PATH) to run the story cases')
+@unittest.skipUnless(CORE_JAR and Path(CORE_JAR).is_file() and shutil.which('javac') and shutil.which('java'),
+                     'set CORE_PROBE_CORE_JAR to a core-cluster.jar (and put a JDK 21 on PATH) to run the story cases')
 class StoryTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -68,10 +81,11 @@ class StoryTest(unittest.TestCase):
         root = Path(cls.tmp.name)
         classes = root / 'classes'; classes.mkdir()
         cls.out = root / 'out'
-        subprocess.run(['javac', '-proc:none', '--release', '21', '-cp', AE_JAR, '-d', str(classes),
+        subprocess.run(['javac', '-proc:none', '--release', '21', '-cp', CORE_JAR, '-d', str(classes),
                         str(HERE / 'java' / 'CoreProbe.java'), str(HERE / 'java' / 'CoreProbeTest.java')],
                        check=True, capture_output=True, text=True)
-        cls.java_run = subprocess.run(['java', *JAVA_FLAGS, '-cp', f'{classes}:{AE_JAR}', 'CoreProbeTest', str(cls.out)],
+        cls.classes = classes
+        cls.java_run = subprocess.run(['java', *JAVA_FLAGS, '-cp', f'{classes}:{CORE_JAR}', 'CoreProbeTest', str(cls.out)],
                                  capture_output=True, text=True, timeout=600)
 
     @classmethod
@@ -84,6 +98,27 @@ class StoryTest(unittest.TestCase):
             with self.subTest(case=case):
                 self.assertIn('PASS ' + case, lines, self.java_run.stdout + self.java_run.stderr)
         self.assertEqual(self.java_run.returncode, 0, self.java_run.stdout + self.java_run.stderr)
+
+    def test_the_probe_process_refuses_a_retired_environment_name(self):
+        def probe(extra, out):
+            env = {k: v for k, v in os.environ.items() if k not in ('AE_AUTH_CREDENTIAL', 'CORE_AE_ADDRESSES',
+                                                                     'CORE_AE_PORT_BASE')}
+            return subprocess.run(['java', *JAVA_FLAGS, '-cp', f'{self.classes}:{CORE_JAR}', 'CoreProbe', 'story',
+                                   'script=funding', 'seed=3', 'users=5', f'out={out}', 'for=a01-mix'],
+                                  env={**env, **extra}, capture_output=True, text=True, timeout=120)
+        control = self.out / 'retired-control.jsonl'
+        r = probe({'CORE_AUTH_CREDENTIAL': '1:TOOL:00'}, control)            # negative control: the new name runs
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(control.is_file())
+        for old, new in (('AE_AUTH_CREDENTIAL', 'CORE_AUTH_CREDENTIAL'), ('CORE_AE_ADDRESSES', 'CORE_ADDRESSES'),
+                         ('CORE_AE_PORT_BASE', 'CORE_PORT_BASE')):
+            with self.subTest(old=old):
+                out = self.out / f'retired-{old}.jsonl'
+                r = probe({old: ''}, out)
+                self.assertEqual(r.returncode, 64, r.stdout + r.stderr)
+                self.assertIn(f'FATAL: CoreProbe refused to start: the environment variable {old} is retired; it is now {new}',
+                              r.stderr)
+                self.assertFalse(out.exists())
 
     def test_rows_carry_the_sample_key_set(self):
         for name in ['a01-mix.jsonl', 'a02-lifecycle.jsonl', 'a01-resolved.jsonl', 'a03-fill.jsonl']:
@@ -133,6 +168,21 @@ class StoryTest(unittest.TestCase):
         model = oracle_model.Model(model_sample(lists))
         self.assertEqual(model.unresolved, [])
         order_oracle.o1(model)
+
+
+
+class CoreJarSettingTest(unittest.TestCase):
+    """The harness setting of this module: the retired name is refused naming the new one; the new name is read."""
+
+    def test_retired_name_is_refused(self):
+        for value in ('/x/core-cluster.jar', ''):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                    RuntimeError, 'CORE_PROBE_AE_JAR is retired; it is now CORE_PROBE_CORE_JAR'):
+                core_jar({'CORE_PROBE_AE_JAR': value, 'CORE_PROBE_CORE_JAR': '/x/core-cluster.jar'})
+
+    def test_negative_control_new_name_is_read(self):
+        self.assertEqual(core_jar({'CORE_PROBE_CORE_JAR': '/x/core-cluster.jar'}), '/x/core-cluster.jar')
+        self.assertIsNone(core_jar({}))
 
 
 if __name__ == '__main__':

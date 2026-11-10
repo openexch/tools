@@ -169,12 +169,25 @@ class CutManifestBuilderTest(unittest.TestCase):
                 path, m = self.built(kind)
                 self.assertEqual(path.name, kind + '--r1.json')
                 self.assertEqual(m['manifest_kind'], kind)
-                for role, name in (('me', 'match-cluster.jar'), ('ae', 'assets-cluster.jar'), ('projector', 'assets-projector.jar')):
+                for role, name in (('me', 'match-cluster.jar'), ('ae', 'core-cluster.jar'), ('projector', 'core-projector.jar')):
                     self.assertEqual(m['artifacts'][role]['sha256'], cut[name]['sha256'], (kind, role))
                 cls = mk_manifests.cut_class(kind)
                 self.assertEqual(release_cut.check(m, self.world.m, cls, old_pins=self.world.pins).items, [], kind)
                 self.assertEqual(m['core_probe']['sha256'], self.world.m['harness']['core_probe']['sha256'])
                 self.assertEqual(m['probe_libs']['aeronmd']['sha256'], self.world.m['harness']['probe_aeronmd']['sha256'])
+
+    def test_an_old_rc2_cut_1_cut_still_derives_its_kinds(self):
+        import release_cut
+        import test_release_cut
+        old = test_release_cut.World(self.root / 'old-cut', test_release_cut.OLD_SCHEMA)
+        old.pins.update(self.world.pins)
+        old_path = self.root / 'rc2-cut-1-manifest.json'; old_path.write_text(json.dumps(old.m))
+        patch = mock.patch.object(mk_manifests.release_cut, 'git_blob', old.blob); patch.start(); self.addCleanup(patch.stop)
+        self.assertEqual(mk_manifests.cut_roles(old.m), {'me': 'match-cluster.jar', 'ae': 'assets-cluster.jar',
+                                                         'projector': 'assets-projector.jar'})
+        _, m = mk_manifests.build_from_cut('s17-ext', 'r1', old_path, self.cfg, old_pins=old.pins)
+        self.assertEqual(m['artifacts']['ae']['sha256'], old.m['artifacts']['assets-cluster.jar']['sha256'])
+        self.assertEqual(release_cut.check(m, old.m, 'rig', old_pins=old.pins).items, [])
 
     def test_slots_profiles_and_build_a(self):
         cut = self.world.m['artifacts']

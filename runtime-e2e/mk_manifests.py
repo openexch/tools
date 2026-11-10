@@ -280,7 +280,12 @@ CUT_KINDS = {
     's17-red1': ('external', 'embedded', 'CUT', 'REDA03', {'forwarder_b': 'ct_forwarder_nc_noresync', 'forwarder': None}),
     's17-red2': ('external', 'embedded', 'CUT', 'REDA04', {'bridge_b': 'ct_bridge_nc_legacy', 'bridge': None}),
 }
-CUT_ROLES = {'me': 'match-cluster.jar', 'ae': 'assets-cluster.jar', 'projector': 'assets-projector.jar'}
+def cut_roles(cut):
+    """Engine role -> the cut artifact it stages (the core jar names follow the cut's schema: core-* or, in rc2-cut/1, assets-*)."""
+    names = release_cut.fixture_names(cut.get('schema'))
+    return {role: names[role] for role in ('me', 'ae', 'projector')}
+
+
 CUT_HARNESS = {'core_probe': 'core_probe', 'journal_probe': 'journal_probe', 't1_me_driver': 't1_me_driver',
                't1_core_driver': 't1_core_driver'}
 PROBE_LIBS = {'aeronmd': 'probe_aeronmd', 'libaeron_driver.so': 'probe_libaeron_driver.so', 'libaeron.so': 'probe_libaeron.so'}
@@ -350,7 +355,7 @@ def build_from_cut(kind, tag, cut_path, cfg=None, old_pins=None):
     artifacts['bridge'] = binary(base, 'bridge')
     for name, source in seconds.items():
         artifacts[name] = None if source is None else binary(source, name)
-    for role, name in CUT_ROLES.items():
+    for role, name in cut_roles(cut).items():
         artifacts[role] = {k: a[name][k] for k in ('path', 'sha256', 'source_sha')}
     helper = Path(cfg.netfilter_helper)
     m = {

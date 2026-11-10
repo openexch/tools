@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Explicit core-topology probe preparation. Never called by run.sh; never rebuilds product jars.
 
-CoreProbe compiles against the frozen AE jar, JournalProbe against the frozen ME jar. Both run in the
+CoreProbe compiles against the frozen core jar, JournalProbe against the frozen ME jar. Both run in the
 probe container with that same frozen jar on the class path, so the probe jar carries only its own
 classes. Copy the objects from probe-manifest.json into the core manifest (``core_probe``,
 ``journal_probe``).
 
 ``--ct-dir <cluster-tools>`` also compiles the two T1 drivers, T1MeDriver (against the ME
-jar) and T1CoreDriver (against the AE jar), FROM ``<ct>/app/forwarder/it/`` and never copies them into tools; the
+jar) and T1CoreDriver (against the core jar), FROM ``<ct>/app/forwarder/it/`` and never copies them into tools; the
 manifest keys ``t1_me_driver`` / ``t1_core_driver`` pin each source file's sha256, and ``ct_head`` records the
 cluster-tools commit the sources came from. ``--ct-dir`` is optional so the probe-only call keeps working.
+
+The flag ``--ae-jar`` is retired (it is now ``--core-jar``): a command line that still uses it is refused naming the new
+flag, before anything is compiled.
 """
 import argparse
 import hashlib
@@ -17,9 +20,21 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 DRIVER_DIR = Path('app') / 'forwarder' / 'it'
-DRIVERS = {'t1_me_driver': ('T1MeDriver', '--me-jar'), 't1_core_driver': ('T1CoreDriver', '--ae-jar')}
+DRIVERS = {'t1_me_driver': ('T1MeDriver', '--me-jar'), 't1_core_driver': ('T1CoreDriver', '--core-jar')}
+RETIRED_FLAGS = {'--ae-jar': '--core-jar'}
+
+
+def retired_refusal(argv):
+    """The refusal line for the first retired flag in ``argv``, or None when there is none."""
+    for arg in argv:
+        name = arg.split('=', 1)[0]
+        if name in RETIRED_FLAGS:
+            return (f'build_core_probes: refused: the flag {name} is retired; it is now {RETIRED_FLAGS[name]} '
+                    '(rename the flag; the old name is never read)')
+    return None
 
 
 def sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -48,19 +63,23 @@ def compile_program(name, source, dependency, directory):
     return artifact, copy, commands
 
 
-def main():
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    refusal = retired_refusal(argv)
+    if refusal is not None:
+        raise SystemExit(refusal)
     parser = argparse.ArgumentParser()
-    parser.add_argument('--ae-jar', required=True, type=Path)
+    parser.add_argument('--core-jar', required=True, type=Path)
     parser.add_argument('--me-jar', required=True, type=Path)
     parser.add_argument('--ct-dir', type=Path, help='cluster-tools tree holding app/forwarder/it/T1*Driver.java')
     parser.add_argument('--output', required=True, type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     drivers = driver_sources(args.ct_dir) if args.ct_dir else {}
     output = args.output.absolute(); output.mkdir(parents=True, exist_ok=False)
     compiler = subprocess.check_output(['javac', '-version'], text=True).strip()
     result = {}
-    jars = {'--ae-jar': args.ae_jar, '--me-jar': args.me_jar}
-    plan = [('CoreProbe', 'core_probe', args.ae_jar, Path(__file__).parent / 'java' / 'CoreProbe.java'),
+    jars = {'--core-jar': args.core_jar, '--me-jar': args.me_jar}
+    plan = [('CoreProbe', 'core_probe', args.core_jar, Path(__file__).parent / 'java' / 'CoreProbe.java'),
             ('JournalProbe', 'journal_probe', args.me_jar, Path(__file__).parent / 'java' / 'JournalProbe.java')]
     plan += [(d['main_class'], key, jars[d['classpath_arg']], d['source']) for key, d in drivers.items()]
     for name, key, dependency, source in plan:

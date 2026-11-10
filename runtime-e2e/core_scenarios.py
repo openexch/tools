@@ -2,7 +2,7 @@
 """Core-topology scenarios for fixture v2.
 
 ``core-boot``  boot, empty genesis on the core, three authentication refusals and one authority refusal
-               (the core moves ``assets_ingress_unauthorised_total``), slot states recorded.
+               (the core moves ``core_ingress_unauthorised_total``), slot states recorded.
 ``core-smoke`` GREEN: funding while the gate is at GENESIS, gate OPEN, creates (one replayed) that
                reach DISPATCH_PENDING. With no forwarder the work must stay pending and the oracles
                must say INCONCLUSIVE, never PASS; a PASS would mean they accept unapplied commands.
@@ -44,9 +44,9 @@ def unauthorised_total(fixture):
     values = []
     for i in range(3):
         metrics = fixture.metrics(f'ae{i}', fixture.m['ports']['ae_metrics'])
-        if 'assets_ingress_unauthorised_total' not in metrics:
-            raise Inconclusive('AE does not export assets_ingress_unauthorised_total')
-        values.append(int(metrics['assets_ingress_unauthorised_total']))
+        if 'core_ingress_unauthorised_total' not in metrics:
+            raise Inconclusive('AE does not export core_ingress_unauthorised_total')
+        values.append(int(metrics['core_ingress_unauthorised_total']))
     return values
 
 
@@ -109,7 +109,7 @@ def authentication_controls(fixture):
     while not all(a > b for a, b in zip(after, before)) and time.monotonic() < deadline:
         time.sleep(.5); after = unauthorised_total(fixture)
     if not all(a > b for a, b in zip(after, before)):
-        raise Violation(f'assets_ingress_unauthorised_total did not move on every member: {before} -> {after}')
+        raise Violation(f'core_ingress_unauthorised_total did not move on every member: {before} -> {after}')
     controls['authority'] = {'reply': reply['replies'][0], 'unauthorised_before': before, 'unauthorised_after': after}
     controls['me'] = me_refusal_control(fixture)
     return controls
@@ -221,21 +221,21 @@ def me_journal(fixture):
 
 
 # The counter export of the AE leader -> sample['counters'] (OM:37), so O11 is judged (OO:231-237)
-COUNTER_METRICS = {'stale_outcomes': 'assets_order_stale_outcomes_total', 'redundant_outcomes': 'assets_order_redundant_outcomes_total',
-                   'stale_terminals': 'assets_order_stale_terminals_total', 'conflicts': 'assets_order_conflicts_total',
-                   'released_late': 'assets_released_late_total'}    # U1: RELEASED copies (O11)
+COUNTER_METRICS = {'stale_outcomes': 'core_order_stale_outcomes_total', 'redundant_outcomes': 'core_order_redundant_outcomes_total',
+                   'stale_terminals': 'core_order_stale_terminals_total', 'conflicts': 'core_order_conflicts_total',
+                   'released_late': 'core_released_late_total'}    # U1: RELEASED copies (O11)
 SCRAPE_PREFIXES = {
-    'ae': ('assets_cluster_role', 'assets_pending_commands', 'assets_order_', 'assets_release_confirm_stale_total', 'assets_market_',
-           'assets_released_late_total', 'assets_me_release_early_total', 'assets_late_apply_on_dead_order_total',
-           'assets_release_backlog', 'assets_me_ledger_size',                   # O-F4 (RUN:372-380)
+    'ae': ('core_cluster_role', 'core_pending_commands', 'core_order_', 'core_release_confirm_stale_total', 'core_market_',
+           'core_released_late_total', 'core_me_release_early_total', 'core_late_apply_on_dead_order_total',
+           'core_release_backlog', 'core_me_ledger_size',                   # O-F4 (RUN:372-380)
            # The capacity gate, the release path, the feed latch, the ticks
-           'assets_release_', 'assets_me_capacity_', 'assets_feed_', 'assets_ticks_', 'assets_last_applied_trade_id'),
+           'core_release_', 'core_me_capacity_', 'core_feed_', 'core_ticks_', 'core_last_applied_trade_id'),
     'me': ('match_cluster_role', 'match_engine_next_journal_seq', 'match_durable_', 'match_command_ledger_size',
            'match_ingress_decode_rejects_total', 'match_ingress_unauthorized_total',    # O-F1 (RUN:331-338)
            'match_command_ledger_', 'match_release_', 'match_orders_submitted_total', 'match_trades_total'),
     'fwd': ('forwarder_resync_total', 'forwarder_session_reconnect_total', 'forwarder_session_new_leader_total',
             'forwarder_dispatch_seq', 'forwarder_ready', 'forwarder_tick_', 'forwarder_ticks_ready'),
-    'bridge': ('bridge_ae_connected', 'bridge_ready', 'bridge_not_ready_bits', 'bridge_state', 'bridge_halted',
+    'bridge': ('bridge_core_connected', 'bridge_ready', 'bridge_not_ready_bits', 'bridge_state', 'bridge_halted',
                'bridge_client_sessions_opened_total', 'bridge_halt_reason', 'bridge_core_halt_reason', 'bridge_skipped_total',
                'bridge_fences_total')}
 
@@ -274,8 +274,8 @@ def observe(fixture, frozen=None):
     gauges, leaders = {}, []
     for i in range(3):
         metrics = fixture.metrics(f'ae{i}', fixture.m['ports']['ae_metrics'])
-        gauges[f'ae{i}'] = {k: int(metrics[k]) for k in ['assets_settle_faults_total', 'assets_settle_rejects_total']}
-        if metrics.get('assets_cluster_role') == 2.0:
+        gauges[f'ae{i}'] = {k: int(metrics[k]) for k in ['core_settle_faults_total', 'core_settle_rejects_total']}
+        if metrics.get('core_cluster_role') == 2.0:
             leaders.append(metrics)
     if len(leaders) != 1:
         raise Inconclusive(f'no AE leader at the barrier: {len(leaders)} members report role 2')
@@ -322,8 +322,8 @@ def core_smoke(fixture):
               'creates': creates, 'amends': [], 'cancels': [],
               'core_events': tap['order_event'], 'admission': tap['admission'], 'dispatch_tap': tap['dispatch'],
               **{k: second[k] for k in ['core', 'me_journal', 'me_journal_seq', 'me_open_legs', 'money_journal', 'money_journal_legs']},
-              'faults': {'settle_fault': max(g['assets_settle_faults_total'] for g in second['gauges'].values()),
-                         'settle_rejected': max(g['assets_settle_rejects_total'] for g in second['gauges'].values()),
+              'faults': {'settle_fault': max(g['core_settle_faults_total'] for g in second['gauges'].values()),
+                         'settle_rejected': max(g['core_settle_rejects_total'] for g in second['gauges'].values()),
                          'order_fault': len(tap['order_fault']),
                          'quarantined': sum(1 for e in tap['order_event'] if e['kind'] == 'QUARANTINED')},
               'declared': {'settle_fault': 0, 'settle_rejected': 0, 'order_fault': 0, 'quarantined': 0, 'halt': False,

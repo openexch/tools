@@ -232,6 +232,34 @@ def seed_dir(root, shape, snapshot, tail=0, opens=0):
     return root
 
 
+class RenamedCoreTextTest(unittest.TestCase):
+    """Old tagged core jars print "Assets Engine node N starting" and the kit's old reason text; current ones print "Core
+    node N starting" and the renamed reason text. Both are read; an unrelated line is not."""
+    NEW_R0 = ('CRITICAL: principal-less session in log: history from before session principals, clean genesis required '
+              '({}, clusterSessionId={}, logPosition={})')
+
+    def test_the_banner_matches_old_and_new_core_and_the_me(self):
+        for line in ('Assets Engine node 0 starting: portBase=19300', 'Core node 2 starting: portBase=19300 driverMode=x',
+                     'Match Engine node 1 starting: portBase=9000'):
+            with self.subTest(line=line):
+                self.assertIsNotNone(xver.BANNER.search(line))
+        for line in ('Core node starting', 'Hardcore node 1 started', 'core node 1 starting'):
+            with self.subTest(refused=line):
+                self.assertIsNone(xver.BANNER.search(line))
+
+    def test_the_capture_witness_reads_the_new_banner(self):
+        m = {'role': 'ae0', 'restart_count': 0, 'log': 'Core node 0 starting: portBase=19300\n' + R0.format('session open', 1, 256)}
+        self.assertTrue(xver.capture_witness(m)['banner'].startswith('Core node 0 starting'))
+
+    def test_both_reason_texts_map_to_the_same_site(self):
+        for text in (R0, self.NEW_R0):
+            with self.subTest(text=text[:70]):
+                site = xver.match_site(text.format('session open', 7, 256), 'ae')
+                self.assertEqual((site['key'], site['clusterSessionId'], site['logPosition']), ('ae-r0-session-open', 7, 256))
+        self.assertIsNone(xver.match_site('CRITICAL: principal-less session in log: clean genesis required (session open, '
+                                          'clusterSessionId=7, logPosition=256)', 'ae'))
+
+
 class SeedWitnessTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

@@ -26,7 +26,24 @@ SLOT_ARTIFACTS = {'fwd0': {'forwarder', 'forwarder_b'}, 'fwd1': {'forwarder', 'f
                   'bridge0': {'bridge', 'bridge_b'}, 'bridge1': {'bridge', 'bridge_b'}, 'shadow0': {'shadow'}}
 PORT_PROFILE = {'me_base': 9000, 'ae_base': 19300, 'stride': 100, 'me_metrics': 19500, 'ae_metrics': 19700,
                 'bridge_http': 9600, 'projector_http': 9601, 'forwarder_http': 9700, 'journal_replay': 19820}
-AE_CREDENTIAL_ENV = {'keys_env': 'ASSETS_AUTH_KEYS', 'credential_env': 'AE_AUTH_CREDENTIAL'}
+AE_CREDENTIAL_ENV = {'keys_env': 'CORE_AUTH_KEYS', 'credential_env': 'CORE_AUTH_CREDENTIAL'}
+# The environment names retired by the rename of the engine to core, old to new (the core's RetiredSettings table for the
+# names this harness sets, plus the probe's own). A fixture that still sets one was written for the old names: it is
+# refused naming the new one, never passed on and never translated.
+RETIRED_ENV = {'ASSETS_NODE_PORT': 'CORE_NODE_PORT', 'ASSETS_AUTH_KEYS': 'CORE_AUTH_KEYS',
+               'AE_AUTH_CREDENTIAL': 'CORE_AUTH_CREDENTIAL', 'BRIDGE_AE_CLUSTER_ADDRESSES': 'BRIDGE_CORE_CLUSTER_ADDRESSES',
+               'BRIDGE_AE_PORT_BASE': 'BRIDGE_CORE_PORT_BASE', 'BRIDGE_AE_EGRESS_ENDPOINT': 'BRIDGE_CORE_EGRESS_ENDPOINT',
+               'PROJECTOR_AE_JOURNAL_ARCHIVES': 'PROJECTOR_CORE_JOURNAL_ARCHIVES', 'CORE_AE_ADDRESSES': 'CORE_ADDRESSES',
+               'CORE_AE_PORT_BASE': 'CORE_PORT_BASE'}
+
+
+def retired_env_refusal(name):
+    """The refusal line for a retired environment name, or None when the name is not retired."""
+    if name not in RETIRED_ENV:
+        return None
+    return (f'the environment variable {name} is retired; it is now {RETIRED_ENV[name]} '
+            '(rename the setting; the old name is never read)')
+
 ME_AUTH_MODES = {'enforced', 'not_enforced_by_artifact'}
 # The drills are about elections, so the fixture keeps every production timeout. Everything is an
 # allowlist: the manifest's top-level keys, the environment names a fixture process may receive, and
@@ -54,11 +71,11 @@ PROCESS_ENV = {
     'CLUSTER_PORT_STRIDE', 'BASE_DIR', 'TRANSPORT_DRIVER_MODE', 'TRANSPORT_IDLE_MODE', 'TRANSPORT_TERM_LENGTH',
     'TRANSPORT_LOG_TERM_LENGTH', 'TRANSPORT_SNAPSHOT_TERM_LENGTH', 'MATCH_ENGINE_BOOK_CAPACITY', 'SNAPSHOT_LOG_BYTES',
     'SNAPSHOT_INTERVAL_MINUTES', 'CLUSTER_NODE', 'CLUSTER_ADDRESSES', 'CLUSTER_PORT_BASE', 'METRICS_PORT',
-    'SETTLEMENT_JOURNAL_ENABLED', 'SETTLEMENT_JOURNAL_DIR', 'SETTLEMENT_JOURNAL_ARCHIVE_BIND', 'ASSETS_NODE_PORT',
-    'ASSETS_AUTH_KEYS', 'AE_AUTH_CREDENTIAL',
+    'SETTLEMENT_JOURNAL_ENABLED', 'SETTLEMENT_JOURNAL_DIR', 'SETTLEMENT_JOURNAL_ARCHIVE_BIND', 'CORE_NODE_PORT',
+    'CORE_AUTH_KEYS', 'CORE_AUTH_CREDENTIAL',
     # The ME builds its engine config from the replicated EngineConfig record, not from env knobs (RUN:158)
     'MATCH_ENGINE_FROM_CONFIG',
-    'PROJECTOR_POSTGRES_URL', 'PROJECTOR_POSTGRES_USER', 'PROJECTOR_POSTGRES_PASSWORD', 'PROJECTOR_AE_JOURNAL_ARCHIVES',
+    'PROJECTOR_POSTGRES_URL', 'PROJECTOR_POSTGRES_USER', 'PROJECTOR_POSTGRES_PASSWORD', 'PROJECTOR_CORE_JOURNAL_ARCHIVES',
     'PROJECTOR_LOCAL_HOST', 'PROJECTOR_METRICS_PORT',
     # Assets c68d163 ProjectorDriver (PROJECTOR_DRIVER_MODE embedded|external, strict; external reads AERON_DIR)
     'PROJECTOR_DRIVER_MODE',
@@ -69,11 +86,11 @@ PROCESS_ENV = {
     # ct-bridge strict env (BC:42-55, 235-327)
     'BRIDGE_ME_JOURNAL_ARCHIVES', 'BRIDGE_JOURNAL_CONTROL_STREAM', 'BRIDGE_JOURNAL_STREAM', 'BRIDGE_JOURNAL_CHANNEL',
     'BRIDGE_REPLAY_STREAM', 'BRIDGE_JOURNAL_MTU', 'BRIDGE_LOCAL_HOST', 'BRIDGE_DRIVER_MODE', 'BRIDGE_DRIVER_DIR',
-    'BRIDGE_DRIVER_TIMEOUT_MS', 'BRIDGE_AE_CLUSTER_ADDRESSES', 'BRIDGE_AE_PORT_BASE', 'BRIDGE_AE_EGRESS_ENDPOINT',
+    'BRIDGE_DRIVER_TIMEOUT_MS', 'BRIDGE_CORE_CLUSTER_ADDRESSES', 'BRIDGE_CORE_PORT_BASE', 'BRIDGE_CORE_EGRESS_ENDPOINT',
     'BRIDGE_INSTANCE_ID', 'BRIDGE_HTTP_BIND',
     # the staged aeronmd: deleted on start and shutdown so a restart never attaches to a dead driver
     'AERON_DIR_DELETE_ON_START', 'AERON_DIR_DELETE_ON_SHUTDOWN', 'LD_LIBRARY_PATH',
-    'CORE_AE_ADDRESSES', 'CORE_AE_PORT_BASE', 'CORE_LOCAL_HOST'}
+    'CORE_ADDRESSES', 'CORE_PORT_BASE', 'CORE_LOCAL_HOST'}
 # Only `execute` on the probe container may carry these (the pinned T1 drivers). The values are
 # session secrets except T1_ME_MARKETS and T1_LOCAL_HOST. T1_BRIDGE_KEY, T1_TAP_KEY and T1_ME_FORWARDER_KEY are
 # never set: the via-bridge genesis needs no bridge key and the capture/resend verbs are not run from the probe.
@@ -478,7 +495,9 @@ def validate_core_manifest(manifest, manifest_path, cpu_count=None, profiles=jou
                             'staged media driver')
         credentials = manifest['credentials']
         if credentials.get('ae') != AE_CREDENTIAL_ENV:
-            raise Violation('AE credentials must use ASSETS_AUTH_KEYS / AE_AUTH_CREDENTIAL')
+            retired = [retired_env_refusal(v) for v in (credentials.get('ae') or {}).values() if v in RETIRED_ENV]
+            raise Violation('core credentials must use CORE_AUTH_KEYS / CORE_AUTH_CREDENTIAL'
+                            + (': ' + '; '.join(retired) if retired else ''))
         me = credentials.get('me') or {}
         if me.get('mode') not in ME_AUTH_MODES:
             raise Violation('ME credential mode must be declared: enforced | not_enforced_by_artifact')
@@ -487,7 +506,7 @@ def validate_core_manifest(manifest, manifest_path, cpu_count=None, profiles=jou
         for key in ['keys_env', 'credential_env']:
             if not re.fullmatch(r'[A-Z][A-Z0-9_]{2,63}', me.get(key) or ''):
                 raise Violation('ME credential environment names must be explicit')
-            if me[key] in PROCESS_ENV or me[key] in IMAGE_ENV or TIMEOUT_WORDS.search(me[key]):
+            if me[key] in PROCESS_ENV or me[key] in IMAGE_ENV or me[key] in RETIRED_ENV or TIMEOUT_WORDS.search(me[key]):
                 raise Violation('ME credential environment name collides with a fixture variable: ' + me[key])
         if me['keys_env'] == me['credential_env']:
             raise Violation('ME key table and credential need distinct environment names')
@@ -506,6 +525,8 @@ def validate_core_manifest(manifest, manifest_path, cpu_count=None, profiles=jou
 def assert_production_timeouts(environment, allowed=PROCESS_ENV):
     """Fixture-side guard: a process receives only allowlisted names, and no value carries a timeout."""
     for key, value in environment.items():
+        if key in RETIRED_ENV:
+            raise Violation('refusing a retired environment name: ' + retired_env_refusal(key))
         if key not in allowed:
             raise Violation('environment names are an allowlist; refusing ' + key)
         exempt = key in DRIVER_TIMEOUT_EXEMPT and type(value) is str and value == DRIVER_TIMEOUT_EXEMPT[key]

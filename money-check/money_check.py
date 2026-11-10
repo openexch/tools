@@ -3,7 +3,7 @@
 """money_check.py -- the live-money guardrail for the Open Exchange cutover soak.
 
 Reconciles the money ledger against three invariants that must hold at all times.
-It is READ-ONLY: it never issues a write to Redis, the AE, or the OMS.
+It is READ-ONLY: it never issues a write to Redis, the core, or the OMS.
 
   INVARIANT 1 -- per-asset conservation (deposit-aware)
       For every asset:  Sigma_users (available + locked)  ==  Sigma deposits - Sigma withdrawals
@@ -21,7 +21,7 @@ It is READ-ONLY: it never issues a write to Redis, the AE, or the OMS.
         SELL order locks the BASE  asset:  remainingQty                (base units)
       Amend caveat: after an amend the OMS's stored holdAmount nets filled qty; the OMS
       does not expose holdAmount on the order, so we use price*remainingQty. For an order
-      with fills at a price other than its limit, that residual can differ from the AE's
+      with fills at a price other than its limit, that residual can differ from the core's
       netted hold by a rounding tick -- treated as explainable drift, not a hard breach.
 
   INVARIANT 3 -- non-negativity
@@ -29,9 +29,10 @@ It is READ-ONLY: it never issues a write to Redis, the AE, or the OMS.
 
 Stores:
   --store redis (default)  read Redis db0 directly (bal:{userId} hashes).
-  --store ae               shell out to the AeDump CLI and read its JSON snapshot.
+  --store core             shell out to the CoreDump CLI and read its JSON snapshot.
 
-Exit codes:  0 = all green   2 = an invariant was violated   1 = operational error.
+Exit codes:  0 = all green   2 = an invariant was violated   1 = operational error
+             64 = a retired flag or value (--ae-dump-cmd, --ae-timeout, --store ae): the line names the new one.
 """
 
 import argparse
@@ -194,7 +195,7 @@ def make_redis(host, port, db, timeout=5.0):
 # --------------------------------------------------------------------------- #
 # stores -- both yield the same shape:
 #   balances : { (userId:int, assetId:int) : {"available": int, "locked": int} }
-#   holds    : { (userId:int, assetId:int) : int }   (AE only; None for redis)
+#   holds    : { (userId:int, assetId:int) : int }   (core only; None for redis)
 #   position : { "consumePosition": int|None, "lastAppliedTradeId": int|None }
 # --------------------------------------------------------------------------- #
 def load_redis_store(host, port, db):
@@ -229,21 +230,21 @@ def load_redis_store(host, port, db):
         r.close()
 
 
-def load_ae_store(dump_cmd, timeout):
+def load_core_store(dump_cmd, timeout):
     try:
         proc = subprocess.run(dump_cmd, shell=True, capture_output=True,
                              timeout=timeout, text=True)
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"AeDump timed out after {timeout}s (cmd: {dump_cmd})")
+        raise RuntimeError(f"CoreDump timed out after {timeout}s (cmd: {dump_cmd})")
     if proc.returncode == 3:
-        raise RuntimeError("AeDump reported its own 30s snapshot timeout (exit 3) -- "
-                          "is the AE cluster up and has a leader?")
+        raise RuntimeError("CoreDump reported its own 30s snapshot timeout (exit 3) -- "
+                          "is the core cluster up and has a leader?")
     if proc.returncode != 0:
-        raise RuntimeError(f"AeDump exited {proc.returncode}: {proc.stderr.strip()[:400]}")
+        raise RuntimeError(f"CoreDump exited {proc.returncode}: {proc.stderr.strip()[:400]}")
     try:
         doc = json.loads(proc.stdout)
     except json.JSONDecodeError as e:
-        raise RuntimeError(f"AeDump stdout was not JSON: {e}; first 200 chars: {proc.stdout[:200]!r}")
+        raise RuntimeError(f"CoreDump stdout was not JSON: {e}; first 200 chars: {proc.stdout[:200]!r}")
     balances = {}
     for b in doc.get("balances", []):
         balances[(int(b["userId"]), int(b["assetId"]))] = {
@@ -525,8 +526,8 @@ def check_nonnegative(balances, asset_map):
             "drifts": drifts}
 
 
-def check_ae_internal(balances, holds, asset_map, tol):
-    """AE-mode bonus: the AE's own hold entries must sum to its own locked balances."""
+def check_core_internal(balances, holds, asset_map, tol):
+    """Core-mode bonus: the core's own hold entries must sum to its own locked balances."""
     if holds is None:
         return None
     drifts = []
@@ -539,7 +540,7 @@ def check_ae_internal(balances, holds, asset_map, tol):
             drifts.append({"scope": "user", "userId": uid, "assetId": asset,
                           "asset": asset_name(asset_map, asset),
                           "expected": hsum, "actual": actual, "gap": gap})
-    return {"name": "ae_holds_vs_locked", "status": "PASS" if not drifts else "FAIL",
+    return {"name": "core_holds_vs_locked", "status": "PASS" if not drifts else "FAIL",
             "drifts": drifts}
 
 
@@ -554,7 +555,7 @@ def run_sweep(args, asset_map):
     if args.store == "redis":
         store = load_redis_store(args.redis_host, args.redis_port, args.redis_db)
     else:
-        store = load_ae_store(args.ae_dump_cmd, args.ae_timeout)
+        store = load_core_store(args.core_dump_cmd, args.core_timeout)
     balances = store["balances"]
     result["position"] = store["position"]
 
@@ -598,9 +599,9 @@ def run_sweep(args, asset_map):
                                               genesis_covered, asset_map, args.tolerance))
     result["checks"].append(check_locked(balances, expected, asset_map, args.tolerance, have_oms))
     result["checks"].append(check_nonnegative(balances, asset_map))
-    ae_internal = check_ae_internal(balances, store["holds"], asset_map, args.tolerance)
-    if ae_internal is not None:
-        result["checks"].append(ae_internal)
+    core_internal = check_core_internal(balances, store["holds"], asset_map, args.tolerance)
+    if core_internal is not None:
+        result["checks"].append(core_internal)
 
     result["accounts"] = len(set(uid for (uid, _a) in balances.keys()))
     result["balance_rows"] = len(balances)
@@ -632,7 +633,7 @@ def print_human(result, verbose):
           f"{result['balance_rows']} balance rows, {result['duration_ms']}ms")
     pos = result.get("position", {})
     if pos.get("consumePosition") is not None:
-        print(f"   AE position: consume={pos['consumePosition']} "
+        print(f"   core position: consume={pos['consumePosition']} "
               f"lastAppliedTradeId={pos['lastAppliedTradeId']}")
     for c in result["checks"]:
         line = f"   {tag.get(c['status'], c['status']):<5} {c['name']}"
@@ -669,8 +670,8 @@ def status_line(result, sweep_no, rolling):
 # --------------------------------------------------------------------------- #
 def build_arg_parser():
     p = argparse.ArgumentParser(description="Live-money guardrail for the Open Exchange cutover soak.")
-    p.add_argument("--store", choices=["redis", "ae"], default="redis",
-                  help="ledger source: redis (default) or ae (via AeDump)")
+    p.add_argument("--store", choices=["redis", "core"], default="redis",
+                  help="ledger source: redis (default) or core (via CoreDump)")
     p.add_argument("--oms-url", default="http://localhost:8080",
                   help="OMS base URL for the open-orders API (default %(default)s)")
     p.add_argument("--sim-log", action="append",
@@ -679,11 +680,11 @@ def build_arg_parser():
     p.add_argument("--redis-host", default="127.0.0.1")
     p.add_argument("--redis-port", type=int, default=6379)
     p.add_argument("--redis-db", type=int, default=0)
-    p.add_argument("--ae-dump-cmd",
-                  default="java -jar assets-bridge/target/assets-bridge.jar dump",
-                  help="command that prints the AeDump JSON snapshot (--store ae)")
-    p.add_argument("--ae-timeout", type=int, default=40,
-                  help="seconds to wait for AeDump (its own timeout is 30s)")
+    p.add_argument("--core-dump-cmd",
+                  default="java -jar core-bridge/target/core-bridge.jar dump",
+                  help="command that prints the CoreDump JSON snapshot (--store core)")
+    p.add_argument("--core-timeout", type=int, default=40,
+                  help="seconds to wait for CoreDump (its own timeout is 30s)")
     p.add_argument("--asset-map", default=None,
                   help='override symbol->id map, e.g. "USD=0,BTC=1,ETH=2,SOL=3,XRP=4,DOGE=5"')
     p.add_argument("--users", default=None,
@@ -711,7 +712,32 @@ def parse_asset_map(spec):
     return out
 
 
+# The flags and values retired by the rename of the engine to core, old to new. A command line that still uses one was
+# written for the old names: it is refused naming the new one before anything runs (no alias, no fallback).
+RETIRED_FLAGS = {"--ae-dump-cmd": "--core-dump-cmd", "--ae-timeout": "--core-timeout"}
+RETIRED_STORE = {"ae": "core"}
+
+
+def retired_refusal(argv):
+    """The refusal line for the first retired flag (or ``--store`` value) in ``argv``, or None when there is none."""
+    for i, arg in enumerate(argv):
+        name, eq, value = arg.partition("=")
+        if name in RETIRED_FLAGS:
+            return (f"money_check: refused: the flag {name} is retired; it is now {RETIRED_FLAGS[name]} "
+                    "(rename the flag; the old name is never read)")
+        if name == "--store":
+            value = value if eq else (argv[i + 1] if i + 1 < len(argv) else None)
+            if value in RETIRED_STORE:
+                return (f"money_check: refused: --store {value} is retired; it is now --store {RETIRED_STORE[value]} "
+                        "(rename the value; the old one is never read)")
+    return None
+
+
 def main(argv=None):
+    refusal = retired_refusal(sys.argv[1:] if argv is None else argv)
+    if refusal is not None:
+        print(refusal, file=sys.stderr)
+        return 64
     args = build_arg_parser().parse_args(argv)
     if args.sim_log is None:
         args.sim_log = ["~/.local/log/cluster/sim.log"]

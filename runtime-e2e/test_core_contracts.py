@@ -14,6 +14,47 @@ from core_contracts import assert_production_timeouts, validate_core_manifest
 from test_core_fixture import manifest, write
 
 
+class RetiredEnvironmentTest(unittest.TestCase):
+    """The names retired by the rename to core are refused naming the new name; the new names pass."""
+
+    def test_every_retired_name_is_refused_naming_its_replacement(self):
+        self.assertEqual(len(core_contracts.RETIRED_ENV), 9)
+        for old, new in core_contracts.RETIRED_ENV.items():
+            with self.subTest(old=old), self.assertRaises(Violation) as caught:
+                # refused even when a caller allowlisted the old name: the retired check comes first
+                assert_production_timeouts({old: 'x'}, core_contracts.PROCESS_ENV | {old})
+            self.assertIn(f'the environment variable {old} is retired; it is now {new}', str(caught.exception))
+
+    def test_negative_control_the_new_names_pass(self):
+        for new in core_contracts.RETIRED_ENV.values():
+            with self.subTest(new=new):
+                assert_production_timeouts({new: 'x'})
+
+    def test_the_table_maps_out_of_and_into_the_allowlist(self):
+        self.assertFalse(set(core_contracts.RETIRED_ENV) & core_contracts.PROCESS_ENV)
+        self.assertLessEqual(set(core_contracts.RETIRED_ENV.values()), core_contracts.PROCESS_ENV)
+        self.assertIsNone(core_contracts.retired_env_refusal('CORE_NODE_PORT'))
+
+    def test_old_credential_names_in_a_manifest_are_refused_naming_the_new_ones(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'manifest.json'
+            m = manifest(d)
+            validate_core_manifest(m, path, cpu_count=24)                     # negative control: the new names pass
+            m['credentials']['ae'] = {'keys_env': 'ASSETS_AUTH_KEYS', 'credential_env': 'AE_AUTH_CREDENTIAL'}
+            with self.assertRaises(Violation) as caught:
+                validate_core_manifest(m, path, cpu_count=24)
+            text = str(caught.exception)
+            self.assertIn('ASSETS_AUTH_KEYS is retired; it is now CORE_AUTH_KEYS', text)
+            self.assertIn('AE_AUTH_CREDENTIAL is retired; it is now CORE_AUTH_CREDENTIAL', text)
+
+    def test_a_retired_name_cannot_be_reused_as_the_me_credential_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'manifest.json'
+            m = manifest(d); m['credentials']['me']['credential_env'] = 'AE_AUTH_CREDENTIAL'
+            with self.assertRaisesRegex(Violation, 'collides'):
+                validate_core_manifest(m, path, cpu_count=24)
+
+
 class DriverTimeoutExemptionTest(unittest.TestCase):
     """Exactly the two driver-liveness names at exactly the string 5000."""
 

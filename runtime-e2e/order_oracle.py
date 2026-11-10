@@ -315,7 +315,7 @@ def o11(m):
     duplicates = sum(len(c) - 1 for c in m.outcome_copies.values())
     released = len(m.released_repeats)
     if 'released_late' not in counters and released:
-        raise Inconclusive('RELEASED copies journaled but assets_released_late_total not exported')
+        raise Inconclusive('RELEASED copies journaled but core_released_late_total not exported')
     preempted = preempted_outcomes(m)
     seen = counters['stale_outcomes'] + counters['redundant_outcomes'] + counters.get('released_late', 0)
     if seen != duplicates + preempted:
