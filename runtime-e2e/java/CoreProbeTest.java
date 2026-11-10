@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import com.openexchange.assets.infrastructure.generated.*;
+import com.openexchange.core.infrastructure.generated.*;
 import org.agrona.concurrent.UnsafeBuffer;
 
 import java.io.PrintWriter;
@@ -18,7 +18,7 @@ import java.util.function.Function;
 
 /**
  * Unit tests of {@code CoreProbe story} and {@code CoreProbe tap}: no cluster, a
- * reply stub and a fake clock. Compiled with CoreProbe.java against the AE jar (the same class path the probe
+ * reply stub and a fake clock. Compiled with CoreProbe.java against the core jar (the same class path the probe
  * runs with) and driven by {@code test_story.py}. Prints {@code PASS <name>} or {@code FAIL <name>: why} per case,
  * exit 0 only when every case passed. Argument: a directory the sample logs are written to (the Python side
  * checks their key sets against the oracle model).
@@ -56,6 +56,7 @@ public final class CoreProbeTest {
         run("tap_reports_dispatch_gaps_and_new_leader", CoreProbeTest::tapGaps);
         run("tap_dense_run_reports_no_gap", CoreProbeTest::tapDense);
         run("order_dump_keeps_every_page", CoreProbeTest::orderDumpPages);
+        run("retired_environment_names_are_refused", CoreProbeTest::retiredEnvironment);
         System.out.println(failures.isEmpty() ? "ALL PASS" : "FAILED " + failures);
         System.exit(failures.isEmpty() ? 0 : 1);
     }
@@ -535,6 +536,20 @@ public final class CoreProbeTest {
                 "out", "/x")));
         refusal("for= must be", () -> CoreProbe.StoryConfig.parse(Map.of("script", "funding", "seed", "3", "users", "5",
                 "out", "/x", "for", "funding")));
+    }
+
+    private static void retiredEnvironment() {
+        final Map<String, String> fresh = Map.of("CORE_AUTH_CREDENTIAL", "1:TOOL:00", "CORE_ADDRESSES", "a,b,c",
+                "CORE_PORT_BASE", "19300");
+        check(CoreProbe.retiredRefusal(fresh::get) == null, "the new names alone are refused");   // negative control
+        check(CoreProbe.RETIRED_ENV.size() == 3, "retired table has " + CoreProbe.RETIRED_ENV.size() + " rows");
+        for (final String[] r : CoreProbe.RETIRED_ENV) {
+            final Map<String, String> env = new HashMap<>(fresh);
+            env.put(r[0], "");                                  // set but empty still counts as set
+            final String line = CoreProbe.retiredRefusal(env::get);
+            check(line != null && line.contains("the environment variable " + r[0] + " is retired; it is now " + r[1]),
+                    r[0] + " not refused naming " + r[1] + ": " + line);
+        }
     }
 
     // ------------------------------------------------------------------ listener / tap cases

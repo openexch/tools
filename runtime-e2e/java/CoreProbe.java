@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-import com.openexchange.assets.application.engine.order.RequestTable;
-import com.openexchange.assets.auth.CoreCredentials;
-import com.openexchange.assets.domain.Asset;
-import com.openexchange.assets.domain.Market;
-import com.openexchange.assets.infrastructure.generated.*;
+import com.openexchange.core.application.engine.order.RequestTable;
+import com.openexchange.core.auth.CoreCredentials;
+import com.openexchange.core.domain.Asset;
+import com.openexchange.core.domain.Market;
+import com.openexchange.core.infrastructure.generated.*;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.client.EgressListener;
 import io.aeron.cluster.codecs.EventCode;
@@ -37,15 +37,18 @@ import java.util.TreeSet;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
+import java.util.function.UnaryOperator;
 
 /**
  * Core probe: the fixture's only client of the OMS + ledger core (money-schema v6, assets a9a865d).
- * Compiled separately against the frozen AE jar and run with it on the class path; never linked into a
+ * Compiled separately against the frozen core jar and run with it on the class path; never linked into a
  * product artifact. One verb per process, one authenticated session, one JSON line on stdout (the LAST
  * line starting with '{' is the verb's answer; other lines are human-readable summaries).
  *
- * <p>Environment (all required, no defaults): CORE_AE_ADDRESSES (comma list, member order),
- * CORE_AE_PORT_BASE, CLUSTER_PORT_STRIDE, CORE_LOCAL_HOST, AE_AUTH_CREDENTIAL (keyId:CLASS:secretHex).
+ * <p>Environment (all required, no defaults): CORE_ADDRESSES (comma list, member order),
+ * CORE_PORT_BASE, CLUSTER_PORT_STRIDE, CORE_LOCAL_HOST, CORE_AUTH_CREDENTIAL (keyId:CLASS:secretHex).
+ * The names retired by the rename to core ({@link #RETIRED_ENV}) refuse the probe before it reads anything, set or
+ * empty: there is no dual read and the old name is never honoured.
  * The credential's class must be one the verb allows; the core checks it again. {@code story script=funding}
  * talks to no cluster and needs none of them.</p>
  *
@@ -56,7 +59,7 @@ import java.util.function.Predicate;
  *
  * <p>Exit codes: 0 answered; 3 no answer before the deadline (outcome UNKNOWN), or a story whose every request
  * stayed UNKNOWN (setup failure); 4 the core refused (the JSON says why); 5 a negative control was NOT refused;
- * 64 usage.</p>
+ * 64 usage (a retired environment name included).</p>
  */
 public final class CoreProbe {
     private static final long DEADLINE_MS = 30_000;
@@ -77,8 +80,34 @@ public final class CoreProbe {
     private boolean closedNoted;
     Continuity continuity = new Continuity(e -> { });
 
+    /** The environment names retired by the rename to core, old to new. */
+    static final List<String[]> RETIRED_ENV = List.of(
+            new String[] {"AE_AUTH_CREDENTIAL", "CORE_AUTH_CREDENTIAL"},
+            new String[] {"CORE_AE_ADDRESSES", "CORE_ADDRESSES"},
+            new String[] {"CORE_AE_PORT_BASE", "CORE_PORT_BASE"});
+
     public static void main(final String[] argv) {
+        final String refusal = retiredRefusal(System::getenv);
+        if (refusal != null) {
+            System.err.println(refusal);
+            System.err.flush();
+            System.exit(64);
+        }
         System.exit(new CoreProbe().run(argv));
+    }
+
+    /**
+     * The refusal line for the first retired environment name that is set (an empty value included), or {@code null}
+     * when none is.
+     */
+    static String retiredRefusal(final UnaryOperator<String> env) {
+        for (final String[] r : RETIRED_ENV) {
+            if (env.apply(r[0]) != null) {
+                return "FATAL: CoreProbe refused to start: the environment variable " + r[0] + " is retired; it is now "
+                        + r[1] + " (rename the setting; the old name is never read)";
+            }
+        }
+        return null;
     }
 
     private static String env(final String name) {
@@ -202,7 +231,7 @@ public final class CoreProbe {
             if (story != null) {
                 new Story(story, new RealClock(), null, m -> { });   // the plan's own refusals (per-user cap) before any session
             }
-            final CoreCredentials credentials = CoreCredentials.fromSpec(env("AE_AUTH_CREDENTIAL"));
+            final CoreCredentials credentials = CoreCredentials.fromSpec(env("CORE_AUTH_CREDENTIAL"));
             if (!"1".equals(args.remove("negative"))) {
                 requireClass(verb, credentials.sessionClass());   // negative=1: let the CORE refuse it (authority control)
             }
@@ -248,8 +277,8 @@ public final class CoreProbe {
     }
 
     private String endpoints() {
-        final String[] hosts = env("CORE_AE_ADDRESSES").split(",");
-        final int base = Integer.parseInt(env("CORE_AE_PORT_BASE"));
+        final String[] hosts = env("CORE_ADDRESSES").split(",");
+        final int base = Integer.parseInt(env("CORE_PORT_BASE"));
         final int stride = Integer.parseInt(env("CLUSTER_PORT_STRIDE"));
         final StringBuilder sb = new StringBuilder();
         for (int i = 0; i < hosts.length; i++) {
@@ -286,7 +315,7 @@ public final class CoreProbe {
     }
 
     private int unauthenticated() {
-        final CoreCredentials good = CoreCredentials.fromSpec(env("AE_AUTH_CREDENTIAL"));
+        final CoreCredentials good = CoreCredentials.fromSpec(env("CORE_AUTH_CREDENTIAL"));
         final byte[] secret = good.secret();
         // legacy_none: what every older client (OMS, legacy bridge, the v1 fixture) presents: nothing.
         final io.aeron.security.CredentialsSupplier presented = arg("mode").equals("legacy_none")

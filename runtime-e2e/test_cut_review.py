@@ -79,8 +79,13 @@ class HarnessTiedToTheCutTest(CutBase):
 
 class SiteCommitsFromTheCutTest(unittest.TestCase):
     def test_a_cut_on_other_commits_is_refused(self):
-        cut = {'repos': dict(xver.COMMITS)}
+        cut = {'schema': 'rc2-cut/1', 'repos': dict(xver.COMMITS)}
         self.assertEqual(xver.check_sites(cut), [])
+        new = {'schema': 'rc2-cut/2', 'repos': {('core' if k == 'assets' else k): v for k, v in xver.COMMITS.items()}}
+        self.assertEqual(xver.check_sites(new), [])        # the same commits under the repo key core
+        new['repos']['core'] = '0' * 40
+        self.assertEqual(xver.check_sites(new), [f'assets: the refusal-site table was read at {xver.COMMITS["assets"]}, the '
+                                                 f'cut is at {"0" * 40}'])
         cut['repos']['match'] = '0' * 40
         self.assertEqual(xver.check_sites(cut), [f'match: the refusal-site table was read at {xver.COMMITS["match"]}, the cut '
                                                  f'is at {"0" * 40}'])
@@ -91,9 +96,9 @@ class SiteCommitsFromTheCutTest(unittest.TestCase):
 class RebuildEqualNeedsTwoBuildsTest(CutBase):
     def test_one_file_listed_twice_is_not_two_builds(self):
         m = copy.deepcopy(self.w.m)
-        name = 'assets-cluster.jar'
+        name = T.CLUSTER
         path = m['artifacts'][name]['path']
-        self.w.record[name] = [{'repo': 'assets', 'source_sha': T.SHAS['assets'], 'path': path,
+        self.w.record[name] = [{'repo': 'core', 'source_sha': T.SHAS['core'], 'path': path,
                                 'sha256': m['artifacts'][name]['sha256']}] * 2
         self.w.refresh_record(m)
         found = self.check(m)
@@ -103,11 +108,11 @@ class RebuildEqualNeedsTwoBuildsTest(CutBase):
 class AeronVersionFromTheJarsTest(CutBase):
     def test_a_1_53_0_jar_under_a_1_53_1_substrate_is_refused(self):
         m = copy.deepcopy(self.w.m)
-        name = 'assets-cluster.jar'
+        name = T.CLUSTER
         data = T.engine_jar(name, aeron='1.53.0')
         p = self.w.put('artifacts/' + name, data)
         self.w.record[name] = []
-        self.w.build(name, 'assets', T.SHAS['assets'], data, 2, tag='-old')
+        self.w.build(name, 'core', T.SHAS['core'], data, 2, tag='-old')
         self.w.refresh_record(m)
         m['artifacts'][name]['sha256'] = T.h(data)
         found = self.check(m)

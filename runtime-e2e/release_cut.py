@@ -9,7 +9,8 @@ usage: release_cut.py check <manifest> [--cut <cut manifest>] [--class product|r
        release_cut.py activation-record <run dir> [--audit <audit.json>]
        release_cut.py genesis-ids <state root> --schema <money-schema.xml | AE jar>
 
-``check`` takes either the cut manifest itself (schema ``rc2-cut/1``) or a fixture manifest derived from it (schema_version 2,
+``check`` takes either the cut manifest itself (schema ``rc2-cut/2``, or the older ``rc2-cut/1`` that names the core
+``assets``) or a fixture manifest derived from it (schema_version 2,
 ``manifest_kind`` s17-*, checked against ``--cut``). It prints one line per refusal, ``K<n> <text>``, and exits 1 when any rule
 refuses, 0 when none does. The rules:
   K1  an artifact without sha256, without a 40-hex source_sha, with tree_dirty true, or whose file re-hash differs
@@ -21,7 +22,7 @@ refuses, 0 when none does. The rules:
       artifact and the binary carries the source sha (or, for the Aeron driver files, the substrate Aeron version); attested is
       refused in a product kind); the upgrade_from / old_artifacts exemption only in rig kinds and only when pinned in
       the old-artifact pins (``--old-pins``, default ``$CUT_OLD_PINS``)
-  K5  a retired artifact (assets-bridge, oms-app, match-gateway) in a core-topology manifest
+  K5  a retired artifact (core-bridge or assets-bridge, oms-app, match-gateway) in a core-topology manifest
   K6  a genesis block with ME behaviour != 2, maxWireVersion != 12, a core sequence other than 1 -> 2 -> 3, two genesisId values,
       or a constant genesisId in a product kind
   K7  a driver profile value other than external or embedded, or a prod profile with an embedded process
@@ -48,11 +49,20 @@ import zipfile
 
 from machine_paths import env_path
 
-SCHEMA = 'rc2-cut/1'
+SCHEMA = 'rc2-cut/2'                      # what a new cut manifest declares
+# The cut manifest layouts the checker reads. rc2-cut/2 names the core repo ``core`` and its jars ``core-*``; rc2-cut/1
+# (cuts written before the rename) names them ``assets`` / ``assets-*`` and stays readable as written.
+LAYOUTS = {
+    'rc2-cut/1': {'repo': 'assets', 'cluster': 'assets-cluster.jar', 'projector': 'assets-projector.jar',
+                  'retired': {'assets-bridge', 'oms-app', 'match-gateway'}},
+    'rc2-cut/2': {'repo': 'core', 'cluster': 'core-cluster.jar', 'projector': 'core-projector.jar',
+                  'retired': {'core-bridge', 'oms-app', 'match-gateway'}},
+}
+SCHEMAS = tuple(LAYOUTS)
 RULES = tuple(f'K{n}' for n in range(1, 11))
 CLASSES = ('product', 'rig', 'rig-xver', 'nightly')
 RIG_CLASSES = ('rig', 'rig-xver', 'nightly')
-REPOS = ('assets', 'match', 'cluster-kit', 'cluster-tools', 'tools')
+OTHER_REPOS = ('match', 'cluster-kit', 'cluster-tools', 'tools')
 SCHEMA_NAMES = ('money', 'order', 'me_journal')
 
 
@@ -61,20 +71,21 @@ def old_pins_path():
     return env_path('CUT_OLD_PINS', 'the old-artifact pins file (old-artifacts.sha256)')
 
 
-# Product artifacts of the cut: repo, language, derivations accepted in a product kind, embedded schema identities.
-PRODUCT = {
+MONEY_SCHEMA_MEMBER = 'sbe/money-schema.xml'
+# Product artifacts of the cut: repo, language, derivations accepted in a product kind, embedded schema identities. The
+# two core jars come from the layout (``product(schema)``); the rest are the same in every layout.
+_PRODUCT_REST = {
     'match-cluster.jar': {'repo': 'match', 'lang': 'java', 'engine': True,
                           'schemas': {'order': 'sbe/order-schema.xml', 'me_journal': 'sbe/me-journal-schema.xml'}},
-    'assets-cluster.jar': {'repo': 'assets', 'lang': 'java', 'engine': True, 'schemas': {'money': 'sbe/money-schema.xml'}},
-    'assets-projector.jar': {'repo': 'assets', 'lang': 'java', 'engine': True, 'schemas': {'money': 'sbe/money-schema.xml'}},
     'ct-forwarder': {'repo': 'cluster-tools', 'lang': 'cpp', 'stamped': True, 'schemas': ('money', 'order')},
     'ct-bridge': {'repo': 'cluster-tools', 'lang': 'cpp', 'stamped': True, 'schemas': ('money', 'me_journal')},
     'aeronmd': {'repo': 'cluster-tools', 'lang': 'cpp', 'schemas': ()},
     'libaeron_driver.so': {'repo': 'cluster-tools', 'lang': 'cpp', 'schemas': ()},
     'libaeron.so': {'repo': 'cluster-tools', 'lang': 'cpp', 'schemas': ()},
 }
-RETIRED = {'assets-bridge', 'oms-app', 'match-gateway'}
-RETIRED_FILE = re.compile(r'(assets-bridge|oms-app|match-gateway)[^/]*$')
+# Every retired artifact name of every layout: an old assets-bridge jar stays retired in a new cut, as core-bridge does.
+RETIRED = set().union(*(layout['retired'] for layout in LAYOUTS.values()))
+RETIRED_FILE = re.compile(r'(assets-bridge|core-bridge|oms-app|match-gateway)[^/]*$')
 TEST_BUILD = re.compile(r'(^|/)(ct_[a-z0-9]+_(nc|tc)_[a-z0-9_]+|[^/]*_b)$')
 DERIVATIONS = {'rebuild-equal', 'binary-build-info', 'attested'}
 KIT_POM = 'META-INF/maven/com.openexchange/cluster-kit/pom.properties'
@@ -99,6 +110,44 @@ PROFILE_NAMES = {'prod', 'dev'}
 BUILD_RECORD_KEYS = {'path', 'sha256'}
 HEX40 = re.compile(r'[0-9a-f]{40}')
 HEX64 = re.compile(r'[0-9a-f]{64}')
+
+
+def layout(schema):
+    """The layout of a cut manifest schema; an unknown schema reads as the current one (K9 refuses it separately)."""
+    return LAYOUTS.get(schema, LAYOUTS[SCHEMA])
+
+
+def repos_of(schema):
+    return (layout(schema)['repo'],) + OTHER_REPOS
+
+
+def product(schema=SCHEMA):
+    """The product artifacts of a cut written in ``schema``."""
+    lay = layout(schema)
+    core = {'repo': lay['repo'], 'lang': 'java', 'engine': True, 'schemas': {'money': MONEY_SCHEMA_MEMBER}}
+    out = {'match-cluster.jar': _PRODUCT_REST['match-cluster.jar'], lay['cluster']: dict(core), lay['projector']: dict(core)}
+    out.update((k, v) for k, v in _PRODUCT_REST.items() if k != 'match-cluster.jar')
+    return out
+
+
+def aeron_roles(schema=SCHEMA):
+    lay = layout(schema)
+    return {'match-cluster.jar': 'me', lay['cluster']: 'ae', lay['projector']: 'projector', 'libaeron_driver.so': 'cpp'}
+
+
+def fixture_names(schema=SCHEMA):
+    """Fixture artifact role -> the cut artifact name it stages."""
+    lay = layout(schema)
+    return {'me': 'match-cluster.jar', 'ae': lay['cluster'], 'projector': lay['projector'], 'forwarder': 'ct-forwarder',
+            'bridge': 'ct-bridge', 'forwarder_b': 'ct-forwarder', 'bridge_b': 'ct-bridge'}
+
+
+def core_repo(cut):
+    """The core repo's commit in a cut of either layout (``repos.core``, or ``repos.assets`` in an rc2-cut/1 cut)."""
+    return ((cut or {}).get('repos') or {}).get(layout((cut or {}).get('schema'))['repo'])
+
+
+PRODUCT = product()
 
 
 class Findings:
@@ -296,8 +345,6 @@ def _harness_at_commit(f, m, harness, repos):
 
 
 AERON_VERSION_CLASS = 'io/aeron/AeronVersion.class'
-AERON_ROLE = {'match-cluster.jar': 'me', 'assets-cluster.jar': 'ae', 'assets-projector.jar': 'projector',
-              'libaeron_driver.so': 'cpp'}
 AERON_RE = re.compile(rb'(?<![0-9.])(1\.\d{1,3}\.\d{1,3})(?![0-9.])')
 
 
@@ -310,9 +357,9 @@ def aeron_version_of(name, path):
     return found[0].decode() if len(found) == 1 else (None if not found else ','.join(v.decode() for v in found))
 
 
-def _aeron_k8(f, artifacts, aeron):
+def _aeron_k8(f, artifacts, aeron, schema=SCHEMA):
     """K8 reads the version from the artifacts, not only the substrate's declared strings."""
-    for name, role in AERON_ROLE.items():
+    for name, role in aeron_roles(schema).items():
         entry = artifacts.get(name)
         if not isinstance(entry, dict) or not Path(str(entry.get('path', ''))).is_file():
             continue
@@ -372,13 +419,15 @@ def _old_entries(f, m, cls, old_pins):
 
 
 def check_cut(m, rules=RULES, cls=None, old_pins=None):
-    """The checks over a cut manifest (``rc2-cut/1``). Returns the Findings (empty = accepted)."""
+    """The checks over a cut manifest (``rc2-cut/2``, or an older ``rc2-cut/1``). Returns the Findings (empty = accepted)."""
     f = Findings(rules)
     if not isinstance(m, dict):
         f.add('K9', 'manifest is not an object')
         return f
-    if m.get('schema') != SCHEMA:
-        f.add('K9', f'schema must be {SCHEMA}, got {m.get("schema")!r}')
+    if m.get('schema') not in SCHEMAS:
+        f.add('K9', f'schema must be one of {", ".join(SCHEMAS)}, got {m.get("schema")!r}')
+    schema = m.get('schema')
+    lay, products = layout(schema), product(schema)
     cls = cls or m.get('class')
     if cls not in CLASSES:
         f.add('K9', 'class must be one of ' + ', '.join(CLASSES) + f', got {cls!r}')
@@ -388,7 +437,7 @@ def check_cut(m, rules=RULES, cls=None, old_pins=None):
     if 'harness_commit' in m and not (isinstance(m['harness_commit'], str) and HEX40.fullmatch(m['harness_commit'])):
         f.add('K9', f'harness_commit: not a 40-hex commit ({m.get("harness_commit")!r})')
     repos = m.get('repos') if isinstance(m.get('repos'), dict) else {}
-    _unknown(f, 'repos', repos, REPOS)
+    _unknown(f, 'repos', repos, repos_of(schema))
     for repo, value in repos.items():
         if not (isinstance(value, str) and HEX40.fullmatch(value)):
             f.add('K9', f'repos.{repo}: not a 40-hex commit ({value!r})')
@@ -429,10 +478,10 @@ def check_cut(m, rules=RULES, cls=None, old_pins=None):
             else:
                 f.add('K9', f'{what}: a test build is never a cut artifact (rig kinds stage it from their own build)')
             continue
-        spec = PRODUCT.get(name)
+        spec = products.get(name)
         if spec is None:
             f.add('K9', f'{what}: unknown artifact key (one artifact per role; a per-member key is unknown by design)')
-            base = PRODUCT.get(name.split('@', 1)[0])
+            base = products.get(name.split('@', 1)[0])
             if base is not None and isinstance(entry, dict):      # rows 41, 52: the second jar's bytes are judged too
                 _derived_k4(f, name, {**entry, 'derivation': entry.get('derivation', 'attested')}, base, repos, record,
                             aeron_version, 'product')
@@ -447,7 +496,7 @@ def check_cut(m, rules=RULES, cls=None, old_pins=None):
         _derived_k4(f, name, entry, spec, repos, record, aeron_version, cls)
         if spec.get('engine') and Path(str(entry.get('path', ''))).is_file():
             pins[name] = kit_pin_of(entry['path'])
-    missing = sorted(set(PRODUCT) - set(artifacts))
+    missing = sorted(set(products) - set(artifacts))
     if missing:
         f.add('K9', 'artifacts: missing ' + ', '.join(missing))
     distinct = sorted({str(v) for v in pins.values()})
@@ -476,7 +525,7 @@ def check_cut(m, rules=RULES, cls=None, old_pins=None):
             _rehash(f, what + ' source', src, need_source=False)
 
     _harness_at_commit(f, m, harness, repos)
-    _aeron_k8(f, artifacts, aeron)
+    _aeron_k8(f, artifacts, aeron, schema)
 
     genesis = m.get('genesis') if isinstance(m.get('genesis'), dict) else {}
     _unknown(f, 'genesis', genesis, GENESIS_KEYS)
@@ -513,12 +562,12 @@ def check_cut(m, rules=RULES, cls=None, old_pins=None):
             elif profile == 'prod' and mode == 'embedded':
                 f.add('K7', f'driver_profiles.prod.{proc}: embedded in the prod profile (production is external aeronmd)')
     retired = m.get('retired')
-    if not isinstance(retired, list) or not RETIRED <= set(retired):
-        f.add('K9', 'retired: must list ' + ', '.join(sorted(RETIRED)))
+    if not isinstance(retired, list) or not lay['retired'] <= set(retired):
+        f.add('K9', 'retired: must list ' + ', '.join(sorted(lay['retired'])))
     _old_entries(f, m, cls, old_pins)
     for member, block in (m.get('members') or {}).items() if isinstance(m.get('members'), dict) else ():
         entry = block.get('artifact') if isinstance(block, dict) else None
-        base = PRODUCT.get({'me': 'match-cluster.jar', 'ae': 'assets-cluster.jar'}.get(str(member)[:2], ''))
+        base = products.get({'me': 'match-cluster.jar', 'ae': lay['cluster']}.get(str(member)[:2], ''))
         if base is not None and isinstance(entry, dict):          # row 41: a per-member jar is unknown and not derived
             _derived_k4(f, f'members.{member}.artifact', {**entry, 'derivation': entry.get('derivation', 'attested')}, base,
                         repos, record, aeron_version, 'product')
@@ -527,8 +576,7 @@ def check_cut(m, rules=RULES, cls=None, old_pins=None):
 
 # ------------------------------------------------------------------ fixture manifests derived from the cut
 
-FIXTURE_NAMES = {'me': 'match-cluster.jar', 'ae': 'assets-cluster.jar', 'projector': 'assets-projector.jar',
-                 'forwarder': 'ct-forwarder', 'bridge': 'ct-bridge', 'forwarder_b': 'ct-forwarder', 'bridge_b': 'ct-bridge'}
+FIXTURE_NAMES = fixture_names()
 
 
 def _cut_index(cut):
@@ -604,7 +652,7 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
                 if entry.get('source_sha') != want or want.encode() not in Path(entry['path']).read_bytes():
                     f.add('K4', f'{what}: negative target {target} is not a build of the cut\'s cluster-tools {want}')
             continue
-        staged(what, entry, FIXTURE_NAMES.get(key))
+        staged(what, entry, fixture_names(cut.get('schema')).get(key))
         for lib, lentry in ((entry or {}).get('libs') or {}).items():
             staged(f'{what}.libs.{lib}', lentry, lib)
     # In a rig kind a negative target is a RED's (a s17-red* kind) or the declared A03 phase 1
@@ -620,7 +668,7 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
                     'A03 phase 1 stages one')
     for block in ('engine_libs', 'projector_libs', 'probe_libs'):
         for lib, lentry in (m.get(block) or {}).items():
-            if lib in PRODUCT:
+            if lib in product(cut.get('schema')):
                 staged(f'{block}.{lib}', lentry, lib)
     for key in ('core_probe', 'journal_probe', 't1_me_driver', 't1_core_driver'):
         if key in m:
@@ -648,7 +696,7 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
 
 
 def check(manifest, cut=None, cls=None, rules=RULES, old_pins=None):
-    if isinstance(manifest, dict) and manifest.get('schema') == SCHEMA:
+    if isinstance(manifest, dict) and manifest.get('schema') in SCHEMAS:
         return check_cut(manifest, rules, cls, old_pins)
     if cut is None:
         f = Findings(rules)
@@ -730,14 +778,14 @@ def log_frames(data):
 
 
 def load_money_schema(source):
-    """The money schema layout: a schema XML path, or an AE jar (its ``sbe/money-schema.xml``, the bytes K2 checks)."""
+    """The money schema layout: a schema XML path, or a core jar (its ``sbe/money-schema.xml``, the bytes K2 checks)."""
     import sbe_layout
     import tempfile
     source = Path(source)
     if source.suffix == '.jar':
-        data = _jar_member(source, PRODUCT['assets-cluster.jar']['schemas']['money'])
+        data = _jar_member(source, MONEY_SCHEMA_MEMBER)
         if data is None:
-            raise ValueError(f'{source}: no {PRODUCT["assets-cluster.jar"]["schemas"]["money"]}')
+            raise ValueError(f'{source}: no {MONEY_SCHEMA_MEMBER}')
         with tempfile.NamedTemporaryFile('wb', suffix='.xml', delete=False) as out:
             out.write(data)
         try:

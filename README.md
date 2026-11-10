@@ -13,7 +13,7 @@ Open Exchange v1 is five repositories:
 | Repo | Role |
 |---|---|
 | `match` | Matching engine, Aeron Raft cluster (Java) |
-| `assets` | Order and ledger core: order lifecycle, risk, holds and ledger in one Aeron cluster (Java) |
+| `core` | Order and ledger core: order lifecycle, risk, holds and ledger in one Aeron cluster (Java) |
 | `cluster-kit` | Shared cluster machinery for both engines (Java) |
 | `cluster-tools` | Cluster client, ME forwarder, settlement bridge, projectors (C++) |
 | `tools` | This repo |
@@ -26,7 +26,7 @@ The previous v0.5 stack (`oms`, `admin-gateway`, `trading-ui`) still runs the de
 |---|---|---|---|
 | [`runtime-e2e/`](runtime-e2e/README.md) | Isolated Docker acceptance harness: runs pinned, already-built artifacts, injects faults, judges money and order state with oracles | v1 core topology and the v0.5 topology | Python, Java probes |
 | [`market-sim/`](market-sim/README.md) | Agent-based market simulator and demo canary with a health endpoint | v0.5 OMS REST API | Go |
-| [`money-check/`](money-check/README.md) | Read-only money invariant checker (conservation, locked equals open holds, non-negativity) | v0.5 Redis ledger or the Assets Engine via `AeDump` | Python |
+| [`money-check/`](money-check/README.md) | Read-only money invariant checker (conservation, locked equals open holds, non-negativity) | v0.5 Redis ledger or the core via `CoreDump` | Python |
 | `tb-bench/` | TigerBeetle two-phase benchmark driver kept from the ledger evaluation | a TigerBeetle cluster | Java |
 
 ## Build and test

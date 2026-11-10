@@ -27,8 +27,8 @@ python3 -m unittest discover -s runtime-e2e -p 'test_*.py'
 python3 runtime-e2e/build_probes.py --me-jar /abs/match-cluster.jar --oms-jar /abs/oms.jar \
   --output /abs/new-probe-dir
 
-# probes for the core topology (CoreProbe against the AE jar, JournalProbe against the ME jar)
-python3 runtime-e2e/build_core_probes.py --ae-jar /abs/assets-cluster.jar --me-jar /abs/match-cluster.jar \
+# probes for the core topology (CoreProbe against the core jar, JournalProbe against the ME jar)
+python3 runtime-e2e/build_core_probes.py --core-jar /abs/core-cluster.jar --me-jar /abs/match-cluster.jar \
   [--ct-dir /abs/cluster-tools] --output /abs/new-probe-dir
 
 # one scenario
@@ -40,7 +40,7 @@ Copy the program entries from the probe directory's `probe-manifest.json` into t
 Helper tools (each prints its own usage):
 
 - `mk_manifests.py <kind> <tag>`: builds a core manifest of a named kind; every manifest of one kind differs only in `run_id` and `state_root`.
-- `release_cut.py check | audit | precheck | activation-record | genesis-ids | record-builds`: checks a release cut manifest and derived fixture manifests against the artifact rules (pinned sha256, clean source commit, no test builds in product kinds, matching schema identities), audits a live state root, and writes activation records.
+- `release_cut.py check | audit | precheck | activation-record | genesis-ids | record-builds`: checks a release cut manifest and derived fixture manifests against the artifact rules (pinned sha256, clean source commit, no test builds in product kinds, matching schema identities), audits a live state root, and writes activation records. Cut manifests are `rc2-cut/2` (repo key `core`); `rc2-cut/1` (repo key `assets`) is still read as written.
 - `oracle_samples.py <new dir>`: writes clean synthetic oracle samples.
 - `nightly.py`: the nightly runner (see below).
 
@@ -63,7 +63,7 @@ v0.5 topology: `critical-path-smoke`, `harness-negative-controls`, `false-ready`
 - Every run needs a new run id and a fresh state root at exactly `<manifest dir>/fixtures/<run id>`. The output directory must not exist. State and evidence are never reset or reused; keep a copy of each manifest.
 - Images are addressed by `sha256`, never by tag. Repeats change only the run id and state path.
 - Core manifests require `timeouts: production`. Environment names are allowlisted per process (`PROCESS_ENV`) and per image (`IMAGE_ENV`); no value may carry a `-D...timeout` style override. The only exempt names are `FWD_DRIVER_TIMEOUT_MS=5000` and `BRIDGE_DRIVER_TIMEOUT_MS=5000`. Every engine member gets its own disjoint cpuset; the network is `--internal`.
-- Credentials are minted per run (`credentials.py`): the AE gets `ASSETS_AUTH_KEYS`, each client `AE_AUTH_CREDENTIAL`. Secrets are redacted from every retained command line, output, log and probe state file before teardown.
+- Credentials are minted per run (`credentials.py`): the core gets `CORE_AUTH_KEYS`, each client `CORE_AUTH_CREDENTIAL`. Secrets are redacted from every retained command line, output, log and probe state file before teardown.
 - Teardown removes only Docker objects carrying both the run label and the run's ownership token, and only the owned PostgreSQL process. After an uncatchable signal, finish cleanup with `Fixture(manifest, attach=True).close()` (or `CoreFixture`). Never prune Docker or reset a database by hand.
 - Keep manifests and state roots in a run directory outside every repository: `state_root` lives under the manifest directory and holds staged binaries.
 
@@ -78,8 +78,8 @@ Results are `PASS`, `FAIL` or `INCONCLUSIVE`; only `PASS` exits zero. All subpro
 
 Known limits:
 
-- The order tap loses order events across an AE leader change. Drills close the gap by backfill from the pending dump and the ME journal; a gap that cannot be closed is INCONCLUSIVE (`tap_loss`), never FAIL.
-- Restarting an AE member shortly after a kill can hang the JVM on an active mark file. The drills wait before restarting.
+- The order tap loses order events across a core leader change. Drills close the gap by backfill from the pending dump and the ME journal; a gap that cannot be closed is INCONCLUSIVE (`tap_loss`), never FAIL.
+- Restarting a core member shortly after a kill can hang the JVM on an active mark file. The drills wait before restarting.
 - Inside a container the `aeronmd` pid is always the same, so driver identity is the `cnc.dat` mtime plus the container start time.
 
 ## Nightly
@@ -93,6 +93,7 @@ Paths are settings, never machine defaults. A night reads them from the environm
 | `NIGHTLY_LOCK`, `NIGHTLY_CUT`, `NIGHTLY_CT_REPO` | `nightly.py` | heavy-job lock file, release cut manifest, cluster-tools checkout (falls back to `CUT_CT_REPO`) |
 | `CUT_TOOLS_REPO`, `CUT_CT_REPO`, `CUT_OLD_PINS` | `release_cut.py` | tools and cluster-tools checkouts, previous pin set |
 | `MK_RUNS`, `MK_BIN_A`, `MK_BUILD_B`, `MK_NC_DIR`, `MK_CUT_NC_DIR`, `MK_DRIVER_PROPERTIES`, `MK_AE_JAR`, `MK_ME_JAR`, `MK_PROJECTOR_JAR`, `MK_PROBE_MANIFEST`, `MK_NETFILTER_HELPER` | `mk_manifests.py` | run directory, C++ binaries and build trees, negative-control builds, external driver properties, engine and probe artifacts |
+| `CORE_PROBE_CORE_JAR` | `test_story.py` | the core jar the story tests compile and run against (unset: they skip) |
 | `LEGACY_TEMPLATE`, `LEGACY_JARS` | `legacy_tag.py` | v0.5.0-beta manifest template and jars |
 | `XVER_LEGACY_RUNS`, `XVER_SEEDS`, `XVER_CUT` | `xver.py` | cross-version run inputs |
 

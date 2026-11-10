@@ -4,7 +4,7 @@
 
 money_check.py is the thing that decides whether the ledger is sound, and until now
 nothing checked the checker. These tests exercise the pure functions only -- no Redis,
-no OMS, no AeDump -- so they run anywhere with the stdlib, matching money_check's own
+no OMS, no CoreDump -- so they run anywhere with the stdlib, matching money_check's own
 zero-dependency rule.
 
     python3 -m unittest discover -s tools/money-check
@@ -24,7 +24,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from money_check import (  # noqa: E402
     SCALE,
-    check_ae_internal,
+    build_arg_parser,
+    check_core_internal,
     check_conservation,
     check_locked,
     check_nonnegative,
@@ -34,6 +35,8 @@ from money_check import (  # noqa: E402
     parse_fixed,
     parse_ledger_log,
     parse_user_arg,
+    main,
+    retired_refusal,
 )
 
 # asset_map is symbol -> id (that is the direction asset_name() reads).
@@ -224,17 +227,17 @@ class LockedVsHolds(unittest.TestCase):
         self.assertEqual(r["status"], "SKIP")
 
 
-class AeInternal(unittest.TestCase):
-    def test_returns_none_when_not_in_ae_mode(self):
-        self.assertIsNone(check_ae_internal({}, None, ASSETS, 0))
+class CoreInternal(unittest.TestCase):
+    def test_returns_none_when_not_in_core_mode(self):
+        self.assertIsNone(check_core_internal({}, None, ASSETS, 0))
 
     def test_passes_when_hold_entries_sum_to_locked(self):
         balances = {(1, 1): {"available": 0, "locked": SCALE}}
-        self.assertEqual(check_ae_internal(balances, {(1, 1): SCALE}, ASSETS, 0)["status"], "PASS")
+        self.assertEqual(check_core_internal(balances, {(1, 1): SCALE}, ASSETS, 0)["status"], "PASS")
 
     def test_catches_a_locked_balance_with_no_hold_behind_it(self):
         balances = {(1, 1): {"available": 0, "locked": SCALE}}
-        r = check_ae_internal(balances, {}, ASSETS, 0)
+        r = check_core_internal(balances, {}, ASSETS, 0)
         self.assertEqual(r["status"], "FAIL")
         self.assertEqual(r["drifts"][0]["gap"], SCALE)
 
@@ -383,6 +386,39 @@ class ArgParsing(unittest.TestCase):
 
     def test_asset_map_is_symbol_equals_id(self):
         self.assertEqual(parse_asset_map("USD=0,BTC=1"), {"USD": 0, "BTC": 1})
+
+
+class RetiredFlags(unittest.TestCase):
+    """The flags and the --store value retired by the rename to core are refused naming the new ones."""
+
+    REFUSED = [
+        (["--ae-dump-cmd", "x"], "the flag --ae-dump-cmd is retired; it is now --core-dump-cmd"),
+        (["--ae-dump-cmd=x"], "the flag --ae-dump-cmd is retired; it is now --core-dump-cmd"),
+        (["--ae-timeout", "5"], "the flag --ae-timeout is retired; it is now --core-timeout"),
+        (["--store", "core", "--ae-timeout=5"], "the flag --ae-timeout is retired; it is now --core-timeout"),
+        (["--store", "ae"], "--store ae is retired; it is now --store core"),
+        (["--store=ae"], "--store ae is retired; it is now --store core"),
+    ]
+
+    def test_retired_flags_and_value_are_refused(self):
+        for argv, text in self.REFUSED:
+            with self.subTest(argv=argv):
+                self.assertIn(text, retired_refusal(argv))
+
+    def test_main_exits_64_before_anything_runs(self):
+        import contextlib
+        import io
+        for argv, text in self.REFUSED:
+            err = io.StringIO()
+            with self.subTest(argv=argv), contextlib.redirect_stderr(err):
+                self.assertEqual(main(argv), 64)
+            self.assertIn(text, err.getvalue())
+
+    def test_negative_control_new_names_parse(self):
+        argv = ["--store", "core", "--core-dump-cmd", "echo {}", "--core-timeout", "5"]
+        self.assertIsNone(retired_refusal(argv))
+        args = build_arg_parser().parse_args(argv)
+        self.assertEqual((args.store, args.core_dump_cmd, args.core_timeout), ("core", "echo {}", 5))
 
 
 if __name__ == "__main__":

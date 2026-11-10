@@ -386,8 +386,8 @@ class CoreFixture(Fixture):
             env['MATCH_ENGINE_FROM_CONFIG'] = 'true'    # RUN:158: the replicated EngineConfig decides, not an env knob
             env[self.m['credentials']['me']['keys_env']] = self.keys.table('me')
         else:
-            env['ASSETS_NODE_PORT'] = str(self.m['ports']['ae_metrics'])
-            env['ASSETS_AUTH_KEYS'] = self.keys.table('ae')
+            env['CORE_NODE_PORT'] = str(self.m['ports']['ae_metrics'])
+            env['CORE_AUTH_KEYS'] = self.keys.table('ae')
         if self.engine_driver() == 'external':
             # TC:84-91 / ATC:37-42 external mode attaches to the wrapper's aeronmd at AERON_DIR (TC:155, ATC:70)
             env.update(TRANSPORT_DRIVER_MODE='external', AERON_DIR=f'/dev/shm/aeron-{engine}{index}')
@@ -450,11 +450,11 @@ class CoreFixture(Fixture):
         return ENGINE_DRIVER_PIDFILE
 
     def probe_env(self, principal):
-        env = {'CORE_AE_ADDRESSES': ','.join(self.m['nodes'][f'ae{i}'] for i in range(3)),
-               'CORE_AE_PORT_BASE': str(self.m['ports']['ae_base']), 'CLUSTER_PORT_STRIDE': str(self.m['ports']['stride']),
+        env = {'CORE_ADDRESSES': ','.join(self.m['nodes'][f'ae{i}'] for i in range(3)),
+               'CORE_PORT_BASE': str(self.m['ports']['ae_base']), 'CLUSTER_PORT_STRIDE': str(self.m['ports']['stride']),
                'CORE_LOCAL_HOST': self.m['nodes']['probe']}
         if principal is not None:
-            env['AE_AUTH_CREDENTIAL'] = self.keys.credential(principal, 'ae')
+            env['CORE_AUTH_CREDENTIAL'] = self.keys.credential(principal, 'ae')
         return env
 
     def t1_env(self):
@@ -467,7 +467,7 @@ class CoreFixture(Fixture):
     def projector_env(self):
         return {'PROJECTOR_POSTGRES_URL': f'jdbc:postgresql://{self.gateway}:{self.pg_port}/r01_money',
                 'PROJECTOR_POSTGRES_USER': 'runtime_fixture', 'PROJECTOR_POSTGRES_PASSWORD': 'synthetic-fixture-only',
-                'PROJECTOR_AE_JOURNAL_ARCHIVES': ','.join(self.m['nodes'][f'ae{i}'] + ':' + str(19301 + 100 * i) for i in range(3)),
+                'PROJECTOR_CORE_JOURNAL_ARCHIVES': ','.join(self.m['nodes'][f'ae{i}'] + ':' + str(19301 + 100 * i) for i in range(3)),
                 'PROJECTOR_LOCAL_HOST': self.m['nodes']['projector'], 'PROJECTOR_METRICS_PORT': str(self.m['ports']['projector_http']),
                 **self.projector_driver_env()}
 
@@ -620,7 +620,7 @@ class CoreFixture(Fixture):
 
     def leader(self, engine):
         """The member reporting cluster role 2 (leader), or None. A member that does not answer is not the leader."""
-        metric = 'assets_cluster_role' if engine == 'ae' else 'match_cluster_role'
+        metric = 'core_cluster_role' if engine == 'ae' else 'match_cluster_role'
         leaders = []
         for i in range(3):
             try:
@@ -1069,7 +1069,7 @@ class CoreFixture(Fixture):
                 raise Violation('ct-forwarder reads its ME credential from ME_AUTH_CREDENTIAL (FC:161); the manifest names '
                                 + me['credential_env'])
             env = {'FWD_CORE_INGRESS': ae_ingress, 'FWD_CORE_RESPONSE_CHANNEL': f'aeron:udp?endpoint={nodes[slot]}:0',
-                   'AE_AUTH_CREDENTIAL': self.keys.credential(slot, 'ae'), 'FWD_ME_INGRESS': me_ingress,
+                   'CORE_AUTH_CREDENTIAL': self.keys.credential(slot, 'ae'), 'FWD_ME_INGRESS': me_ingress,
                    'FWD_ME_RESPONSE_CHANNEL': f'aeron:udp?endpoint={nodes[slot]}:0',
                    'ME_AUTH_CREDENTIAL': self.keys.credential(slot, 'me'),
                    'FWD_INGRESS_CHANNEL': 'aeron:udp?term-length=4m|mtu=8192', 'FWD_DRIVER_MODE': mode,
@@ -1085,9 +1085,9 @@ class CoreFixture(Fixture):
                'BRIDGE_JOURNAL_CHANNEL': 'aeron:ipc', 'BRIDGE_REPLAY_STREAM': '4012',
                'BRIDGE_JOURNAL_MTU': '1408',     # the ME journal archive's MTU (RUN:354; the 2026-09 incident's lesson)
                'BRIDGE_LOCAL_HOST': nodes[slot], 'BRIDGE_DRIVER_MODE': mode, 'BRIDGE_DRIVER_TIMEOUT_MS': '5000',
-               'BRIDGE_AE_CLUSTER_ADDRESSES': ','.join(nodes[f'ae{i}'] for i in range(3)),
-               'BRIDGE_AE_PORT_BASE': str(ports['ae_base']), 'CLUSTER_PORT_STRIDE': str(ports['stride']),
-               'BRIDGE_AE_EGRESS_ENDPOINT': nodes[slot] + ':19394', 'AE_AUTH_CREDENTIAL': self.keys.credential(slot, 'ae'),
+               'BRIDGE_CORE_CLUSTER_ADDRESSES': ','.join(nodes[f'ae{i}'] for i in range(3)),
+               'BRIDGE_CORE_PORT_BASE': str(ports['ae_base']), 'CLUSTER_PORT_STRIDE': str(ports['stride']),
+               'BRIDGE_CORE_EGRESS_ENDPOINT': nodes[slot] + ':19394', 'CORE_AUTH_CREDENTIAL': self.keys.credential(slot, 'ae'),
                'BRIDGE_INSTANCE_ID': instance, 'BRIDGE_HTTP_BIND': f'{nodes[slot]}:{ports["bridge_http"]}'}
         if mode == 'external':
             env['AERON_DIR'] = '/dev/shm/aeron-' + slot
@@ -1155,7 +1155,7 @@ class CoreFixture(Fixture):
         port, path = self.ready_target(slot)
         row = {'state': 'STARTED', 'artifact': artifact_name, 'sha256': artifact['sha256'], 'source_sha': artifact['source_sha'],
                'driver': artifact['driver'], 'readiness': path}
-        try:    # /health is the witness only (aeConnected, halted, meEpoch ...); readiness was /ready
+        try:    # /health is the witness only (coreConnected, halted, meEpoch ...); readiness was /ready
             row['health'] = json.loads(self.http(slot, port, '/health')['body'])
         except (ValueError, KeyError, TypeError):
             row['health'] = None

@@ -31,6 +31,7 @@ import threading
 import time
 
 from contracts import Inconclusive, Violation
+import release_cut
 from machine_paths import env_path, recorded
 PREFIXES = ('core-xver-', 'core-act-', 'core-rollback-')
 DEFAULTS = {'XVER_BOUND_S': 150, 'XVER_STAGGER_S': 5, 'XVER_TAIL_MIN': 8, 'ENGINE_QUORUM_WAIT_MS': 120000,
@@ -151,14 +152,17 @@ def case_for(scenario, kind):
 
 COMMITS = {'match': 'c35689577e8cd524d91692bce6d964c02b45daef', 'assets': 'eb559a7f9070296bae9c73a3087e49a01efb5852',
            'cluster-kit': '947fe50aa2161ae9f302a90c6e1a6bad7eb0eb32', 'cluster-tools': 'e56a4ce5b1118e9c57b975725be6c6010bfdb52d'}
-_R0 = (r'CRITICAL: principal-less session in log: pre-S6 history, clean genesis required \(({}), clusterSessionId=(-?[0-9]+), '
+# the kit's reason text before and after the rename (old tagged jars print the first, current ones the second)
+_R0 = (r'CRITICAL: principal-less session in log: [^,()]*history[^,()]*, clean genesis '
+       r'required \(({}), clusterSessionId=(-?[0-9]+), '
        r'logPosition=(-?[0-9]+)\)')
 ACS_ME = 'match-cluster/src/main/java/com/match/infrastructure/persistence/AppClusteredService.java'
 ACS_AE = 'assets-cluster/src/main/java/com/openexchange/assets/infrastructure/persistence/AssetsClusteredService.java'
 KIT_GATE = 'cluster-kit src/main/java/com/openexchange/cluster/auth/PrincipalGate.java:15,40-42'
 def check_sites(cut):
     """The refusal-site table was read at COMMITS; a cut on other commits makes every site citation stale."""
-    repos = (cut or {}).get('repos') or {}
+    repos = dict((cut or {}).get('repos') or {})
+    repos['assets'] = release_cut.core_repo(cut)     # the core: repos.core in rc2-cut/2, repos.assets in rc2-cut/1
     return [f'{repo}: the refusal-site table was read at {commit}, the cut is at {repos.get(repo)}'
             for repo, commit in sorted(COMMITS.items()) if repos.get(repo) != commit]
 
@@ -270,7 +274,8 @@ def classify_member(m, allowed):
     return dict(out, **{'class': 'other', 'reason': 'exit 1 with no refusal text'})
 
 
-BANNER = re.compile(r'(Assets|Match) Engine node \d+ starting')       # AeronCluster's start line (both engines)
+# AeronCluster's start line: the ME, the core ("Core node N starting") and old tagged core jars ("Assets Engine node N")
+BANNER = re.compile(r'((Assets|Match) Engine|Core) node \d+ starting')
 DROP = 'INGRESS DROP'      # AssetsSbeDemuxer at eb559a7: (schema) :388, (unknown template) :402, (frame bounds) :1489,
                            # (decode) :1496, (unhandled template) :1504
 
@@ -1797,7 +1802,7 @@ def scenario(manifest_path, name, out_dir):
     stale = check_sites(cut)            # The site table cites the refusing binaries' own commits
     if stale:
         raise Inconclusive('refusal-site table stale for this cut: ' + '; '.join(stale))
-    for role, name_ in (('me', 'match-cluster.jar'), ('ae', 'assets-cluster.jar')):
+    for role, name_ in (('me', 'match-cluster.jar'), ('ae', release_cut.fixture_names(cut.get('schema'))['ae'])):
         if (m.get('artifacts') or {}).get(role, {}).get('sha256') != (cut.get('artifacts') or {}).get(name_, {}).get('sha256'):
             raise Inconclusive(f'the manifest\'s {role} jar is not the cut\'s {name_} ({cut.get("cut_id")})')
     if name.startswith('core-act-toolkill'):

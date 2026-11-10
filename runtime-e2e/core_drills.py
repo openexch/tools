@@ -140,7 +140,7 @@ def max_over(scrape, prefix, name):
 
 
 def leader_of(scrape, engine):
-    metric = 'assets_cluster_role' if engine == 'ae' else 'match_cluster_role'
+    metric = 'core_cluster_role' if engine == 'ae' else 'match_cluster_role'
     leaders = [f'{engine}{i}' for i in range(3) if value(scrape, f'{engine}{i}', metric) == 2.0]
     return leaders[0] if len(leaders) == 1 else None
 
@@ -289,7 +289,7 @@ def line_duplicates_delta(w):
 
 
 def line_bridge_branches(w):
-    """lostack: each bridge took branch A (exit 70 observed, restart, /ready 200) or B (/health aeConnected false or
+    """lostack: each bridge took branch A (exit 70 observed, restart, /ready 200) or B (/health coreConnected false or
     /ready 503 seen, then bridge_client_sessions_opened_total delta >= 1). A pause that closed nothing is neither."""
     out = {}
     for bridge in BRIDGES:
@@ -327,11 +327,11 @@ def line_released_outcome(w):
     was ORDER-released WHILE fwd0 was paused (the ME journal seq read just before the pause and just after the thaw
     brackets both), and the core's release NOOP counter moved. Repeats from outside the pause window do not count."""
     attributed = w.get('released_after_thaw')
-    d = delta(w['snaps']['before'], w['snaps']['after'], w['ae_leader_after'] or 'ae0', 'assets_release_confirm_stale_total')
+    d = delta(w['snaps']['before'], w['snaps']['after'], w['ae_leader_after'] or 'ae0', 'core_release_confirm_stale_total')
     n = sum(attributed or [])
     return _line(attributed is not None and n >= 1 and (d or 0) >= 1,
                  f'RELEASED repeats after the thaw of fwd0 for orders released during its pause {attributed} '
-                 f'(all RELEASED repeats in the run {w["released_repeats"]}), assets_release_confirm_stale_total delta {d}')
+                 f'(all RELEASED repeats in the run {w["released_repeats"]}), core_release_confirm_stale_total delta {d}')
 
 
 def late_copies_after_thaw(model, ledger_rows):
@@ -579,8 +579,8 @@ SETTINGS = {
     'FWDRING_PAUSE_S': FWDRING_PAUSE_S, 'A03_PAUSE_S': A03_PAUSE_S, 'A03_CAPACITY': A03_CAPACITY,
 }
 PROGRESS = 'match_engine_next_journal_seq'    # ME progress: the journal sequence; match_orders_submitted_total does not move
-GATE_REASON_ME_CAPACITY = 16                  # Assets_order_entry_gate_reasons is a mask 1 << code (ME_CAPACITY 4)
-SOURCE_SCHEMA = 3                             # BMR:420 bridge_halt_reason 3; assets_feed_latch_reason 3
+GATE_REASON_ME_CAPACITY = 16                  # core_order_entry_gate_reasons is a mask 1 << code (ME_CAPACITY 4)
+SOURCE_SCHEMA = 3                             # BMR:420 bridge_halt_reason 3; core_feed_latch_reason 3
 GATE_A03 = GATE_SEQUENCE + [['SUSPENDED', 'ME_CAPACITY'], ['OPEN', 'ADMIN']]
 GATE_A04_HALT = GATE_SEQUENCE + [['SUSPENDED', 'BRIDGE_HALT']]
 RED_A03_TEXT = "gate transitions [['SUSPENDED', 'GENESIS'], ['OPEN', 'ADMIN'], ['SUSPENDED', 'ME_CAPACITY']] != declared"
@@ -783,10 +783,10 @@ def line_capacity_cycle(w):
     """A03: the AE leader's estimate peaks >= 0.8 c and later reads <= 0.6 c; the tap shows [SUSPENDED, ME_CAPACITY]
     then [OPEN, ADMIN]; gate reasons bit ME_CAPACITY (16) seen in a sample. The ME ledger gauge is evidence only."""
     c = w['capacity']
-    est = series(w['samples'], 'ae', 'assets_me_capacity_estimate')
+    est = series(w['samples'], 'ae', 'core_me_capacity_estimate')
     values = [v for _, v in est]
     if not values:          # An empty sampler series is a missing witness, never a FAIL
-        return _line(False, {'why': 'no sampler row answered assets_me_capacity_estimate on the AE leader', 'capacity': c},
+        return _line(False, {'why': 'no sampler row answered core_me_capacity_estimate on the AE leader', 'capacity': c},
                      inconclusive=True)
     peak = max(values) if values else None
     i = values.index(peak) if values else None
@@ -795,7 +795,7 @@ def line_capacity_cycle(w):
     compact = [s for n, s in enumerate(gate) if n == 0 or s != gate[n - 1]]
     closed = ['SUSPENDED', 'ME_CAPACITY'] in compact
     reopened = closed and ['OPEN', 'ADMIN'] in compact[compact.index(['SUSPENDED', 'ME_CAPACITY']):]
-    bit = any(int(v) & GATE_REASON_ME_CAPACITY for _, v in series(w['samples'], 'ae', 'assets_order_entry_gate_reasons'))
+    bit = any(int(v) & GATE_REASON_ME_CAPACITY for _, v in series(w['samples'], 'ae', 'core_order_entry_gate_reasons'))
     ledger = [v for _, v in series(w['samples'], 'me', 'match_command_ledger_size')]
     holds = peak is not None and peak >= 0.8 * c and later <= 0.6 * c and closed and reopened and bit
     detail = {'capacity': c, 'estimate_peak': peak, 'estimate_after_peak_min': later, 'tap_closed': closed,
@@ -810,7 +810,7 @@ def line_release_once(w):
     """A03 (the drain is the forwarder swap, no cancel wave): the record-4 entries free at least what
     the ME ledger held at its peak (and every ORDER-terminal id), no (command, floor, scope) is removed by two entries,
     match_durable_capacity_total delta 0. The count of removed == 0 entries is recorded against
-    assets_release_confirm_stale_total (a measurement, [E, DR])."""
+    core_release_confirm_stale_total (a measurement, [E, DR])."""
     entries = release_entries(w['me_journal'])
     removed = Counter((r['commandIdHigh'], r['idLowFloor'], r.get('scope')) for _, r in entries if (r.get('removed') or 0) >= 1)
     twice = [k for k, n in removed.items() if n > 1]
@@ -873,7 +873,7 @@ def line_halt_local(w):
         out[b] = {'metric': reason, 'status': status, 'haltReason': (body or {}).get('haltReason'),
                   'meEpoch': (body or {}).get('meEpoch')}
     ae = leader_of(w['halt_scrape'], 'ae')
-    latch = value(w['halt_scrape'], ae, 'assets_feed_latch_reason') if ae else None
+    latch = value(w['halt_scrape'], ae, 'core_feed_latch_reason') if ae else None
     core = w['core']
     ok = all(v['metric'] == SOURCE_SCHEMA and v['status'] == 503 and v['haltReason'] == 'SOURCE_SCHEMA' and v['meEpoch'] == g1
              for v in out.values()) and core.get('feed_halted') is True and core.get('halt_reason') == 'SOURCE_SCHEMA' \
@@ -1073,13 +1073,13 @@ def line_ready_after_kill(w):
 
 
 def line_settle_no_gap(w):
-    """A05 bridges: settle lag = ME leader match_trades_total - core assets_last_applied_trade_id per sample; each swap
+    """A05 bridges: settle lag = ME leader match_trades_total - core core_last_applied_trade_id per sample; each swap
     window's max lag <= the baseline [10, 30) max + A05_SETTLE_LAG_SLACK trades (a count: the projection has no clock)."""
     s = w.get('settings') or SETTINGS
     t0 = _t0_s(w)
     lag = []
     for row in w.get('samples') or []:
-        me, ae = s_value(row, 'me', 'match_trades_total'), s_value(row, 'ae', 'assets_last_applied_trade_id')
+        me, ae = s_value(row, 'me', 'match_trades_total'), s_value(row, 'ae', 'core_last_applied_trade_id')
         if me is not None and ae is not None:
             lag.append(((row['t0'] + row['t1']) / 2, me - ae))
 
@@ -1094,8 +1094,8 @@ def line_settle_no_gap(w):
                  {'baseline_max': base, 'swaps': out, 'slack': s['A05_SETTLE_LAG_SLACK']})
 
 
-TICK_CORE = ['assets_ticks_applied_total', 'assets_ticks_stale_total', 'assets_ticks_invalid_total',
-             'assets_ticks_epoch_drop_total', 'assets_ticks_unbound_total']
+TICK_CORE = ['core_ticks_applied_total', 'core_ticks_stale_total', 'core_ticks_invalid_total',
+             'core_ticks_epoch_drop_total', 'core_ticks_unbound_total']
 
 
 def line_tick_conservation(w):
@@ -1148,16 +1148,16 @@ def _tick_delta(w, n):
 
 
 def line_tick_stale_positive(w):
-    d = _tick_delta(w, 'assets_ticks_stale_total')
-    return _line(d is not None and d > 0, f'assets_ticks_stale_total delta {d}')
+    d = _tick_delta(w, 'core_ticks_stale_total')
+    return _line(d is not None and d > 0, f'core_ticks_stale_total delta {d}')
 
 
 def line_tick_invalid_zero(w):
-    d = {n: _tick_delta(w, n) for n in ('assets_ticks_invalid_total', 'assets_ticks_epoch_drop_total')}
+    d = {n: _tick_delta(w, n) for n in ('core_ticks_invalid_total', 'core_ticks_epoch_drop_total')}
     leader = (w.get('ae_leaders') or [None])[-1]
-    unbound = None if leader is None else (value(w['snaps']['after'], leader, 'assets_ticks_unbound_total', 0) or 0) \
-        - value(w['snaps']['t29'], leader, 'assets_ticks_unbound_total', 0)
-    applied29 = value(w['snaps']['t29'], leader, 'assets_ticks_applied_total', 0) if leader else 0
+    unbound = None if leader is None else (value(w['snaps']['after'], leader, 'core_ticks_unbound_total', 0) or 0) \
+        - value(w['snaps']['t29'], leader, 'core_ticks_unbound_total', 0)
+    applied29 = value(w['snaps']['t29'], leader, 'core_ticks_applied_total', 0) if leader else 0
     return _line(all(v == 0 for v in d.values()) and unbound == 0 and applied29 > 0,
                  dict(d, unbound_after_first_applied=unbound, applied_at_t29=applied29))
 
@@ -1174,8 +1174,8 @@ def line_tick_end_state(w):
     out, ok = {}, bool(book.get(1)) and leader is not None
     for m in range(1, 6):
         me = book.get(m)
-        c = {'bid': core('assets_market_best_bid', m), 'ask': core('assets_market_best_ask', m),
-             'version': core('assets_market_book_version', m)}
+        c = {'bid': core('core_market_best_bid', m), 'ask': core('core_market_best_ask', m),
+             'version': core('core_market_book_version', m)}
         if me is None:
             ok = ok and c['version'] in (None, 0)
         else:
@@ -1188,7 +1188,7 @@ def line_tick_end_state(w):
 
 
 def line_tick_survivor(w):
-    """fwd0 dead from its kill to its restart: assets_ticks_applied_total rose with fwd1 alone. Measured (a06-n1: 2
+    """fwd0 dead from its kill to its restart: core_ticks_applied_total rose with fwd1 alone. Measured (a06-n1: 2
     "rises" with no survivor): a rise counts only between two sampler rows both inside [kill + TICK_SETTLE_S, restart
     issued] (``restart_begin_s``, read before docker start: the restarted fwd0 offered before its /ready returned, and
     fwd0's pre-kill ticks commit just after the kill, which the row before the window used to count). Fewer than two
@@ -1198,7 +1198,7 @@ def line_tick_survivor(w):
     if win.get('kill_s') is None or win.get('restart_begin_s') is None:
         return _line(False, {'why': 'kill window not bracketed', 'kill_window': win}, inconclusive=True)
     lo, hi = t0 + win['kill_s'] + s['TICK_SETTLE_S'], t0 + win['restart_begin_s']
-    rises, _, n = progress(series(w['samples'], 'ae', 'assets_ticks_applied_total'), lo, hi, inside=True)
+    rises, _, n = progress(series(w['samples'], 'ae', 'core_ticks_applied_total'), lo, hi, inside=True)
     after = value(w['snaps']['after'], 'fwd0', 'forwarder_tick_offered_total')
     detail = {'applied_rises_while_fwd0_down': len(rises), 'rows': n, 'window_s': [round(lo - t0, 3), round(hi - t0, 3)],
               'fwd0_offered_after_restart': after}
@@ -1320,9 +1320,9 @@ LINES = {name[5:]: fn for name, fn in globals().items() if name.startswith('line
 # ------------------------------------------------------------------ the sampler
 
 SAMPLE_NAMES = {
-    'ae': ('assets_cluster_role', 'assets_me_capacity_estimate', 'assets_release_backlog', 'assets_order_entry_gate_reasons',
-           'assets_pending_commands', 'assets_last_applied_trade_id', 'assets_ticks_applied_total',
-           'assets_release_minted_order_total', 'assets_release_minted_up_to_total'),
+    'ae': ('core_cluster_role', 'core_me_capacity_estimate', 'core_release_backlog', 'core_order_entry_gate_reasons',
+           'core_pending_commands', 'core_last_applied_trade_id', 'core_ticks_applied_total',
+           'core_release_minted_order_total', 'core_release_minted_up_to_total'),
     'me': ('match_cluster_role', 'match_command_ledger_size', PROGRESS, 'match_durable_duplicates_suppressed_total',
            'match_trades_total', 'match_orders_submitted_total', 'match_release_applied_total', 'match_durable_capacity_total'),
     'bridge': ('bridge_halted', 'bridge_halt_reason'),
@@ -1524,7 +1524,7 @@ class ScheduleDrills:
         self.wait_marker('fill_ended', story_seconds(self.spec['story']) + 60)
         latest = self.sampler.latest()
         me = f.leader('me')
-        hold_w = {'backlog_at_swap': s_value(latest, 'ae', 'assets_release_backlog'),
+        hold_w = {'backlog_at_swap': s_value(latest, 'ae', 'core_release_backlog'),
                   'swap_dispatch_seq': max([r['seq'] for r in self.tap_rows()['dispatch'] if r.get('seq') is not None] or [0]),
                   'swap_me_seq': self.me_seq(me), 'closed_seen': self.gate.closed_ns is not None}
         if not hold:
@@ -2104,8 +2104,8 @@ def of_rows(after, sample, me_scrape=None, halted=False):
     of1 = {m: {n: value(after, m, n, 0) for n in ME_REFUSALS} for m in ('me0', 'me1', 'me2')}
     ae = leader_of(after, 'ae')
     me = leader_of(after, 'me')
-    of4 = {'pending': value(after, ae, 'assets_pending_commands'), 'release_backlog': value(after, ae, 'assets_release_backlog'),
-           'core_ledger': value(after, ae, 'assets_me_ledger_size'), 'me_ledger': value(after, me, 'match_command_ledger_size')}
+    of4 = {'pending': value(after, ae, 'core_pending_commands'), 'release_backlog': value(after, ae, 'core_release_backlog'),
+           'core_ledger': value(after, ae, 'core_me_ledger_size'), 'me_ledger': value(after, me, 'match_command_ledger_size')}
     try:
         gap = Model(sample).tap_closed()
         of5 = {'closed': gap is None, 'open_gap': gap}
@@ -2366,7 +2366,7 @@ class DrillRun(ScheduleDrills):
                     continue
                 status, body = self.f.ready_body(role)
                 health = self.health(role)
-                if status != 200 or health.get('aeConnected') is False:
+                if status != 200 or health.get('coreConnected') is False:
                     saw_down[role] = True
                     continue
                 scrape = core_scenarios.barrier_scrape(self.f)
@@ -2607,7 +2607,7 @@ class DrillRun(ScheduleDrills):
         # run: 2121 for the whole drop). The AE leader's pending-command gauge is the core's side: it rises while the core
         # dispatches and the ME applies nothing.
         ae = getattr(self, 'phase1_ae', None)
-        pending = get(ae, self.f.m['ports']['ae_metrics'], 'assets_pending_commands') if ae else None
+        pending = get(ae, self.f.m['ports']['ae_metrics'], 'core_pending_commands') if ae else None
         return {'t0': round(t0, 3), 't1': round(time.monotonic() - started, 3), 'phase': phase, 'me_seq': seq,
                 'core_head': max((h for h in heads if h is not None), default=None), 'core_pending': pending}
 
@@ -2810,7 +2810,7 @@ class DrillRun(ScheduleDrills):
         """Section 4: forwarders Running and /health 200, nothing pending at the AE leader, the ME members converged; a
         60 s bound that falls through and is recorded (only the barrier's own bound gives INCONCLUSIVE). Only the
         forwarders the run still has (a *-n1 control removed one, an N = 1 manifest has none in fwd1); A03 also needs
-        assets_release_backlog 0 (O-F4)."""
+        core_release_backlog 0 (O-F4)."""
         deadline = time.monotonic() + PRE_BARRIER_S
         status = 'settled'
         forwarders = self.active_forwarders() if hasattr(self, 'removed') else FORWARDERS
@@ -2820,8 +2820,8 @@ class DrillRun(ScheduleDrills):
             fwd_ok = all(self.state(f)['Running'] and self.f.http(f, self.f.ready_target(f)[0], '/health')['status'] == 200
                          for f in forwarders)
             ae = leader_of(scrape, 'ae')
-            pending = value(scrape, ae, 'assets_pending_commands') if ae else None
-            backlog = value(scrape, ae, 'assets_release_backlog') if ae else None
+            pending = value(scrape, ae, 'core_pending_commands') if ae else None
+            backlog = value(scrape, ae, 'core_release_backlog') if ae else None
             seqs = {value(scrape, f'me{i}', 'match_engine_next_journal_seq') for i in range(3)}
             drained = not a03 or backlog == 0
             if fwd_ok and pending == 0 and drained and len(seqs) == 1 and None not in seqs:
@@ -2895,8 +2895,8 @@ class DrillRun(ScheduleDrills):
                   'core_events': tap['order_event'], 'admission': tap['admission'], 'dispatch_tap': second['dispatch_tap'],
                   **{k: second[k] for k in ['core', 'me_journal', 'me_journal_seq', 'me_open_legs', 'money_journal',
                                             'money_journal_legs']},
-                  'faults': {'settle_fault': max(g['assets_settle_faults_total'] for g in second['gauges'].values()),
-                             'settle_rejected': max(g['assets_settle_rejects_total'] for g in second['gauges'].values()),
+                  'faults': {'settle_fault': max(g['core_settle_faults_total'] for g in second['gauges'].values()),
+                             'settle_rejected': max(g['core_settle_rejects_total'] for g in second['gauges'].values()),
                              'order_fault': len(tap['order_fault']),
                              'quarantined': sum(1 for e in tap['order_event'] if e['kind'] == 'QUARANTINED')},
                   'declared': declared_block(self.ledger, int(f.genesis_id(f.life('core') if hasattr(f, 'life') else 1), 16),

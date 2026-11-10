@@ -442,7 +442,7 @@ class LinesTest(unittest.TestCase):
         self.assertFalse(cd.line_pause_branches(self._pauses([a, half]))['holds'])
 
     def test_released_outcome_line(self):
-        stale = 'assets_release_confirm_stale_total'
+        stale = 'core_release_confirm_stale_total'
         before, after = scrape(ae0={stale: 2.0}), scrape(ae0={stale: 3.0})
         snaps = {'before': before, 'after': after}
         self.assertTrue(cd.line_released_outcome(witness(cd.Ledger(), released_repeats=1, released_after_thaw=[1, 0], snaps=snaps))['holds'])
@@ -864,14 +864,14 @@ class VerdictTest(unittest.TestCase):
     def test_of_rows(self):
         sample = clean_sample()
         after = scrape(me0={**{n: 0.0 for n in cd.ME_REFUSALS}, 'match_cluster_role': 2.0, 'match_command_ledger_size': 7.0},
-                       me1={}, me2={}, ae0={'assets_cluster_role': 2.0, 'assets_pending_commands': 0.0,
-                                            'assets_release_backlog': 0.0, 'assets_me_ledger_size': 7.0},
+                       me1={}, me2={}, ae0={'core_cluster_role': 2.0, 'core_pending_commands': 0.0,
+                                            'core_release_backlog': 0.0, 'core_me_ledger_size': 7.0},
                        bridge0={'bridge_halted': 0.0}, bridge1={'bridge_halted': 0.0})
         rows = cd.of_rows(after, sample)
         self.assertTrue(all(r['holds'] for r in rows.values()), rows)
         refused = copy.deepcopy(after); refused['me1']['match_ingress_unauthorized_total'] = 1.0
         self.assertFalse(cd.of_rows(refused, sample)['O-F1']['holds'])
-        drift = copy.deepcopy(after); drift['ae0']['assets_me_ledger_size'] = 8.0
+        drift = copy.deepcopy(after); drift['ae0']['core_me_ledger_size'] = 8.0
         self.assertFalse(cd.of_rows(drift, sample)['O-F4']['holds'])
         self.assertFalse(cd.of_rows(after, holed(6))['O-F5']['holds'])
         halted = copy.deepcopy(after); halted['bridge1']['bridge_halted'] = 1.0
@@ -948,7 +948,7 @@ class TableTest(unittest.TestCase):
         self.assertIsNone(cd.value({'fwd0': {'unavailable': 'x'}}, 'fwd0', 'forwarder_resync_total'))
         self.assertEqual(cd.delta(scrape(f={'c': 5.0}), scrape(f={'c': 2.0}), 'f', 'c'), 2.0)            # restarted, reset
         self.assertEqual(cd.delta(scrape(f={'c': 5.0}), scrape(f={'c': 7.0}), 'f', 'c'), 2.0)
-        self.assertEqual(cd.leader_of(scrape(ae0={'assets_cluster_role': 1.0}, ae1={'assets_cluster_role': 2.0}), 'ae'), 'ae1')
+        self.assertEqual(cd.leader_of(scrape(ae0={'core_cluster_role': 1.0}, ae1={'core_cluster_role': 2.0}), 'ae'), 'ae1')
 
 
 # ------------------------------------------------------------------ the heal observer on a stub fixture
@@ -964,7 +964,7 @@ class BranchObserverTest(unittest.TestCase):
         f.inspect = lambda kind, cid: {'State': state}
         f.ready_target = lambda r: (9700, '/ready')
         f.ready_body = lambda r: (ready, '')
-        f.http = lambda r, port, path: {'status': 200, 'body': json.dumps(health or {'aeConnected': True})}
+        f.http = lambda r, port, path: {'status': 200, 'body': json.dumps(health or {'coreConnected': True})}
         f.restart = lambda r, readiness=None: calls.append(('restart', r)) or {'kind': 'restart', 'target': r}
         f.close_fault = lambda r: calls.append(('close', r))
         run = cd.DrillRun.__new__(cd.DrillRun)
@@ -1111,7 +1111,7 @@ def S(t, **roles):
 
 
 def lead(engine, value=2.0):
-    return {('assets_cluster_role' if engine == 'ae' else 'match_cluster_role'): value}
+    return {('core_cluster_role' if engine == 'ae' else 'match_cluster_role'): value}
 
 
 def release_event(seq, entries, epoch=7):
@@ -1205,8 +1205,8 @@ class A03LinesTest(unittest.TestCase):
     def samples(self, peak=1600, after=0, reasons=16.0):
         rows = []
         for i, est in enumerate([0, 400, 800, 1200, peak, peak, after, after]):
-            rows.append(S(100 + i, ae1=dict(lead('ae'), assets_me_capacity_estimate=float(est), assets_release_backlog=float(est),
-                                            assets_order_entry_gate_reasons=reasons if est >= 0.8 * self.CAP else 0.0),
+            rows.append(S(100 + i, ae1=dict(lead('ae'), core_me_capacity_estimate=float(est), core_release_backlog=float(est),
+                                            core_order_entry_gate_reasons=reasons if est >= 0.8 * self.CAP else 0.0),
                           me0=dict(lead('me'), match_command_ledger_size=float(est))))
         return rows
 
@@ -1287,7 +1287,7 @@ class A04LinesTest(unittest.TestCase):
         base = {'g1': self.EPOCH1,
                 'bridge_health': {b: self.health() for b in cd.BRIDGES},
                 'halt_scrape': scrape(bridge0={'bridge_halt_reason': 3.0}, bridge1={'bridge_halt_reason': 3.0},
-                                      ae0=dict(lead('ae'), assets_feed_latch_reason=3.0)),
+                                      ae0=dict(lead('ae'), core_feed_latch_reason=3.0)),
                 'core': {'feed_halted': True, 'halt_reason': 'SOURCE_SCHEMA', 'bound_me_epoch': self.EPOCH1},
                 'settle_rejected': 0,
                 'open_gate': {'meaning': 'REFUSED', 'reply': {'replies': [{'t': 'AdminAck', 'result': 'REJECTED', 'reason': 40}]}},
@@ -1304,11 +1304,11 @@ class A04LinesTest(unittest.TestCase):
         self.assertTrue(cd.line_halt_local(self.w())['holds'])
         red = self.w(bridge_health={b: self.health('NONE', 200) for b in cd.BRIDGES},
                      halt_scrape=scrape(bridge0={'bridge_halt_reason': 0.0}, bridge1={'bridge_halt_reason': 0.0},
-                                        ae0=dict(lead('ae'), assets_feed_latch_reason=0.0)),
+                                        ae0=dict(lead('ae'), core_feed_latch_reason=0.0)),
                      core={'feed_halted': False, 'halt_reason': 'NONE', 'bound_me_epoch': self.EPOCH1})
         self.assertFalse(cd.line_halt_local(red)['holds'])
         mismatch = self.w(halt_scrape=scrape(bridge0={'bridge_halt_reason': 2.0}, bridge1={'bridge_halt_reason': 3.0},
-                                             ae0=dict(lead('ae'), assets_feed_latch_reason=3.0)))
+                                             ae0=dict(lead('ae'), core_feed_latch_reason=3.0)))
         self.assertFalse(cd.line_halt_local(mismatch)['holds'])          # EPOCH_MISMATCH is not the declared reason
 
     def test_open_refused_money_while_halted_fenced_and_the_noregen_control(self):
@@ -1527,7 +1527,7 @@ class A05LinesTest(unittest.TestCase):
                 t = 1000.0 + i * 0.25
                 lag = 4 if not (lo <= t - 1000.0 < hi) else 4 + int(rate * (t - 1000.0 - lo))
                 rows.append(S(t, me0=dict(lead('me'), match_trades_total=float(1000 + i)),
-                              ae0=dict(lead('ae'), assets_last_applied_trade_id=float(1000 + i - lag))))
+                              ae0=dict(lead('ae'), core_last_applied_trade_id=float(1000 + i - lag))))
             return rows
         bswaps = [dict(swaps[0], slot='bridge0')]
         line = cd.line_settle_no_gap(self.w(swaps=bswaps, samples=lag_rows(30.0, 30.0 + hold + 1.1)))
@@ -1546,7 +1546,7 @@ class A05LinesTest(unittest.TestCase):
                 t = 1000.0 + i * 0.25
                 lag = 30 if not (30.0 <= t - 1000.0 < 31.6) else spike
                 rows.append(S(t, me0=dict(lead('me'), match_trades_total=float(1000 + i)),
-                              ae0=dict(lead('ae'), assets_last_applied_trade_id=float(1000 + i - lag))))
+                              ae0=dict(lead('ae'), core_last_applied_trade_id=float(1000 + i - lag))))
             return rows
         swaps = [dict(s, slot=s['slot'].replace('fwd', 'bridge')) for s in self.swaps()]
         self.assertTrue(cd.line_settle_no_gap(self.w(swaps=swaps, samples=lag_rows(40)))['holds'])
@@ -1560,11 +1560,11 @@ class A06LinesTest(unittest.TestCase):
                 'forwarder_tick_pending_age_ms{market="1"}': age, 'forwarder_ticks_ready': ready}
 
     def core(self, applied, stale, version=3185472, leader=True):
-        return dict(lead('ae', 2.0 if leader else 1.0), assets_ticks_applied_total=float(applied),
-                    assets_ticks_stale_total=float(stale), assets_ticks_invalid_total=0.0, assets_ticks_epoch_drop_total=0.0,
-                    assets_ticks_unbound_total=0.0, **{'assets_market_book_version{market="1"}': float(version),
-                                                       'assets_market_best_bid{market="1"}': 8057000000.0,
-                                                       'assets_market_best_ask{market="1"}': 9787000000.0})
+        return dict(lead('ae', 2.0 if leader else 1.0), core_ticks_applied_total=float(applied),
+                    core_ticks_stale_total=float(stale), core_ticks_invalid_total=0.0, core_ticks_epoch_drop_total=0.0,
+                    core_ticks_unbound_total=0.0, **{'core_market_book_version{market="1"}': float(version),
+                                                       'core_market_best_bid{market="1"}': 8057000000.0,
+                                                       'core_market_best_ask{market="1"}': 9787000000.0})
 
     def w(self, **kw):
         """The DR-A06 counters (a06.log): fwd0 291 at t29, 301 just before the kill, 147 after its restart; fwd1 601."""
@@ -1630,12 +1630,12 @@ class A06LinesTest(unittest.TestCase):
         The window is [kill + TICK_SETTLE_S, restart issued] and a rise needs two rows inside it."""
         series = [(25.584, 256), (26.584, 266), (27.592, 276), (28.586, 286), (29.592, 296), (30.585, 302)] + \
                  [(31.585 + i, 302) for i in range(14)] + [(45.607, 304), (46.586, 314), (47.585, 324)]
-        samples = [S(1000.0 + t, ae2=dict(lead('ae'), assets_ticks_applied_total=float(v))) for t, v in series]
+        samples = [S(1000.0 + t, ae2=dict(lead('ae'), core_ticks_applied_total=float(v))) for t, v in series]
         n1 = self.w(samples=samples, kill_window={'kill_s': 30.298, 'restart_begin_s': 45.01, 'restart_s': 46.158})
         line = cd.line_tick_survivor(n1)
         self.assertFalse(line['holds'], line)
         self.assertEqual(line['detail']['applied_rises_while_fwd0_down'], 0)
-        old = cd.progress(cd.series(samples, 'ae', 'assets_ticks_applied_total'), 1030.298, 1046.158)[0]
+        old = cd.progress(cd.series(samples, 'ae', 'core_ticks_applied_total'), 1030.298, 1046.158)[0]
         self.assertEqual(len(old), 2)                                    # what the run counted: the pre-kill commit and the restart
         unbracketed = cd.line_tick_survivor(self.w(kill_window={'kill_s': 30.0, 'restart_s': 45.0}))
         self.assertTrue(unbracketed.get('inconclusive'))
@@ -1781,14 +1781,14 @@ class ObserveLife1Test(unittest.TestCase):
         money = {'balances': [], 'holds': [], 'lastAppliedTradeId': 12, 'meEpoch': 15112027, 'lastAppliedJournalSeq': 7505,
                  'feedHalted': True, 'haltReason': 'SOURCE_SCHEMA'}
         replies = {'money-dump': money, 'order-dump': {'orders': []}, 'pending-dump': {'count': 0, 'head': 9, 'entries': []}}
-        metrics = {'assets_settle_faults_total': 0.0, 'assets_settle_rejects_total': 0.0, 'assets_cluster_role': 2.0,
+        metrics = {'core_settle_faults_total': 0.0, 'core_settle_rejects_total': 0.0, 'core_cluster_role': 2.0,
                    **{m: 0.0 for m in core_scenarios.COUNTER_METRICS.values()}}
         f = types.SimpleNamespace(m={'ports': {'ae_metrics': 9, 'me_metrics': 8, 'forwarder_http': 7, 'bridge_http': 6},
                                      'me_journal_profile': 'me-journal-4'}, slots={},
                                   core=lambda verb, principal, **kw: ('ANSWERED', replies[verb]),
                                   journal_dump=me, me_open_legs=me,
                                   metrics=lambda role, port: me() if role.startswith('me') else
-                                  dict(metrics, assets_cluster_role=2.0 if role == 'ae0' else 1.0))
+                                  dict(metrics, core_cluster_role=2.0 if role == 'ae0' else 1.0))
         f.psql = lambda db, sql: '[]'
         return f, calls
 
@@ -1825,13 +1825,13 @@ class SamplerTest(unittest.TestCase):
     def test_sampler_rows_from_one_probe_exec(self):
         """RED 6380b01: no Sampler. One probe exec per tick reads every target; a target that does not answer is
         'unavailable' in that row, never a crash, and only the wanted names are kept."""
-        out = json.dumps({'ae0': {'status': 200, 'body': 'assets_cluster_role 2\nassets_release_backlog 4\nother 1\n'},
+        out = json.dumps({'ae0': {'status': 200, 'body': 'core_cluster_role 2\ncore_release_backlog 4\nother 1\n'},
                           'me0': {'status': 0, 'error': 'refused'}})
-        row = cd.Sampler.parse(out, {'ae0': ('assets_cluster_role', 'assets_release_backlog'), 'me0': ('match_trades_total',)},
+        row = cd.Sampler.parse(out, {'ae0': ('core_cluster_role', 'core_release_backlog'), 'me0': ('match_trades_total',)},
                                10.0, 10.2)
-        self.assertEqual(row['roles']['ae0'], {'assets_cluster_role': 2.0, 'assets_release_backlog': 4.0})
+        self.assertEqual(row['roles']['ae0'], {'core_cluster_role': 2.0, 'core_release_backlog': 4.0})
         self.assertIn('unavailable', row['roles']['me0'])
-        self.assertEqual(cd.s_value(row, 'ae', 'assets_release_backlog'), 4.0)       # leader resolution inside one row
+        self.assertEqual(cd.s_value(row, 'ae', 'core_release_backlog'), 4.0)       # leader resolution inside one row
 
 
 class RunA04OrderTest(unittest.TestCase):
@@ -2099,7 +2099,7 @@ class ScheduleDrillsTest(unittest.TestCase):
         run, calls = self.run_for('a03-lifetime', {'hold': False}, leader=lambda e: 'me0')
         run.red = None
         run.gate = types.SimpleNamespace(closed_ns=None, opened_ns=None)
-        run.sampler = types.SimpleNamespace(latest=lambda: S(1, ae0=dict(lead('ae'), assets_release_backlog=0.0)))
+        run.sampler = types.SimpleNamespace(latest=lambda: S(1, ae0=dict(lead('ae'), core_release_backlog=0.0)))
         run.wait_marker = lambda name, bound, where=None: calls.append(('marker', name)) or {}
         run.tap_rows = lambda: {'dispatch': [{'seq': 5}, {'seq': 9}]}
         run.me_seq = lambda me: 777
@@ -2167,7 +2167,7 @@ class ScheduleDrillsTest(unittest.TestCase):
     def test_a06_scrapes_the_core_around_the_kill_and_brackets_the_restart(self):
         run, calls = self.run_for('a06-two-forwarders-ticks', ports={'ae_metrics': 9})
         run.f.m['ports'] = {'ae_metrics': 9, 'forwarder_http': 7}
-        run.f.metrics = lambda role, port: calls.append(('metrics', role)) or {'assets_ticks_applied_total': 1.0}
+        run.f.metrics = lambda role, port: calls.append(('metrics', role)) or {'core_ticks_applied_total': 1.0}
         run.snaps = {'before': scrape(ae2=dict(lead('ae')))}
         run.snap = lambda label: run.snaps.__setitem__(label, scrape(ae2=dict(lead('ae')))) or run.snaps[label]
         run.restart = lambda row: calls.append(('restart', row['target'])) or run.ledger.heal(row, 'restart', {'ready': True})

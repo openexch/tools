@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fixture v2 contracts without Docker."""
+import contextlib
 import copy
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -89,7 +91,7 @@ class CoreManifestTest(unittest.TestCase):
         self.bad(lambda m: m.pop('journal_probe'), Inconclusive)
 
     def test_credentials_must_be_explicit(self):
-        self.bad(lambda m: m['credentials']['ae'].update(keys_env='ASSETS_KEYS'), text='ASSETS_AUTH_KEYS')
+        self.bad(lambda m: m['credentials']['ae'].update(keys_env='CORE_KEYS'), text='CORE_AUTH_KEYS')
         self.bad(lambda m: m['credentials']['me'].update(mode='maybe'), text='ME credential mode')
         self.bad(lambda m: m['credentials']['me'].update(keys_env=''), text='environment names')
 
@@ -232,8 +234,8 @@ class FaultAndMetricsTest(unittest.TestCase):
                 partition_arguments(self.m, *args)
 
     def test_prometheus_parsing_is_strict(self):
-        values = parse_prometheus('# HELP x\nassets_ingress_unauthorised_total 3\nbridge_halted{reason="gap"} 1.0\n')
-        self.assertEqual(values['assets_ingress_unauthorised_total'], 3.0)
+        values = parse_prometheus('# HELP x\ncore_ingress_unauthorised_total 3\nbridge_halted{reason="gap"} 1.0\n')
+        self.assertEqual(values['core_ingress_unauthorised_total'], 3.0)
         self.assertEqual(values['bridge_halted{reason="gap"}'], 1.0)
         with self.assertRaises(Inconclusive): parse_prometheus('this is not a metric line at all\n')
 
@@ -321,13 +323,13 @@ class Docker:
 
 
 class SlotEnvTest(unittest.TestCase):
-    FWD = {'FWD_CORE_INGRESS', 'FWD_CORE_RESPONSE_CHANNEL', 'AE_AUTH_CREDENTIAL', 'FWD_ME_INGRESS', 'FWD_ME_RESPONSE_CHANNEL',
+    FWD = {'FWD_CORE_INGRESS', 'FWD_CORE_RESPONSE_CHANNEL', 'CORE_AUTH_CREDENTIAL', 'FWD_ME_INGRESS', 'FWD_ME_RESPONSE_CHANNEL',
            'ME_AUTH_CREDENTIAL', 'FWD_INGRESS_CHANNEL', 'FWD_DRIVER_MODE', 'FWD_DRIVER_TIMEOUT_MS', 'FWD_INSTANCE_ID',
            'FWD_HTTP_BIND'}
     BRIDGE = {'BRIDGE_ME_JOURNAL_ARCHIVES', 'BRIDGE_JOURNAL_CONTROL_STREAM', 'BRIDGE_JOURNAL_STREAM', 'BRIDGE_JOURNAL_CHANNEL',
               'BRIDGE_REPLAY_STREAM', 'BRIDGE_JOURNAL_MTU', 'BRIDGE_LOCAL_HOST', 'BRIDGE_DRIVER_MODE', 'BRIDGE_DRIVER_TIMEOUT_MS',
-              'BRIDGE_AE_CLUSTER_ADDRESSES', 'BRIDGE_AE_PORT_BASE', 'CLUSTER_PORT_STRIDE', 'BRIDGE_AE_EGRESS_ENDPOINT',
-              'AE_AUTH_CREDENTIAL', 'BRIDGE_INSTANCE_ID', 'BRIDGE_HTTP_BIND'}
+              'BRIDGE_CORE_CLUSTER_ADDRESSES', 'BRIDGE_CORE_PORT_BASE', 'CLUSTER_PORT_STRIDE', 'BRIDGE_CORE_EGRESS_ENDPOINT',
+              'CORE_AUTH_CREDENTIAL', 'BRIDGE_INSTANCE_ID', 'BRIDGE_HTTP_BIND'}
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(); self.dir = self.temp.name
@@ -353,7 +355,7 @@ class SlotEnvTest(unittest.TestCase):
                     self.assertEqual(env['FWD_INGRESS_CHANNEL'], 'aeron:udp?term-length=4m|mtu=8192')
                     self.assertEqual(env['FWD_CORE_RESPONSE_CHANNEL'], 'aeron:udp?endpoint=' + f.m['nodes'][slot] + ':0')
                     self.assertTrue(env['ME_AUTH_CREDENTIAL'].startswith('121:' if slot == 'fwd0' else '122:'))
-                    self.assertTrue(env['AE_AUTH_CREDENTIAL'].startswith(instance + ':FORWARDER:'))
+                    self.assertTrue(env['CORE_AUTH_CREDENTIAL'].startswith(instance + ':FORWARDER:'))
             self.assertEqual(f.slot_env('fwd0')[extra], '/dev/shm/aeron-fwd0' if extra == 'AERON_DIR' else '/dev/shm/fwd-embedded')
 
     def test_bridge_env_is_the_strict_set(self):
@@ -454,8 +456,8 @@ class DriverWrapperTest(unittest.TestCase):
         f = fixture_for(slot_manifest(self.dir, driver), self.dir)
         spawned, waits = [], []
         f.spawn = lambda name, command, env=None: spawned.append((name, command, env))
-        f.wait_http = lambda name, port, path, **kw: waits.append((name, port, path)) or {'status': 200, 'body': '{"aeConnected": true}'}
-        f.http = lambda name, port, path, **kw: {'status': 200, 'body': '{"aeConnected": true, "halted": false}'}
+        f.wait_http = lambda name, port, path, **kw: waits.append((name, port, path)) or {'status': 200, 'body': '{"coreConnected": true}'}
+        f.http = lambda name, port, path, **kw: {'status': 200, 'body': '{"coreConnected": true, "halted": false}'}
         f.driver_identity = lambda role: {'cnc_mtime': '1.0', 'started_at': 'S0'}
         f.registry.setdefault('driver_identity', {})
         row = f.start_slot(slot)
@@ -851,20 +853,20 @@ class TapRegistrationAndFundingGateTest(unittest.TestCase):
 
 class BarrierCountersTest(unittest.TestCase):
     def metrics(self, role):
-        base = {'assets_settle_faults_total': 0.0, 'assets_settle_rejects_total': 0.0, 'assets_cluster_role': 1.0,
-                'assets_order_stale_outcomes_total': 0.0, 'assets_order_redundant_outcomes_total': 0.0,
-                'assets_order_stale_terminals_total': 0.0, 'assets_order_conflicts_total': 0.0, 'assets_released_late_total': 0.0}
+        base = {'core_settle_faults_total': 0.0, 'core_settle_rejects_total': 0.0, 'core_cluster_role': 1.0,
+                'core_order_stale_outcomes_total': 0.0, 'core_order_redundant_outcomes_total': 0.0,
+                'core_order_stale_terminals_total': 0.0, 'core_order_conflicts_total': 0.0, 'core_released_late_total': 0.0}
         if role == 'ae1':
-            base.update(assets_cluster_role=2.0, assets_order_stale_outcomes_total=5.0, assets_order_redundant_outcomes_total=16.0,
-                        assets_order_stale_terminals_total=16.0, assets_order_conflicts_total=0.0,
-                        assets_released_late_total=2.0)   # Table D U1 joins sample.counters (O11)
+            base.update(core_cluster_role=2.0, core_order_stale_outcomes_total=5.0, core_order_redundant_outcomes_total=16.0,
+                        core_order_stale_terminals_total=16.0, core_order_conflicts_total=0.0,
+                        core_released_late_total=2.0)   # Table D U1 joins sample.counters (O11)
         return base
 
     def stub(self, leaderless=False):
         f = types.SimpleNamespace(m={'ports': dict(core_contracts.PORT_PROFILE)})
         f.core = lambda verb, principal, **kw: ('ANSWERED', {'count': 0, 'head': 0, 'entries': []})
         f.me_open_legs = lambda: []
-        f.metrics = lambda role, port: dict(self.metrics(role), assets_cluster_role=1.0) if leaderless else self.metrics(role)
+        f.metrics = lambda role, port: dict(self.metrics(role), core_cluster_role=1.0) if leaderless else self.metrics(role)
         return f
 
     def run_observe(self, fixture):
@@ -925,8 +927,25 @@ class BuildProbesCtDirTest(unittest.TestCase):
             self.assertEqual(sorted(sources), ['t1_core_driver', 't1_me_driver'])
             self.assertEqual(sources['t1_me_driver']['source'], it / 'T1MeDriver.java')
             self.assertEqual(sources['t1_me_driver']['main_class'], 'T1MeDriver')
-            self.assertEqual(sources['t1_core_driver']['classpath_arg'], '--ae-jar')
+            self.assertEqual(sources['t1_core_driver']['classpath_arg'], '--core-jar')
             self.assertEqual(sources['t1_me_driver']['classpath_arg'], '--me-jar')
+
+    def test_the_retired_ae_jar_flag_is_refused_naming_core_jar(self):
+        import build_core_probes
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / 'out'
+            for argv in (['--ae-jar', '/x.jar', '--me-jar', '/y.jar', '--output', str(out)],
+                         ['--me-jar', '/y.jar', '--ae-jar=/x.jar', '--output', str(out)]):
+                with self.subTest(argv=argv), self.assertRaisesRegex(
+                        SystemExit, 'the flag --ae-jar is retired; it is now --core-jar'):
+                    build_core_probes.main(argv)
+                self.assertFalse(out.exists())                       # refused before anything is written
+            # negative control: the new flag gets past the refusal (and on to argparse's own checks)
+            self.assertIsNone(build_core_probes.retired_refusal(['--core-jar', '/x.jar', '--me-jar', '/y.jar']))
+            with self.assertRaises(SystemExit) as caught, contextlib.redirect_stderr(io.StringIO()) as err:
+                build_core_probes.main(['--core-jar', '/x.jar'])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn('--me-jar', err.getvalue())
 
 
 # ======================================================================================================
@@ -1054,7 +1073,7 @@ class LifecycleBase(unittest.TestCase):
         self.clock = Clock(); f.clock = self.clock; f.sleep = self.clock.sleep
         self.docker = Docker4(f, roles, self.clock)
         f.registry.update(fault_targets={}, faults=[])
-        self.health = {'aeConnected': True}
+        self.health = {'coreConnected': True}
         f.http = lambda name, port, path, **kw: {'status': 200, 'body': json.dumps(self.health)}
         f.wait_http = lambda *a, **k: {'status': 200, 'body': '{}'}
         for role in roles:
@@ -1100,7 +1119,7 @@ class ReplaceSlotTest(LifecycleBase):
             f.replace_slot('fwd0', 'forwarder_b')
         (f.root / 'state' / 'fwd0' / 'old.txt').write_text('gen0')
         f.stop('fwd0')
-        self.health = {'aeConnected': True, 'build': 'b' * 40}
+        self.health = {'coreConnected': True, 'build': 'b' * 40}
         w = f.replace_slot('fwd0', 'forwarder_b')
         a, b = f.m['artifacts']['forwarder'], f.m['artifacts']['forwarder_b']
         self.assertEqual(w['old'], {'artifact': 'forwarder', 'sha256': a['sha256'], 'source_sha': a['source_sha']})
