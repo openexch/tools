@@ -366,6 +366,7 @@ class UnitFilesTest(unittest.TestCase):
         text = (self.D / 'runtime-e2e-nightly.service').read_text()
         self.assertRegex(text, r'(?m)^Environment=NIGHTLY_BOUND_S=18000$')
         self.assertRegex(text, r'(?m)^Nice=5$'); self.assertRegex(text, r'(?m)^After=docker.service$')
+        self.assertIn('--alternate ${RUNTIME_E2E_PLAN_EMBEDDED} ${RUNTIME_E2E_PLAN_EXTERNAL}', text)
         self.assertIn('--plan', text); self.assertIn('--harness-commit', text)
         self.assertNotRegex(text, r'(?m)^TimeoutStartSec=.*\$')       # systemd does not expand Environment= there
 
@@ -503,3 +504,25 @@ class RepoPathsTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class AlternateNightTest(NightBase):
+    """--alternate: the chosen set, its parity and whether it was forced are in the night's summary; NIGHTLY_PLAN_SET is
+    embedded or external only."""
+
+    def test_the_summary_states_the_plan_set_and_its_parity(self):
+        host = FakeHost()
+        host.clock_start = host.monotonic()
+        chosen = {'set': 'external', 'parity': 1, 'day_of_year': 317, 'file': 'nightly-cut-external.json', 'forced': False,
+                  'files': ['nightly-cut-embedded.json', 'nightly-cut-external.json']}
+        code, summary = nightly.run_night(nightly.parse_plan(plan2()), self.ev, self.work, self.settings(), host,
+                                          plan_set=chosen)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.summary(summary['night'])['plan_set'], chosen)
+        self.assertTrue(nightly.verify_seal(self.ev / summary['night']))
+
+    def test_the_forced_set_is_a_setting_with_two_values(self):
+        self.assertEqual(nightly.settings_from_env({'NIGHTLY_PLAN_SET': 'external'}).plan_set, 'external')
+        self.assertIsNone(nightly.settings_from_env({}).plan_set)
+        with self.assertRaises(Violation):
+            nightly.settings_from_env({'NIGHTLY_PLAN_SET': 'both'})

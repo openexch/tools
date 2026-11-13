@@ -3,8 +3,8 @@
 
 The legacy schema v1 (OMS order entry, PostgreSQL order truth) stays in contracts.py for the frozen
 v0.5 scenarios. v2 is the OMS + ledger core: ME x3, AE x3, two forwarder slots, two bridge slots, the
-money projector, a reserved shadow replica slot and the probe. Slots whose product does not exist
-yet (C++ forwarder and bridge, the shadow replica) declare ``null`` and are skipped, never faked.
+money projector, the shadow replica slot and the probe. A slot a manifest leaves empty declares ``null`` and is skipped,
+never faked; the replica slot runs the core jar as ``CORE_ROLE=replica`` on the replica kinds (``REPLICA_KINDS``).
 """
 import hashlib
 import ipaddress
@@ -25,7 +25,13 @@ OPTIONAL_BINARIES = ['forwarder', 'forwarder_b', 'bridge', 'bridge_b', 'shadow']
 SLOT_ARTIFACTS = {'fwd0': {'forwarder', 'forwarder_b'}, 'fwd1': {'forwarder', 'forwarder_b'},
                   'bridge0': {'bridge', 'bridge_b'}, 'bridge1': {'bridge', 'bridge_b'}, 'shadow0': {'shadow'}}
 PORT_PROFILE = {'me_base': 9000, 'ae_base': 19300, 'stride': 100, 'me_metrics': 19500, 'ae_metrics': 19700,
-                'bridge_http': 9600, 'projector_http': 9601, 'forwarder_http': 9700, 'journal_replay': 19820}
+                'bridge_http': 9600, 'projector_http': 9601, 'forwarder_http': 9700, 'journal_replay': 19820,
+                'shadow_metrics': 19703}
+# The replica's port slot (CLUSTER_REPLICA_SLOT): its ports are ae_base + slot x stride + offset, like a member's
+REPLICA_SLOT = 3
+# A replica restarted right after a kill or an exit meets its own archive's mark file, as an AE member does (the same
+# measured 12.5 s, AE_RESTART_MIN_AFTER_KILL_S in core_fixture); a setting, recorded as waited_after_kill_s
+SHADOW_RESTART_MIN_AFTER_KILL_S = 12.5
 AE_CREDENTIAL_ENV = {'keys_env': 'CORE_AUTH_KEYS', 'credential_env': 'CORE_AUTH_CREDENTIAL'}
 # The environment names retired by the rename of the engine to core, old to new (the core's RetiredSettings table for the
 # names this harness sets, plus the probe's own). A fixture that still sets one was written for the old names: it is
@@ -90,7 +96,14 @@ PROCESS_ENV = {
     'BRIDGE_INSTANCE_ID', 'BRIDGE_HTTP_BIND',
     # the staged aeronmd: deleted on start and shutdown so a restart never attaches to a dead driver
     'AERON_DIR_DELETE_ON_START', 'AERON_DIR_DELETE_ON_SHUTDOWN', 'LD_LIBRARY_PATH',
-    'CORE_ADDRESSES', 'CORE_PORT_BASE', 'CORE_LOCAL_HOST'}
+    'CORE_ADDRESSES', 'CORE_PORT_BASE', 'CORE_LOCAL_HOST',
+    # The members' shadow block (engine_env, REPLICA_KINDS) and the replica (replica_env); the core README names each
+    'SNAPSHOT_MODE', 'SHADOW_PULL_SOURCES', 'SHADOW_PRODUCER_BUFFER_MB', 'SHADOW_WITNESS_ALARM_MS', 'SHADOW_ANCHOR_RULE',
+    'CORE_ROLE', 'CLUSTER_REPLICA_SLOT', 'CLUSTER_REPLICA_ADDRESS', 'REPLICA_BACKUP_SOURCE', 'REPLICA_SHADOW_BUFFER_MB',
+    'REPLICA_CATCHUP_RCV_WND', 'SHADOW_RETAIN_N', 'REPLICA_BACKUP_COOLDOWN_MS', 'SHADOW_REBOOTSTRAP_REPLAY_FAILURES',
+    'REPLICA_BACKUP_QUERY_INTERVAL_MS',
+    # the core's archive segment length (members and replica of the replica and full drill kinds; core README)
+    'ARCHIVE_SEGMENT_LENGTH'}
 # Only `execute` on the probe container may carry these (the pinned T1 drivers). The values are
 # session secrets except T1_ME_MARKETS and T1_LOCAL_HOST. T1_BRIDGE_KEY, T1_TAP_KEY and T1_ME_FORWARDER_KEY are
 # never set: the via-bridge genesis needs no bridge key and the capture/resend verbs are not run from the probe.
@@ -126,7 +139,46 @@ BASE_KINDS = {'s16', 's16-ext', 's16-embedded', 's16-n1', 's16-a03', 's16-a03-em
 CUT_KINDS = {'s17', 's17-ext', 's17-embedded', 's17-n1', 's17-xver', 's17-xver-ext', 's17-act', 's17-rollback', 's17-a05',
              's17-a05-embedded', 's17-a05-keep', 's17-a05-reverse', 's17-ctl-edk-cnctimeout',
              's17-a03', 's17-a03-embedded', 's17-red-a03', 's17-red-a04', 's17-red1', 's17-red2'}
+# The replica kinds, named by content and derived from the cut like the s17 kinds. Each runs the core jar as the shadow
+# replica in shadow0 and its AE members in SNAPSHOT_MODE=shadow; the env each adds to the common shadow block
+# (core_fixture.engine_env / replica_env) is the kind's, because env lives in manifests (one kind per control setting).
+#   shadow               slots external, engines and replica embedded
+#   shadow-ext           engines and replica on the staged aeronmd
+#   shadow-anyverified   members purge behind one producer's ALIGNED (the re-bootstrap drill: the replica is down)
+#   shadow-cooldown30    the supplier-loss control: the replica's backup cool-down 30 s
+#   shadow-detectoronly  the re-bootstrap control: the detector counts and never acts (members as shadow-anyverified,
+#                        else nothing is purged below the stopped replica and the detector has nothing to count)
+#   shadow-query         the leader-loss and catalog rows: a 13 s backup query interval (10 s sits below window + 1000,
+#                        a CRITICAL line)
+#   shadow-query-ext     shadow-query with the engines and the replica on the staged aeronmd
+#   shadow-anyverified-ext  shadow-anyverified with the engines and the replica on the staged aeronmd
+REPLICA_KINDS = {
+    'shadow': {'members': {}, 'replica': {}},
+    'shadow-ext': {'members': {}, 'replica': {}},
+    'shadow-anyverified': {'members': {'SHADOW_ANCHOR_RULE': 'any-verified'}, 'replica': {}},
+    'shadow-cooldown30': {'members': {}, 'replica': {'REPLICA_BACKUP_COOLDOWN_MS': '30000'}},
+    'shadow-detectoronly': {'members': {'SHADOW_ANCHOR_RULE': 'any-verified'},
+                            'replica': {'SHADOW_REBOOTSTRAP_REPLAY_FAILURES': '0'}},
+    'shadow-query': {'members': {}, 'replica': {'REPLICA_BACKUP_QUERY_INTERVAL_MS': '13000'}},
+    'shadow-query-ext': {'members': {}, 'replica': {'REPLICA_BACKUP_QUERY_INTERVAL_MS': '13000'}},
+    'shadow-anyverified-ext': {'members': {'SHADOW_ANCHOR_RULE': 'any-verified'}, 'replica': {}},
+}
+# The full-mode control kind: no replica, SNAPSHOT_MODE unset (full snapshots), the same snapshot cadence
+FULL_KINDS = {'full'}
+# The members' shadow block of every replica kind and the cadence every replica and full kind runs (settings)
+MEMBER_SHADOW_ENV = {'SNAPSHOT_MODE': 'shadow', 'SHADOW_PRODUCER_BUFFER_MB': '64', 'SHADOW_WITNESS_ALARM_MS': '120000'}
+DRILL_CADENCE_ENV = {'SNAPSHOT_INTERVAL_MINUTES': '1'}
+# The replica's settings on the fixture (core README "Replica"): FOLLOWER keeps replay off the leader; the catch-up window
+# is the replica's own (it never reads TRANSPORT_LOG_RCV_WINDOW); the term is the members' (the lag default reads it)
+REPLICA_ENV = {'CORE_ROLE': 'replica', 'CLUSTER_REPLICA_SLOT': str(REPLICA_SLOT), 'REPLICA_BACKUP_SOURCE': 'FOLLOWER',
+               'REPLICA_SHADOW_BUFFER_MB': '64', 'REPLICA_CATCHUP_RCV_WND': '512k', 'SHADOW_RETAIN_N': '3'}
+CUT_KINDS = CUT_KINDS | set(REPLICA_KINDS) | FULL_KINDS
 KINDS = BASE_KINDS | CUT_KINDS
+
+
+def cut_derived(kind):
+    """True for a kind ``mk_manifests.build_from_cut`` derives (the s17 kinds and the replica and full kinds)."""
+    return kind in CUT_KINDS
 EDK_CNCTIMEOUT_KIND = 's16-ctl-edk-cnctimeout'
 EDK_CNCTIMEOUT_KINDS = {EDK_CNCTIMEOUT_KIND, 's17-ctl-edk-cnctimeout'}
 ENGINE_DRIVER_SKIP_MEMBERS = ('ae0', 'me0')          # cnc_timeout_loud: one AE member and one ME member
@@ -385,6 +437,29 @@ def validate_cpus(manifest, cpu_count):
             raise Violation('invalid bounded CPU quota for ' + str(role))
 
 
+def validate_replica_slot(manifest):
+    """shadow0 runs the core jar as the replica (one artifact) through the engines' wrapper (their driver mode), on the
+    replica kinds and nowhere else among the kinded manifests."""
+    kind = manifest.get('manifest_kind')
+    slot = manifest['slot_artifacts'].get('shadow0')
+    entry = manifest['artifacts'].get('shadow')
+    if kind in REPLICA_KINDS and slot != 'shadow':
+        raise Violation(f'manifest kind {kind} runs the replica: slot_artifacts.shadow0 must be shadow, got {slot}')
+    if kind is not None and kind not in REPLICA_KINDS and slot is not None:
+        raise Violation(f'manifest kind {kind} runs no replica: slot_artifacts.shadow0 must be null, got {slot}')
+    if slot != 'shadow':
+        return
+    if entry is None:
+        raise Violation('shadow0 runs the shadow artifact, but artifacts.shadow is null')
+    if entry.get('sha256') != (manifest['artifacts'].get('ae') or {}).get('sha256'):
+        raise Violation('artifacts.shadow must be the core jar (artifacts.ae): the replica is CORE_ROLE=replica of that jar')
+    if entry.get('driver') != manifest.get('engine_driver', 'embedded'):
+        raise Violation(f'artifacts.shadow driver {entry.get("driver")} must equal engine_driver '
+                        f'{manifest.get("engine_driver", "embedded")}: the replica runs through the engines\' wrapper')
+    if entry.get('libs'):
+        raise Violation('artifacts.shadow stages no libs: an external replica runs on engine_libs')
+
+
 def validate_role_limits(limits):
     """Optional per-role overrides of shm_mb / memory_mb (an ME member needs 1.5 GiB of tmpfs)."""
     for key in ('shm_mb_by_role', 'memory_mb_by_role'):
@@ -475,6 +550,7 @@ def validate_core_manifest(manifest, manifest_path, cpu_count=None, profiles=jou
         for slot, name in slots.items():
             if name is not None and name not in SLOT_ARTIFACTS[slot]:
                 raise Violation(f'slot {slot} cannot run artifact {name}')
+        validate_replica_slot(manifest)
         for key in PINNED_PROGRAMS + [k for k in OPTIONAL_PROGRAMS if k in manifest]:
             helper = manifest[key]
             for path_key, digest_key in [('path', 'sha256'), ('source_path', 'source_sha256')]:

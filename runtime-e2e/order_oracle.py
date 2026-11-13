@@ -125,7 +125,9 @@ def o4(m):
 
 def o5(m):
     """A non-live order with no tapped terminal is ``tap_loss`` (INCONCLUSIVE on that id) when an order-event
-    gap or a tap session window lies after its last tapped event; outside every window it stays a FAIL."""
+    gap or a tap session window lies after its last tapped event; outside every window it stays a FAIL. When every such
+    window lies inside a declared untappable window (a declared quorum loss or leader election), the order is recorded in
+    ``m.untapped_orders``, not judged."""
     last_event = defaultdict(int)
     for event in m.s['core_events']:
         last_event[event['order']] = max(last_event[event['order']], integer(event['seq']))
@@ -143,6 +145,9 @@ def o5(m):
         if oid in m.live:
             continue
         if oid not in terminal:
+            if m.only_untappable_after(last_event[oid]):
+                m.untapped_orders = getattr(m, 'untapped_orders', []) + [oid]     # recorded, not judged
+                continue
             if m.in_event_window(last_event[oid]):
                 tap_loss.append(oid)
                 continue

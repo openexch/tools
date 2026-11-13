@@ -37,7 +37,11 @@ user other than the creating user is a FAIL (M2, O4). Holds are recomputed from 
   counters         optional {"stale_outcomes","redundant_outcomes","stale_terminals","conflicts"} (the AE counter export)
   declared         {"settle_fault","settle_rejected","order_fault","quarantined","halt","fault_open",
                     "forwarder_absent","gate_sequence": [[state, reason], ...] | null, "epochs": [e, ...],
-                    "ordering_exception": null | {"me_term", "until_seq", "from_journal_seq" (optional)}} 
+                    "ordering_exception": null | {"me_term", "until_seq", "from_journal_seq" (optional)},
+                    "untappable": optional {"reason", "dispatch": [[a, b], ...], "events": [[a, b], ...]}: windows the
+                    tap could not observe (its session closed across a declared quorum loss or a recorded leader
+                    election and reconnected after); a dispatch gap inside one may stay short of backfill and an
+                    order whose terminal falls in one is recorded, not judged (Model.tap_closed, order_oracle.o5)}
   tap_continuity   optional {"transitions": [CoreProbe tap session notes], "summary": {...}}; the dispatch
                    density is computed from the rows themselves against core.pending_dispatch.head
   story rows       request rows may carry "id", "resolves" and "resolved_by": an UNKNOWN original resolved by
@@ -258,13 +262,20 @@ class Model:
         windows = [w for w in windows if w[1] is None or w[1] >= w[0]]
         return {'gaps': gaps, 'backfill': backfill, 'event_windows': windows, 'head': head}
 
+    def untappable(self, kind):
+        """The declared untappable windows of ``kind`` ('dispatch' or 'events'), [] when none is declared."""
+        return [list(w) for w in ((self.s.get('declared') or {}).get('untappable') or {}).get(kind) or []]
+
     def tap_closed(self):
         """None when every dispatch gap is accounted for by backfill rows (count over the gap), else the first open gap.
 
         A backfill row with a known seq must sit inside a gap; rows without a seq (resolved at the ME, rebuilt from its
         journal) are pooled across the gaps, so the check is: for every gap, known rows <= its size, and the pooled
-        rows cover the remainder exactly."""
+        rows cover the remainder exactly. A gap inside a declared untappable window may stay short: the shortfall is
+        recorded in ``self.untapped`` and the gap counts as closed; pooled rows still may not exceed the deficit."""
+        self.untapped = []
         gaps, backfill = self.continuity['gaps'], self.continuity['backfill']
+        declared = self.untappable('dispatch')
         known = [integer(r['seq']) for r in backfill if r.get('seq') is not None]
         pooled = sum(1 for r in backfill if r.get('seq') is None)
         deficit, first_open = 0, None
@@ -279,7 +290,14 @@ class Model:
             raise Inconclusive(f'backfill rows at seqs {stray[:5]} that the tap did not miss')
         if pooled > deficit:
             raise Inconclusive(f'{pooled} backfill rows without a seq but only {deficit} missing dispatch seqs')
-        return None if deficit == pooled else first_open
+        if deficit == pooled:
+            return None
+        open_gaps = [[a, b] for a, b in gaps if (b - a + 1) - sum(1 for seq in known if a <= seq <= b)]
+        if declared and all(any(lo <= a and b <= hi for lo, hi in declared) for a, b in open_gaps):
+            self.untapped = [{'gaps': open_gaps, 'short': deficit - pooled,
+                              'reason': (self.s.get('declared') or {}).get('untappable', {}).get('reason')}]
+            return None
+        return first_open
 
     def require_tap_closed(self):
         gap = self.tap_closed()
@@ -289,6 +307,13 @@ class Model:
     def in_event_window(self, last_seen):
         """True when an order whose last tapped event seq is ``last_seen`` could have lost a later event in a window."""
         return any(b is None or b > last_seen for a, b in self.continuity['event_windows'])
+
+    def only_untappable_after(self, last_seen):
+        """True when every event window after ``last_seen`` lies inside a declared untappable window."""
+        after = [w for w in self.continuity['event_windows'] if w[1] is None or w[1] > last_seen]
+        declared = self.untappable('events')
+        return bool(after) and bool(declared) and all(
+            w[1] is not None and any(lo <= w[0] and w[1] <= hi for lo, hi in declared) for w in after)
 
     def unaccounted(self, text):
         """An order no accepted request created is a FAIL, unless a gateway reply is still unresolved

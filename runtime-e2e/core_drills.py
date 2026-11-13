@@ -761,7 +761,7 @@ def release_entries(me_journal):
 
 
 def parse_book(text):
-    """``T1MeDriver book`` lines: ``BOOK market=1 version=V bid=B ask=A ...`` or ``BOOK market=2 none`` (a06.log)."""
+    """``ItMeDriver book`` lines: ``BOOK market=1 version=V bid=B ask=A ...`` or ``BOOK market=2 none`` (a06.log)."""
     out = {}
     for line in (text or '').splitlines():
         m = re.match(r'BOOK market=(\d+) (.*)$', line.strip())
@@ -1163,7 +1163,7 @@ def line_tick_invalid_zero(w):
 
 
 def line_tick_end_state(w):
-    """After the quiet: the core's market-1 best bid/ask equal T1MeDriver book; its book version <= the ME's and == the
+    """After the quiet: the core's market-1 best bid/ask equal ItMeDriver book; its book version <= the ME's and == the
     forwarders' max last offered version; markets 2..5 empty at both or equal."""
     leader = (w.get('ae_leaders') or [None])[-1]
     after, book = w['snaps']['after'], w.get('book') or {}
@@ -1693,7 +1693,7 @@ class ScheduleDrills:
         self.kill_window['restart_s'] = round((time.time_ns() - self.t0) / 1e9, 3)
 
     def a06_barrier_extra(self):
-        """At the barrier: every forwarder's pending tick age 0 (bounded), a 1 s quiet, then T1MeDriver book."""
+        """At the barrier: every forwarder's pending tick age 0 (bounded), a 1 s quiet, then ItMeDriver book."""
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             scrape = core_scenarios.barrier_scrape(self.f)
@@ -1701,7 +1701,7 @@ class ScheduleDrills:
                 break
             self.sleep(0.5)
         self.sleep(1)
-        out = self.f._driver('t1_me_driver', 'T1MeDriver', 'book', PROBE_AERON_DIR, self.f._ingress('me'), timeout=60)
+        out = self.f._driver('t1_me_driver', 'ItMeDriver', 'book', PROBE_AERON_DIR, self.f._ingress('me'), timeout=60)
         self.book_text = out.stdout
         self.book = parse_book(out.stdout)
 
@@ -2107,8 +2107,11 @@ def of_rows(after, sample, me_scrape=None, halted=False):
     of4 = {'pending': value(after, ae, 'core_pending_commands'), 'release_backlog': value(after, ae, 'core_release_backlog'),
            'core_ledger': value(after, ae, 'core_me_ledger_size'), 'me_ledger': value(after, me, 'match_command_ledger_size')}
     try:
-        gap = Model(sample).tap_closed()
+        model = Model(sample)
+        gap = model.tap_closed()
         of5 = {'closed': gap is None, 'open_gap': gap}
+        if model.untapped:
+            of5['untappable'] = model.untapped          # closed only through a declared untappable window
     except (Inconclusive, Violation) as error:
         of5 = {'closed': False, 'error': str(error)}
     halted_bridges = {b: value(after, b, 'bridge_halted') for b in BRIDGES}
@@ -3198,6 +3201,74 @@ def iceberg_slice_journaled(events, parent):
     return filled >= ICEBERG_DISPLAY and terminal
 
 
+# ------------------------------------------------------------------ the replica drills (implementation: replica_drills.py)
+
+# 120 s at 100/s is about 14 400 story requests (CoreProbe sends rate x 1.2); 256 retained requests per user per 15 min
+# need >= 57 users, so the replica drills fund 80 users of their own range
+REPLICA_USERS = list(range(78001, 78081))
+
+
+def _replica_story(seconds=120, rate=100):
+    return {'script': 'a01-mix', 'seconds': seconds, 'rate': rate, 'users': REPLICA_USERS}
+
+
+# ``replica``: the replica_drills step; ``kinds``: the manifest kinds a drill runs on (the drill needs the replica and the
+# members in shadow mode; a control names its own kind). ``cycles``: the fault rows a run opens (leader loss counts its
+# attempts, recorded). Every drill runs in both driver modes: on shadow (embedded) and shadow-ext (external); the shadow
+# catalog and leader loss on shadow-query and shadow-query-ext (a 13 s backup query: the catalog bound adds the interval,
+# the promotion is re-validated at the next query); re-bootstrap on shadow-anyverified and shadow-anyverified-ext (the
+# members must purge below the stopped replica, which the two-producer rule refuses by design). A control runs in one
+# mode, on its own kind.
+_SHADOW_DRILL_KINDS = ['shadow', 'shadow-ext']
+_QUERY_DRILL_KINDS = ['shadow-query', 'shadow-query-ext']
+_ANYVERIFIED_DRILL_KINDS = ['shadow-anyverified', 'shadow-anyverified-ext']
+DRILLS.update({
+    'member-kill9': {'replica': 'member_kill9', 'faults': 'replica', 'cycles': 3, 'story': _replica_story(),
+                     'kinds': _SHADOW_DRILL_KINDS,
+                     'lines': ['restore_path_shadow', 'ready_after_start']},
+    'peerloss': {'replica': 'peerloss', 'faults': 'replica', 'cycles': 3, 'story': _replica_story(),
+                 'kinds': _SHADOW_DRILL_KINDS, 'lines': ['peerloss_restore', 'aligned_after_fault']},
+    'peerloss-loud': {'replica': 'peerloss_loud', 'faults': 'replica', 'cycles': 3, 'story': _replica_story(),
+                      'kinds': _SHADOW_DRILL_KINDS, 'netfilter': True, 'lines': ['peerloss_loud_halt', 'filters_removed']},
+    'shadow-catalog': {'replica': 'shadow_catalog', 'faults': 'replica', 'cycles': 1, 'story': _replica_story(rate=20),
+                       'kinds': _QUERY_DRILL_KINDS, 'lines': ['sampler_saw_pause', 'catalog_bound', 'lag_within_term']},
+    'supplierloss': {'replica': 'supplierloss', 'faults': 'replica', 'cycles': 1, 'story': _replica_story(),
+                     'kinds': _SHADOW_DRILL_KINDS, 'lines': ['supplier_loss_recovery', 'aligned_after_fault']},
+    'leaderloss-promotion': {'replica': 'leaderloss_promotion', 'faults': 'replica', 'cycles': 1, 'story': _replica_story(),
+                             'kinds': _QUERY_DRILL_KINDS, 'lines': ['promotion_states', 'promotion_observed',
+                                                                    'attempt_lag_within_term', 'aligned_per_snapshot']},
+    'replica-restart': {'replica': 'replica_restart', 'faults': 'replica', 'cycles': 1, 'story': _replica_story(),
+                        'kinds': _SHADOW_DRILL_KINDS, 'lines': ['replica_restart_local', 'member_floors_kept',
+                                                                'aligned_after_fault']},
+    'replica-wipe': {'replica': 'replica_wipe', 'faults': 'replica', 'cycles': 1, 'story': _replica_story(),
+                     'kinds': _SHADOW_DRILL_KINDS, 'lines': ['replica_pulled', 'aligned_after_fault']},
+    'replica-rebootstrap': {'replica': 'replica_rebootstrap', 'faults': 'replica', 'cycles': 1, 'story': _replica_story(),
+                            'kinds': _ANYVERIFIED_DRILL_KINDS, 'lines': ['anchor_rule_any_verified', 'members_purged',
+                                                                       'rebootstrap_exit3', 'second_life_local', 'not_fenced',
+                                                                       'aligned_after_fault']},
+})
+# The replica controls: (drill, variant, the lines that must FAIL). REPLICA_CONTROL_EXPECT names the text each failing line
+# must carry and the lines that must still HOLD (a control that fails for another reason is not the control).
+CONTROLS.update({
+    'kill9-fullmode': ('member-kill9', {'kind': 'full'}, ['restore_path_shadow']),
+    'peerloss-loud-unblocked': ('peerloss-loud', {'kind': 'shadow', 'unblocked': True}, []),
+    'supplierloss-cooldown30': ('supplierloss', {'kind': 'shadow-cooldown30'}, ['supplier_loss_recovery']),
+    'rebootstrap-detectoronly': ('replica-rebootstrap', {'kind': 'shadow-detectoronly', 'detector_only': True},
+                                 ['rebootstrap_exit3']),
+    'rebootstrap-nowitness': ('replica-rebootstrap', {'kind': 'shadow', 'nowitness': True}, ['members_purged']),
+})
+REPLICA_CONTROL_EXPECT = {
+    'kill9-fullmode': {'fail': {'restore_path_shadow': 'restore path FULL on ae'}, 'hold': ['ready_after_start']},
+    'peerloss-loud-unblocked': {'fail': {}, 'hold': ['pull_skip_unchanged', 'filters_removed']},
+    'supplierloss-cooldown30': {'fail': {'supplier_loss_recovery': 'supplier loss recovery'}, 'hold': []},
+    'rebootstrap-detectoronly': {'fail': {'rebootstrap_exit3': 're-bootstrap missed'},
+                                 'hold': ['anchor_rule_any_verified', 'members_purged', 'rebootstrap_refusals_counted',
+                                          'not_fenced']},
+    'rebootstrap-nowitness': {'fail': {'members_purged': 'no purge below the stopped replica'},
+                              'hold': ['witness_missing_replica', 'disk_grew', 'not_fenced']},
+}
+
+
 def scenario(fixture, scenario_name, out_dir):
     """runner.py entry: ``core-drill-<drill>``, ``core-control-<control>``, ``core-red-<1|2|2-negctl>``."""
     core_contracts.check_build_b(fixture.m, scenario_name)      # Build B is real, a RED's _b is an nc_ target
@@ -3234,12 +3305,18 @@ def scenario(fixture, scenario_name, out_dir):
             artifact = fixture.m['slot_artifacts'].get(slot)
             if artifact in {'forwarder_b', 'bridge_b'} and not (a03 and slot in FORWARDERS and artifact == 'forwarder_b'):
                 raise Inconclusive(f'{slot} stages {artifact}: GREEN drills run the real binaries only')
-    run = DrillRun(fixture, name, Path(out_dir) / 'drill', variant=variant, red=red)
+    if DRILLS[name].get('replica'):
+        import replica_drills
+        run = replica_drills.ReplicaDrillRun(fixture, name, Path(out_dir) / 'drill', variant=variant)
+    else:
+        run = DrillRun(fixture, name, Path(out_dir) / 'drill', variant=variant, red=red)
     result = run.run()
     status = result['status']
     return dict(result, status=status, assertions=len(result['lines']) + len(result['of_rows']) + 2, processed=1, skipped=0,
                 child_exit_codes=[0], scope=('core-topology drill on fixture v4; GREEN needs 3/3'
                                              if DRILLS[name].get('schedule_v4') else
+                                             'replica drill on the fixture with shadow0; GREEN needs 3/3'
+                                             if DRILLS[name].get('replica') else
                                              'core-topology drill on fixture v3; GREEN needs 3/3'))
 
 

@@ -25,6 +25,8 @@ JAVA = ['java', '--add-opens', 'java.base/jdk.internal.misc=ALL-UNNAMED',
         '--add-opens', 'java.base/java.nio=ALL-UNNAMED',
         '-Xms128m', '-Xmx512m', '-Duser.home=/data', '-Daeron.dir=/dev/shm/aeron',
         '-Daeron.threading.mode=SHARED', '-Daeron.archive.threading.mode=SHARED',
+        # read by none of today's engines (the core and the ME set the length explicitly; the core takes
+        # ARCHIVE_SEGMENT_LENGTH); kept so older artifacts that honour it keep the length they were measured with
         '-Daeron.archive.segment.file.length=1048576']
 
 

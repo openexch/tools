@@ -5,6 +5,11 @@ Usage: mk_manifests.py <kind> <tag> [--b-source-sha SHA] [--build-b DIR] [--octe
                        [--shm ROLE=MB ...] [--memory ROLE=MB ...]          prints the manifest path
        mk_manifests.py <s17 kind> <tag> --cut <cut manifest> [...]   derived from the cut;
                        written only when ``release_cut.py check`` accepts it (build A must be pinned in the old-artifact pins)
+       mk_manifests.py <replica kind> <tag> --cut <cut manifest>        the replica and full kinds, derived the same way:
+                       shadow, shadow-ext, shadow-anyverified, shadow-anyverified-ext, shadow-cooldown30, shadow-detectoronly,
+                       shadow-query, shadow-query-ext, full
+                       (core_contracts.REPLICA_KINDS / FULL_KINDS); a replica kind stages the cut's core jar as ``shadow``
+                       in shadow0 on the engines' driver mode
 
 Kinds (the eleven base manifests; ``core_contracts.BASE_KINDS``):
   s16                  C++ slots external (build A), engines embedded (dev profile)
@@ -279,7 +284,19 @@ CUT_KINDS = {
     # RED-1 (forwarder without RESYNC) and RED-2 (legacy bridge) on the cut
     's17-red1': ('external', 'embedded', 'CUT', 'REDA03', {'forwarder_b': 'ct_forwarder_nc_noresync', 'forwarder': None}),
     's17-red2': ('external', 'embedded', 'CUT', 'REDA04', {'bridge_b': 'ct_bridge_nc_legacy', 'bridge': None}),
+    # The replica kinds (core_contracts.REPLICA_KINDS: the env each adds) and the full-mode control kind, named by content
+    'shadow': ('external', 'embedded', 'CUT', 'A', {}),
+    'shadow-ext': ('external', 'external', 'CUT', 'A', {}),
+    'shadow-anyverified': ('external', 'embedded', 'CUT', 'A', {}),
+    'shadow-cooldown30': ('external', 'embedded', 'CUT', 'A', {}),
+    'shadow-detectoronly': ('external', 'embedded', 'CUT', 'A', {}),
+    'shadow-query': ('external', 'embedded', 'CUT', 'A', {}),
+    'shadow-query-ext': ('external', 'external', 'CUT', 'A', {}),
+    'shadow-anyverified-ext': ('external', 'external', 'CUT', 'A', {}),
+    'full': ('external', 'embedded', 'CUT', 'A', {}),
 }
+# The replica's container on the replica kinds: settings with defaults (the slots' CPUs, one CPU of quota, 2 GiB)
+REPLICA_LIMITS = {'cpu_set': [6, 7, 8, 9], 'cpu_quota': 1.0, 'memory_mb': 2048, 'shm_mb': 1024}
 def cut_roles(cut):
     """Engine role -> the cut artifact it stages (the core jar names follow the cut's schema: core-* or, in rc2-cut/1, assets-*)."""
     names = release_cut.fixture_names(cut.get('schema'))
@@ -321,7 +338,7 @@ def build_from_cut(kind, tag, cut_path, cfg=None, old_pins=None):
     cut manifest (or, for build A, from a pin of the old-artifact pins); written only when ``release_cut.check`` accepts it."""
     cfg = cfg or Config()
     if kind not in CUT_KINDS:
-        raise Violation('unknown s17 kind ' + kind + '; kinds: ' + ', '.join(sorted(CUT_KINDS)))
+        raise Violation('unknown cut kind ' + kind + '; kinds: ' + ', '.join(sorted(CUT_KINDS)))
     if not re.fullmatch(r'[A-Za-z0-9_.-]{1,40}', tag) or '--' in tag:
         raise Violation('a tag is a short name without "--"')
     cut = json.loads(Path(cut_path).read_text())
@@ -382,6 +399,15 @@ def build_from_cut(kind, tag, cut_path, cfg=None, old_pins=None):
                          f'projector {engine_driver}; shm/memory sizes are settings, not acceptance limits'),
         'projector_driver': engine_driver,
     }
+    if kind in core_contracts.REPLICA_KINDS:
+        # One artifact: the replica is CORE_ROLE=replica of the cut's core jar, on the engines' driver mode
+        m['artifacts']['shadow'] = dict(m['artifacts']['ae'], driver=engine_driver)
+        m['slot_artifacts']['shadow0'] = 'shadow'
+        limits = m['limits']
+        limits['cpu_set_by_role']['shadow0'] = list(REPLICA_LIMITS['cpu_set'])
+        limits['cpu_quota_by_role']['shadow0'] = REPLICA_LIMITS['cpu_quota']
+        limits['memory_mb_by_role']['shadow0'] = cfg.memory_mb.get('shadow0', REPLICA_LIMITS['memory_mb'])
+        limits['shm_mb_by_role']['shadow0'] = cfg.shm_mb.get('shadow0', REPLICA_LIMITS['shm_mb'])
     if cfg.harness_drift:
         m['harness_drift'] = {'reason': cfg.harness_drift, 'cut_harness_commit': cut.get('harness_commit'),
                               'harness_commit': commit, 'harness_dirty': dirty}
@@ -438,7 +464,7 @@ def main(argv=None):
             raise SystemExit(f'{args.kind} is derived from the cut: --cut <rc2-cut-manifest.json>')
         out, _ = build_from_cut(args.kind, args.tag, args.cut, cfg)
     elif args.cut is not None:
-        raise SystemExit(f'--cut derives the s17 kinds only; {args.kind} is a base kind')
+        raise SystemExit(f'--cut derives the cut kinds only; {args.kind} is a base kind')
     else:
         out, _ = build(args.kind, args.tag, cfg)
     print(out)

@@ -45,19 +45,40 @@ def qualified_lag_samples(samples):
     return qualified
 
 
-def filter_arguments(manifest, target, action):
-    if target not in {e + str(i) for e in ('me', 'ae') for i in range(3)}:
+# The port kinds a filter names (never a raw number): the log channel (offset 4) of a member, and the archive control
+# channel (offset 1) of a member or of the replica. The archive rule leaves loopback alone, so a member's own consensus
+# module and services keep their archive while every other process's control requests are dropped.
+PORT_KINDS = {'log': 4, 'archive': 1}
+REPLICA_TARGET = 'shadow0'
+
+
+def filter_arguments(manifest, target, action, port_kind='log'):
+    """iptables arguments for a UDP drop on INPUT in ``target``'s own namespace. ``port_kind`` is ``log`` (an engine
+    member) or ``archive`` (an AE member or the replica, ``shadow0``, whose ports sit at ``ae_base + 3 x stride``)."""
+    if port_kind not in PORT_KINDS:
+        raise Violation('unknown port kind ' + repr(port_kind) + '; kinds: ' + ', '.join(sorted(PORT_KINDS)))
+    members = {e + str(i) for e in ('me', 'ae') for i in range(3)}
+    if target == REPLICA_TARGET:
+        if port_kind != 'archive':
+            raise Violation('the replica has no log port to filter; its port kind is archive')
+    elif target not in members:
         raise Violation('log filter requires an explicit fixture engine member')
     if action not in {'add', 'delete', 'counters'}:
         raise Violation('unsupported log filter operation')
     if action == 'counters': return ['-L', 'INPUT', '-n', '-v', '-x']
-    port = manifest['ports'][target[:2] + '_base'] + int(target[2:]) * manifest['ports']['stride'] + 4
-    return ['-w', '2', '-A' if action == 'add' else '-D', 'INPUT', '-p', 'udp',
+    ports = manifest['ports']
+    if target == REPLICA_TARGET:
+        import core_contracts
+        port = ports['ae_base'] + core_contracts.REPLICA_SLOT * ports['stride'] + PORT_KINDS['archive']
+    else:
+        port = ports[target[:2] + '_base'] + int(target[2:]) * ports['stride'] + PORT_KINDS[port_kind]
+    loopback = ['!', '-i', 'lo'] if port_kind == 'archive' else []
+    return ['-w', '2', '-A' if action == 'add' else '-D', 'INPUT', '-p', 'udp', *loopback,
             '--dport', str(port), '-j', 'DROP']
 
 
-def log_filter(fixture, target, action):
-    arguments = filter_arguments(fixture.m, target, action)
+def log_filter(fixture, target, action, port_kind='log'):
+    arguments = filter_arguments(fixture.m, target, action, port_kind)
     cid = fixture.registry['containers'][target]
     target_state = fixture.inspect('container', cid)
     if not target_state['State']['Running'] or target_state['HostConfig']['NetworkMode'] != fixture.registry['network_id']:

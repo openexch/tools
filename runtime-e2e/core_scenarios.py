@@ -237,7 +237,8 @@ SCRAPE_PREFIXES = {
             'forwarder_dispatch_seq', 'forwarder_ready', 'forwarder_tick_', 'forwarder_ticks_ready'),
     'bridge': ('bridge_core_connected', 'bridge_ready', 'bridge_not_ready_bits', 'bridge_state', 'bridge_halted',
                'bridge_client_sessions_opened_total', 'bridge_halt_reason', 'bridge_core_halt_reason', 'bridge_skipped_total',
-               'bridge_fences_total')}
+               'bridge_fences_total'),
+    'shadow': ('shadow_',)}
 
 
 def barrier_scrape(fixture, skip_me=False):
@@ -247,7 +248,11 @@ def barrier_scrape(fixture, skip_me=False):
     ports = fixture.m['ports']
     targets = [(f'{e}{i}', e, ports[e + '_metrics']) for e in (('ae',) if skip_me else ('ae', 'me')) for i in range(3)]
     for slot, state in (getattr(fixture, 'slots', None) or {}).items():
-        if state.get('state') == 'STARTED':
+        if state.get('state') != 'STARTED':
+            continue
+        if slot == 'shadow0':           # the replica: its own metrics port, its shadow_* names
+            targets.append((slot, 'shadow', ports['shadow_metrics']))
+        else:
             targets.append((slot, 'fwd' if slot.startswith('fwd') else 'bridge', ports['forwarder_http' if slot.startswith('fwd') else 'bridge_http']))
     scrape = {}
     for role, kind, port in targets:

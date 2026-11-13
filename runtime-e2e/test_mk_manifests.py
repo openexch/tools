@@ -207,6 +207,32 @@ class CutManifestBuilderTest(unittest.TestCase):
         self.assertEqual(m['artifacts']['forwarder']['sha256'], cut['ct-forwarder']['sha256'])
         self.assertEqual(m['artifacts']['bridge_b']['source_sha'], mk_manifests.CT_A_SOURCE_SHA)
 
+    def test_the_replica_kinds_stage_the_core_jar_in_shadow0_on_the_engines_driver(self):
+        import release_cut
+        cut = self.world.m['artifacts']
+        for kind in sorted(core_contracts.REPLICA_KINDS):
+            with self.subTest(kind=kind):
+                path, m = self.built(kind)
+                self.assertEqual(m['slot_artifacts']['shadow0'], 'shadow')
+                self.assertEqual(m['artifacts']['shadow']['sha256'], cut['core-cluster.jar']['sha256'])
+                self.assertEqual(m['artifacts']['shadow']['driver'], m.get('engine_driver', 'embedded'))
+                self.assertEqual(m['limits']['cpu_set_by_role']['shadow0'], [6, 7, 8, 9])
+                self.assertEqual((m['limits']['memory_mb_by_role']['shadow0'], m['limits']['cpu_quota_by_role']['shadow0']),
+                                 (2048, 1.0))
+                self.assertEqual(release_cut.audit_expected(m)['shadow0']['files'][0]['path'], '/artifacts/shadow/bin')
+        self.assertEqual(self.built('shadow-ext')[1]['artifacts']['shadow']['driver'], 'external')
+        _, m = self.built('full')
+        self.assertIsNone(m['slot_artifacts']['shadow0'])
+        self.assertIsNone(m['artifacts']['shadow'])
+        self.assertNotIn('shadow0', release_cut.audit_expected(m))
+
+    def test_the_cut_checker_refuses_a_shadow_artifact_that_is_not_the_core_jar(self):
+        import release_cut
+        _, m = self.built('shadow')
+        m['artifacts']['shadow'] = dict(m['artifacts']['me'], driver='embedded')
+        findings = release_cut.check(m, self.world.m, 'rig', old_pins=self.world.pins).items
+        self.assertTrue(any(rule == 'K4' and 'artifacts.shadow' in text for rule, text in findings), findings)
+
     def test_negative_kinds_stage_the_cut_s_test_builds(self):
         cut = self.world.m['artifacts']
         _, m = self.built('s17-a03')
