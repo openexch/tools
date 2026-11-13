@@ -392,6 +392,13 @@ class SlotEnvTest(unittest.TestCase):
             for principal in (None, 'probe-admin'):
                 names |= set(f.probe_env(principal))
             names |= set(core_fixture.DRIVER_ENV)
+        # The replica kinds: the members' shadow block and the replica's own env, both driver modes
+        for kind in core_contracts.REPLICA_KINDS:
+            for driver in ('external', 'embedded'):
+                m = dict(slot_manifest(self.dir, driver), manifest_kind=kind)
+                m['slot_artifacts'] = dict(m['slot_artifacts'], shadow0='shadow')
+                f = fixture_for(m, self.dir); f.keys = KeyRing(replica=True)
+                names |= set(f.engine_env('ae', 0)) | set(f.replica_env())
         f = self.fx()
         self.assertEqual(names, f.allowed_env())
         # every set value passes the guard
@@ -920,13 +927,13 @@ class BuildProbesCtDirTest(unittest.TestCase):
         import build_core_probes
         with tempfile.TemporaryDirectory() as temp:
             ct = Path(temp); it = ct / 'app' / 'forwarder' / 'it'; it.mkdir(parents=True)
-            with self.assertRaisesRegex(SystemExit, 'T1MeDriver.java'):
+            with self.assertRaisesRegex(SystemExit, 'ItMeDriver.java'):
                 build_core_probes.driver_sources(ct)
-            (it / 'T1MeDriver.java').write_text('class T1MeDriver {}'); (it / 'T1CoreDriver.java').write_text('class T1CoreDriver {}')
+            (it / 'ItMeDriver.java').write_text('class ItMeDriver {}'); (it / 'ItCoreDriver.java').write_text('class ItCoreDriver {}')
             sources = build_core_probes.driver_sources(ct)
             self.assertEqual(sorted(sources), ['t1_core_driver', 't1_me_driver'])
-            self.assertEqual(sources['t1_me_driver']['source'], it / 'T1MeDriver.java')
-            self.assertEqual(sources['t1_me_driver']['main_class'], 'T1MeDriver')
+            self.assertEqual(sources['t1_me_driver']['source'], it / 'ItMeDriver.java')
+            self.assertEqual(sources['t1_me_driver']['main_class'], 'ItMeDriver')
             self.assertEqual(sources['t1_core_driver']['classpath_arg'], '--core-jar')
             self.assertEqual(sources['t1_me_driver']['classpath_arg'], '--me-jar')
 
@@ -1793,7 +1800,7 @@ class VerifyFundedMemberAwareTest(LifecycleBase):
 class PartialGenesisTest(LifecycleBase):
     def fx_core(self, results=None):
         f = self.fx()
-        src = Path(self.dir) / 'T1CoreDriver.java'          # The rows come from the pinned driver source
+        src = Path(self.dir) / 'ItCoreDriver.java'          # The rows come from the pinned driver source
         src.write_text('.quoteAssetId(d.quoteAsset().id()).tickSize(1).minPrice(1).maxPrice(1_000_000_000_000_000L).lotSize(0);')
         f.m['t1_core_driver'] = {'path': str(src), 'sha256': '0' * 64, 'source_path': str(src), 'source_sha256': '0' * 64}
         self.sent = []

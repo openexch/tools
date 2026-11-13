@@ -2,7 +2,14 @@
 """Core-topology fixture nightly on a dev box: a local systemd timer runs this, never a GitHub runner.
 
 usage: nightly.py --plan nightly-cut.json --evidence-root DIR [--harness-commit SHA] [--tools-repo DIR] [--ct-repo DIR] [settings]
+       nightly.py --alternate nightly-cut-embedded.json nightly-cut-external.json --evidence-root DIR [...]
        nightly.py --template core-template.json --evidence-root DIR [--scenario S ...]    the template path (core-smoke)
+
+``--alternate EMBEDDED EXTERNAL`` runs one of two plan sets per night, chosen by the parity of the UTC day of the year (even:
+the first, the embedded set; odd: the second, the external set), so both driver modes run every 48 h while each night stays
+under the bound (at the turn of a 365-day year two odd days follow each other: the summary records the parity it used).
+``NIGHTLY_PLAN_SET`` (``embedded`` or ``external``) forces one set. Both files must be the plans at the pinned commit; the chosen
+set, the parity and whether it was forced are written into ``summary.json`` (``plan_set``).
 
 A plan lists entries ``{kind, scenario}``; every entry derives its OWN manifest from the cut (``mk_manifests.build_from_cut``, so one
 night runs A04 on ``s17-ext`` and A05 on ``s17-a05``) and runs ``runner.py`` on it. Behaviour (each is a nightly control):
@@ -49,6 +56,7 @@ FIXTURE_LABEL = 'org.openexchange.runtime-fixture'
 NIGHT_NAME = re.compile(r'\d{8}T\d{6}Z')
 EXIT = {'PASS': 0, 'FAIL': 1, 'INCONCLUSIVE': 2, 'SKIPPED_BUSY': 75, 'INTERRUPTED': 0}
 DEFAULT_BOUND_S = 5 * 3600.0
+PLAN_SETS = ('embedded', 'external')               # --alternate: the first file, the second file
 
 
 
@@ -72,11 +80,13 @@ class Settings:
     cut_sha256: str = None            # The cut the night derives from, by sha256 and id
     cut_id: str = None
     repos: dict = None                # The tools and cluster-tools repos the cut checker reads
+    plan_set: str = None              # NIGHTLY_PLAN_SET: force the embedded or external set of an --alternate night
 
     def record(self):
         return {'lock': self.lock, 'bound_s': self.bound_s, 'after_interrupt': self.after_interrupt, 'load_max': self.load_max,
                 'cut': self.cut, 'cut_sha256': self.cut_sha256, 'cut_id': self.cut_id, 'template': self.template,
-                'keep_state': self.keep_state, 'stop_grace_s': self.stop_grace_s, 'repos': self.repos}
+                'keep_state': self.keep_state, 'stop_grace_s': self.stop_grace_s, 'repos': self.repos,
+                'plan_set': self.plan_set}
 
 
 def _number(env, key, default):
@@ -94,11 +104,14 @@ def settings_from_env(env=None):
     after = env.get('NIGHTLY_AFTER_INTERRUPT', 'run')
     if after not in ('run', 'skip'):
         raise Violation(f'NIGHTLY_AFTER_INTERRUPT is run or skip, got {after!r}')
+    plan_set = env.get('NIGHTLY_PLAN_SET') or None
+    if plan_set is not None and plan_set not in PLAN_SETS:
+        raise Violation(f'NIGHTLY_PLAN_SET is ' + ' or '.join(PLAN_SETS) + f', got {plan_set!r}')
     return Settings(lock=env.get('NIGHTLY_LOCK') or None, bound_s=_number(env, 'NIGHTLY_BOUND_S', DEFAULT_BOUND_S),
                     after_interrupt=after, load_max=_number(env, 'NIGHTLY_LOAD_MAX', 6.0),
                     harness_commit=env.get('NIGHTLY_HARNESS_COMMIT') or None, cut=env.get('NIGHTLY_CUT') or None,
                     keep_state=env.get('NIGHTLY_KEEP_STATE', '') in ('1', 'true', 'yes'),
-                    stop_grace_s=_number(env, 'NIGHTLY_STOP_GRACE_S', 180))
+                    stop_grace_s=_number(env, 'NIGHTLY_STOP_GRACE_S', 180), plan_set=plan_set)
 
 
 # ------------------------------------------------------------------ plan
@@ -143,6 +156,19 @@ def parse_plan(obj, kinds=None):
         if not isinstance(entry['scenario'], str) or not scenario_known(entry['scenario']):
             raise Violation(f'plan entry {index}: unknown scenario {entry["scenario"]!r}')
     return [dict(e) for e in entries]
+
+
+def choose_plan_set(files, day, forced=None):
+    """(plan file, set name, parity) of an --alternate night: the parity of ``day``'s day of the year picks the
+    embedded set (even) or the external set (odd); ``forced`` (NIGHTLY_PLAN_SET) names one set instead."""
+    parity = day.timetuple().tm_yday % 2
+    if forced is None:
+        index = parity
+    elif forced in PLAN_SETS:
+        index = PLAN_SETS.index(forced)
+    else:
+        raise Violation('NIGHTLY_PLAN_SET is ' + ' or '.join(PLAN_SETS) + f', got {forced!r}')
+    return files[index], PLAN_SETS[index], parity
 
 
 def derive(template, template_path, scenario):
@@ -371,8 +397,9 @@ def _overall(entries):
     return 'PASS' if states == {'PASS'} else 'INCONCLUSIVE'
 
 
-def run_night(plan, evidence_root, work_root, settings, host):
-    """One night: lock, preflight, entries under the bound, summary, seal. Returns (exit code, summary)."""
+def run_night(plan, evidence_root, work_root, settings, host, plan_set=None):
+    """One night: lock, preflight, entries under the bound, summary, seal. Returns (exit code, summary). ``plan_set``: the
+    alternate night's choice (set, parity, file, forced), written into the summary."""
     evidence_root = Path(evidence_root); evidence_root.mkdir(parents=True, exist_ok=True)
     moment = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
     while (evidence_root / moment.strftime('%Y%m%dT%H%M%SZ')).exists() or (evidence_root / moment.strftime('.skip-%Y%m%dT%H%M%SZ')).exists():
@@ -380,6 +407,8 @@ def run_night(plan, evidence_root, work_root, settings, host):
     stamp = moment.strftime('%Y%m%dT%H%M%SZ')
     summary = {'night': stamp, 'status': None, 'lock': settings.lock, 'settings': settings.record(),
                'harness': {'commit': settings.harness_commit, 'dirty': False}, 'plan': plan, 'entries': [], 'preflight': {}}
+    if plan_set is not None:
+        summary['plan_set'] = plan_set
     started = host.monotonic()
     Path(settings.lock).parent.mkdir(parents=True, exist_ok=True)
     lock = open(settings.lock, 'a')
@@ -526,6 +555,8 @@ def main_with(argv, host=None):
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--plan', type=Path)
+    group.add_argument('--alternate', nargs=2, type=Path, metavar=('EMBEDDED', 'EXTERNAL'),
+                       help='two plan sets on alternating nights by day-of-year parity (setting NIGHTLY_PLAN_SET forces one)')
     group.add_argument('--template', type=Path)
     parser.add_argument('--evidence-root', required=True, type=Path)
     parser.add_argument('--scenario', action='append', help='with --template: the scenarios (default core-boots-10, core-smoke)')
@@ -543,7 +574,7 @@ def main_with(argv, host=None):
     parser.add_argument('--after-interrupt', choices=('run', 'skip'), default=env.after_interrupt)
     parser.add_argument('--keep-state', action='store_true', default=env.keep_state)
     args = parser.parse_args(argv)
-    if args.plan is not None and not args.harness_commit:
+    if (args.plan is not None or args.alternate is not None) and not args.harness_commit:
         # An unset NIGHTLY_HARNESS_COMMIT expands to "" in ExecStart; a night never falls back to HEAD
         raise Violation('an empty harness commit: --plan nights run only on a pinned NIGHTLY_HARNESS_COMMIT')
     commit = args.harness_commit or _git(args.tools_repo, 'rev-parse', 'HEAD').stdout.decode().strip()
@@ -567,7 +598,8 @@ def main_with(argv, host=None):
     settings = Settings(lock=args.lock, bound_s=args.bound_s, after_interrupt=args.after_interrupt, load_max=args.load_max,
                         harness_commit=commit, cut=args.cut, keep_state=args.keep_state,
                         repos={'tools': str(tools_repo), 'cluster-tools': str(ct_repo)},
-                        template=str(args.template.absolute()) if args.template else None)
+                        template=str(args.template.absolute()) if args.template else None, plan_set=env.plan_set)
+    plan_set = None
     if args.template:
         template = json.loads(args.template.read_text())
         validate_core_manifest(template, args.template)
@@ -576,7 +608,16 @@ def main_with(argv, host=None):
             if not scenario_known(entry['scenario']):
                 raise Violation(f'unknown scenario {entry["scenario"]!r}')
     else:
-        plan_path = pinned_plan(args.plan, harness / 'runtime-e2e')
+        if args.alternate is not None:
+            for path in args.alternate:                  # both sets are the plans at the pinned commit, every night
+                pinned_plan(path, harness / 'runtime-e2e')
+            day = datetime.datetime.now(datetime.timezone.utc).date()
+            chosen, name, parity = choose_plan_set(args.alternate, day, env.plan_set)
+            plan_set = {'set': name, 'parity': parity, 'day_of_year': day.timetuple().tm_yday, 'file': Path(chosen).name,
+                        'forced': env.plan_set is not None, 'files': [Path(p).name for p in args.alternate]}
+            plan_path = pinned_plan(chosen, harness / 'runtime-e2e')
+        else:
+            plan_path = pinned_plan(args.plan, harness / 'runtime-e2e')
         plan = parse_plan(json.loads(plan_path.read_text()))
         if not args.cut:
             raise Violation('NIGHTLY_CUT is not set: set it (or pass --cut) to the cut manifest the plan derives from')
@@ -590,7 +631,7 @@ def main_with(argv, host=None):
         host.stop_grace_s = settings.stop_grace_s
     if not settings.lock:
         raise Violation('NIGHTLY_LOCK is not set: set it (or pass --lock) to the heavy-job lock file the night takes')
-    code, summary = run_night(plan, args.evidence_root, work_root, settings, host)
+    code, summary = run_night(plan, args.evidence_root, work_root, settings, host, plan_set=plan_set)
     print(json.dumps({k: summary[k] for k in ('night', 'status', 'lock', 'wall_s')} | {
         'entries': [{k: e.get(k) for k in ('scenario', 'kind', 'status', 'wall_s')} for e in summary['entries']]}))
     return code

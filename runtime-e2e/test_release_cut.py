@@ -833,7 +833,7 @@ class RunDir:
                       'tap': {'path': str(self.state / 'state/probe/tap-life1.jsonl')}, 'fault_targets': {}}
         self.owner['genesis']['derivation'] = {'rule': core_contracts.GENESIS_DERIVATION, 'run_id': 'rc2-000000000001'}
         self.commands = []
-        self.command(['T1CoreDriver', 'genesis', '/dev/shm/probe-aeron', 'x', hex(gid)], 0,
+        self.command(['ItCoreDriver', 'genesis', '/dev/shm/probe-aeron', 'x', hex(gid)], 0,
                      'CoreConfig 1 result 0\nCoreConfig 2 result 0\nCoreConfig 3 result 0\nGLOBAL OPEN (bound through the bridge)\n')
         for m in ('me0', 'me1', 'me2'):
             self.command(['JournalProbe', 'dump', f'source={m}'], 0, record5(gid, source=m))
@@ -993,7 +993,7 @@ class ActivationRecordTest(unittest.TestCase):
         for m in ('ae0', 'ae1', 'ae2'):                    # the AE wipe: life 2's frames only
             write_ae_member(d.state, m, [core_config_payload(v, gid2) for v in (1, 2, 3)])
         lives['2']['core'] = {'genesis_id': hex(gid2)}
-        d.command(['T1CoreDriver', 'genesis', '/dev/shm/probe-aeron', 'x', hex(gid2)], 0,
+        d.command(['ItCoreDriver', 'genesis', '/dev/shm/probe-aeron', 'x', hex(gid2)], 0,
                   'CoreConfig 1 result 0\nCoreConfig 2 result 0\nCoreConfig 3 result 0\nGLOBAL OPEN (bound through the bridge)\n')
         d.requests.append({'verb': 'money-dump', 'reply': {'meEpoch': gid2, 'lastAppliedJournalSeq': 1}, 'at_ns': t0 + 8})
         tap2 = d.state / 'state/probe/tap-life2.jsonl'

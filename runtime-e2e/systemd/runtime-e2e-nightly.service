@@ -14,7 +14,13 @@ After=docker.service
 [Service]
 Type=oneshot
 Environment=RUNTIME_E2E_REPO=%h/Apps/openexchange/tools
+# Two plan sets on alternating nights (day-of-year parity: even the embedded set, odd the external set). A single-plan night
+# runs `--plan ${RUNTIME_E2E_PLAN}` in place of `--alternate ...` (nightly-cut.json, the default plan alone).
 Environment=RUNTIME_E2E_PLAN=%h/Apps/openexchange/tools/runtime-e2e/nightly-cut.json
+Environment=RUNTIME_E2E_PLAN_EMBEDDED=%h/Apps/openexchange/tools/runtime-e2e/nightly-cut-embedded.json
+Environment=RUNTIME_E2E_PLAN_EXTERNAL=%h/Apps/openexchange/tools/runtime-e2e/nightly-cut-external.json
+# Optional: force one set (embedded or external) for a measured run of that set; unset, the parity decides.
+Environment=NIGHTLY_PLAN_SET=
 Environment=RUNTIME_E2E_EVIDENCE=%h/runtime-e2e-nightly/evidence
 # the cluster-tools repo (a git work tree) the cut checker reads the T1 driver sources from; the tools repo is RUNTIME_E2E_REPO.
 # nightly.py hands both to the archived night as CUT_TOOLS_REPO / CUT_CT_REPO (harness-<sha>/ is no git repo).
@@ -35,7 +41,7 @@ Environment=NIGHTLY_LOAD_MAX=6
 # Optional, shown at their defaults: keep the state root of a PASSing entry (1) and the runner's SIGTERM-to-SIGKILL grace.
 Environment=NIGHTLY_KEEP_STATE=0
 Environment=NIGHTLY_STOP_GRACE_S=180
-ExecStart=/usr/bin/python3 ${RUNTIME_E2E_REPO}/runtime-e2e/nightly.py --tools-repo ${RUNTIME_E2E_REPO} --ct-repo ${NIGHTLY_CT_REPO} --plan ${RUNTIME_E2E_PLAN} --evidence-root ${RUNTIME_E2E_EVIDENCE} --harness-commit ${NIGHTLY_HARNESS_COMMIT}
+ExecStart=/usr/bin/python3 ${RUNTIME_E2E_REPO}/runtime-e2e/nightly.py --tools-repo ${RUNTIME_E2E_REPO} --ct-repo ${NIGHTLY_CT_REPO} --alternate ${RUNTIME_E2E_PLAN_EMBEDDED} ${RUNTIME_E2E_PLAN_EXTERNAL} --evidence-root ${RUNTIME_E2E_EVIDENCE} --harness-commit ${NIGHTLY_HARNESS_COMMIT}
 # A held heavy lock or foreign load exits 75 (SKIPPED_BUSY): a skipped night is not a failed unit.
 SuccessExitStatus=75
 Nice=5

@@ -6,7 +6,8 @@ Docker object carries the run label and an unpredictable token, nothing is reset
 kept. What changes: the role set (no OMS, no market gateway, no legacy bridge), per-run session keys
 for AE and ME with secrets redacted from every retained log, the core probe and journal probe,
 optional slots for the C++ forwarder and bridge that start from a pinned binary or are skipped and
-said so, a reserved ``shadow0`` slot for the shadow replica, cpuset-pinned engines and production timeouts.
+said so, the ``shadow0`` slot for the shadow replica (the core jar as ``CORE_ROLE=replica`` on the replica kinds, reserved
+on every other manifest), cpuset-pinned engines and production timeouts.
 """
 import hashlib
 import ipaddress
@@ -56,7 +57,7 @@ LIFE2_CORE_ORDER = [step for step in GENESIS_ORDER if step[0] != 'me_genesis']
 # stop(): the polite-stop bound per role (docker stop -t). Forwarder: exit 0, contract <= 1 s (RUN:465-472);
 # bridge: exit 0 within 10 s (RUN:1768-1770); engines: 15 s then kill is the escalation bound only; on jars with the
 # polite-stop fix the code and time are judged by the drills' engine_polite_stop line (143 within ENGINE_SHUTDOWN_TIMEOUT_S + slack).
-STOP_BOUND_S = {'forwarder': 3, 'bridge': 10, 'engine': 15, 'projector': 10}
+STOP_BOUND_S = {'forwarder': 3, 'bridge': 10, 'engine': 15, 'projector': 10, 'replica': 15}
 FORWARDER_STOP_CONTRACT_S = 1.0
 SESSION_WINDOW_S = 10.0          # the core's session timeout a killed forwarder's session outlives it by
 READY_AFTER_KILL_S = 5.0         # The ready_after_kill bound, a setting (measured 1.12 s in DR-A05)
@@ -68,6 +69,15 @@ ENGINE_DRIVER_PIDFILE = '/data/aeronmd.pid'
 DEFAULT_RISK = {'version': 1, 'min_qty': 1, 'max_qty': 10**6 * FP, 'collar_bps': 5000, 'per_sec': 1000, 'max_open': 5000,
                 'slippage_bps': 100}
 PORT_OFFSETS = {'archive': 1, 'ingress': 2, 'member': 3, 'log': 4, 'transfer': 5}
+# The core's archive segment length on the replica and full drill kinds (members and the replica), a core setting
+# (ARCHIVE_SEGMENT_LENGTH) since the core stopped hard-coding 64 MiB: the core never read fixture.JAVA's
+# -Daeron.archive.segment.file.length (it sets the length explicitly), so the env setting is what makes a 1m fixture log
+# purge in whole 1 MiB segments. archive_listing reads the length a recording actually got from its catalog descriptor,
+# never from this constant.
+ARCHIVE_SEGMENT_LENGTH_SETTING = '1m'
+ARCHIVE_SEGMENT_LENGTH = int(ARCHIVE_SEGMENT_LENGTH_SETTING[:-1]) * 1024 * 1024
+# The replica's first /ready: a genesis start replays the log from 0 and is VERIFIED from the start; a setting
+SHADOW_START_READY_BOUND_S = 120
 EXIT_MEANING = {0: 'ANSWERED', 3: 'UNKNOWN', 4: 'REFUSED', 5: 'NOT_REFUSED', 64: 'USAGE'}
 
 
@@ -101,10 +111,10 @@ T1_ROW = re.compile(r'\.tickSize\(([0-9_]+)L?\)\.minPrice\(([0-9_]+)L?\)\.maxPri
 
 
 def t1_market_rows(source):
-    """tick, min, max, lot of the market rows the T1CoreDriver genesis encodes (one literal row for every market)."""
+    """tick, min, max, lot of the market rows the ItCoreDriver genesis encodes (one literal row for every market)."""
     rows = {tuple(int(v.replace('_', '')) for v in hit) for hit in T1_ROW.findall(source)}
     if len(rows) != 1:
-        raise Violation(f'T1CoreDriver: expected one literal market rows encoding, found {sorted(rows)}')
+        raise Violation(f'ItCoreDriver: expected one literal market rows encoding, found {sorted(rows)}')
     tick, low, high, lot = rows.pop()
     return {'tick': tick, 'min': low, 'max': high, 'lot': lot}
 
@@ -117,6 +127,8 @@ def role_kind(name):
         return 'forwarder'
     if name in ('bridge0', 'bridge1'):
         return 'bridge'
+    if name == 'shadow0':
+        return 'replica'
     return 'projector' if name == 'projector' else None
 
 
@@ -155,6 +167,85 @@ def partition_arguments(manifest, source, target, kind, action):
     return rules
 
 
+CATALOG_HEADER_LENGTH = 32          # Aeron's CatalogHeader block (version, length, nextRecordingId, alignment)
+DESCRIPTOR_HEADER_LENGTH = 32       # RecordingDescriptorHeader (length, state, checksum)
+RECORDING_VALID = 1                 # RecordingState.VALID
+SHADOW_STREAM_ID = 4301             # cluster-kit ShadowAlias.STREAM_ID: the only stream wipe_shadows may delete
+
+
+def catalog_descriptors(archive_dir):
+    """recording id -> {'state', 'start', 'stop', 'segment_length', 'term_length', 'stream'} read from an Aeron archive's
+    ``archive.catalog`` (host side, little-endian, Aeron 1.53 layout: a 32-byte header whose alignment pads every entry,
+    then per entry a 32-byte descriptor header and the RecordingDescriptor body). A missing or unreadable catalog is
+    an empty map; the caller says what it could not read."""
+    import struct
+    path = Path(archive_dir) / 'archive.catalog'
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return {}
+    if len(data) < CATALOG_HEADER_LENGTH:
+        return {}
+    alignment = struct.unpack_from('<i', data, 16)[0]
+    offset = CATALOG_HEADER_LENGTH if alignment else 1024
+    alignment = alignment or 1024
+    out = {}
+    while offset + DESCRIPTOR_HEADER_LENGTH + 80 <= len(data):
+        length, state = struct.unpack_from('<ii', data, offset)
+        if length <= 0:
+            break
+        body = offset + DESCRIPTOR_HEADER_LENGTH
+        rid = struct.unpack_from('<q', data, body + 16)[0]
+        start, stop = struct.unpack_from('<qq', data, body + 40)
+        segment, term, _mtu, _session, stream = struct.unpack_from('<iiiii', data, body + 60)
+        out[rid] = {'state': state, 'start': start, 'stop': stop, 'segment_length': segment, 'term_length': term,
+                    'stream': stream}
+        offset += (length + DESCRIPTOR_HEADER_LENGTH + alignment - 1) // alignment * alignment
+    return out
+
+
+def delete_shadow_segment(path, descriptor, keep=()):
+    """Unlink one shadow segment file and return its size. The guard under wipe_shadows: a test helper must never delete
+    money-journal (or any other non-shadow) data, so a descriptor whose stream is not SHADOW_STREAM_ID, or a recording
+    the member's recording.log names, is refused whatever the caller selected."""
+    rid = int(Path(path).stem.split('-')[0])
+    if descriptor is None or descriptor.get('stream') != SHADOW_STREAM_ID or rid in keep:
+        raise Violation(f'refusing to delete {Path(path).name}: stream '
+                        f'{None if descriptor is None else descriptor.get("stream")} is not the shadow stream '
+                        f'{SHADOW_STREAM_ID}' + (' (named by recording.log)' if rid in keep else ''))
+    size = Path(path).stat().st_size
+    Path(path).unlink()
+    return size
+
+
+def archive_listing(state_root, member):
+    """The log recording of one member read from its bind-mounted state (host side, like release_cut.genesis_reader):
+    the newest TERM recording of ``cluster/recording.log``, its segment length from the archive catalog's descriptor,
+    and the base positions of its ``<id>-<base>.rec`` segment files. ``log_start_segment`` > 0 proves the log no longer
+    starts at 0 (a purge removed whole segments); 0 proves nothing either way. ``contiguous`` is false when a segment is
+    missing between the first and the last, or when the descriptor (and so the segment length) cannot be read."""
+    import release_cut
+    base = Path(state_root) / 'state' / member / 'state'
+    log = base / 'cluster' / 'recording.log'
+    if not log.is_file():
+        return {'member': member, 'error': 'no recording.log', 'log_recording': None, 'segments': [],
+                'log_start_segment': None, 'contiguous': False}
+    terms = [e for e in release_cut.recording_log(log) if e['type'] == 'TERM' and e['valid']]
+    if not terms:
+        return {'member': member, 'error': 'no TERM entry', 'log_recording': None, 'segments': [],
+                'log_start_segment': None, 'contiguous': False}
+    rid = terms[-1]['recording_id']
+    bases = sorted(int(p.stem.split('-')[1]) for p in (base / 'archive').glob(f'{rid}-*.rec'))
+    descriptor = catalog_descriptors(base / 'archive').get(rid)
+    segment = descriptor['segment_length'] if descriptor else None
+    out = {'member': member, 'log_recording': rid, 'segments': bases, 'log_start_segment': bases[0] if bases else None,
+           'segment_length': segment,
+           'contiguous': bool(bases) and bool(segment) and all(b - a == segment for a, b in zip(bases, bases[1:]))}
+    if not descriptor:
+        out['error'] = f'recording {rid} not in archive.catalog: segment length unknown'
+    return out
+
+
 class CoreFixture(Fixture):
     # time seams: the fault helpers wait on real time, the unit tests on a fake clock
     clock = staticmethod(time.time)
@@ -175,7 +266,8 @@ class CoreFixture(Fixture):
         self.pg_port = self.m['postgres_port']
         if type(self.pg_port) is not int or not 1024 < self.pg_port < 65536:
             raise Violation('invalid fixture postgres port')
-        self.keys = keyring or KeyRing()
+        # The REPLICA key only when this manifest runs the replica (an older core refuses a table naming the class)
+        self.keys = keyring or KeyRing(replica=self.m['slot_artifacts'].get('shadow0') == 'shadow')
         self.secret_values = self.keys.secrets()
         self.slots = {}
         if attach:
@@ -388,10 +480,64 @@ class CoreFixture(Fixture):
         else:
             env['CORE_NODE_PORT'] = str(self.m['ports']['ae_metrics'])
             env['CORE_AUTH_KEYS'] = self.keys.table('ae')
+            env.update(self.member_shadow_env(index))
         if self.engine_driver() == 'external':
             # TC:84-91 / ATC:37-42 external mode attaches to the wrapper's aeronmd at AERON_DIR (TC:155, ATC:70)
             env.update(TRANSPORT_DRIVER_MODE='external', AERON_DIR=f'/dev/shm/aeron-{engine}{index}')
         return env
+
+    def member_shadow_env(self, index):
+        """The AE member's shadow block on a replica kind (core_contracts.REPLICA_KINDS): SNAPSHOT_MODE=shadow, pull sources
+        = the replica's archive then the two peers' (spelled as CLUSTER_ADDRESSES spells them; the member's own endpoint is
+        refused at boot), the producer buffer, the witness alarm, a 1-minute cadence and the kind's own member settings. A
+        full-mode kind keeps SNAPSHOT_MODE unset and takes the cadence only. No TRANSPORT_LOG_RCV_WINDOW: the member derives
+        its window from the term and logs it at boot."""
+        kind = self.m.get('manifest_kind')
+        # 1 MiB archive segments on the replica and full drill kinds only: their drills need a log that purges (logStart
+        # > 0); the older kinds were measured on the core's 64 MiB default and keep it until they are re-measured
+        segment = {'ARCHIVE_SEGMENT_LENGTH': ARCHIVE_SEGMENT_LENGTH_SETTING}
+        if kind in core_contracts.FULL_KINDS:
+            return {**core_contracts.DRILL_CADENCE_ENV, **segment}
+        if kind not in core_contracts.REPLICA_KINDS:
+            return {}
+        sources = [self.archive_endpoint('shadow0')] + [self.archive_endpoint(f'ae{j}') for j in range(3) if j != index]
+        return {**core_contracts.MEMBER_SHADOW_ENV, **core_contracts.DRILL_CADENCE_ENV, **segment,
+                'SHADOW_PULL_SOURCES': ','.join(sources), **core_contracts.REPLICA_KINDS[kind]['members']}
+
+    def archive_endpoint(self, role):
+        """``host:port`` of an AE member's or the replica's archive control channel (port offset 1)."""
+        ports = self.m['ports']
+        slot = core_contracts.REPLICA_SLOT if role == 'shadow0' else int(role[2:])
+        if role != 'shadow0' and not (role.startswith('ae') and role in ENGINES):
+            raise Violation('an archive endpoint of an AE member or the replica only: ' + role)
+        return f'{self.m["nodes"][role]}:{ports["ae_base"] + slot * ports["stride"] + PORT_OFFSETS["archive"]}'
+
+    def replica_env(self):
+        """The replica's environment (core README "Replica"): the cluster it follows, its slot and address, FOLLOWER
+        backup source, its metrics port, the three members' archives as pull sources, its REPLICA key, the fixture term,
+        and the kind's own replica settings. External mode attaches to its wrapper's aeronmd."""
+        nodes, ports = self.m['nodes'], self.m['ports']
+        env = {**core_contracts.REPLICA_ENV, 'BASE_DIR': ENGINE_COMMON['BASE_DIR'],
+               'CLUSTER_ADDRESSES': ','.join(nodes[f'ae{i}'] for i in range(3)), 'CLUSTER_PORT_BASE': str(ports['ae_base']),
+               'CLUSTER_PORT_STRIDE': str(ports['stride']), 'CLUSTER_REPLICA_ADDRESS': nodes['shadow0'],
+               'CORE_NODE_PORT': str(ports['shadow_metrics']),
+               'SHADOW_PULL_SOURCES': ','.join(self.archive_endpoint(f'ae{i}') for i in range(3)),
+               'TRANSPORT_LOG_TERM_LENGTH': ENGINE_COMMON['TRANSPORT_LOG_TERM_LENGTH'],
+               'ARCHIVE_SEGMENT_LENGTH': ARCHIVE_SEGMENT_LENGTH_SETTING,
+               'TRANSPORT_IDLE_MODE': ENGINE_COMMON['TRANSPORT_IDLE_MODE'], 'TRANSPORT_DRIVER_MODE': 'embedded',
+               'CORE_AUTH_CREDENTIAL': self.keys.credential('shadow0', 'ae')}
+        env.update(core_contracts.REPLICA_KINDS.get(self.m.get('manifest_kind'), {}).get('replica', {}))
+        if self.engine_driver() == 'external':
+            env.update(TRANSPORT_DRIVER_MODE='external', AERON_DIR='/dev/shm/aeron-shadow0')
+        return env
+
+    def replica_command(self):
+        """The engines' launch shape, never the C++ slot wrapper: ``java -jar`` of the staged core jar embedded, the
+        engines' aeronmd wrapper (engine_libs) external."""
+        jar = JAVA + ['-jar', '/artifacts/shadow/bin']
+        if self.engine_driver() != 'external':
+            return jar
+        return self._driver_wrapper('shadow0', ENGINE_LIBS_DIR, jar)
 
     def engine_driver(self):
         """``embedded`` (dev default) or ``external`` (the staged aeronmd in the engine container, C13)."""
@@ -550,11 +696,12 @@ class CoreFixture(Fixture):
         return self.execute('probe', argv, timeout=90, check=False, accepted=(0, 1))
 
     def tap_paths(self, life=1):
-        """One tap per life, ``tap-life<n>.jsonl/.out/.err/.sessions.jsonl`` in the probe's /data (host: state/probe)."""
+        """One tap per life, ``tap-life<n>.jsonl/.out/.err/.sessions.jsonl`` in the probe's /data (host: state/probe), and
+        its stop file ``tap-life<n>.stop`` (the tap ends early once it exists, ``stop_tap``)."""
         stem = f'tap-life{int(life)}'
         host = self.root / 'state' / 'probe'
         return {k: host / (stem + suffix) for k, suffix in
-                (('rows', '.jsonl'), ('out', '.out'), ('err', '.err'), ('sessions', '.sessions.jsonl'))}
+                (('rows', '.jsonl'), ('out', '.out'), ('err', '.err'), ('sessions', '.sessions.jsonl'), ('stop', '.stop'))}
 
     def start_tap(self, duration_ms, life=1):
         """Independent dispatch/order/admission witness (TOOL session), in the background, on per-life files."""
@@ -563,11 +710,21 @@ class CoreFixture(Fixture):
         environment = self.probe_env('probe-tool')
         assert_production_timeouts(environment, self.allowed_env())
         for key, value in sorted(environment.items()): command += ['--env', f'{key}={value}']
-        data = {k: '/data/' + v.name for k, v in self.tap_paths(life).items()}
+        paths = self.tap_paths(life)
+        if paths['stop'].exists():
+            raise Violation(f'the tap stop file {paths["stop"]} exists before the tap started')
+        data = {k: '/data/' + v.name for k, v in paths.items()}
         argv = JAVA + ['-cp', '/artifacts/core-probe.jar:/artifacts/ae.jar', 'CoreProbe', 'tap', f'out={data["rows"]}',
-                       f'sessions={data["sessions"]}', f'duration_ms={int(duration_ms)}']
+                       f'sessions={data["sessions"]}', f'duration_ms={int(duration_ms)}', f'stop={data["stop"]}']
         self.command([*command, cid, 'sh', '-c', shlex.join(argv) + f' > {data["out"]} 2> {data["err"]}'])
         return self.tap_paths(life)['rows']
+
+    def stop_tap(self, life=None):
+        """Ask the current life's tap to end now (it polls its stop file every 200 ms and then prints its summary);
+        ``duration_ms`` stays its worst case. Returns the stop time (ns)."""
+        path = self.tap_paths(life or self.life('core'))['stop']
+        path.write_text(str(time.time_ns()) + '\n')
+        return time.time_ns()
 
     def start_story(self, kv, name='story'):
         """One ``CoreProbe story`` JVM in the background on the GATEWAY principal. Returns the host paths of its
@@ -587,6 +744,39 @@ class CoreFixture(Fixture):
                                                         'started_ns': time.time_ns(), **{k: str(v) for k, v in paths.items()}}
         self.save()
         return paths
+
+    def start_lag_sampler(self, hz, term_bytes, name='lag'):
+        """``lag_sampler.py`` once, detached in the probe container for a drill's duration (never a process per sample):
+        staged into the probe's /data from this harness (pinned with it), polling the members' and the replica's
+        ``/metrics`` over the fixture network; it stops on ``/data/<name>/stop`` and writes ``lag.tsv`` and ``summary.json``
+        there. Returns the host paths (the probe's /data is ``state/probe``)."""
+        host = self.root / 'state' / 'probe'
+        source = Path(__file__).with_name('lag_sampler.py')
+        shutil.copyfile(source, host / 'lag_sampler.py')
+        out = host / name
+        out.mkdir()
+        nodes, ports = self.m['nodes'], self.m['ports']
+        members = ','.join(f'http://{nodes[f"ae{i}"]}:{ports["ae_metrics"]}/metrics' for i in range(3))
+        replica = f'http://{nodes["shadow0"]}:{ports["shadow_metrics"]}/metrics'
+        argv = ['python3', '-I', '/data/lag_sampler.py', '--members', members, '--replica', replica, '--out', f'/data/{name}',
+                '--hz', str(hz), '--term-bytes', str(term_bytes), '--stop-file', f'/data/{name}/stop']
+        cid = self.registry['containers']['probe']; self.inspect('container', cid)
+        self.command(['docker', 'exec', '-d', cid, 'sh', '-c', shlex.join(argv) + f' > /data/{name}/sampler.out 2>&1'])
+        paths = {'dir': out, 'tsv': out / 'lag.tsv', 'summary': out / 'summary.json', 'stop': out / 'stop',
+                 'sampler_sha256': hashlib.sha256(source.read_bytes()).hexdigest(), 'started_ns': time.time_ns()}
+        self.registry.setdefault('samplers', {})[name] = {k: str(v) for k, v in paths.items()}
+        self.save()
+        return paths
+
+    def stop_lag_sampler(self, paths, bound_s=15):
+        """Ask the sampler to stop and read its summary (an absent summary within the bound is INCONCLUSIVE)."""
+        paths['stop'].write_text('stop\n')
+        deadline = time.monotonic() + bound_s
+        while time.monotonic() < deadline:
+            if paths['summary'].is_file():
+                return json.loads(paths['summary'].read_text())
+            self.sleep(0.2)
+        raise Inconclusive(f'the lag sampler wrote no summary within {bound_s} s of its stop file ({paths["dir"]})')
 
     def funding_plan(self, script, users, seed):
         """The deposit table of ``CoreProbe story script=funding`` (no cluster), one owner of the amounts."""
@@ -664,7 +854,7 @@ class CoreFixture(Fixture):
         boot['phases']['engines_ready_ns'] = time.time_ns()
         if plan is None:
             self.arm_money_journal(None); self.start_projector(None)
-            cut = str(self.m.get('manifest_kind', '')).startswith('s17')
+            cut = core_contracts.cut_derived(self.m.get('manifest_kind'))
             for slot in sorted(SLOTS):
                 if cut and slot == 'fwd0':
                     # The cut forwarder waits for the ME epoch (not ready on a bare ME), so the
@@ -698,7 +888,7 @@ class CoreFixture(Fixture):
         """Right after every s17 genesis the audit is taken into ``audit.json`` of the state
         root (``audit-life<n>.json`` for a later core life); runner.py turns it and the run's evidence into
         the activation record of that life. Never fatal: the record judges it."""
-        if not str(self.m.get('manifest_kind', '')).startswith('s17'):
+        if not core_contracts.cut_derived(self.m.get('manifest_kind')):
             return None
         import release_cut
         path = self.root / ('audit.json' if life == 1 else f'audit-life{life}.json')
@@ -721,7 +911,7 @@ class CoreFixture(Fixture):
         """The core's recorded genesisId of ``life`` is in the AE log recordings that regenesis('core')
         is about to wipe; the reader output (release_cut.genesis_reader) is kept in the state root with its sha256 first. s17 kinds
         (the ones that issue activation records); an error is recorded as the capture, so the record cannot read OK."""
-        if not str(self.m.get('manifest_kind', '')).startswith('s17'):
+        if not core_contracts.cut_derived(self.m.get('manifest_kind')):
             return None
         import release_cut
         try:
@@ -815,7 +1005,7 @@ class CoreFixture(Fixture):
         if key not in self.m:
             raise Inconclusive(f'manifest has no {key}: the genesis drivers are pinned through build_core_probes.py --ct-dir')
         jar = '/artifacts/' + key.replace('_', '-') + '.jar'
-        base = '/artifacts/me.jar' if main == 'T1MeDriver' else '/artifacts/ae.jar'
+        base = '/artifacts/me.jar' if main == 'ItMeDriver' else '/artifacts/ae.jar'
         argv = JAVA + ['-cp', f'{jar}:{base}', main, *map(str, args)]
         return self.execute('probe', argv, environment=self.t1_env(), timeout=timeout, check=check, accepted=accepted)
 
@@ -824,8 +1014,8 @@ class CoreFixture(Fixture):
         return ','.join(f'{i}={nodes[f"{engine}{i}"]}:{ports[engine + "_base"] + i * ports["stride"] + 2}' for i in range(3))
 
     def me_genesis(self, plan):
-        """Step 4: EngineConfig FRESH through T1MeDriver; markets 2..5 exist at the ME."""
-        self._driver('t1_me_driver', 'T1MeDriver', 'genesis', PROBE_AERON_DIR, self._ingress('me'),
+        """Step 4: EngineConfig FRESH through ItMeDriver; markets 2..5 exist at the ME."""
+        self._driver('t1_me_driver', 'ItMeDriver', 'genesis', PROBE_AERON_DIR, self._ingress('me'),
                      self.genesis_id(self.life('me')), plan.get('ledger_capacity', 100_000))
 
     def arm_money_journal(self, plan):
@@ -859,11 +1049,11 @@ class CoreFixture(Fixture):
     def core_genesis(self, plan):
         """Step 7: CoreConfig 1 -> 2 -> 3, OPEN GLOBAL retried until the bridge binds the epoch. users = 0: no
         fire-and-forget deposits (T1C:269-281); the oracle-grade funding is step 9."""
-        self._driver('t1_core_driver', 'T1CoreDriver', 'genesis', PROBE_AERON_DIR, self._ingress('ae'),
+        self._driver('t1_core_driver', 'ItCoreDriver', 'genesis', PROBE_AERON_DIR, self._ingress('ae'),
                      self.genesis_id(self.life('core')), plan.get('ledger_capacity', 100_000), 0, 'via-bridge')
 
     def t1_market(self):
-        """The market rows of the pinned T1CoreDriver genesis, read from its source (an earlier constant had maxPrice
+        """The market rows of the pinned ItCoreDriver genesis, read from its source (an earlier constant had maxPrice
         10^18, the driver sends 1_000_000_000_000_000L = 10^15: the tables differed, so the driver's re-run met STALE at
         CoreConfig 1, CoreConfigStateMachine.java:94-98 at eb559a7)."""
         return t1_market_rows(Path(self.m['t1_core_driver']['source_path']).read_text())
@@ -1132,14 +1322,21 @@ class CoreFixture(Fixture):
             return ports['projector_http'], '/health'
         if role in ENGINES:
             return ports[role[:2] + '_metrics'], '/ready'
+        if role == 'shadow0' and self.slot_artifact('shadow0') == 'shadow':
+            return ports['shadow_metrics'], '/ready'
         raise Violation('no readiness target for ' + role)
 
     def start_slot(self, slot):
         artifact_name = self.slot_artifact(slot)
         if slot == 'shadow0':
-            if artifact_name is not None:
-                raise Inconclusive('shadow0 is reserved for the shadow replica; this fixture does not start one')
-            return {'state': 'RESERVED', 'reason': 'reserved for the shadow replica role'}
+            if artifact_name is None:
+                return {'state': 'RESERVED', 'reason': 'reserved for the shadow replica role (this manifest runs none)'}
+            if artifact_name != 'shadow' or self.m['artifacts'].get('shadow') is None:
+                raise Inconclusive(f'shadow0 runs the shadow artifact only, got {artifact_name}')
+            self.spawn(slot, self.replica_command(), self.replica_env())
+            port, path = self.ready_target(slot)
+            self.wait_http(slot, port, path, timeout=SHADOW_START_READY_BOUND_S)
+            return self.slot_row(slot, artifact_name)
         artifact = self.m['artifacts'][artifact_name] if artifact_name else None
         if artifact is None:
             return {'state': 'SKIPPED_ABSENT', 'artifact': artifact_name,
@@ -1258,7 +1455,7 @@ class CoreFixture(Fixture):
                 seen = state['ExitCode']
                 if (seen == 0) if code == 'nonzero' else (seen != code):
                     raise Inconclusive(f'{name} exited {seen}, expected {code}')
-                if name in ENGINES:
+                if name in ENGINES or name == 'shadow0':
                     self.registry.setdefault('last_kill', {})[name] = {'at': self.clock(), 'finished_at': state['FinishedAt'],
                                                                        'cause': 'exit', 'exit_code': seen}
                 return self.record_fault({'kind': 'exit', 'target': name, 'exit_code': seen, 'expected': code,
@@ -1267,7 +1464,7 @@ class CoreFixture(Fixture):
                 raise Inconclusive(f'{name} did not exit within {bound_s} s')
             self.sleep(0.25)
 
-    def restart(self, name, ready_timeout=60, readiness=None):
+    def restart(self, name, ready_timeout=60, readiness=None, wait_ready=True):
         """``docker start`` a killed or exited container (same state dir, same env) and return once /ready answers 200.
         An AE member is not started before 12.5 s after its kill (measured: earlier it hangs on the old archive mark
         file with the container Up). An external slot must come back on a NEW driver."""
@@ -1277,13 +1474,21 @@ class CoreFixture(Fixture):
         old = (self.registry.get('driver_identity') or {}).get(name)
         waited = None
         killed = (self.registry.get('last_kill') or {}).get(name)
-        if name.startswith('ae') and killed:
-            remaining = killed['at'] + AE_RESTART_MIN_AFTER_KILL_S - self.clock()
+        if (name.startswith('ae') or name == 'shadow0') and killed:
+            minimum = core_contracts.SHADOW_RESTART_MIN_AFTER_KILL_S if name == 'shadow0' else AE_RESTART_MIN_AFTER_KILL_S
+            remaining = killed['at'] + minimum - self.clock()
             if remaining > 0:
                 self.sleep(remaining)
             waited = round(self.clock() - killed['at'], 3)
         self.command(['docker', 'start', cid])
         started = self.inspect('container', cid)['State']
+        if not wait_ready:
+            # A start whose outcome is the drill's to observe (the replica's re-bootstrap exits 3): the fault stays open
+            witness = {'kind': 'start', 'target': name, 'container_id': cid, 'exit_code': before['ExitCode'],
+                       'started_at': started['StartedAt'], 'ready': None}
+            if waited is not None:
+                witness['waited_after_kill_s'] = waited
+            return self.record_fault(witness)
         port, path = self.ready_target(name)
         path = readiness or path
         self.wait_http(name, port, path, timeout=ready_timeout)
@@ -1441,11 +1646,14 @@ class CoreFixture(Fixture):
         reset_projection recorded (a precondition, never a fallback: no dump, no wipe). The X runs' recovery line
         wipes members that ran on a foreign seed in a fixture where no money ever moved; ``projection_dump_required=False``
         names that with a ``reason`` (required), recorded in the witness."""
-        if role not in ENGINES:
-            raise Violation('wipe_engine wipes an engine member only: ' + role)
+        if role not in ENGINES and role != 'shadow0':
+            raise Violation('wipe_engine wipes an engine member or the replica only: ' + role)
         cid = self._fault_target(role)
         if self.inspect('container', cid)['State']['Running']:
             raise Violation('wipe_engine refuses a running member: ' + role)
+        if role == 'shadow0':
+            # The replica branch: its BASE_DIR holds a log copy and shadows, never the money state of a life
+            projection_dump_required, reason = False, reason or 'replica: BASE_DIR holds a log copy and shadows, not a money source'
         if not projection_dump_required and not reason:
             raise Violation('wipe_engine without the projection dump needs a reason')
         if role.startswith('ae') and projection_dump_required:
@@ -1477,6 +1685,41 @@ class CoreFixture(Fixture):
         if not projection_dump_required:
             witness['projection_dump'] = 'not required: ' + reason
         return self.record_fault(witness)
+
+    def wipe_shadows(self, role):
+        """Remove a stopped AE member's shadow recordings from its bind-mounted archive: every ``<id>-<base>.rec`` whose
+        catalog descriptor names the shadow stream (SHADOW_STREAM_ID). Everything else stays: the log and snapshots the
+        member's ``cluster/recording.log`` names, and the money journal recording, which the projector reads. The member
+        then holds no local shadow, so a stub restore must pull one. A segment file the catalog does not describe is
+        refused (its stream is unknown), never guessed. The witness lists what was removed."""
+        import release_cut
+        if role not in ENGINES or not role.startswith('ae'):
+            raise Violation('wipe_shadows wipes an AE member\'s shadows only: ' + role)
+        cid = self._fault_target(role)
+        if self.inspect('container', cid)['State']['Running']:
+            raise Violation('wipe_shadows refuses a running member: ' + role)
+        base = self.root / 'state' / role / 'state'
+        log = base / 'cluster' / 'recording.log'
+        if not log.is_file():
+            raise Inconclusive(f'wipe_shadows: {role} has no recording.log')
+        keep = {e['recording_id'] for e in release_cut.recording_log(log)}
+        descriptors = catalog_descriptors(base / 'archive')
+        files = sorted((base / 'archive').glob('*-*.rec'))
+        unknown = sorted({int(p.stem.split('-')[0]) for p in files} - set(descriptors))
+        if unknown:
+            raise Inconclusive(f'wipe_shadows: {role} archive.catalog does not describe recordings {unknown}: their stream '
+                               'is unknown, nothing removed')
+        shadows = {rid for rid, d in descriptors.items() if d['stream'] == SHADOW_STREAM_ID and rid not in keep}
+        doomed = [p for p in files if int(p.stem.split('-')[0]) in shadows]
+        removed, total = {}, 0
+        for path in doomed:
+            rid = int(path.stem.split('-')[0])
+            removed[path.name] = delete_shadow_segment(path, descriptors[rid], keep)
+            total += removed[path.name]
+        if role not in (self.registry.get('fault_targets') or {}):
+            self.open_fault(role, 0, REGENESIS_HEAL_BOUND_S, reason='shadows wiped')
+        return self.record_fault({'kind': 'wipe_shadows', 'target': role, 'kept_recordings': sorted(keep),
+                                  'files_removed': removed, 'bytes_removed': total})
 
     def reset_projection(self, out_dir=None):
         """Stop the projector, dump every table of the run's money database to ``<out>/life-<n>/money_journal.pg.jsonl``

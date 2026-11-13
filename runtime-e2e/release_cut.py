@@ -139,7 +139,8 @@ def fixture_names(schema=SCHEMA):
     """Fixture artifact role -> the cut artifact name it stages."""
     lay = layout(schema)
     return {'me': 'match-cluster.jar', 'ae': lay['cluster'], 'projector': lay['projector'], 'forwarder': 'ct-forwarder',
-            'bridge': 'ct-bridge', 'forwarder_b': 'ct-forwarder', 'bridge_b': 'ct-bridge'}
+            'bridge': 'ct-bridge', 'forwarder_b': 'ct-forwarder', 'bridge_b': 'ct-bridge',
+            'shadow': lay['cluster']}            # the replica is CORE_ROLE=replica of the core jar
 
 
 def core_repo(cut):
@@ -314,8 +315,8 @@ def _derived_k4(f, name, entry, spec, repos, record, aeron_version, cls):
 # drivers of cluster-tools at repos.cluster-tools); a stale probe or a stale harness_commit is refused.
 HARNESS_SOURCES = {'core_probe': ('tools', 'runtime-e2e/java/CoreProbe.java'),
                    'journal_probe': ('tools', 'runtime-e2e/java/JournalProbe.java'),
-                   't1_me_driver': ('cluster-tools', 'app/forwarder/it/T1MeDriver.java'),
-                   't1_core_driver': ('cluster-tools', 'app/forwarder/it/T1CoreDriver.java')}
+                   't1_me_driver': ('cluster-tools', 'app/forwarder/it/ItMeDriver.java'),
+                   't1_core_driver': ('cluster-tools', 'app/forwarder/it/ItCoreDriver.java')}
 REPO_PATHS = {'tools': Path(os.environ.get('CUT_TOOLS_REPO', str(Path(__file__).resolve().parent.parent))),
               'cluster-tools': env_path('CUT_CT_REPO', 'the cluster-tools git work tree the T1 driver sources are read from')}
 
@@ -673,7 +674,7 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
     for key in ('core_probe', 'journal_probe', 't1_me_driver', 't1_core_driver'):
         if key in m:
             staged(key, {'path': m[key]['path'], 'sha256': m[key]['sha256']})
-    if m.get('manifest_kind') and not str(m['manifest_kind']).startswith('s17'):
+    if m.get('manifest_kind') and not core_contracts.cut_derived(m['manifest_kind']):
         f.add('K9', f'manifest_kind {m["manifest_kind"]} is not derived from a cut')
     # The derived manifest runs the cut's harness, clean; a rig manifest may waive the drift with a named reason
     # (harness_drift, recorded), never a product or nightly one
@@ -902,6 +903,12 @@ def audit_expected(m, registry=None):
         out[slot] = {'files': files, 'build': core_contracts.health_build_expected(entry), 'artifact': name,
                      'build_absent': core_contracts.HEALTH_BUILD_ABSENT.get(entry['sha256']),
                      'aeron_version_of': files[-1]['path'] if len(files) > 1 else None}
+    shadow = art.get('shadow') if (m.get('slot_artifacts') or {}).get('shadow0') == 'shadow' else None
+    if shadow:          # the replica: the core jar staged as the shadow artifact, on the engines' aeronmd when external
+        files = [{'path': '/artifacts/shadow/bin', 'sha256': shadow['sha256'], 'what': 'shadow jar'}]
+        if m.get('engine_driver') == 'external':
+            files += aeronmd(m.get('engine_libs'), '/artifacts/engine_libs')
+        out['shadow0'] = {'files': files, 'build': None, 'aeron_version_of': files[-1]['path'] if len(files) > 1 else None}
     probe = aeronmd(m.get('probe_libs'), '/artifacts/probe')
     if probe:
         out['probe'] = {'files': probe, 'build': None, 'aeron_version_of': probe[0]['path']}
@@ -1365,7 +1372,8 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
     me['genesisId'] = me_gid
     out['me'] = me
     derivation = genesis.get('derivation')
-    if not derivation and str(m.get('manifest_kind', '')).startswith('s17'):
+    import core_contracts
+    if not derivation and core_contracts.cut_derived(m.get('manifest_kind')):
         rec.say('REFUSED', 'genesisId derivation missing: an s17 run derives its genesisId from its run_id')
     if derivation:
         import core_contracts
@@ -1384,7 +1392,7 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
                     acks.append((r.get('at_ns') or 0, int((r.get('args') or {}).get('version', reply.get('configVersion', 0))),
                                  reply['result']))
     for c in core_window_commands:
-        if re.search(r'\bT1CoreDriver genesis\b', ' '.join(c.get('argv', []))):
+        if re.search(r'\bItCoreDriver genesis\b', ' '.join(c.get('argv', []))):
             log = Path(c['output'])
             text = log.read_text() if log.is_file() else ''
             stamp = log.stat().st_mtime_ns if log.is_file() else 0

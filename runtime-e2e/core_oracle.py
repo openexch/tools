@@ -408,7 +408,13 @@ def run_rules(sample, rules):
             results[name] = {'status': 'INCONCLUSIVE', 'detail': f'{type(error).__name__}: {error}'}
     statuses = {r['status'] for r in results.values()}
     status = 'FAIL' if 'FAIL' in statuses else 'INCONCLUSIVE' if 'INCONCLUSIVE' in statuses else 'PASS'
-    return {'status': status, 'rules': results}
+    out = {'status': status, 'rules': results}
+    if getattr(model, 'untapped', None) or getattr(model, 'untapped_orders', None):
+        # a declared untappable window (declared.untappable): what it left unjudged, recorded with the verdict
+        unjudged = getattr(model, 'untapped_orders', [])
+        out['untappable'] = {'declared': sample['declared'].get('untappable'), 'dispatch_short': model.untapped,
+                             'orders_unjudged': unjudged, 'orders_unjudged_count': len(unjudged)}
+    return out
 
 
 def judge(sample):

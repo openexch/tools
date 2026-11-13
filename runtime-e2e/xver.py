@@ -545,7 +545,7 @@ def judge_a1(obs):
 
 def judge_a2(obs):
     """6.8 X-A2: the partial CoreConfig acks are ACCEPTED/ADOPTED; (a) the same-id re-run runs on the untouched
-    partial state BEFORE (b) the new-id run; (b) the core REJECTED (2) at CoreConfig 1 and the T1MeDriver FRESH with the new id
+    partial state BEFORE (b) the new-id run; (b) the core REJECTED (2) at CoreConfig 1 and the ItMeDriver FRESH with the new id
     did not answer its epoch; k = 2 records the gate after the finish and after the explicit OPEN separately."""
     reasons, out = [], {}
     if obs['before'].get('status') not in ('INCOMPLETE', 'ABORTED'):
@@ -561,7 +561,7 @@ def judge_a2(obs):
         reasons.append('the new genesisId was not REJECTED at CoreConfig 1')
     me = obs.get('new_id_me') or {}
     if me.get('exit') == 0 or f'EPOCH {obs.get("new_id")}' in me.get('out', ''):
-        reasons.append(f'the ME FRESH with a new genesisId was not refused (T1MeDriver exit {me.get("exit")}): REJECTED_GENESIS expected')
+        reasons.append(f'the ME FRESH with a new genesisId was not refused (ItMeDriver exit {me.get("exit")}): REJECTED_GENESIS expected')
     same = obs['same_id']
     if obs['stop_after'] == 1:
         if same.get('exit') != 0 or obs.get('gate_final') != 'OPEN':
@@ -744,7 +744,7 @@ def probe_cadence(rows, s):
 
 class ActiveProbe(threading.Thread):
     """During every X run a client at the binary's own wire attempts a session plus one request: ME ``JournalProbe open-legs``
-    (the T1MeDriver connect retries for 60 s, too slow for a 1 s cadence), AE ``CoreProbe deposit`` on the TOOL principal. One
+    (the ItMeDriver connect retries for 60 s, too slow for a 1 s cadence), AE ``CoreProbe deposit`` on the TOOL principal. One
     attempt starts every second while fewer than ``inflight`` are running; every attempt and answer is a row of ``out``."""
 
     def __init__(self, f, engine, out, inflight=2, interval=1.0):
@@ -1257,7 +1257,7 @@ def _steps(f, plan, steps):
 def _core_driver(f, genesis_id=None, timeout=None):
     from core_fixture import PROBE_AERON_DIR
     timeout = _S['XVER_DRIVER_S'] if timeout is None else timeout
-    r = f._driver('t1_core_driver', 'T1CoreDriver', 'genesis', PROBE_AERON_DIR, f._ingress('ae'),
+    r = f._driver('t1_core_driver', 'ItCoreDriver', 'genesis', PROBE_AERON_DIR, f._ingress('ae'),
                   genesis_id or f.genesis_id(1), 100_000, 0, 'via-bridge', timeout=timeout, check=False, accepted=(0, 1))
     return {'exit': r.returncode, 'out': (r.stdout or '') + (r.stderr or '')}
 
@@ -1265,7 +1265,7 @@ def _core_driver(f, genesis_id=None, timeout=None):
 def _me_driver(f, genesis_id, timeout=None):
     from core_fixture import PROBE_AERON_DIR
     timeout = _S['XVER_ME_DRIVER_S'] if timeout is None else timeout
-    r = f._driver('t1_me_driver', 'T1MeDriver', 'genesis', PROBE_AERON_DIR, f._ingress('me'), genesis_id, 100_000,
+    r = f._driver('t1_me_driver', 'ItMeDriver', 'genesis', PROBE_AERON_DIR, f._ingress('me'), genesis_id, 100_000,
                   timeout=timeout, check=False, accepted=(0, 1, 78))
     return {'exit': r.returncode, 'out': (r.stdout or '') + (r.stderr or '')}
 

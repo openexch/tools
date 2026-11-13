@@ -1,0 +1,77 @@
+{
+ "note": "Alternate-night plan, the external set (nightly.py --alternate, second file): the nine replica drills with the engines and the replica on the staged aeronmd (the shadow catalog and leader loss on shadow-query-ext, re-bootstrap on shadow-anyverified-ext), the four embedded replica drills the embedded set has no room for (member kill -9, peer loss, the shadow catalog and leader loss on shadow-query), and the five controls in one mode each.",
+ "entries": [
+  {
+   "kind": "shadow-ext",
+   "scenario": "core-drill-member-kill9"
+  },
+  {
+   "kind": "shadow-ext",
+   "scenario": "core-drill-peerloss"
+  },
+  {
+   "kind": "shadow-ext",
+   "scenario": "core-drill-peerloss-loud"
+  },
+  {
+   "kind": "shadow-query-ext",
+   "scenario": "core-drill-shadow-catalog"
+  },
+  {
+   "kind": "shadow-ext",
+   "scenario": "core-drill-supplierloss"
+  },
+  {
+   "kind": "shadow-query-ext",
+   "scenario": "core-drill-leaderloss-promotion"
+  },
+  {
+   "kind": "shadow-ext",
+   "scenario": "core-drill-replica-restart"
+  },
+  {
+   "kind": "shadow-ext",
+   "scenario": "core-drill-replica-wipe"
+  },
+  {
+   "kind": "shadow-anyverified-ext",
+   "scenario": "core-drill-replica-rebootstrap"
+  },
+  {
+   "kind": "shadow",
+   "scenario": "core-drill-member-kill9"
+  },
+  {
+   "kind": "shadow",
+   "scenario": "core-drill-peerloss"
+  },
+  {
+   "kind": "shadow-query",
+   "scenario": "core-drill-shadow-catalog"
+  },
+  {
+   "kind": "shadow-query",
+   "scenario": "core-drill-leaderloss-promotion"
+  },
+  {
+   "kind": "full",
+   "scenario": "core-control-kill9-fullmode"
+  },
+  {
+   "kind": "shadow",
+   "scenario": "core-control-peerloss-loud-unblocked"
+  },
+  {
+   "kind": "shadow-cooldown30",
+   "scenario": "core-control-supplierloss-cooldown30"
+  },
+  {
+   "kind": "shadow-detectoronly",
+   "scenario": "core-control-rebootstrap-detectoronly"
+  },
+  {
+   "kind": "shadow",
+   "scenario": "core-control-rebootstrap-nowitness"
+  }
+ ]
+}

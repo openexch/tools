@@ -294,6 +294,44 @@ class TapContinuityTest(unittest.TestCase):
         result = rule(order_oracle.judge(variant(clean_sample(), edit)), 'O5')
         self.assertEqual(result['status'], 'INCONCLUSIVE', result)
 
+    def test_a_declared_untappable_window_closes_its_gap_and_records_what_it_left(self):
+        """A quorum loss the drill declares (declared.untappable): a dispatch gap inside the window may stay short of
+        backfill, an order whose terminal falls in an event window inside it is recorded, not judged; outside the
+        window both stay INCONCLUSIVE."""
+        def declare(dispatch, events):
+            return lambda s: s.__setitem__('declared', dict(s['declared'], untappable={
+                'reason': 'quorum loss: test', 'dispatch': dispatch, 'events': events}))
+        def tap_with_release(s):
+            create = next(r for r in s['dispatch_tap'] if r['seq'] == 3)
+            other = next(r for r in s['dispatch_tap'] if r['seq'] == 1)
+            s['dispatch_tap'] += [dict(create, seq=11, kind='RELEASE_ID'), dict(other, seq=12, kind='RELEASE_ID')]
+            s['me_journal'].append({'type': 'release', 'releases': [
+                {'commandIdHigh': 1003, 'idLowFloor': 4, 'scope': 0, 'result': 0, 'removed': 1},
+                {'commandIdHigh': 1001, 'idLowFloor': 0, 'scope': 0, 'result': 0, 'removed': 1}]})
+            s['core']['pending_dispatch']['head'] = 12
+        lost = variant(variant(clean_sample(), tap_with_release),
+                       lambda s: s.__setitem__('dispatch_tap', [r for r in s['dispatch_tap'] if r['seq'] != 12]))
+        sample, _ = backfilled(lost)                      # an unverified release mapping: slot 12 stays open
+        self.assertEqual(Model(sample).tap_closed(), [12, 12])
+        inside = variant(sample, declare([[11, 12]], []))
+        model = Model(inside)
+        self.assertIsNone(model.tap_closed())
+        self.assertEqual(model.untapped, [{'gaps': [[12, 12]], 'short': 1, 'reason': 'quorum loss: test'}])
+        order = order_oracle.judge(inside)
+        self.assertEqual((rule(order, 'O3')['status'], rule(order, 'O10')['status']), ('PASS', 'PASS'), order)
+        self.assertEqual(order['untappable']['dispatch_short'][0]['short'], 1)
+        self.assertEqual(Model(variant(sample, declare([[13, 14]], []))).tap_closed(), [12, 12])
+        # the declaration never hides an ME outcome without a dispatch (backfill rebuilds those; here none ran)
+        hidden = order_oracle.judge(variant(holed(6), declare([[5, 7]], [])))
+        self.assertEqual(rule(hidden, 'O3')['status'], 'FAIL', hidden)
+        lost = variant(clean_sample(), lambda s: s.__setitem__('core_events', [e for e in s['core_events'] if e['seq'] != 4]))
+        unjudged = order_oracle.judge(variant(lost, declare([], [[4, 4]])))
+        self.assertEqual(rule(unjudged, 'O5')['status'], 'PASS', unjudged)
+        self.assertEqual(unjudged['untappable']['orders_unjudged'], [1004])
+        elsewhere = order_oracle.judge(variant(lost, declare([], [[2, 3]])))
+        self.assertEqual(rule(elsewhere, 'O5')['status'], 'INCONCLUSIVE', elsewhere)
+        self.assertNotIn('untappable', order_oracle.judge(clean_sample()))
+
 
 # ------------------------------------------------------------------ 7 ordering exception
 
@@ -895,8 +933,12 @@ class TableTest(unittest.TestCase):
     def test_every_drill_has_a_schedule_and_known_lines(self):
         self.assertTrue({'lostack', 'coreleader', 'meleader', 'fwdrestart', 'fwdpause', 'partition', 'driverkill', 'lifecycle',
                          'lifecycle-faults'} <= set(cd.DRILLS))           # the base kinds add nine (BaseKindTableTest)
+        import replica_drills          # the replica drills' run class and lines (registered into cd.LINES on import)
         for name, spec in cd.DRILLS.items():
-            self.assertTrue(hasattr(cd.DrillRun, 'faults_' + spec['faults']), name)
+            run = replica_drills.ReplicaDrillRun if spec.get('replica') else cd.DrillRun
+            self.assertTrue(hasattr(run, 'faults_' + spec['faults']), name)
+            if spec.get('replica'):
+                self.assertTrue(hasattr(run, 'replica_' + spec['replica']), name)
             for line in spec['lines']:
                 self.assertIn(line, cd.LINES, (name, line))
         for control, (drill, _, lines) in cd.CONTROLS.items():

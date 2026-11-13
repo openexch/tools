@@ -6,8 +6,8 @@ probe container with that same frozen jar on the class path, so the probe jar ca
 classes. Copy the objects from probe-manifest.json into the core manifest (``core_probe``,
 ``journal_probe``).
 
-``--ct-dir <cluster-tools>`` also compiles the two T1 drivers, T1MeDriver (against the ME
-jar) and T1CoreDriver (against the core jar), FROM ``<ct>/app/forwarder/it/`` and never copies them into tools; the
+``--ct-dir <cluster-tools>`` also compiles the two genesis drivers, ItMeDriver (against the ME
+jar) and ItCoreDriver (against the core jar), FROM ``<ct>/app/forwarder/it/`` and never copies them into tools; the
 manifest keys ``t1_me_driver`` / ``t1_core_driver`` pin each source file's sha256, and ``ct_head`` records the
 cluster-tools commit the sources came from. ``--ct-dir`` is optional so the probe-only call keeps working.
 
@@ -23,7 +23,7 @@ import subprocess
 import sys
 
 DRIVER_DIR = Path('app') / 'forwarder' / 'it'
-DRIVERS = {'t1_me_driver': ('T1MeDriver', '--me-jar'), 't1_core_driver': ('T1CoreDriver', '--core-jar')}
+DRIVERS = {'t1_me_driver': ('ItMeDriver', '--me-jar'), 't1_core_driver': ('ItCoreDriver', '--core-jar')}
 RETIRED_FLAGS = {'--ae-jar': '--core-jar'}
 
 

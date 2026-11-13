@@ -609,11 +609,18 @@ public final class CoreProbe {
      * {@code TAP first=F last=L rows=N gaps=[[a,b],...]} over the dispatchSeq values seen, then the JSON summary.
      * The density cannot see a missing TAIL: the drill compares {@code last} with the core head
      * ({@code pending-dump}), which a TOOL session cannot read.
+     * <p>{@code duration_ms} is the worst case. With {@code stop=<file>} the tap also ends once that file exists
+     * (checked every {@link #TAP_STOP_POLL_MS} ms): the drill writes it when its last assertion is decided plus its
+     * settle setting. The summary names which of the two ended it ({@code ended}).
      */
+    static final long TAP_STOP_POLL_MS = 200;
+
     private int tap() {
         final long until = System.currentTimeMillis() + num("duration_ms");
         final String out = arg("out");
         final String sessions = args.getOrDefault("sessions", out + ".sessions.jsonl");
+        final Path stop = args.containsKey("stop") ? Path.of(args.get("stop")) : null;
+        String ended = "duration";
         try (PrintWriter rowsOut = new PrintWriter(new FileWriter(out, true));
              PrintWriter sessionsOut = new PrintWriter(new FileWriter(sessions, true))) {
             continuity = new Continuity(e -> {
@@ -624,15 +631,25 @@ public final class CoreProbe {
             register(corr(), SessionClass.TOOL, true, true);
             continuity.note("registered", map("session", cluster.clusterSessionId(), "leader", cluster.leaderMemberId()));
             final BackoffIdleStrategy idle = new BackoffIdleStrategy();
+            long nextStopCheck = 0;
             while (System.currentTimeMillis() < until && !Thread.currentThread().isInterrupted()) {
                 idle.idle(pump(SessionClass.TOOL, true, true));
                 rowsOut.flush();
+                final long now = System.currentTimeMillis();
+                if (stop != null && now >= nextStopCheck) {
+                    nextStopCheck = now + TAP_STOP_POLL_MS;
+                    if (Files.exists(stop)) {
+                        ended = "stop";
+                        break;
+                    }
+                }
             }
         } catch (final IOException e) {
             throw new IllegalStateException("tap output: " + e.getMessage());
         }
         System.out.println(continuity.dispatch.tapLine());
-        final Map<String, Object> summary = map("verb", "tap", "rows", listener.tapped, "sessions_file", sessions);
+        final Map<String, Object> summary = map("verb", "tap", "rows", listener.tapped, "sessions_file", sessions,
+                "ended", ended);
         summary.putAll(continuity.summary());
         System.out.println(json(summary));
         return 0;
