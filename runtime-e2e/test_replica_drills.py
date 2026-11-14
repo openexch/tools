@@ -285,7 +285,8 @@ class ReplicaLineTest(unittest.TestCase):
         self.assertTrue(holds(rd.line_replica_restart_local(w(replica_restart=ok))))
         line = rd.line_replica_restart_local(w(replica_restart=dict(ok, restore_path=2)))
         self.assertIn('restarted replica did not restore from its local shadow', line['detail'])
-        self.assertFalse(holds(rd.line_replica_restart_local(w(replica_restart=dict(ok, ready_after_start_s=61.0)))))
+        self.assertTrue(holds(rd.line_replica_restart_local(w(replica_restart=dict(ok, ready_after_start_s=61.901)))))
+        self.assertFalse(holds(rd.line_replica_restart_local(w(replica_restart=dict(ok, ready_after_start_s=131.0)))))
         self.assertTrue(holds(rd.line_replica_pulled(w(replica_wipe={'restore_path': 3, 'ready': True}))))
         self.assertIn('GENESIS', rd.line_replica_pulled(w(replica_wipe={'restore_path': 2, 'ready': True}))['detail'])
         self.assertTrue(holds(rd.line_second_life_local(w(second_life={'restore_path': 1, 'ready': True}))))
@@ -293,10 +294,23 @@ class ReplicaLineTest(unittest.TestCase):
 
     def test_rebootstrap_exit_and_not_taken(self):
         x = {'exit_code': 3, 'replay_below_start_max': 3, 'rebootstrap_total_max': 0, 'replay_failures_setting': 3,
-             'restart_line': 'ERROR CRITICAL replica restart (exit 3): members pruned past the local log'}
+             'restart_line': 'ERROR CRITICAL replica restart (exit 3): members pruned past the local log (3 replay refusals)'}
         self.assertTrue(holds(rd.line_rebootstrap_exit3(w(rebootstrap=x))))     # the counter is recorded, not required
-        self.assertFalse(holds(rd.line_rebootstrap_exit3(w(rebootstrap=dict(x, replay_below_start_max=2)))))
+        # the restart line states the refusal count; the scraped counter is recorded, not required
+        self.assertFalse(holds(rd.line_rebootstrap_exit3(w(rebootstrap=dict(x, restart_line=x['restart_line'].replace('3 replay', '2 replay'))))))
+        self.assertFalse(holds(rd.line_rebootstrap_exit3(w(rebootstrap=dict(x, restart_line='CRITICAL replica restart (exit 3): no count')))))
         self.assertFalse(holds(rd.line_rebootstrap_exit3(w(rebootstrap=dict(x, restart_line=None)))))
+        # the process exits before the 0.5 s scrape sees its third refusal: the restart line's count decides
+        seen = {'exit_code': 3, 'replay_below_start_max': 2.0, 'rebootstrap_total_max': 0, 'replay_failures_setting': 3,
+                'restart_line': '[ERROR] CoreShadowReplicaMain - CRITICAL replica restart (exit 3): replica re-bootstrap: '
+                                'members pruned past L.stop=887840 (3 replay refusals); pulled ALIGNED at 15004416 from '
+                                '172.30.216.10:19301; backup state will move to cluster.rebootstrap-20261114T172248721Z; '
+                                'restarting'}
+        line = rd.line_rebootstrap_exit3(w(rebootstrap=seen))
+        self.assertTrue(holds(line))
+        self.assertIn('exit 3 after 3 replay refusals in the restart line (setting 3)', line['detail'])
+        self.assertIn('replay-below-start scraped 2.0', line['detail'])
+        self.assertFalse(holds(rd.line_rebootstrap_exit3(w(rebootstrap=dict(seen, replay_failures_setting=4)))))
         # detector only (SHADOW_REBOOTSTRAP_REPLAY_FAILURES 0): counts and never acts, and the kit never says not taken
         detector = {'exit_code': None, 'detector_only': True, 'replay_below_start_max': 4, 'refusals_needed': 3,
                     'missed_observed_s': 30.2, 'not_taken_max': 0,

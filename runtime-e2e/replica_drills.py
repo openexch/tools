@@ -43,7 +43,10 @@ SETTINGS_SPEC = {
     'SAMPLER_CONTROL_PAUSE_S': (3, 1, 60),              # the sampler control: the replica paused this long
     'SAMPLER_PAUSE_RECOVERY_S': (10, 1, 600),           # ... and back below REPLICA_READY_MAX_LAG_BYTES within this
     'MEMBER_RESTART_READY_BOUND_S': (30, 1, 600),            # a killed member's /ready, measured from docker start
-    'REPLICA_RESTART_READY_BOUND_S': (60, 1, 600),  # the restarted replica's /ready, measured from docker start
+    # the restarted replica's /ready, measured from docker start. A LOCAL_SHADOW start reads 503 unverified continuation
+    # until its next ALIGNED compares equal with the member snapshot the backup retrieved: up to one member cadence
+    # (1 minute) plus one backup query (60 s default) plus the compare. 3.1 to 62.1 s measured; 60 s failed one run
+    'REPLICA_RESTART_READY_BOUND_S': (130, 1, 600),
     'PEERLOSS_PULLS_BEFORE_KILL': (2, 1, 10),             # pulls the peer-loss target counted before the kills
     'PROMOTION_ATTEMPTS': (3, 1, 10),           # leader-loss attempts to see the supplier promoted
     'KILL_HEAL_BOUND_S': (core_fixture.KILL_HEAL_BOUND_S, 1, 3600),   # the fixture's kill heal bound, plus the drill's waits
@@ -372,11 +375,24 @@ def line_rebootstrap_exit3(w):
         return _line(False, f'replica did not exit 3: {reason} (exit {x.get("exit_code")}, '
                             f'replay-below-start {x.get("replay_below_start_max")})')
     need = x.get('replay_failures_setting', 3)
-    # the decided restart is read from the replica's own exit line: the process exits right after it counts the
-    # re-bootstrap, so a /metrics scrape rarely sees shadow_replica_rebootstrap_total move (recorded, not required)
-    return _line((x.get('replay_below_start_max') or 0) >= need and RESTART_TEXT in (x.get('restart_line') or ''),
-                 f'exit 3 after replay-below-start {x.get("replay_below_start_max")} (setting {need}), restart line: '
-                 f'{str(x.get("restart_line"))[:200]}; recorded: re-bootstrap total seen {x.get("rebootstrap_total_max")}')
+    # The decided restart and its refusal count are read from the replica's own exit line, the authoritative record:
+    # the process exits right after it counts the refusal that decides and the re-bootstrap, so a 0.5 s /metrics
+    # scrape can miss the last refusal and rarely sees shadow_replica_rebootstrap_total move (both recorded, not required)
+    restart_line = x.get('restart_line') or ''
+    refusals = restart_refusals(restart_line) if RESTART_TEXT in restart_line else None
+    return _line(refusals is not None and refusals >= need,
+                 f'exit 3 after {refusals} replay refusals in the restart line (setting {need}), restart line: '
+                 f'{str(x.get("restart_line"))[:200]}; recorded: replay-below-start scraped '
+                 f'{x.get("replay_below_start_max")}, re-bootstrap total seen {x.get("rebootstrap_total_max")}')
+
+
+RESTART_REFUSALS = re.compile(r'\((\d+) replay refusals\)')
+
+
+def restart_refusals(line):
+    """The refusal count the replica's restart line states (``... (3 replay refusals) ...``), or None."""
+    m = RESTART_REFUSALS.search(line or '')
+    return int(m.group(1)) if m else None
 
 
 def line_rebootstrap_refusals_counted(w):
