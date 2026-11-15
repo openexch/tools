@@ -261,7 +261,7 @@ def build(kind, tag, cfg=None):
 # ------------------------------------------------------------------ the s17 kinds, derived from the cut
 
 # kind -> (slot driver, engine/projector driver, slot base build, slot plan, second builds); CUT = the cut manifest's ct
-# binaries, A = build A (ct 2be3a19, the upgrade_from of the A05 rows, pinned in the old-artifact pins)
+# binaries, A = build A (MK_BIN_A, the upgrade_from of the A05 rows; its commit is read from its pin in the old-artifact pins)
 CUT_KINDS = {
     's17': ('external', 'embedded', 'CUT', 'A', {}),
     's17-ext': ('external', 'external', 'CUT', 'A', {}),
@@ -348,6 +348,15 @@ def build_from_cut(kind, tag, cut_path, cfg=None, old_pins=None):
     cut_libs = {'aeronmd': _cut_lib(a['aeronmd'], True), 'libaeron_driver.so': _cut_lib(a['libaeron_driver.so']),
                 'libaeron.so': _cut_lib(a['libaeron.so'])}
 
+    def a_source(path):
+        """Build A's commit is the source_sha of its pin in the old-artifact pins (the bytes name the build, so a newer
+        build A needs only a new pin, not a code change); an unpinned build A is refused before anything is written."""
+        pin = pins.get(sha(path))
+        if pin is None:
+            raise Violation(f'build A {path} (sha256 {sha(path)}) is not pinned in the old-artifact pins: pin it with its '
+                            'source_sha and recipe (CUT_OLD_PINS)')
+        return _source(pin.get('source_sha'), f'the pin of build A {path}')
+
     def binary(source, role):
         sub = 'forwarder' if role.startswith('forwarder') else 'bridge'
         if source == 'CUT':
@@ -359,7 +368,7 @@ def build_from_cut(kind, tag, cut_path, cfg=None, old_pins=None):
             return {'path': str(path), 'sha256': sha(path), 'source_sha': cut['repos']['cluster-tools'], 'driver': slot_driver,
                     'target': source, 'libs': json.loads(json.dumps(cut_libs))}
         path = _need(cfg.bin_a / f'ct-{sub}', f'{role} build A')
-        return {'path': str(path), 'sha256': sha(path), 'source_sha': CT_A_SOURCE_SHA, 'driver': slot_driver,
+        return {'path': str(path), 'sha256': sha(path), 'source_sha': a_source(path), 'driver': slot_driver,
                 'target': f'ct-{sub}', 'libs': _driver_libs(cfg)}
 
     roles = sorted(core_contracts.ROLES)
@@ -395,7 +404,7 @@ def build_from_cut(kind, tag, cut_path, cfg=None, old_pins=None):
                                                             for p in sorted(helper.rglob('*')) if p.is_file()}},
         'manifest_kind': kind, 'harness_commit': commit, 'harness_dirty': dirty,
         'profile_note': (f'{kind} from cut {cut.get("cut_id")}: production timeouts; pinned cpu plan; C++ slots '
-                         f'{slot_driver} on {"build A ct " + CT_A_SOURCE_SHA[:7] if base == "A" else "the cut"}, engines and '
+                         f'{slot_driver} on {"build A ct " + artifacts["forwarder"]["source_sha"][:7] if base == "A" else "the cut"}, engines and '
                          f'projector {engine_driver}; shm/memory sizes are settings, not acceptance limits'),
         'projector_driver': engine_driver,
     }
