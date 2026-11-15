@@ -249,6 +249,44 @@ class CutLayoutTest(CheckerBase):
         m = copy.deepcopy(self.w.m); m['retired'] = [r for r in m['retired'] if r != 'core-bridge']
         self.assertIn(('K9', 'retired: must list core-bridge, match-gateway, oms-app'), self.check(m).items)
 
+    def tool(self, m, name='core-bridge.jar', builds=2, **over):
+        """A tools.core-dump entry: the core-bridge jar built twice from the cut's core commit (money schema inside)."""
+        data = jar_bytes({'MANIFEST': b'jar core-bridge', 'sbe/money-schema.xml': SCHEMA_TEXT['money']})
+        p = self.w.put('artifacts/' + name, data)
+        self.w.record.pop('core-bridge.jar', None)
+        self.w.build('core-bridge.jar', 'core', SHAS['core'], data, builds, tag='t')
+        self.w.refresh_record(m)
+        entry = dict(World.entry(p, SHAS['core'], 'rebuild-equal'), kind='tool', main='com.openexchange.core.bridge.CoreDump')
+        m['tools'] = {'core-dump': {**entry, **over}}
+        return m
+
+    def test_the_core_dump_jar_is_accepted_as_a_tool(self):
+        """money-check --store core runs CoreDump from the cut: the bridge jar is a tool there, never a service artifact."""
+        m = self.tool(copy.deepcopy(self.w.m))
+        self.assertEqual(self.check(m).items, [])
+        self.assertEqual(release_cut.tool_path(m, 'core-dump')[0], Path(m['tools']['core-dump']['path']))
+
+    def test_a_tool_entry_is_checked_like_an_artifact(self):
+        self.refused(self.tool(copy.deepcopy(self.w.m), kind='product'), {'K9'})
+        self.refused(self.tool(copy.deepcopy(self.w.m), main='com.openexchange.core.bridge.BridgeMain'), {'K9'})
+        self.refused(self.tool(copy.deepcopy(self.w.m), builds=1), {'K4'})
+        self.refused(self.tool(copy.deepcopy(self.w.m), source_sha='f' * 40), {'K4'})
+        self.refused(self.tool(copy.deepcopy(self.w.m), name='other.jar'), {'K9'})
+        m = self.tool(copy.deepcopy(self.w.m)); m['tools']['bridge'] = m['tools'].pop('core-dump')
+        self.refused(m, {'K9'})
+        m = self.tool(copy.deepcopy(self.w.m)); m['tools']['core-dump']['sha256'] = '0' * 64
+        self.assertIn('K1', self.check(m).by_rule())
+        with self.assertRaisesRegex(ValueError, 'does not hash'):
+            release_cut.tool_path(m, 'core-dump')
+        with self.assertRaisesRegex(ValueError, 'no tools.core-dump'):
+            release_cut.tool_path(copy.deepcopy(self.w.m), 'core-dump')
+
+    def test_the_bridge_jar_as_a_service_artifact_is_still_retired(self):
+        m = self.tool(copy.deepcopy(self.w.m))
+        m['artifacts']['core-bridge'] = dict(m['tools']['core-dump'], kind='product')
+        del m['artifacts']['core-bridge']['main']
+        self.assertIn('K5', self.check(m).by_rule())
+
     def test_the_core_repo_of_either_layout(self):
         self.assertEqual(release_cut.core_repo(self.w.m), SHAS['core'])
         self.assertEqual(release_cut.core_repo(self.old_world().m), SHAS['core'])
@@ -448,6 +486,16 @@ class FixtureManifestTest(CheckerBase):
         self.assertEqual(found.by_rule(), ['K3'])
         self.assertEqual(release_cut.check(self.fixture(b=True), self.w.m, 'rig', old_pins=self.w.pins).items, [])
 
+    def test_a_slot_running_the_cut_core_dump_jar_is_refused(self):
+        """The tool-only jar is in the cut, yet a fixture slot that stages it (the Java bridge as a service) is refused."""
+        cut = CutLayoutTest.tool(self, copy.deepcopy(self.w.m))
+        tool = cut['tools']['core-dump']
+        m = self.fixture()
+        m['artifacts']['bridge'] = dict(m['artifacts']['bridge'], path=tool['path'], sha256=tool['sha256'],
+                                        source_sha=tool['source_sha'])
+        found = release_cut.check(m, cut, 'rig', old_pins=self.w.pins)
+        self.assertIn('K5', found.by_rule(), found.items)
+
     def test_bytes_outside_the_cut_are_refused(self):
         m = self.fixture()
         p = self.w.put('foreign.jar', b'foreign')
@@ -589,6 +637,24 @@ class LogReaderTest(unittest.TestCase):
         out = release_cut.genesis_reader(self.root, self.schema)
         self.assertIsNone(out['genesis_id'])
         self.assertEqual(out['status'], 'not observable')
+
+    def test_a_frame_of_another_money_schema_version_is_refused(self):
+        """A cut is one wire version: a CoreConfig of another version in the log (a v7 producer before a v8 core) is refused,
+        never decoded with the cut's layout."""
+        for m in ('ae0', 'ae1', 'ae2'):
+            write_ae_member(self.root, m, [core_config_payload(1, GID), core_config_payload(2, GID, schema_version=6)])
+        with self.assertRaisesRegex(ValueError, 'CoreConfig of money schema version 6, the cut.s schema is version 7'):
+            release_cut.genesis_reader(self.root, self.schema)
+
+    def test_the_money_schema_is_read_with_its_required_version(self):
+        self.assertEqual(release_cut.load_money_schema(self.schema, 7).version, 7)
+        with self.assertRaisesRegex(ValueError, 'schema 2 is version 7, not the required version 8'):
+            release_cut.load_money_schema(self.schema, 8)
+        jar = self.root / 'core.jar'
+        jar.write_bytes(jar_bytes({'sbe/money-schema.xml': MONEY_SCHEMA}))
+        with self.assertRaisesRegex(ValueError, 'not the required version 8'):
+            release_cut.load_money_schema(jar, 8)
+        self.assertEqual(release_cut.load_money_schema(jar).version, 7)
 
     def test_members_that_disagree_are_not_equal(self):
         write_ae_member(self.root, 'ae0', [core_config_payload(1, GID)])

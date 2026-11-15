@@ -11,7 +11,9 @@ under the bound (at the turn of a 365-day year two odd days follow each other: t
 ``NIGHTLY_PLAN_SET`` (``embedded`` or ``external``) forces one set. Both files must be the plans at the pinned commit; the chosen
 set, the parity and whether it was forced are written into ``summary.json`` (``plan_set``).
 
-A plan lists entries ``{kind, scenario}``; every entry derives its OWN manifest from the cut (``mk_manifests.build_from_cut``, so one
+A plan names the money schema version it runs on (``money_schema_version``): the cut's core jar must carry that version, so a
+plan and its cut move to a new wire together (an older cut is refused, never run with the newer plan). A plan lists entries
+``{kind, scenario}``; every entry derives its OWN manifest from the cut (``mk_manifests.build_from_cut``, so one
 night runs A04 on ``s17-ext`` and A05 on ``s17-a05``) and runs ``runner.py`` on it. Behaviour (each is a nightly control):
   * pinned harness: this file re-executes itself from ``git archive <harness_commit>`` unpacked once into ``<root>/harness-<sha>/``
     and checked blob by blob against the commit; a modified or extra file refuses the night before any run (``nightly-dirty``);
@@ -79,12 +81,14 @@ class Settings:
     stop_grace_s: float = 180         # The runner's SIGTERM-to-SIGKILL grace, a setting
     cut_sha256: str = None            # The cut the night derives from, by sha256 and id
     cut_id: str = None
+    money_schema_version: int = None  # The wire the plan names; the cut's core jar carries it
     repos: dict = None                # The tools and cluster-tools repos the cut checker reads
     plan_set: str = None              # NIGHTLY_PLAN_SET: force the embedded or external set of an --alternate night
 
     def record(self):
         return {'lock': self.lock, 'bound_s': self.bound_s, 'after_interrupt': self.after_interrupt, 'load_max': self.load_max,
-                'cut': self.cut, 'cut_sha256': self.cut_sha256, 'cut_id': self.cut_id, 'template': self.template,
+                'cut': self.cut, 'cut_sha256': self.cut_sha256, 'cut_id': self.cut_id,
+                'money_schema_version': self.money_schema_version, 'template': self.template,
                 'keep_state': self.keep_state, 'stop_grace_s': self.stop_grace_s, 'repos': self.repos,
                 'plan_set': self.plan_set}
 
@@ -526,6 +530,28 @@ def cut_identity(cut, commit):
     return {'cut_id': m.get('cut_id'), 'sha256': hashlib.sha256(data).hexdigest(), 'harness_commit': m.get('harness_commit')}
 
 
+def plan_money_schema(obj):
+    """The money schema version a plan file names (``money_schema_version``, required)."""
+    version = obj.get('money_schema_version') if isinstance(obj, dict) else None
+    if type(version) is not int or version < 1:
+        raise Violation('the plan names no money_schema_version: a plan runs on one wire version, the one its cut carries')
+    return version
+
+
+def cut_money_schema(cut, version):
+    """Refuses a cut whose core jar does not carry money schema ``version`` (read from the jar, the bytes K2 checks)."""
+    m = json.loads(Path(cut).read_bytes())
+    name = release_cut.layout(m.get('schema'))['cluster']
+    path = ((m.get('artifacts') or {}).get(name) or {}).get('path')
+    if not path or not Path(path).is_file():
+        raise Violation(f'the cut {m.get("cut_id")} names no readable {name} to read its money schema from')
+    try:
+        return release_cut.load_money_schema(path, version).version
+    except (ValueError, OSError) as error:
+        raise Violation(f'the cut {m.get("cut_id")} does not carry the plan\'s money schema version {version} '
+                        f'(move the plan and the cut together): {error}')
+
+
 def pinned_plan(plan, harness_dir):
     """The plan the night runs is the one at the pinned commit (``<harness>/runtime-e2e/<name>``), byte-equal."""
     plan, pinned = Path(plan), Path(harness_dir) / Path(plan).name
@@ -609,8 +635,11 @@ def main_with(argv, host=None):
                 raise Violation(f'unknown scenario {entry["scenario"]!r}')
     else:
         if args.alternate is not None:
+            versions = set()
             for path in args.alternate:                  # both sets are the plans at the pinned commit, every night
-                pinned_plan(path, harness / 'runtime-e2e')
+                versions.add(plan_money_schema(json.loads(pinned_plan(path, harness / 'runtime-e2e').read_text())))
+            if len(versions) != 1:
+                raise Violation(f'the two plan sets name different money schema versions {sorted(versions)}: they move together')
             day = datetime.datetime.now(datetime.timezone.utc).date()
             chosen, name, parity = choose_plan_set(args.alternate, day, env.plan_set)
             plan_set = {'set': name, 'parity': parity, 'day_of_year': day.timetuple().tm_yday, 'file': Path(chosen).name,
@@ -618,11 +647,14 @@ def main_with(argv, host=None):
             plan_path = pinned_plan(chosen, harness / 'runtime-e2e')
         else:
             plan_path = pinned_plan(args.plan, harness / 'runtime-e2e')
-        plan = parse_plan(json.loads(plan_path.read_text()))
+        plan_obj = json.loads(plan_path.read_text())
+        plan = parse_plan(plan_obj)
+        wire = plan_money_schema(plan_obj)
         if not args.cut:
             raise Violation('NIGHTLY_CUT is not set: set it (or pass --cut) to the cut manifest the plan derives from')
         ident = cut_identity(args.cut, commit)
         settings.cut_sha256, settings.cut_id = ident['sha256'], ident['cut_id']
+        settings.money_schema_version = cut_money_schema(args.cut, wire)
     work_root = args.work_root or args.evidence_root.resolve().parent / 'work'
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, _terminate)

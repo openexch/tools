@@ -259,6 +259,11 @@ class Model:
             last = note.get('last_event_seq', 0)
             after = [s for s in events if s > last]
             windows.append([last + 1, min(after) - 1] if after else [last + 1, None])
+        # The tap's gaps were replayed from the core's order-event ring up to its head (core_drills.replay_event_gaps):
+        # a window left open after the last tapped event ends at that head, so it is empty when the replay reached it
+        replay = (sample.get('tap_continuity') or {}).get('event_replay') or {}
+        if replay.get('complete') and type(replay.get('head')) is int:
+            windows = [[w[0], replay['head']] if w[1] is None else w for w in windows]
         windows = [w for w in windows if w[1] is None or w[1] >= w[0]]
         return {'gaps': gaps, 'backfill': backfill, 'event_windows': windows, 'head': head}
 

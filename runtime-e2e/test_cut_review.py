@@ -335,6 +335,28 @@ class NightlyPinTest(unittest.TestCase):
         with self.assertRaisesRegex(Violation, 'the cut names harness_commit'):
             self.nightly.cut_identity(cut, 'b' * 40)
 
+    def test_the_plans_and_the_cut_name_one_money_schema_version(self):
+        """A plan names its wire; a cut whose core jar carries another money schema version is refused, so the nightly moves
+        to a new wire with its cut in one change."""
+        here = Path(self.nightly.__file__).parent
+        versions = {n: self.nightly.plan_money_schema(json.loads((here / n).read_text()))
+                    for n in ('nightly-cut.json', 'nightly-cut-embedded.json', 'nightly-cut-external.json')}
+        self.assertEqual(set(versions.values()), {8}, versions)
+        with self.assertRaisesRegex(Violation, 'names no money_schema_version'):
+            self.nightly.plan_money_schema({'entries': []})
+        with self.assertRaisesRegex(Violation, 'names no money_schema_version'):
+            self.nightly.plan_money_schema([{'kind': 's17', 'scenario': 'core-smoke'}])
+        jar = self.dir / 'core-cluster.jar'
+        jar.write_bytes(T.jar_bytes({'sbe/money-schema.xml': T.MONEY_SCHEMA}))          # a version 7 schema
+        cut = self.dir / 'cut.json'
+        cut.write_text(json.dumps({'schema': 'rc2-cut/2', 'cut_id': 'v7-cut', 'artifacts': {'core-cluster.jar': {'path': str(jar)}}}))
+        self.assertEqual(self.nightly.cut_money_schema(cut, 7), 7)
+        with self.assertRaisesRegex(Violation, 'v7-cut does not carry the plan.s money schema version 8'):
+            self.nightly.cut_money_schema(cut, 8)
+        cut.write_text(json.dumps({'schema': 'rc2-cut/2', 'cut_id': 'empty', 'artifacts': {}}))
+        with self.assertRaisesRegex(Violation, 'names no readable core-cluster.jar'):
+            self.nightly.cut_money_schema(cut, 8)
+
     def test_the_plan_is_the_one_at_the_pinned_commit(self):
         harness = self.dir / 'harness-x' / 'runtime-e2e'; harness.mkdir(parents=True)
         (harness / 'nightly-cut.json').write_text('{"entries": []}')

@@ -1,4 +1,5 @@
 {
+ "money_schema_version": 8,
  "note": "Alternate-night plan, the embedded set (nightly.py --alternate, first file): the default plan (nightly-cut.json) in its order, then five replica drills with the engines and the replica embedded (re-bootstrap on shadow-anyverified). The other four embedded replica drills (member kill -9, peer loss, the shadow catalog and leader loss) run in the external set, which has the room: the sets are balanced by measured walls. Night bound NIGHTLY_BOUND_S.",
  "entries": [
   {

@@ -957,7 +957,7 @@ class TableTest(unittest.TestCase):
             self.assertEqual(plan['funding_for'], cd.funding_script(story))     # a03-fill funds as a01-mix
             if story['script'] == 'a01-mix':
                 requests = (story['rate'] + story['rate'] // 5) * story['seconds']
-                self.assertLessEqual(requests / len(story['users']), 256, name)    # A7 RequestTable.PER_USER_CAP
+                self.assertLessEqual(requests / len(story['users']), 256, name)    # A7 RequestTable.DEFAULT_PER_USER_CAP
                 self.assertEqual(len(story['users']) % 2, 0)
             self.assertGreaterEqual(plan['tap_ms'] / 1000, cd.story_seconds(story) + cd.PRE_BARRIER_S + 60, name)
             self.assertGreaterEqual(plan['risk']['per_sec'], 2 * story['rate'])
@@ -2260,3 +2260,101 @@ class A05KeepTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class EventReplayTest(unittest.TestCase):
+    """The tap's order-event gaps are filled from the core's ring (``CoreProbe order-events``): a filled gap ends the
+    tap_loss INCONCLUSIVE; what the ring no longer covered stays a gap and is judged as before."""
+    @staticmethod
+    def without(sample, *seqs):
+        return variant(sample, lambda s: s.__setitem__('core_events', [e for e in s['core_events'] if e['seq'] not in seqs]))
+
+    @staticmethod
+    def closed_at(sample, last_event_seq):
+        note = {'event': 'session_closed', 'at_ms': 5000, 'last_dispatch_seq': 0, 'last_event_seq': last_event_seq}
+        back = dict(note, event='reconnected', at_ms=6000)
+        return variant(sample, lambda s: s.__setitem__('tap_continuity', {'transitions': [note, back]}))
+
+    def test_the_span_covers_every_gap_and_the_tail_after_a_transition(self):
+        events = [{'seq': n} for n in (1, 2, 5, 6, 9)]
+        self.assertEqual(cd.event_replay_span(events, [{'event': 'registered', 'last_event_seq': 0}]),
+                         {'from': 2, 'until': 8, 'gaps': [[3, 4], [7, 8]], 'tail': False})
+        tail = cd.event_replay_span(events, [{'event': 'session_closed', 'last_event_seq': 9}])
+        self.assertEqual((tail['from'], tail['until'], tail['tail']), (2, None, True))
+        self.assertIsNone(cd.event_replay_span([{'seq': n} for n in (1, 2, 3)], [{'event': 'new_leader', 'last_event_seq': 1}]))
+        self.assertEqual(cd.event_replay_span([], [{'event': 'session_closed', 'last_event_seq': 0}])['from'], 0)
+        self.assertIsNone(cd.event_replay_span([], []))
+
+    def test_a_filled_gap_ends_tap_loss(self):
+        clean = clean_sample()
+        lost = self.closed_at(self.without(clean, 4), 3)
+        self.assertEqual(rule(order_oracle.judge(lost), 'O5')['status'], 'INCONCLUSIVE')
+        span = cd.event_replay_span(lost['core_events'], lost['tap_continuity']['transitions'])
+        replayed = [e for e in clean['core_events'] if e['seq'] > span['from']]
+        reply = {'events': replayed, 'requests': 1, 'lost': [], 'last_seq': 9, 'complete': True}
+        events, report = cd.merge_event_replay(lost['core_events'], reply, span)
+        self.assertEqual((report['added'], report['remaining_gaps'], report['complete'], report['head']), (1, [], True, None))
+        self.assertEqual([e['seq'] for e in events], list(range(1, 10)))
+        self.assertEqual(next(e for e in events if e['seq'] == 4)['source'], 'replay')
+
+        def fill(s):
+            s['core_events'] = events
+            s['tap_continuity']['event_replay'] = report
+        filled = variant(lost, fill)
+        self.assertEqual(rule(order_oracle.judge(filled), 'O5')['status'], 'PASS', order_oracle.judge(filled))
+
+    def test_a_replayed_tail_closes_the_open_window(self):
+        clean = clean_sample()
+        quiet = self.closed_at(clean, 9)                     # nothing tapped after the session closed
+        self.assertEqual(Model(quiet).continuity['event_windows'], [[10, None]] * 2)       # the close and the reconnect
+
+        def replay(s, head):
+            s['tap_continuity']['event_replay'] = {'complete': True, 'head': head, 'remaining_gaps': []}
+        self.assertEqual(Model(variant(quiet, lambda s: replay(s, 9))).continuity['event_windows'], [])
+        self.assertEqual(Model(variant(quiet, lambda s: replay(s, 11))).continuity['event_windows'], [[10, 11]] * 2)
+        incomplete = variant(quiet, lambda s: s['tap_continuity'].__setitem__('event_replay', {'complete': False, 'head': 9}))
+        self.assertEqual(Model(incomplete).continuity['event_windows'], [[10, None]] * 2)
+
+    def test_an_overrun_leaves_the_gap_open(self):
+        lost = self.without(clean_sample(), 3, 4)
+        span = cd.event_replay_span(lost['core_events'], [])
+        reply = {'events': [e for e in clean_sample()['core_events'] if e['seq'] == 4], 'requests': 2, 'lost': [[3, 3]],
+                 'last_seq': 9, 'complete': False}
+        events, report = cd.merge_event_replay(lost['core_events'], reply, span)
+        self.assertEqual((report['added'], report['remaining_gaps'], report['complete'], report['lost']),
+                         (1, [[3, 3]], False, [[3, 3]]))
+        self.assertEqual(cd.replayed_summary({'events': {'gaps': [[3, 4]]}, 'dispatch': {'gaps': []}}, report)['events']['gaps'],
+                         [[3, 3]])
+
+    def test_a_replayed_event_that_differs_from_the_tapped_one_is_a_violation(self):
+        clean = clean_sample()
+        lost = self.without(clean, 4)
+        span = cd.event_replay_span(lost['core_events'], [])
+        replayed = [dict(e, status='CANCELLED') if e['seq'] == 5 else e for e in clean['core_events'] if e['seq'] > 3]
+        with self.assertRaisesRegex(Violation, 'differs from the tapped event at seqs \\[5\\]'):
+            cd.merge_event_replay(lost['core_events'], {'events': replayed, 'lost': [], 'last_seq': 9, 'complete': True}, span)
+
+    def test_the_fixture_call_and_a_probe_that_does_not_answer(self):
+        clean = clean_sample()
+        lost = self.without(clean, 4)
+        calls = []
+
+        class Fixture:
+            def __init__(self, answer):
+                self.answer = answer
+
+            def core(self, verb, principal, timeout=60, **kv):
+                calls.append((verb, principal, kv))
+                return self.answer
+
+        reply = {'events': [e for e in clean['core_events'] if e['seq'] == 4], 'requests': 1, 'lost': [], 'last_seq': 9,
+                 'complete': True}
+        events, report = cd.replay_event_gaps(Fixture(('ANSWERED', reply)), lost['core_events'], [])
+        self.assertEqual(calls, [('order-events', 'probe-admin', {'from': 3, 'until': 4})])
+        self.assertTrue(report['complete'])
+        events, report = cd.replay_event_gaps(Fixture(('UNKNOWN', None)), lost['core_events'], [])
+        self.assertEqual(([e['seq'] for e in events], report['complete'], report['error'], report['remaining_gaps']),
+                         ([1, 2, 3, 5, 6, 7, 8, 9], False, 'order-events UNKNOWN', [[4, 4]]))
+        self.assertIs(cd.replayed_summary({'events': {'gaps': [[4, 4]]}}, report)['events']['gaps'][0][0], 4)
+        events, report = cd.replay_event_gaps(Fixture(('ANSWERED', None)), clean['core_events'], [])
+        self.assertEqual((report['span'], report['complete'], len(events)), (None, True, 9))

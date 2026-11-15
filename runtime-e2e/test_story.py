@@ -46,7 +46,11 @@ CASES = ['a01_request_log_is_a_function_of_the_seed', 'a02_request_log_is_a_func
          'a03_refuses_ambiguous_arguments', 'a01_ioc_burst_follows_the_marker_for_two_seconds',
          'a01_takes_120_users_and_funding_covers_them', 'money_dump_exports_the_v7_halt_fields',
          'listener_routes_story_replies_by_correlation', 'tap_reports_dispatch_gaps_and_new_leader',
-         'tap_dense_run_reports_no_gap', 'order_dump_keeps_every_page', 'retired_environment_names_are_refused']
+         'tap_dense_run_reports_no_gap', 'order_dump_keeps_every_page', 'retired_environment_names_are_refused',
+         'order_events_pages_to_the_head', 'order_events_overrun_reports_the_lost_range_and_continues',
+         'order_events_head_probe_is_one_end', 'order_events_stops_at_the_bound',
+         'order_events_cursor_ahead_of_the_core_is_not_complete', 'order_events_listener_decodes_pages_and_end',
+         'user_balances_reply_is_decoded', 'config_report_reply_is_decoded']
 # the sample's request rows (oracle_model docstring; core_scenarios._create writes the same create keys)
 CREATE_KEYS = {'request', 'user', 'market', 'side', 'type', 'tif', 'price', 'quantity', 'budget', 'stop_price', 'display_qty',
                'reply'}

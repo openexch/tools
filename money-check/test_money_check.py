@@ -14,6 +14,7 @@ order (2026-07-25, $9.15M of maker collateral frozen), a deposit that has to be
 subtracted from an apparent conservation breach (2026-08-03), and the fixed-point
 arithmetic that must never go through a float.
 """
+import json
 import os
 import shutil
 import sys
@@ -23,7 +24,9 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from money_check import (  # noqa: E402
+    CORE_DUMP_MAIN,
     SCALE,
+    core_dump_command,
     build_arg_parser,
     check_core_internal,
     check_conservation,
@@ -392,8 +395,9 @@ class RetiredFlags(unittest.TestCase):
     """The flags and the --store value retired by the rename to core are refused naming the new ones."""
 
     REFUSED = [
-        (["--ae-dump-cmd", "x"], "the flag --ae-dump-cmd is retired; it is now --core-dump-cmd"),
-        (["--ae-dump-cmd=x"], "the flag --ae-dump-cmd is retired; it is now --core-dump-cmd"),
+        (["--ae-dump-cmd", "x"], "the flag --ae-dump-cmd is retired; it is now --cut"),
+        (["--ae-dump-cmd=x"], "the flag --ae-dump-cmd is retired; it is now --cut"),
+        (["--store", "core", "--core-dump-cmd", "x"], "the flag --core-dump-cmd is retired; it is now --cut"),
         (["--ae-timeout", "5"], "the flag --ae-timeout is retired; it is now --core-timeout"),
         (["--store", "core", "--ae-timeout=5"], "the flag --ae-timeout is retired; it is now --core-timeout"),
         (["--store", "ae"], "--store ae is retired; it is now --store core"),
@@ -415,10 +419,57 @@ class RetiredFlags(unittest.TestCase):
             self.assertIn(text, err.getvalue())
 
     def test_negative_control_new_names_parse(self):
-        argv = ["--store", "core", "--core-dump-cmd", "echo {}", "--core-timeout", "5"]
+        argv = ["--store", "core", "--cut", "cut.json", "--core-timeout", "5"]
         self.assertIsNone(retired_refusal(argv))
         args = build_arg_parser().parse_args(argv)
-        self.assertEqual((args.store, args.core_dump_cmd, args.core_timeout), ("core", "echo {}", 5))
+        self.assertEqual((args.store, args.cut, args.core_timeout), ("core", "cut.json", 5))
+
+
+class CoreDumpFromTheCut(unittest.TestCase):
+    """--store core runs CoreDump from the cut's tools.core-dump jar, re-hashed; no cut or no jar refuses to run."""
+
+    def setUp(self):
+        import hashlib
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.jar = os.path.join(self.dir, "core-bridge.jar")
+        with open(self.jar, "wb") as fh:
+            fh.write(b"jar bytes")
+        self.entry = {"path": self.jar, "sha256": hashlib.sha256(b"jar bytes").hexdigest(), "source_sha": "a" * 40,
+                      "derivation": "rebuild-equal", "tree_dirty": False, "kind": "tool", "main": CORE_DUMP_MAIN}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def cut(self, tools):
+        path = os.path.join(self.dir, "cut.json")
+        with open(path, "w") as fh:
+            json.dump({"cut_id": "v8-cut-1", "tools": tools}, fh)
+        return path
+
+    def test_the_command_is_the_cut_jar(self):
+        self.assertEqual(core_dump_command(self.cut({"core-dump": self.entry})), ["java", "-cp", self.jar, CORE_DUMP_MAIN])
+
+    def test_no_cut_no_jar_or_other_bytes_refuse(self):
+        with self.assertRaisesRegex(RuntimeError, "needs --cut MANIFEST"):
+            core_dump_command(None)
+        with self.assertRaisesRegex(RuntimeError, "names no tools.core-dump jar"):
+            core_dump_command(self.cut({}))
+        with self.assertRaisesRegex(RuntimeError, "not a readable cut manifest"):
+            core_dump_command(os.path.join(self.dir, "missing.json"))
+        with self.assertRaisesRegex(RuntimeError, "hashes to .* the cut pins"):
+            core_dump_command(self.cut({"core-dump": dict(self.entry, sha256="0" * 64)}))
+        with self.assertRaisesRegex(RuntimeError, "main is 'x'"):
+            core_dump_command(self.cut({"core-dump": dict(self.entry, main="x")}))
+
+    def test_a_core_sweep_without_a_cut_is_an_operational_error(self):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(main(["--store", "core", "--oms-url", "http://127.0.0.1:9"]), 1)
+        self.assertIn("needs --cut MANIFEST", err.getvalue())
 
 
 if __name__ == "__main__":
