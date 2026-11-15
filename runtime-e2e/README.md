@@ -37,6 +37,10 @@ runtime-e2e/run.sh --manifest /abs/manifest.json --scenario core-smoke --output 
 
 Copy the program entries from the probe directory's `probe-manifest.json` into the fixture manifest.
 
+`CoreProbe` verbs added for money schema v8: `order-events from= [until=] [max=]` (order-event replay; pages to the bound or the head, and on an overrun records the lost range and continues from the oldest event the ring still holds), `user-balances user=`, `config-report` and `core-limits version= ttl_ms= cap= ring=` (an ADMIN config write, answered by AdminAck).
+
+`sbe_layout.py` reads the money schema from the cut's core jar and refuses a schema file of any other version; the genesis reader refuses a config frame of another wire version. The nightly plans name `money_schema_version`, both plan sets must name the same one, and a night refuses a cut whose core jar carries another version.
+
 Helper tools (each prints its own usage):
 
 - `mk_manifests.py <kind> <tag>`: builds a core manifest of a named kind; every manifest of one kind differs only in `run_id` and `state_root`.
@@ -79,7 +83,7 @@ Results are `PASS`, `FAIL` or `INCONCLUSIVE`; only `PASS` exits zero. All subpro
 
 Known limits:
 
-- The order tap loses order events across a core leader change. Drills close the gap by backfill from the pending dump and the ME journal; a gap that cannot be closed is INCONCLUSIVE (`tap_loss`), never FAIL.
+- The order tap loses order events across a core leader change. After the tap ends, the drill replays each order-event gap from the core (`CoreProbe order-events`, the any-user ADMIN key): a replayed event the tap also saw must match it byte for byte or the run fails, and a fully replayed gap closes the window. A gap older than the core's event ring stays open and is declared untappable with its `events_short` count; only that is INCONCLUSIVE (`tap_loss`), never FAIL.
 - Restarting a core member shortly after a kill can hang the JVM on an active mark file. The drills wait before restarting.
 - Inside a container the `aeronmd` pid is always the same, so driver identity is the `cnc.dat` mtime plus the container start time.
 

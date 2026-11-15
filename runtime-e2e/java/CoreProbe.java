@@ -40,7 +40,8 @@ import java.util.function.Predicate;
 import java.util.function.UnaryOperator;
 
 /**
- * Core probe: the fixture's only client of the OMS + ledger core (money-schema v6, assets a9a865d).
+ * Core probe: the fixture's only client of the OMS + ledger core (money-schema v8: the version of the core jar it is
+ * compiled against, the cut's jar).
  * Compiled separately against the frozen core jar and run with it on the class path; never linked into a
  * product artifact. One verb per process, one authenticated session, one JSON line on stdout (the LAST
  * line starting with '{' is the verb's answer; other lines are human-readable summaries).
@@ -55,7 +56,9 @@ import java.util.function.UnaryOperator;
  * <p>{@code story} is the seeded functional story driver (one GATEWAY
  * session for the whole load, open loop, paced by wall clock, the UNKNOWN resolution pass); {@code tap} keeps
  * its TOOL session across leader changes and session loss and reports the dispatchSeq density; {@code
- * order-dump} keeps every page.</p>
+ * order-dump} keeps every page. {@code order-events} replays the core's order-event ring (RequestOrderEvents, 54) page by
+ * page up to a bound or the head; {@code user-balances} (55), {@code config-report} (56) and {@code core-limits} (77) are
+ * one request each.</p>
  *
  * <p>Exit codes: 0 answered; 3 no answer before the deadline (outcome UNKNOWN), or a story whose every request
  * stayed UNKNOWN (setup failure); 4 the core refused (the JSON says why); 5 a negative control was NOT refused;
@@ -244,6 +247,10 @@ public final class CoreProbe {
                 case "deposit", "withdraw" -> funding(verb.equals("deposit"));
                 case "create", "cancel", "amend" -> order(verb);
                 case "order-dump" -> orderDump();
+                case "order-events" -> orderEvents();
+                case "user-balances" -> userBalances();
+                case "config-report" -> configReport();
+                case "core-limits" -> coreLimits();
                 case "money-dump" -> moneyDump();
                 case "pending-dump" -> pendingDump();
                 case "tap" -> tap();
@@ -264,7 +271,8 @@ public final class CoreProbe {
 
     private static void requireClass(final String verb, final SessionClass c) {
         final boolean ok = switch (verb) {
-            case "money-journal", "core-config", "risk", "gate", "order-dump" -> c == SessionClass.ADMIN;
+            case "money-journal", "core-config", "risk", "gate", "order-dump", "core-limits" -> c == SessionClass.ADMIN;
+            case "order-events", "user-balances", "config-report" -> c == SessionClass.ADMIN || c == SessionClass.GATEWAY;
             case "deposit", "withdraw", "money-dump" -> c == SessionClass.ADMIN || c == SessionClass.TOOL;
             case "create", "cancel", "amend", "story" -> c == SessionClass.GATEWAY;
             case "pending-dump" -> c == SessionClass.FORWARDER;
@@ -559,6 +567,60 @@ public final class CoreProbe {
         System.out.println("{\"verb\":\"order-dump\",\"pages\":" + pages + ",\"count\":" + rows.size()
                 + ",\"orders\":[" + String.join(",", rows) + "]}");
         return 0;
+    }
+
+    /**
+     * Replays the core's order-event ring: {@code from} is the exclusive cursor (the last seq already held), {@code until}
+     * the inclusive bound (default: the core's head at the first reply), {@code max} the page size (default 4096; 0 is
+     * the head probe, one End and no events; a negative value is sent as is and the core refuses it). Pages are requested
+     * until the bound or the head is reached. An overrun (the ring no longer holds the next event) is never a silent short
+     * reply: the range it lost is reported in {@code lost} and the replay continues from the oldest event the ring holds.
+     */
+    private int orderEvents() {
+        final long until = args.containsKey("until") ? num("until") : Long.MAX_VALUE;
+        final int max = args.containsKey("max") ? (int) num("max") : EventReplay.PAGE_MAX;
+        final EventReplay replay = new EventReplay(num("from"), until, max);
+        listener.reset();
+        listener.replay = replay;
+        while (replay.next()) {
+            listener.nextPage();
+            offer(HEADER + new RequestOrderEventsEncoder().wrapAndApplyHeader(buffer, 0, headerEncoder)
+                    .correlationId(listener.expectCorrelation = corr()).fromEventSeq(replay.cursor).maxEvents(replay.pageSize())
+                    .encodedLength());
+            await(t -> t == OrderEventsEndDecoder.TEMPLATE_ID || t == OrderRejectDecoder.TEMPLATE_ID);
+            if (listener.refused) {
+                return print("order-events");
+            }
+        }
+        final Map<String, Object> out = replay.json();
+        out.put("verb", "order-events");
+        final StringBuilder sb = new StringBuilder(json(out));
+        sb.setLength(sb.length() - 1);
+        System.out.println(sb.append(",\"events\":[").append(String.join(",", rows)).append("]}"));
+        return 0;
+    }
+
+    private int userBalances() {
+        offer(HEADER + new RequestUserBalancesEncoder().wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .correlationId(listener.expectCorrelation = corr()).userId(num("user")).encodedLength());
+        await(t -> t == UserBalancesDecoder.TEMPLATE_ID || t == OrderRejectDecoder.TEMPLATE_ID);
+        return print("user-balances");
+    }
+
+    private int configReport() {
+        offer(HEADER + new RequestCoreConfigEncoder().wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .correlationId(listener.expectCorrelation = corr()).encodedLength());
+        await(t -> t == CoreConfigReportDecoder.TEMPLATE_ID || t == OrderRejectDecoder.TEMPLATE_ID);
+        return print("config-report");
+    }
+
+    private int coreLimits() {
+        offer(HEADER + new CoreLimitsSetEncoder().wrapAndApplyHeader(buffer, 0, headerEncoder)
+                .correlationId(listener.expectCorrelation = corr()).configVersion(num("version")).requestTtlMs(num("ttl_ms"))
+                .requestPerUserCap((int) num("cap")).orderEventRingCapacity((int) num("ring")).encodedLength());
+        await(t -> t == AdminAckDecoder.TEMPLATE_ID || t == OrderRejectDecoder.TEMPLATE_ID);
+        listener.refused = listener.refused || listener.lastAdminResult.equals("REJECTED") || listener.lastAdminResult.equals("STALE");
+        return print("core-limits");
     }
 
     private int moneyDump() {
@@ -1605,7 +1667,10 @@ public final class CoreProbe {
             }
         }
 
-        /** RequestTable.PER_USER_CAP (256 retained requests per user, TTL 15 min): refused before sending. */
+        /**
+         * RequestTable.DEFAULT_PER_USER_CAP (256 retained requests per user, TTL 15 min): refused before sending. The cap is
+         * the genesis value of the core's limits record; the fixture never sends CoreLimitsSet, so it stays in force.
+         */
         private void checkPerUserCap() {
             final Map<Long, Integer> perUser = new TreeMap<>();
             for (final Timed t : timeline) {
@@ -1623,10 +1688,10 @@ public final class CoreProbe {
                 }
             }
             for (final Map.Entry<Long, Integer> e : perUser.entrySet()) {
-                if (e.getValue() > RequestTable.PER_USER_CAP) {
+                if (e.getValue() > RequestTable.DEFAULT_PER_USER_CAP) {
                     throw new IllegalArgumentException("story " + cfg.script + " plans " + e.getValue() + " requests for user "
-                            + e.getKey() + "; the core retains at most " + RequestTable.PER_USER_CAP
-                            + " per user (RequestTable.PER_USER_CAP): pass more users");
+                            + e.getKey() + "; the core retains at most " + RequestTable.DEFAULT_PER_USER_CAP
+                            + " per user (RequestTable.DEFAULT_PER_USER_CAP): pass more users");
                 }
             }
         }
@@ -2108,6 +2173,98 @@ public final class CoreProbe {
         }
     }
 
+    // ------------------------------------------------------------------ order-event replay
+
+    /**
+     * The paging of one {@code order-events} replay, without a session (unit-tested). {@link #next()} says whether another
+     * request is due and {@link #onEnd} applies its OrderEventsEnd. An overrun moves the cursor to the oldest event the
+     * ring still holds and records the range it lost; the replay is {@code complete} only when nothing was lost and the
+     * bound (or the head) was reached.
+     */
+    static final class EventReplay {
+        static final int PAGE_MAX = 4096;          // the core's clamp (RequestOrderEvents.maxEvents)
+        static final int REQUESTS_MAX = 100_000;   // a replay that cannot end is a probe fault, not a hang
+
+        final long from;
+        final long until;
+        final int max;
+        long cursor;
+        int requests;
+        long firstAvailable = -1, lastSeq = -1, nextFrom = -1;
+        final List<long[]> lost = new ArrayList<>();
+        long events;
+        boolean ahead;
+        private boolean done;
+
+        EventReplay(final long from, final long until, final int max) {
+            this.from = from;
+            this.until = until;
+            this.max = max;
+            this.cursor = from;
+        }
+
+        boolean next() {
+            if (!done && requests >= REQUESTS_MAX) {
+                throw new IllegalStateException("order-events: " + requests + " requests without reaching the bound");
+            }
+            return !done;
+        }
+
+        /** The bound this replay ends at: {@code until}, or the head once the core has said where it is. */
+        long target() {
+            return lastSeq < 0 ? until : Math.min(until, lastSeq);
+        }
+
+        int pageSize() {
+            if (max <= 0) {
+                return max;
+            }
+            final long left = target() == Long.MAX_VALUE ? max : target() - cursor;
+            return (int) Math.max(1, Math.min(max, left));
+        }
+
+        /** True when {@code seq} belongs to the requested range (a page past the bound is cut there). */
+        boolean wanted(final long seq) {
+            return seq > from && seq <= until;
+        }
+
+        void onEnd(final int count, final long firstAvailableSeq, final long lastSeqNow, final long nextFromSeq) {
+            requests++;
+            firstAvailable = firstAvailableSeq;
+            lastSeq = lastSeqNow;
+            nextFrom = nextFromSeq;
+            if (max <= 0) {
+                done = true;
+                return;
+            }
+            final long target = target();
+            if (cursor > lastSeqNow) {
+                ahead = true;                       // a cursor past this core's head: nothing to replay from it
+                done = true;
+            } else if (count == 0 && firstAvailableSeq > cursor + 1 && cursor < target) {
+                final long to = Math.min(firstAvailableSeq - 1, target);
+                lost.add(new long[] {cursor + 1, to});
+                cursor = to;
+                done = to >= target;
+            } else if (count == 0 || nextFromSeq >= target) {
+                cursor = Math.max(cursor, Math.min(nextFromSeq, target));
+                done = true;
+            } else {
+                cursor = nextFromSeq;
+            }
+        }
+
+        boolean complete() {
+            return done && lost.isEmpty() && !ahead && (until == Long.MAX_VALUE || cursor >= Math.min(until, lastSeq));
+        }
+
+        Map<String, Object> json() {
+            return map("from", from, "until", until == Long.MAX_VALUE ? null : until, "page", max, "requests", requests,
+                    "events_count", events, "first_available", firstAvailable, "last_seq", lastSeq, "next_from", nextFrom,
+                    "cursor", cursor, "lost", lost, "ahead", ahead, "complete", complete());
+        }
+    }
+
     // ------------------------------------------------------------------ continuity
 
     /** dispatchSeq (or eventSeq) values seen by a tap; density over [first, last], duplicates counted, kept once. */
@@ -2201,6 +2358,7 @@ public final class CoreProbe {
         long tapped;
         StorySink story;
         boolean reregister;
+        EventReplay replay;
         final Map<String, String> balances = new java.util.LinkedHashMap<>();
         final Map<Long, String> holds = new java.util.LinkedHashMap<>();
 
@@ -2392,6 +2550,45 @@ public final class CoreProbe {
                         }
                     }
                 }
+                case OrderEventsPageDecoder.TEMPLATE_ID -> {
+                    final OrderEventsPageDecoder d = new OrderEventsPageDecoder().wrapAndApplyHeader(b, offset, header);
+                    if (d.correlationId() != expectCorrelation || replay == null) return;
+                    for (final OrderEventsPageDecoder.EventsDecoder e : d.events()) {
+                        if (replay.wanted(e.eventSeq())) {
+                            replay.events++;
+                            rows.add(eventRow(e.eventSeq(), e.orderId(), e.eventKind().name(), e.status().name(), e.reason().name(),
+                                    e.filledQty(), e.quantity(), e.remainingQty(), e.tradeId(), e.meOrderId(), e.holdAmount(),
+                                    e.holdRemaining(), e.logPosition()));
+                        }
+                    }
+                }
+                case OrderEventsEndDecoder.TEMPLATE_ID -> {
+                    final OrderEventsEndDecoder d = new OrderEventsEndDecoder().wrapAndApplyHeader(b, offset, header);
+                    if (d.correlationId() != expectCorrelation || replay == null) return;
+                    replay.onEnd(d.count(), d.firstAvailableSeq(), d.lastSeq(), d.nextFromSeq());
+                    finish(t);
+                }
+                case UserBalancesDecoder.TEMPLATE_ID -> {
+                    final UserBalancesDecoder d = new UserBalancesDecoder().wrapAndApplyHeader(b, offset, header);
+                    if (d.correlationId() != expectCorrelation) return;
+                    final StringBuilder sb = new StringBuilder("{\"t\":\"UserBalances\",\"user\":").append(d.userId())
+                            .append(",\"known\":").append(d.known() == BoolFlag.TRUE).append(",\"as_of_log_position\":")
+                            .append(d.asOfLogPosition()).append(",\"balances\":[");
+                    boolean first = true;
+                    for (final UserBalancesDecoder.BalancesDecoder u : d.balances()) {
+                        sb.append(first ? "" : ",").append("{\"asset\":").append(u.assetId()).append(",\"available\":")
+                                .append(u.available()).append(",\"locked\":").append(u.locked()).append('}');
+                        first = false;
+                    }
+                    rows.add(sb.append("]}").toString());
+                    finish(t);
+                }
+                case CoreConfigReportDecoder.TEMPLATE_ID -> {
+                    final CoreConfigReportDecoder d = new CoreConfigReportDecoder().wrapAndApplyHeader(b, offset, header);
+                    if (d.correlationId() != expectCorrelation) return;
+                    rows.add(configReportRow(d));
+                    finish(t);
+                }
                 case PendingDispatchEndDecoder.TEMPLATE_ID -> {
                     final PendingDispatchEndDecoder d = new PendingDispatchEndDecoder().wrapAndApplyHeader(b, offset, header);
                     if (d.correlationId() != expectCorrelation) return;
@@ -2507,10 +2704,48 @@ public final class CoreProbe {
         private String event(final long seq, final long order, final String kind, final String status, final String reason,
                              final long filled, final long qty, final long remaining, final long trade, final long leg,
                              final long holdAmount, final long holdRemaining, final long logPosition) {
-            return "{\"tap\":\"order_event\",\"row\":{\"seq\":" + seq + ",\"order\":" + order + ",\"kind\":" + q(kind)
+            return "{\"tap\":\"order_event\",\"row\":" + eventRow(seq, order, kind, status, reason, filled, qty, remaining, trade,
+                    leg, holdAmount, holdRemaining, logPosition) + "}";
+        }
+
+        /** One order event in the tap's row shape; {@code order-events} replays use the same keys. */
+        String eventRow(final long seq, final long order, final String kind, final String status, final String reason,
+                        final long filled, final long qty, final long remaining, final long trade, final long leg,
+                        final long holdAmount, final long holdRemaining, final long logPosition) {
+            return "{\"seq\":" + seq + ",\"order\":" + order + ",\"kind\":" + q(kind)
                     + ",\"status\":" + q(status) + ",\"reason\":" + q(reason) + ",\"filled\":" + filled + ",\"quantity\":" + qty
                     + ",\"remaining\":" + remaining + ",\"trade\":" + trade + ",\"leg\":" + leg + ",\"hold_amount\":" + holdAmount
-                    + ",\"hold_remaining\":" + holdRemaining + ",\"log_position\":" + logPosition + "}}";
+                    + ",\"hold_remaining\":" + holdRemaining + ",\"log_position\":" + logPosition + "}";
+        }
+
+        private String configReportRow(final CoreConfigReportDecoder d) {
+            final StringBuilder sb = new StringBuilder("{\"t\":\"CoreConfigReport\",\"configVersion\":").append(d.configVersion())
+                    .append(",\"behaviorVersion\":").append(d.behaviorVersion()).append(",\"limitsVersion\":").append(d.limitsVersion())
+                    .append(",\"requestTtlMs\":").append(d.requestTtlMs()).append(",\"requestPerUserCap\":").append(d.requestPerUserCap())
+                    .append(",\"orderEventRingCapacity\":").append(d.orderEventRingCapacity())
+                    .append(",\"gateState\":").append(q(d.gateState().name())).append(",\"gateReasons\":").append(d.gateReasons().getRaw())
+                    .append(",\"asOfLogPosition\":").append(d.asOfLogPosition()).append(",\"markets\":[");
+            boolean first = true;
+            for (final CoreConfigReportDecoder.MarketsDecoder m : d.markets()) {
+                sb.append(first ? "" : ",").append("{\"marketId\":").append(m.marketId()).append(",\"symbol\":").append(q(m.symbol().trim()))
+                        .append(",\"baseAssetId\":").append(m.baseAssetId()).append(",\"quoteAssetId\":").append(m.quoteAssetId())
+                        .append(",\"tickSize\":").append(m.tickSize()).append(",\"minPrice\":").append(m.minPrice())
+                        .append(",\"maxPrice\":").append(m.maxPrice()).append(",\"lotSize\":").append(m.lotSize())
+                        .append(",\"minQuantity\":").append(m.minQuantity()).append(",\"maxQuantity\":").append(m.maxQuantity())
+                        .append(",\"minNotional\":").append(m.minNotional()).append(",\"maxNotional\":").append(m.maxNotional())
+                        .append(",\"riskConfigVersion\":").append(m.riskConfigVersion()).append(",\"gateState\":")
+                        .append(q(m.gateState().name())).append(",\"gateReasons\":").append(m.gateReasons().getRaw())
+                        .append(",\"circuitBreaker\":").append(m.circuitBreaker() == BoolFlag.TRUE).append('}');
+                first = false;
+            }
+            sb.append("],\"assets\":[");
+            first = true;
+            for (final CoreConfigReportDecoder.AssetsDecoder a : d.assets()) {
+                sb.append(first ? "" : ",").append("{\"assetId\":").append(a.assetId()).append(",\"code\":").append(q(a.code().trim()))
+                        .append(",\"scale\":").append(a.scale()).append('}');
+                first = false;
+            }
+            return sb.append("]}").toString();
         }
     }
 }

@@ -22,7 +22,9 @@ refuses, 0 when none does. The rules:
       artifact and the binary carries the source sha (or, for the Aeron driver files, the substrate Aeron version); attested is
       refused in a product kind); the upgrade_from / old_artifacts exemption only in rig kinds and only when pinned in
       the old-artifact pins (``--old-pins``, default ``$CUT_OLD_PINS``)
-  K5  a retired artifact (core-bridge or assets-bridge, oms-app, match-gateway) in a core-topology manifest
+  K5  a retired artifact (core-bridge or assets-bridge, oms-app, match-gateway) in a core-topology manifest, as a product
+      artifact, a staged file or a process; the cut's ``tools`` block is the one place the core-bridge jar may appear, as
+      the CoreDump command-line tool (``money-check --store core``), which no fixture slot or nightly entry ever runs
   K6  a genesis block with ME behaviour != 2, maxWireVersion != 12, a core sequence other than 1 -> 2 -> 3, two genesisId values,
       or a constant genesisId in a product kind
   K7  a driver profile value other than external or embedded, or a prod profile with an embedded process
@@ -96,7 +98,13 @@ SUBSTRATE_AERON = {'ae', 'me', 'projector', 'cpp', 'host_aeronmd'}
 
 TOP_KEYS = {'schema', 'class', 'cut_id', 'created', 'harness_commit', 'repos', 'schemas', 'substrate', 'artifacts', 'harness',
             'genesis', 'driver_profiles', 'retired', 'excluded', 'build_record'}
-TOP_OPTIONAL = {'upgrade_from', 'old_artifacts', 'note'}
+TOP_OPTIONAL = {'upgrade_from', 'old_artifacts', 'note', 'tools'}
+# Tool-only artifacts of a cut: command-line programs an operator runs against the cut's core, never a service. ``main`` is the
+# class the tool runs; ``file`` the jar name. A tools entry is checked as a product artifact is (K1, K2, K4) and is never
+# staged: the fixture index (``_cut_index``) does not know it, so a slot or a process naming it is still refused (K5, K9).
+TOOL_KEYS = {'path', 'sha256', 'source_sha', 'derivation', 'tree_dirty', 'kind', 'main'}
+TOOLS = {'core-dump': {'file': 'core-bridge.jar', 'lang': 'java', 'main': 'com.openexchange.core.bridge.CoreDump',
+                       'schemas': {'money': 'sbe/money-schema.xml'}}}
 ARTIFACT_KEYS = {'path', 'sha256', 'source_sha', 'derivation', 'tree_dirty', 'kind'}
 OLD_KEYS = {'path', 'sha256', 'source_sha', 'derivation', 'tree_dirty', 'kind', 'role'}
 HARNESS_KEYS = {'path', 'sha256', 'kind', 'driver_mode', 'source_path', 'source_sha256'}
@@ -419,6 +427,48 @@ def _old_entries(f, m, cls, old_pins):
                 f.add('K3', f'{what}: test or negative build in a product kind')
 
 
+def _tools(f, tools, schemas, repos, record, aeron_version, cls, lay):
+    """The ``tools`` block: tool-only artifacts (``TOOLS``), each the file its key names, built from the cut's core commit."""
+    if tools is None:
+        return
+    if not isinstance(tools, dict):
+        f.add('K9', 'tools: must be an object')
+        return
+    for name, entry in tools.items():
+        what = 'tools.' + name
+        spec = TOOLS.get(name)
+        if spec is None:
+            f.add('K9', f'{what}: unknown tool (tools: ' + ', '.join(sorted(TOOLS)) + ')')
+            continue
+        if not _unknown(f, what, entry, TOOL_KEYS):
+            continue
+        _shas(f, what, entry)
+        if entry.get('kind') != 'tool':
+            f.add('K9', f'{what}: kind must be tool (a tool is never a product or a service), got {entry.get("kind")!r}')
+        if entry.get('main') != spec['main']:
+            f.add('K9', f'{what}: main must be {spec["main"]}, got {entry.get("main")!r}')
+        if Path(str(entry.get('path', ''))).name != spec['file']:
+            f.add('K9', f'{what}: the file must be {spec["file"]}, got {entry.get("path")!r}')
+        _rehash(f, what, entry)
+        full = dict(spec, repo=lay['repo'])
+        _schemas_k2(f, spec['file'], entry, schemas, full)
+        _derived_k4(f, spec['file'], entry, full, repos, record, aeron_version, cls)
+
+
+def tool_path(cut, name):
+    """The file of a cut's tool (``tools.<name>.path``), re-hashed against the manifest; ValueError naming what is missing."""
+    m = json.loads(Path(cut).read_text()) if not isinstance(cut, dict) else cut
+    entry = (m.get('tools') or {}).get(name)
+    if not isinstance(entry, dict) or not entry.get('path'):
+        raise ValueError(f'the cut {m.get("cut_id")} has no tools.{name} entry')
+    path = Path(entry['path'])
+    if not path.is_file():
+        raise ValueError(f'tools.{name}: {path} does not exist')
+    if sha256_file(path) != entry.get('sha256'):
+        raise ValueError(f'tools.{name}: {path} does not hash to the cut\'s sha256 {entry.get("sha256")}')
+    return path, entry
+
+
 def check_cut(m, rules=RULES, cls=None, old_pins=None):
     """The checks over a cut manifest (``rc2-cut/2``, or an older ``rc2-cut/1``). Returns the Findings (empty = accepted)."""
     f = Findings(rules)
@@ -527,6 +577,7 @@ def check_cut(m, rules=RULES, cls=None, old_pins=None):
 
     _harness_at_commit(f, m, harness, repos)
     _aeron_k8(f, artifacts, aeron, schema)
+    _tools(f, m.get('tools'), schemas, repos, record, aeron_version, cls, lay)
 
     genesis = m.get('genesis') if isinstance(m.get('genesis'), dict) else {}
     _unknown(f, 'genesis', genesis, GENESIS_KEYS)
@@ -602,6 +653,7 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
     for rule, text in cut_findings.items:
         f.add(rule, 'cut: ' + text)
     index = _cut_index(cut)
+    tools = {e.get('sha256'): n for n, e in (cut.get('tools') or {}).items() if isinstance(e, dict)}
 
     def staged(what, entry, name=None):
         if not isinstance(entry, dict):
@@ -609,6 +661,11 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
         if not _rehash(f, what, entry, need_source=False):
             return
         hit = index.get(entry['sha256'])
+        if entry['sha256'] in tools:
+            # a tool-only artifact (the core-bridge jar of tools.core-dump) staged into a fixture is the Java bridge run as a
+            # service: retired, whatever the slot
+            f.add('K5', f'{what}: tools.{tools[entry["sha256"]]} is a tool-only artifact; staging it is the retired Java bridge')
+            return
         if hit is None:
             pin = old_pins.get(entry['sha256'])
             if pin is None:
@@ -778,8 +835,9 @@ def log_frames(data):
         offset += (length + 31) & ~31
 
 
-def load_money_schema(source):
-    """The money schema layout: a schema XML path, or a core jar (its ``sbe/money-schema.xml``, the bytes K2 checks)."""
+def load_money_schema(source, version=None):
+    """The money schema layout: a schema XML path, or a core jar (its ``sbe/money-schema.xml``, the bytes K2 checks). A
+    fixture reads it from the cut's core jar, so the layout is the cut's own version; ``version`` also requires it."""
     import sbe_layout
     import tempfile
     source = Path(source)
@@ -790,16 +848,19 @@ def load_money_schema(source):
         with tempfile.NamedTemporaryFile('wb', suffix='.xml', delete=False) as out:
             out.write(data)
         try:
-            return sbe_layout.load(out.name)
+            return sbe_layout.load(out.name, version)
         finally:
             Path(out.name).unlink()
-    return sbe_layout.load(source)
+    return sbe_layout.load(source, version)
 
 
 def core_config_frames(member_dir, schema):
     """The CoreConfig (template 70) frames of one AE member's LOG recordings (the TERM entries of its recording.log; snapshot
-    recordings are not walked): the core's own replicated bytes (read from the recordings as they are; no engine change)."""
+    recordings are not walked): the core's own replicated bytes (read from the recordings as they are; no engine change).
+    A frame of another money schema version than ``schema`` (the cut's) is refused, as ``sbe_layout`` refuses it: a cut is
+    one wire version and a clean genesis, so such a frame means the log is not this cut's."""
     import struct
+    import sbe_layout
     base = Path(member_dir) / 'state'
     log = base / 'cluster' / 'recording.log'
     recordings = sorted({e['recording_id'] for e in recording_log(log) if e['type'] == 'TERM'})
@@ -820,6 +881,9 @@ def core_config_frames(member_dir, schema):
                 _, template, schema_id, version = struct.unpack_from('<HHHH', app, 0)
                 if template != CORE_CONFIG_TEMPLATE or schema_id != schema.schema_id:
                     continue
+                if version != schema.version:
+                    raise sbe_layout.SchemaError(f'{segment.name} offset {offset}: CoreConfig of money schema version '
+                                                 f'{version}, the cut\'s schema is version {schema.version}')
                 row = {'recording': rid, 'file': segment.name, 'path': str(segment), 'offset': offset, 'schema_version': version}
                 row.update({f.name: f.decode(app, 8, schema.order) for f in message.fields if f.since <= version})
                 frames.append(row)

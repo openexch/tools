@@ -477,9 +477,11 @@ def untappable_windows(transitions, summary, quorum_loss=None, elections=None):
     dispatch or order-event gap of the tap summary that starts right after a ``session_closed`` note inside the
     quorum-loss interval or inside an election window (``from_ms`` .. ``to_ms``: the leader kill to the new leader
     serving) and is followed by a ``reconnected`` note: the tap's session closed while the cluster had no quorum or no
-    leader. The core keeps no history of its egress, so what it emitted meanwhile cannot be tapped late; the
-    dispatches the barrier's backfill rebuilds still count, the rest is recorded. A gap after a ``new_leader`` note (the
-    session survived) is never declared."""
+    leader. The core keeps no history of its dispatches, so what it emitted meanwhile cannot be tapped late; the
+    dispatches the barrier's backfill rebuilds still count, the rest is recorded. Order events are replayed from the
+    core's ring first (``core_drills.replay_event_gaps``): ``summary`` carries only the event gaps the ring no longer
+    covered, each declared with its count (``events_short``). A gap after a ``new_leader`` note (the session survived) is
+    never declared."""
     intervals = []
     if quorum_loss:
         intervals.append((quorum_loss['from_ms'], quorum_loss['to_ms'],
@@ -511,8 +513,9 @@ def untappable_windows(transitions, summary, quorum_loss=None, elections=None):
             causes.append(inside[2])
     if not out['dispatch'] and not out['events']:
         return None
-    out['reason'] = (f'{"; ".join(causes)}; the tap session closed and reconnected after, and the core keeps no egress '
-                     f'history to tap late')
+    out['reason'] = (f'{"; ".join(causes)}; the tap session closed and reconnected after; the core keeps no dispatch '
+                     f'history to tap late and its order-event ring no longer held the events missed')
+    out['events_short'] = sum(g[1] - g[0] + 1 for g in out['events'])
     return out
 
 
@@ -750,7 +753,8 @@ class ReplicaDrillRun(DrillRun):
         O5, O10)."""
         sample = super().build_sample(story, tap, tap_summary, second, pre)
         if self.rw.get('quorum_loss') or self.rw.get('elections'):
-            windows = untappable_windows(tap_summary.get('transitions'), tap_summary.get('summary'),
+            windows = untappable_windows(tap_summary.get('transitions'),
+                                         core_drills.replayed_summary(tap_summary.get('summary'), getattr(self, 'event_replay', None)),
                                          self.rw.get('quorum_loss'), self.rw.get('elections'))
             self.rw['untappable'] = windows
             if windows:

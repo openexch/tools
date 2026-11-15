@@ -5,7 +5,7 @@ Read-only money invariant checker. `money_check.py` reconciles the ledger agains
 It reads the ledger from either store behind one interface:
 
 - `--store redis` (default): Redis `db0` directly (`bal:{userId}` hashes), the v0.5 stack.
-- `--store core`: runs the `CoreDump` command from the `core` repo and reads its JSON snapshot.
+- `--store core`: runs `CoreDump` from the release cut's `tools.core-dump` jar (core-bridge.jar at the cut's core commit) and reads its JSON snapshot.
 
 The expected-hold side always comes from the v0.5 OMS open-orders API, so the tool needs a running v0.5 OMS.
 
@@ -50,19 +50,19 @@ python3 money_check.py --json
 # continuous: one sweep every 60 s
 python3 money_check.py --loop 60
 
-# against the core (build the core-bridge jar in the core repo first)
+# against the core: CoreDump runs from the release cut's tools.core-dump jar (sha256 checked)
 CORE_AUTH_CREDENTIAL=<ADMIN or TOOL credential> python3 money_check.py --store core \
-    --core-dump-cmd "java -jar /path/to/core/core-bridge/target/core-bridge.jar dump"
+    --cut /abs/cut-manifest.json
 
 # unit tests
 python3 -m unittest test_money_check
 ```
 
-Flags: `--store {redis,core}`, `--oms-url`, `--sim-log` (repeatable, globs allowed), `--extra-deposits FILE` (lines `ts user asset amount`), `--redis-host`, `--redis-port`, `--redis-db`, `--core-dump-cmd` (default `java -jar core-bridge/target/core-bridge.jar dump`, relative to the working directory), `--core-timeout` (default 40 s), `--asset-map "USD=0,BTC=1,..."`, `--users 900000-900999`, `--tolerance N` (per-row 8-dp gap tolerated, default 0), `--http-timeout` (default 5 s), `--loop SECONDS`, `--max-sweeps N`, `--json`, `--verbose`.
+Flags: `--store {redis,core}`, `--oms-url`, `--sim-log` (repeatable, globs allowed), `--extra-deposits FILE` (lines `ts user asset amount`), `--redis-host`, `--redis-port`, `--redis-db`, `--cut` (the release cut manifest; required with `--store core`, no default), `--core-timeout` (default 40 s), `--asset-map "USD=0,BTC=1,..."`, `--users 900000-900999`, `--tolerance N` (per-row 8-dp gap tolerated, default 0), `--http-timeout` (default 5 s), `--loop SECONDS`, `--max-sweeps N`, `--json`, `--verbose`.
 
 Default asset map, matching the market-sim `DefaultMarkets` table: `USD=0, BTC=1, ETH=2, SOL=3, XRP=4, DOGE=5`. Override with `--asset-map` if a deployment numbers assets differently.
 
-Exit codes: `0` all green, `2` an invariant was violated, `1` operational error (store or OMS unreachable, CoreDump timeout), `64` a retired flag or value (`--ae-dump-cmd`, `--ae-timeout`, `--store ae`). With `--loop` the process runs until Ctrl-C or `--max-sweeps` and exits `2` if any sweep violated.
+Exit codes: `0` all green, `2` an invariant was violated, `1` operational error (store or OMS unreachable, CoreDump timeout), `64` a retired flag or value (`--ae-dump-cmd`, `--ae-timeout`, `--store ae`, `--core-dump-cmd`: use `--cut`). With `--loop` the process runs until Ctrl-C or `--max-sweeps` and exits `2` if any sweep violated.
 
 ## Reading results on a live stack
 
@@ -74,7 +74,7 @@ For a clean point-in-time check, pause the simulator (`POST /control {"pause":tr
 
 ## CoreDump
 
-`CoreDump` is `com.openexchange.core.bridge.CoreDump` in the `core` repo, run as `java -jar core-bridge.jar dump`. It connects an `AeronCluster` client with the credential from `CORE_AUTH_CREDENTIAL` (or `-Dcore.auth.credential`), requests balance, hold and feed-position snapshots, prints one JSON document and exits `0`, or `3` when the 30 s snapshot deadline passes:
+`CoreDump` is `com.openexchange.core.bridge.CoreDump` in the `core` repo, run by money-check as `java -cp <cut jar> CoreDump` after checking the jar's sha256 against the cut. It connects an `AeronCluster` client with the credential from `CORE_AUTH_CREDENTIAL` (or `-Dcore.auth.credential`), requests balance, hold and feed-position snapshots, prints one JSON document and exits `0`, or `3` when the 30 s snapshot deadline passes:
 
 ```json
 {

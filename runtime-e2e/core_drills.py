@@ -255,6 +255,83 @@ def backfill(tap_rows, pending_entries, me_journal, known_orders, head):
     return rows, report
 
 
+# ------------------------------------------------------------------ order-event replay (the tap's gaps)
+
+EVENT_REPLAY_TIMEOUT_S = 180
+
+
+def event_replay_span(events, transitions):
+    """The one ``CoreProbe order-events`` request that covers what the tap missed, or None when it missed nothing: every
+    gap in [1, highest tapped seq], and, when a session transition left nothing tapped after it, the tail up to the core's
+    head (``until`` None). ``from`` is the exclusive cursor; the tapped events inside the span come back too and are
+    compared with what the tap saw."""
+    seqs = sorted({integer(e['seq']) for e in events})
+    top = seqs[-1] if seqs else 0
+    gaps = seq_gaps(seqs, 1, top) if seqs else []
+    tail = any(n.get('event') != 'registered' and integer(n.get('last_event_seq') or 0) >= top for n in transitions or [])
+    if not gaps and not tail:
+        return None
+    start = gaps[0][0] if gaps else top + 1
+    return {'from': start - 1, 'until': None if tail else gaps[-1][1], 'gaps': gaps, 'tail': tail}
+
+
+def merge_event_replay(events, reply, span):
+    """The tapped events plus the replayed ones the tap missed (``source: replay``), in seq order, and the report. A
+    replayed event the tap also saw must equal it key for key (the ring holds the broadcast block byte for byte); a
+    difference is a Violation. What the replay could not cover (an overrun: the ring no longer held it) stays a gap,
+    judged as before (a declared untappable window, or tap_loss)."""
+    tapped = {integer(e['seq']): e for e in events}
+    mismatch, added = [], []
+    for row in reply.get('events') or []:
+        seq = integer(row['seq'])
+        seen = tapped.get(seq)
+        if seen is None:
+            if not any(integer(r['seq']) == seq for r in added):
+                added.append(dict(row, source='replay'))
+        elif {k: v for k, v in seen.items() if k != 'source'} != row:
+            mismatch.append(seq)
+    if mismatch:
+        raise Violation(f'order-event replay differs from the tapped event at seqs {mismatch[:5]} ({len(mismatch)})')
+    merged = sorted(list(events) + added, key=lambda e: integer(e['seq']))
+    seqs = [integer(e['seq']) for e in merged]
+    remaining = seq_gaps(seqs, 1, max(seqs)) if seqs else []
+    head = reply.get('last_seq') if span['until'] is None else None
+    complete = bool(reply.get('complete')) and not remaining
+    return merged, {'span': span, 'requests': reply.get('requests'), 'added': len(added), 'lost': reply.get('lost') or [],
+                    'remaining_gaps': remaining, 'head': head if type(head) is int else None, 'complete': complete}
+
+
+def replay_event_gaps(fixture, events, transitions):
+    """Fills the tap's order-event gaps from the core's ring (``CoreProbe order-events`` on the ADMIN principal, an any-user
+    key). Returns (events, report); a probe that does not answer leaves the events as tapped and says so in the report."""
+    span = event_replay_span(events, transitions)
+    if span is None:
+        return list(events), {'span': None, 'requests': 0, 'added': 0, 'lost': [], 'remaining_gaps': [], 'head': None,
+                              'complete': True}
+    kv = {'from': span['from']}
+    if span['until'] is not None:
+        kv['until'] = span['until']
+    try:
+        meaning, reply = fixture.core('order-events', 'probe-admin', timeout=EVENT_REPLAY_TIMEOUT_S, **kv)
+    except Inconclusive as error:
+        meaning, reply = str(error), None
+    if meaning != 'ANSWERED' or not isinstance(reply, dict) or 'events' not in reply:
+        seqs = sorted({integer(e['seq']) for e in events})
+        return list(events), {'span': span, 'requests': None, 'added': 0, 'lost': [], 'head': None, 'complete': False,
+                              'remaining_gaps': seq_gaps(seqs, 1, seqs[-1]) if seqs else [],
+                              'error': f'order-events {meaning}'}
+    return merge_event_replay(events, reply, span)
+
+
+def replayed_summary(summary, report):
+    """The tap summary with its order-event gaps replaced by what the replay left open (for the untappable windows)."""
+    if not report or report.get('span') is None or report.get('error'):
+        return summary
+    out = dict(summary or {})
+    out['events'] = dict(out.get('events') or {}, gaps=[list(g) for g in report['remaining_gaps']])
+    return out
+
+
 # ------------------------------------------------------------------ non-vacuity lines, each can fail
 
 
@@ -1834,7 +1911,7 @@ class ScheduleDrills:
         if spec['faults'] == 'a06':
             self.a06_barrier_extra()
         tap_summary = self.wait_tap_end()
-        tap = self.tap_rows()
+        tap = self.replayed_tap(tap_summary)
         first, second = self.barrier(story, tap, tap_summary)
         after = self.snap('after')
         sample = self.seal(self.build_sample(story, tap, tap_summary, second, pre), first, second)
@@ -1969,7 +2046,7 @@ class ScheduleDrills:
     def judge_life(self, life, story, pre, out):
         """Tap end, barrier, sample (declared per life), both oracles; evidence under ``out``."""
         tap_summary = self.wait_tap_end()
-        tap = self.tap_rows()
+        tap = self.replayed_tap(tap_summary)
         first, second = self.barrier(story, tap, tap_summary)
         after = self.snap('after' if life == 2 else 'halt', skip_me=self.frozen is not None)    # never the fresh ME
         sample = self.seal(self.build_sample(story, tap, tap_summary, second, pre), first, second)
@@ -2297,6 +2374,14 @@ class DrillRun(ScheduleDrills):
 
     def tap_rows(self):
         return core_scenarios.read_tap(Path(self.f.registry['tap']['path']))
+
+    def replayed_tap(self, tap_summary):
+        """The finished tap with its order-event gaps filled from the core's ring (``replay_event_gaps``); the report is
+        kept for the sample (``tap_continuity.event_replay``)."""
+        tap = self.tap_rows()
+        if 'order_event' in tap:
+            tap['order_event'], self.event_replay = replay_event_gaps(self.f, tap['order_event'], tap_summary.get('transitions'))
+        return tap
 
     def wait_leader(self, engine, old, bound_s=ELECTION_BOUND_S):
         started = time.monotonic()
@@ -2906,7 +2991,8 @@ class DrillRun(ScheduleDrills):
                                              self.ordering_exception if self.spec.get('ordering_exception') else None,
                                              **declared_for(self.name, self.variant, getattr(self, 'life_no', 1))),
                   'tap_continuity': {'transitions': tap_summary['transitions'], 'summary': tap_summary['summary'],
-                                     'line': tap_summary['line'], 'backfill': second['backfill']},
+                                     'line': tap_summary['line'], 'backfill': second['backfill'],
+                                     'event_replay': getattr(self, 'event_replay', None)},
                   'story': {'line': story['line'], 'summary': story['summary'], 'unsent': lists['unsent']},
                   'pre_barrier': pre, 'fault_rows': self.ledger.rows}
         return sample
@@ -2987,7 +3073,7 @@ class DrillRun(ScheduleDrills):
         story = self.wait_story()
         pre = self.pre_barrier()
         tap_summary = self.wait_tap_end()
-        tap = self.tap_rows()
+        tap = self.replayed_tap(tap_summary)
         first, second = self.barrier(story, tap, tap_summary)
         after = self.snap('after')
         sample = self.seal(self.build_sample(story, tap, tap_summary, second, pre), first, second)

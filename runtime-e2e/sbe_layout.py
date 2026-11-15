@@ -12,6 +12,10 @@ CommandRelease (template 4) carries the ``releases`` group. A group is the dimen
 (``groupSizeEncoding``: blockLength uint16 + numInGroup uint16) and ``numInGroup`` fixed entries of
 ``blockLength`` bytes; the total frame length must equal ``HEADER + block + 4 + n * entryBlock`` exactly.
 A nested group, a second group, a ``<data>`` part or a group that carries ``<data>`` is still refused.
+
+A schema is exact about its version: a frame of another version of the same schema is refused (``Schema.decode``), and
+``load(path, version=n)`` refuses a schema file that is not version ``n``. The money schema is read from the cut's core
+jar (``release_cut.load_money_schema``), never from a copy in this repo, so the version it refuses is the cut's.
 """
 import struct
 import xml.etree.ElementTree as ET
@@ -184,13 +188,17 @@ def _group(node, table, path, template):
     return Group(node.get('name'), int(declared) if declared is not None else offset, fields)
 
 
-def load(path):
-    """Parse a schema XML into fixed-block layouts. Raises SchemaError on anything a journal cannot carry."""
+def load(path, version=None):
+    """Parse a schema XML into fixed-block layouts. Raises SchemaError on anything a journal cannot carry, and, with
+    ``version``, on a schema of another version."""
     root = ET.parse(path).getroot()
     if _local(root.tag) != 'messageSchema':
         raise SchemaError(f'{path}: not an SBE messageSchema')
     order = '<' if root.get('byteOrder', 'littleEndian') == 'littleEndian' else '>'
-    schema_id, version = int(root.get('id')), int(root.get('version', '0'))
+    schema_id, declared = int(root.get('id')), int(root.get('version', '0'))
+    if version is not None and declared != int(version):
+        raise SchemaError(f'{path}: schema {schema_id} is version {declared}, not the required version {version}')
+    version = declared
     table = {}
     for types in root:
         if _local(types.tag) == 'types':

@@ -29,14 +29,18 @@ It is READ-ONLY: it never issues a write to Redis, the core, or the OMS.
 
 Stores:
   --store redis (default)  read Redis db0 directly (bal:{userId} hashes).
-  --store core             shell out to the CoreDump CLI and read its JSON snapshot.
+  --store core             run the CoreDump CLI of the release cut (--cut MANIFEST: the jar of its tools.core-dump entry,
+                           re-hashed against the manifest) and read its JSON snapshot. There is no default jar: without
+                           --cut, or with a cut that names no CoreDump jar, the check refuses to run (exit 1).
 
 Exit codes:  0 = all green   2 = an invariant was violated   1 = operational error
-             64 = a retired flag or value (--ae-dump-cmd, --ae-timeout, --store ae): the line names the new one.
+             64 = a retired flag or value (--ae-dump-cmd, --core-dump-cmd, --ae-timeout, --store ae): the line
+                  names the new one.
 """
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -230,9 +234,41 @@ def load_redis_store(host, port, db):
         r.close()
 
 
+CORE_DUMP_TOOL = "core-dump"
+CORE_DUMP_MAIN = "com.openexchange.core.bridge.CoreDump"
+
+
+def core_dump_command(cut_path):
+    """The CoreDump command of a release cut: ``java -cp <tools.core-dump.path> <main>``. The jar must exist and hash to the
+    manifest's sha256; anything missing is a RuntimeError naming it (there is no default jar)."""
+    if not cut_path:
+        raise RuntimeError("--store core needs --cut MANIFEST: CoreDump runs from the release cut's jar "
+                           "(tools.core-dump), never from a default path")
+    try:
+        with open(cut_path) as fh:
+            cut = json.load(fh)
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"--cut {cut_path}: not a readable cut manifest: {e}")
+    entry = (cut.get("tools") or {}).get(CORE_DUMP_TOOL) if isinstance(cut, dict) else None
+    if not isinstance(entry, dict) or not entry.get("path") or not entry.get("sha256"):
+        raise RuntimeError(f"--cut {cut_path}: the cut {cut.get('cut_id') if isinstance(cut, dict) else None} names no "
+                           f"tools.{CORE_DUMP_TOOL} jar (path and sha256)")
+    if entry.get("main") != CORE_DUMP_MAIN:
+        raise RuntimeError(f"--cut {cut_path}: tools.{CORE_DUMP_TOOL}.main is {entry.get('main')!r}, not {CORE_DUMP_MAIN}")
+    jar = entry["path"]
+    try:
+        with open(jar, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+    except OSError as e:
+        raise RuntimeError(f"--cut {cut_path}: the CoreDump jar {jar} is not readable: {e}")
+    if digest != entry["sha256"]:
+        raise RuntimeError(f"--cut {cut_path}: the CoreDump jar {jar} hashes to {digest}, the cut pins {entry['sha256']}")
+    return ["java", "-cp", jar, CORE_DUMP_MAIN]
+
+
 def load_core_store(dump_cmd, timeout):
     try:
-        proc = subprocess.run(dump_cmd, shell=True, capture_output=True,
+        proc = subprocess.run(dump_cmd, shell=isinstance(dump_cmd, str), capture_output=True,
                              timeout=timeout, text=True)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"CoreDump timed out after {timeout}s (cmd: {dump_cmd})")
@@ -555,7 +591,7 @@ def run_sweep(args, asset_map):
     if args.store == "redis":
         store = load_redis_store(args.redis_host, args.redis_port, args.redis_db)
     else:
-        store = load_core_store(args.core_dump_cmd, args.core_timeout)
+        store = load_core_store(core_dump_command(args.cut), args.core_timeout)
     balances = store["balances"]
     result["position"] = store["position"]
 
@@ -680,9 +716,8 @@ def build_arg_parser():
     p.add_argument("--redis-host", default="127.0.0.1")
     p.add_argument("--redis-port", type=int, default=6379)
     p.add_argument("--redis-db", type=int, default=0)
-    p.add_argument("--core-dump-cmd",
-                  default="java -jar core-bridge/target/core-bridge.jar dump",
-                  help="command that prints the CoreDump JSON snapshot (--store core)")
+    p.add_argument("--cut", default=None, metavar="MANIFEST",
+                  help="release cut manifest; --store core runs CoreDump from its tools.core-dump jar (required)")
     p.add_argument("--core-timeout", type=int, default=40,
                   help="seconds to wait for CoreDump (its own timeout is 30s)")
     p.add_argument("--asset-map", default=None,
@@ -714,7 +749,7 @@ def parse_asset_map(spec):
 
 # The flags and values retired by the rename of the engine to core, old to new. A command line that still uses one was
 # written for the old names: it is refused naming the new one before anything runs (no alias, no fallback).
-RETIRED_FLAGS = {"--ae-dump-cmd": "--core-dump-cmd", "--ae-timeout": "--core-timeout"}
+RETIRED_FLAGS = {"--ae-dump-cmd": "--cut", "--core-dump-cmd": "--cut", "--ae-timeout": "--core-timeout"}
 RETIRED_STORE = {"ae": "core"}
 
 

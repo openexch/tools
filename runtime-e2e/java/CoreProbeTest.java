@@ -57,6 +57,14 @@ public final class CoreProbeTest {
         run("tap_dense_run_reports_no_gap", CoreProbeTest::tapDense);
         run("order_dump_keeps_every_page", CoreProbeTest::orderDumpPages);
         run("retired_environment_names_are_refused", CoreProbeTest::retiredEnvironment);
+        run("order_events_pages_to_the_head", CoreProbeTest::replayPagesToHead);
+        run("order_events_overrun_reports_the_lost_range_and_continues", CoreProbeTest::replayOverrun);
+        run("order_events_head_probe_is_one_end", CoreProbeTest::replayHeadProbe);
+        run("order_events_stops_at_the_bound", CoreProbeTest::replayBound);
+        run("order_events_cursor_ahead_of_the_core_is_not_complete", CoreProbeTest::replayAhead);
+        run("order_events_listener_decodes_pages_and_end", CoreProbeTest::replayListener);
+        run("user_balances_reply_is_decoded", CoreProbeTest::userBalancesReply);
+        run("config_report_reply_is_decoded", CoreProbeTest::configReportReply);
         System.out.println(failures.isEmpty() ? "ALL PASS" : "FAILED " + failures);
         System.exit(failures.isEmpty() ? 0 : 1);
     }
@@ -934,5 +942,124 @@ public final class CoreProbeTest {
         check(calls.equals(List.of("ack 77 9 true PENDING_NEW", "reject 78 TOO_MANY_PENDING_REQUESTS 256",
                 "event 9 FILL PARTIALLY_FILLED 3")), "story routing " + calls);
         check(p.rows.isEmpty(), "story replies leaked into the one-verb reply rows");
+    }
+
+    // ------------------------------------------------------------------ v8 reads: order-event replay, balances, config
+
+    private static void replayPagesToHead() {
+        final CoreProbe.EventReplay r = new CoreProbe.EventReplay(10, Long.MAX_VALUE, 4096);
+        check(r.next() && r.pageSize() == 4096, "first page " + r.pageSize());
+        r.onEnd(4096, 1, 10_000, 4106);
+        check(r.next() && r.cursor == 4106 && r.pageSize() == 4096, "second page cursor " + r.cursor + " size " + r.pageSize());
+        r.onEnd(4096, 1, 10_000, 8202);
+        check(r.next() && r.pageSize() == 1798, "last page size " + r.pageSize());
+        r.onEnd(1798, 1, 10_000, 10_000);
+        check(!r.next() && r.complete() && r.requests == 3 && r.lost.isEmpty(), "replay to the head: " + CoreProbe.json(r.json()));
+    }
+
+    private static void replayOverrun() {
+        final CoreProbe.EventReplay r = new CoreProbe.EventReplay(100, Long.MAX_VALUE, 4096);
+        r.onEnd(0, 500, 1000, 100);
+        check(r.next() && r.cursor == 499 && r.lost.size() == 1 && r.lost.get(0)[0] == 101 && r.lost.get(0)[1] == 499,
+                "overrun range " + CoreProbe.json(r.json()));
+        check(r.pageSize() == 501, "page after the overrun " + r.pageSize());
+        r.onEnd(501, 500, 1000, 1000);
+        check(!r.next() && !r.complete(), "an overrun replay must not read complete: " + CoreProbe.json(r.json()));
+        final CoreProbe.EventReplay all = new CoreProbe.EventReplay(5, 300, 4096);
+        all.onEnd(0, 500, 1000, 5);
+        check(!all.next() && !all.complete() && all.lost.get(0)[0] == 6 && all.lost.get(0)[1] == 300,
+                "an overrun past the bound ends at the bound: " + CoreProbe.json(all.json()));
+    }
+
+    private static void replayHeadProbe() {
+        final CoreProbe.EventReplay r = new CoreProbe.EventReplay(0, Long.MAX_VALUE, 0);
+        check(r.next() && r.pageSize() == 0, "head probe sends maxEvents 0");
+        r.onEnd(0, 1, 77, 0);
+        check(!r.next() && r.lastSeq == 77 && r.requests == 1, "head probe " + CoreProbe.json(r.json()));
+        final CoreProbe.EventReplay negative = new CoreProbe.EventReplay(0, Long.MAX_VALUE, -1);
+        check(negative.pageSize() == -1, "a negative max is sent as is (the core refuses it)");
+    }
+
+    private static void replayBound() {
+        final CoreProbe.EventReplay r = new CoreProbe.EventReplay(10, 20, 4096);
+        check(r.pageSize() == 10, "a bounded first page asks for the bound only: " + r.pageSize());
+        r.onEnd(10, 1, 1000, 20);
+        check(!r.next() && r.complete(), "bounded replay " + CoreProbe.json(r.json()));
+        check(r.wanted(11) && r.wanted(20) && !r.wanted(10) && !r.wanted(21), "the requested range is (from, until]");
+    }
+
+    private static void replayAhead() {
+        final CoreProbe.EventReplay r = new CoreProbe.EventReplay(2000, Long.MAX_VALUE, 4096);
+        r.onEnd(0, 1, 1000, 2000);
+        check(!r.next() && r.ahead && !r.complete(), "cursor ahead " + CoreProbe.json(r.json()));
+    }
+
+    private static int eventsPage(final long correlation, final long... seqs) {
+        final OrderEventsPageEncoder e = new OrderEventsPageEncoder().wrapAndApplyHeader(BUF, 0, HDR).correlationId(correlation);
+        final OrderEventsPageEncoder.EventsEncoder g = e.eventsCount(seqs.length);
+        for (final long seq : seqs) {
+            g.next().eventSeq(seq).logPosition(seq * 64).orderId(seq + 100).userId(1).marketId(1).eventKind(EventKind.ACK_NEW)
+                    .status(OrderStatus.NEW).reason(CoreRejectReason.NONE).side(Side.BUY).orderType(OrderType.LIMIT)
+                    .timeInForce(TimeInForce.GTC).price(1).stopPrice(0).quantity(3).filledQty(0).remainingQty(3).lastPrice(0)
+                    .lastQty(0).tradeId(0).meOrderId(0).holdAssetId(0).holdAmount(3).holdRemaining(3).clientOrderIdHigh(0)
+                    .clientOrderIdLow(0).createdAtMs(0).updatedAtMs(0).meReason((short) 255);
+        }
+        return MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength();
+    }
+
+    private static void replayListener() {
+        final CoreProbe p = new CoreProbe();
+        p.listener = p.new Listener();
+        p.listener.replay = new CoreProbe.EventReplay(10, 12, 4096);
+        p.listener.expectCorrelation = 9;
+        p.listener.onMessage(1, 1, BUF, 0, eventsPage(8, 11), null);          // another request's page is not ours
+        check(p.rows.isEmpty(), "a page of another correlation was taken");
+        p.listener.onMessage(1, 1, BUF, 0, eventsPage(9, 11, 12, 13), null);
+        check(p.rows.size() == 2 && p.rows.get(0).startsWith("{\"seq\":11,\"order\":111,\"kind\":\"ACK_NEW\",\"status\":\"NEW\"")
+                && p.rows.get(1).contains("\"seq\":12") && p.rows.get(1).contains("\"hold_remaining\":3")
+                && p.rows.get(1).contains("\"log_position\":768"), "replayed rows " + p.rows);
+        final String[] keys = {"seq", "order", "kind", "status", "reason", "filled", "quantity", "remaining", "trade", "leg",
+                "hold_amount", "hold_remaining", "log_position"};
+        for (final String k : keys) {
+            check(p.rows.get(0).contains("\"" + k + "\":"), "replayed row lacks the tap key " + k);
+        }
+        final int n = MessageHeaderEncoder.ENCODED_LENGTH + new OrderEventsEndEncoder().wrapAndApplyHeader(BUF, 0, HDR).correlationId(9)
+                .count(3).firstAvailableSeq(1).lastSeq(40).nextFromSeq(13).encodedLength();
+        p.listener.onMessage(1, 1, BUF, 0, n, null);
+        check(p.listener.replay.requests == 1 && p.listener.replay.lastSeq == 40 && p.listener.replay.complete()
+                && p.listener.replay.events == 2, "end frame " + CoreProbe.json(p.listener.replay.json()));
+    }
+
+    private static void userBalancesReply() {
+        final CoreProbe p = new CoreProbe();
+        p.listener = p.new Listener();
+        p.listener.expectCorrelation = 4;
+        final UserBalancesEncoder e = new UserBalancesEncoder().wrapAndApplyHeader(BUF, 0, HDR).correlationId(4).userId(1001)
+                .known(BoolFlag.TRUE).asOfLogPosition(4096);
+        e.balancesCount(2).next().assetId(0).available(500).locked(25).next().assetId(3).available(7).locked(0);
+        p.listener.onMessage(1, 1, BUF, 0, MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength(), null);
+        check(p.rows.equals(List.of("{\"t\":\"UserBalances\",\"user\":1001,\"known\":true,\"as_of_log_position\":4096,\"balances\":["
+                + "{\"asset\":0,\"available\":500,\"locked\":25},{\"asset\":3,\"available\":7,\"locked\":0}]}")), "user balances " + p.rows);
+    }
+
+    private static void configReportReply() {
+        final CoreProbe p = new CoreProbe();
+        p.listener = p.new Listener();
+        p.listener.expectCorrelation = 6;
+        final CoreConfigReportEncoder e = new CoreConfigReportEncoder().wrapAndApplyHeader(BUF, 0, HDR).correlationId(6)
+                .configVersion(3).behaviorVersion(3).limitsVersion(0).requestTtlMs(900_000).requestPerUserCap(256)
+                .orderEventRingCapacity(65_536).gateState(GateState.OPEN).asOfLogPosition(128);
+        e.gateReasons().clear();
+        final CoreConfigReportEncoder.MarketsEncoder m = e.marketsCount(1).next().marketId(1).symbol("BTC-USD").baseAssetId(1)
+                .quoteAssetId(0).tickSize(1).minPrice(1).maxPrice(100).lotSize(1).minQuantity(1).maxQuantity(10).minNotional(0)
+                .maxNotional(Long.MAX_VALUE).riskConfigVersion(2).gateState(GateState.OPEN).circuitBreaker(BoolFlag.FALSE);
+        m.gateReasons().clear();
+        e.assetsCount(1).next().assetId(0).code("USD").scale((short) 8);
+        p.listener.onMessage(1, 1, BUF, 0, MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength(), null);
+        final String row = p.rows.size() == 1 ? p.rows.get(0) : "";
+        check(row.contains("\"requestTtlMs\":900000") && row.contains("\"requestPerUserCap\":256")
+                && row.contains("\"orderEventRingCapacity\":65536") && row.contains("\"symbol\":\"BTC-USD\"")
+                && row.contains("\"minQuantity\":1") && row.contains("\"riskConfigVersion\":2") && row.contains("\"code\":\"USD\"")
+                && row.contains("\"gateState\":\"OPEN\""), "config report " + p.rows);
     }
 }
