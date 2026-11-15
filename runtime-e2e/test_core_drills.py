@@ -1552,6 +1552,31 @@ class A05LinesTest(unittest.TestCase):
                for s in self.progress()]
         self.assertFalse(cd.line_dup_outcomes(self.w(tap_dispatch=tap, samples=off))['holds'])   # 15 off > 10
 
+    def test_dup_outcomes_counts_dispatches_over_the_span_the_counter_reads_cover(self):
+        """RED: the embedded fwd-upgrade entry FAILed 2031 vs 2056 with the counter exact. The row before the lower edge
+        was read 2 ms before it, the row before the upper edge 251 ms before it (the next one 4 ms after the edge): the
+        counter covered 19.75 s while the tap was counted over 20 s, 25 dispatches short at 100/s. Counted over the rows'
+        own read times, the duplicates equal the dispatches."""
+        t0 = 1_000_000
+        tap = [{'seq': i + 1, 'id_high': i + 1, 'id_low': 0, 'kind': 'CREATE', 'at_ms': t0 + i * 10} for i in range(10_000)]
+        times = [1000.0 + k * 0.25 - 0.002 for k in range(400)]
+        times[120] = 1030.004                                   # the read that would have been 2 ms before 30 s
+        rows = [S(t, me0=dict(lead('me'), match_durable_duplicates_suppressed_total=float(
+                sum(1 for r in tap if r['at_ms'] < t * 1000)))) for t in times]
+        line = cd.line_dup_outcomes(self.w(tap_dispatch=tap, samples=rows))
+        self.assertTrue(line['holds'], line)
+        base = line['detail']['windows']['baseline']
+        self.assertEqual(base['span_s'], [9.998, 29.748])
+        self.assertEqual(base['duplicates'], base['dispatches'])
+        # the nominal-window count the line used to compare against: 25 more dispatches than the counter could see
+        nominal = sum(1 for r in tap if t0 + 10_000 <= r['at_ms'] < t0 + 30_000)
+        self.assertEqual(nominal - base['duplicates'], 25)
+        # the alignment is no slack: one in 50 dispatches never duplicated still FAILs (40 off > 10)
+        lost = [dict(r, roles={'me0': dict(r['roles']['me0'], match_durable_duplicates_suppressed_total=
+                                           r['roles']['me0']['match_durable_duplicates_suppressed_total']
+                                           - sum(1 for x in tap[::50] if x['at_ms'] < r['t0'] * 1000))}) for r in rows]
+        self.assertFalse(cd.line_dup_outcomes(self.w(tap_dispatch=tap, samples=lost))['holds'])
+
     def test_n1_hold_makes_the_controls_gap_exceed_the_slack(self):
         """The n1 windows were 1.08-1.3 s (survivor gap 0.76 s < 1.0 s; settle lag 51 vs 5 + 40). With the
         single slot held A05_N1_HOLD_S the window is >= 5 s: no progress for 5 s FAILs survivor_delivered and the lag of a
