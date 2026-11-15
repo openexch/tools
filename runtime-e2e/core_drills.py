@@ -628,7 +628,7 @@ A04_HALT_PHASE_S = 60                         # life-1 tap beyond the story: fre
                                               # then 640 s idle on 420; the default is 60 s, a setting (SETTINGS)
 SETTINGS = {
     'A05_P999_SLACK_MS': 20,                  # swap p99.9 <= baseline p99.9 + slack; default 20 ms (the replacement's session setup costs 16-28 ms on the 1-CPU ME; raised from 10 on 2026-11-05)
-    'A05_DUP_EDGE_SLACK': 10,                 # the in-flight count at the window edges; measured duplicates - dispatches = -1
+    'A05_DUP_EDGE_SLACK': 10,                 # the in-flight count at the two counter reads; measured duplicates - dispatches -3..+3
     'A05_SETTLE_LAG_SLACK': 40,               # [E] trades; measured a lag of 10-36 trades
     'SWAP_WINDOW_MIN_S': 1.0,                 # measured swap windows of 1.45-1.49 s
     'SURVIVOR_MAX_GAP_S': 1.0,                # inside a ~1.5 s window a 2 s gap could never show
@@ -829,7 +829,13 @@ def progress(points, lo, hi, inside=False):
 
 
 def at_or_before(points, t):
-    hits = [v for tt, v in points if tt <= t]
+    hit = point_at_or_before(points, t)
+    return None if hit is None else hit[1]
+
+
+def point_at_or_before(points, t):
+    """The last (t, value) read at or before ``t``, or None."""
+    hits = [p for p in points if p[0] <= t]
     return hits[-1] if hits else None
 
 
@@ -1114,18 +1120,27 @@ def line_survivor_delivered(w):
 def line_dup_outcomes(w):
     """F7: outside the swap windows (baseline [10, 30) s and after [60, 90) s), the ME leader's duplicate counter delta ==
     (N - 1) x the tapped command dispatches (RELEASE_ID excluded: releases are not duplicate-suppressed, cost.log), within
-    A05_DUP_EDGE_SLACK. N is the drill's design (2); the N = 1 control must FAIL it."""
+    A05_DUP_EDGE_SLACK. N is the drill's design (2); the N = 1 control must FAIL it.
+
+    Both sides cover the same span: the counter is read by the sampler rows at or before each window edge, so the
+    dispatches are counted between those two rows' read times, never over the nominal window. The sampler phase drifts
+    (one row landed 2 ms before the lower edge and the next 251 ms before the upper one): over the nominal window the
+    counter covered 0.25 s less than the tap, 25 dispatches at 100/s, while the slack only absorbs the in-flight
+    commands at a read."""
     s = w.get('settings') or SETTINGS
     t0 = _t0_s(w)
     points = series(w['samples'], 'me', 'match_durable_duplicates_suppressed_total')
     out = {}
     for name, (a, b) in (('baseline', (10, 30)), ('after', (60, 90))):
         lo, hi = t0 + a, t0 + b
-        first, last = at_or_before(points, lo), at_or_before(points, hi)
+        first, last = point_at_or_before(points, lo), point_at_or_before(points, hi)
+        if first is None or last is None:
+            out[name] = {'duplicates': None, 'dispatches': None, 'expected': None}
+            continue
         dispatched = sum(1 for r in w['tap_dispatch'] if r.get('kind') != RELEASE_KIND and r.get('at_ms') is not None
-                         and lo * 1000 <= r['at_ms'] < hi * 1000)
-        dup = None if first is None or last is None else last - first
-        out[name] = {'duplicates': dup, 'dispatches': dispatched, 'expected': (w.get('n', 2) - 1) * dispatched}
+                         and first[0] * 1000 <= r['at_ms'] < last[0] * 1000)
+        out[name] = {'duplicates': last[1] - first[1], 'dispatches': dispatched, 'expected': (w.get('n', 2) - 1) * dispatched,
+                     'span_s': [round(first[0] - t0, 3), round(last[0] - t0, 3)]}
     if any(v['duplicates'] is None for v in out.values()):     # no sampler row at a window edge
         return _line(False, {'why': 'a dup window edge has no sampler row', 'windows': out}, inconclusive=True)
     ok = all(v['dispatches'] > 0 and abs(v['duplicates'] - v['expected']) <= s['A05_DUP_EDGE_SLACK'] for v in out.values())
