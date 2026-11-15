@@ -276,9 +276,29 @@ class CutManifestBuilderTest(unittest.TestCase):
 
     def test_build_a_must_be_pinned(self):
         self.world.pins.clear()
-        with self.assertRaisesRegex(Violation, 'K4 .*not pinned in the old-artifact pins'):
+        with self.assertRaisesRegex(Violation, 'build A .*ct-forwarder .*is not pinned in the old-artifact pins'):
             self.built('s17-a05')
+        self.assertFalse((self.cfg.runs / 'manifests' / 's17-a05--r1.json').exists())
         self.built('s17-ext')           # a kind without build A needs no pin
+
+    def test_build_a_is_named_by_its_pin_not_by_a_constant(self):
+        """A v8 cut needs a build A on the v8 wire (an older build of the cut's own wire): build A is whatever MK_BIN_A
+        holds, and its commit is the source_sha of its pin, so a new build A is a new pin, never a code change."""
+        import release_cut
+        newer = 'b' * 40
+        self.world.pins = {k: dict(v, source_sha=newer) for k, v in self.world.pins.items()}
+        for kind in ('s17-a05', 's17-a05-embedded', 's17-a05-keep', 's17-a05-reverse'):
+            with self.subTest(kind=kind):
+                _, m = self.built(kind)
+                slot = 'bridge_b' if kind == 's17-a05-reverse' else 'forwarder'
+                self.assertEqual(m['artifacts'][slot]['source_sha'], newer)
+                self.assertEqual(release_cut.check(m, self.world.m, mk_manifests.cut_class(kind), old_pins=self.world.pins).items,
+                                 [], kind)
+        self.assertIn('build A ct bbbbbbb', self.built('s17-a05')[1]['profile_note'])
+        broken = {k: dict(v, source_sha='short') for k, v in self.world.pins.items()}
+        self.world.pins = broken
+        with self.assertRaisesRegex(Violation, 'the pin of build A .* needs a 40-hex source_sha'):
+            self.built('s17-a05')
 
     def test_a_cut_the_checker_refuses_is_refused(self):
         bad = json.loads(self.cut_path.read_text()); bad['substrate']['aeron']['ae'] = '1.53.0'
