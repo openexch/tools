@@ -62,6 +62,7 @@ FORWARDER_STOP_CONTRACT_S = 1.0
 SESSION_WINDOW_S = 10.0          # the core's session timeout a killed forwarder's session outlives it by
 READY_AFTER_KILL_S = 5.0         # The ready_after_kill bound, a setting (measured 1.12 s in DR-A05)
 REPLACE_READY_BOUND_S = 60       # stops a hung replacement wait; not a line
+GENESIS_CAPTURE_SETTLE_S = 15         # a follower appends the committed CoreConfig frames within this after the genesis
 REGENESIS_HEAL_BOUND_S = 900     # a stopped or fenced role stays a fault target across both regenesis scopes and the halt phase
 ENGINE_LIBS_DIR = '/artifacts/engine_libs'
 PROJECTOR_LIBS_DIR = '/artifacts/projector_libs'
@@ -907,21 +908,40 @@ class CoreFixture(Fixture):
             return sum(1 for line in path.read_text().splitlines() if line.strip()) if path.is_file() else 0
         return {'commands': rows('commands.jsonl'), 'core_requests': rows('core-requests.jsonl')}
 
-    def capture_core_genesis(self, life):
-        """The core's recorded genesisId of ``life`` is in the AE log recordings that regenesis('core')
-        is about to wipe; the reader output (release_cut.genesis_reader) is kept in the state root with its sha256 first. s17 kinds
-        (the ones that issue activation records); an error is recorded as the capture, so the record cannot read OK."""
+    def capture_core_genesis(self, life, settle_s=0):
+        """The core's recorded genesisId of ``life`` (release_cut.genesis_reader over the AE log recordings), kept in the state
+        root with its sha256; the activation record reads this capture, not the end-of-run logs. s17 kinds (the ones that
+        issue activation records); an error is recorded as the capture, so the record cannot read OK.
+
+        Taken twice. Right after the core genesis (``settle_s`` > 0): the CoreConfig frames sit at the head of every
+        member's log, and a later log purge (snapshot reclaim, the shadow floor) removes the segment that holds them, so a
+        reader at the end of the run finds them on some members only ("members differ"). A follower that has not appended
+        them yet is waited for up to ``settle_s`` (only while the members differ). And before regenesis('core') wipes the
+        AE: that one keeps an earlier capture of the life that observed the genesisId (the logs may be purged by then)."""
         if not core_contracts.cut_derived(self.m.get('manifest_kind')):
             return None
         import release_cut
-        try:
-            reader = release_cut.genesis_reader(self.root, release_cut.load_money_schema(self.m['artifacts']['ae']['path']))
-        except Exception as error:
-            reader = {'status': 'not observable', 'genesis_id': None, 'error': str(error)[:300], 'members': {}}
+        record = self.registry.setdefault('lives', {}).setdefault(str(life), {})
+        earlier = record.get('core_genesis_reader')
+        if earlier and Path(earlier['path']).is_file():
+            try:
+                if json.loads(Path(earlier['path']).read_text()).get('status') == 'observed':
+                    return earlier
+            except ValueError:
+                pass
+        deadline = time.monotonic() + settle_s
+        while True:
+            try:
+                reader = release_cut.genesis_reader(self.root, release_cut.load_money_schema(self.m['artifacts']['ae']['path']))
+            except Exception as error:
+                reader = {'status': 'not observable', 'genesis_id': None, 'error': str(error)[:300], 'members': {}}
+            if reader.get('status') != 'members differ' or time.monotonic() >= deadline:
+                break
+            self.sleep(0.5)
         path = self.root / f'core-genesis-life{life}.json'
         path.write_text(json.dumps(reader, indent=1) + '\n')
         entry = {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
-        self.registry.setdefault('lives', {}).setdefault(str(life), {})['core_genesis_reader'] = entry
+        record['core_genesis_reader'] = entry
         self.save()
         return entry
 
@@ -932,6 +952,8 @@ class CoreFixture(Fixture):
             getattr(self, step)(plan)
             phases[phase] = time.time_ns()
             self.save()
+            if step == 'core_genesis':          # before any snapshot can let a log purge take the CoreConfig frames
+                self.capture_core_genesis(self.life('core'), settle_s=GENESIS_CAPTURE_SETTLE_S)
 
     def _ok(self, verb, principal, **kv):
         meaning, reply = self.core(verb, principal, **kv)
