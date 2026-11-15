@@ -1352,7 +1352,7 @@ class RegenesisTest(LifecycleBase):
         with (f.root / 'commands.jsonl').open('a') as log:
             log.write('{}\n' * 4)
         order = []
-        f.capture_core_genesis = lambda life: order.append(('capture', life))
+        f.capture_core_genesis = lambda life, **kw: order.append(('capture', life))
         f.audit_genesis = lambda life=1: order.append(('audit', life))
         calls = self.recorded(f, ['stop', 'wipe_engine', 'reset_projection', 'start_members'] + self.CORE_STEPS)
         wipe = f.wipe_engine
@@ -1362,6 +1362,7 @@ class RegenesisTest(LifecycleBase):
         self.assertEqual(order[0], ('capture', 1))                       # before the first AE wipe
         self.assertEqual(order[1], ('wipe', 'ae0'))
         self.assertEqual(order[-1], ('audit', 2))
+        self.assertIn(('capture', 2), order)                             # life 2 captured right after its genesis
         self.assertEqual(f.registry['genesis']['derivation'], f.genesis_derivation())
         self.assertEqual(f.registry['genesis']['life'], 2)
         self.assertEqual(f.registry['lives']['1']['records']['genesis']['genesis_id'], g1)
@@ -1377,6 +1378,46 @@ class RegenesisTest(LifecycleBase):
         entry = f.registry['lives']['1']['core_genesis_reader']
         self.assertEqual(json.loads(Path(entry['path']).read_text()), fake)
         self.assertEqual(entry['sha256'], hashlib.sha256(Path(entry['path']).read_bytes()).hexdigest())
+
+    def test_the_genesis_capture_survives_a_later_log_purge(self):
+        """RED 29798d0: the activation record read the CoreConfig frames from the AE logs at the END of the run; the shadow
+        floor and the snapshot reclaim had purged the log segment that held them on two members (ae0 and ae2 started at
+        10485760), so the record read 'members differ' and was INCOMPLETE on 17 of 18 entries of a night whose drills all
+        passed. The reader is now captured right after the core genesis, and a later capture (regenesis) keeps it."""
+        import release_cut
+        import test_release_cut as T
+        f = self.fx()
+        f.m['manifest_kind'] = 's17-ext'
+        schema = f.root / 'money-schema.xml'; schema.write_bytes(T.MONEY_SCHEMA)
+        f.m['artifacts']['ae']['path'] = str(schema)
+        for m in ('ae0', 'ae1', 'ae2'):
+            T.write_ae_member(f.root, m, [T.core_config_payload(v, T.GID) for v in (1, 2, 3)])
+        f.sleep = lambda s: None
+        f.core_genesis = lambda plan: None                                 # the driver ran: the frames are in the logs
+        f.run_genesis_steps({}, [('core_genesis', 'core_genesis_ns')], {})
+        entry = f.registry['lives']['1']['core_genesis_reader']
+        self.assertEqual(json.loads(Path(entry['path']).read_text())['genesis_id'], T.GID)
+        for m in ('ae0', 'ae2'):                                            # the purge after the snapshots
+            (f.root / 'state' / m / 'state' / 'archive' / '0-0.rec').unlink()
+        self.assertEqual(release_cut.genesis_reader(f.root, schema)['status'], 'members differ')     # the end-of-run read
+        self.assertEqual(f.capture_core_genesis(1), entry)                  # regenesis: the observed capture is kept
+        self.assertEqual(json.loads(Path(entry['path']).read_text())['status'], 'observed')
+
+    def test_the_genesis_capture_waits_for_a_late_follower_only_while_members_differ(self):
+        import release_cut
+        f = self.fx()
+        f.m['manifest_kind'] = 's17-ext'
+        reads = iter([{'status': 'members differ', 'members': {}}, {'status': 'observed', 'genesis_id': 7, 'members': {}}])
+        slept = []
+        f.sleep = slept.append
+        with mock.patch.object(release_cut, 'genesis_reader', lambda root, schema: next(reads)), \
+                mock.patch.object(release_cut, 'load_money_schema', lambda jar: 'schema'):
+            entry = f.capture_core_genesis(1, settle_s=15)
+        self.assertEqual((json.loads(Path(entry['path']).read_text())['status'], slept), ('observed', [0.5]))
+        with mock.patch.object(release_cut, 'genesis_reader', lambda root, schema: {'status': 'not observable', 'members': {}}), \
+                mock.patch.object(release_cut, 'load_money_schema', lambda jar: 'schema'):
+            f.capture_core_genesis(2, settle_s=15)
+        self.assertEqual(slept, [0.5])                                      # nothing to wait for: no member holds a frame
 
     def test_regenesis_core_needs_an_me_regenesis_first(self):
         f = self.fx(); life1(f)
