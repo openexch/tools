@@ -158,17 +158,20 @@ class CutManifestBuilderTest(unittest.TestCase):
             nc[attr] = put(d + '/bin/oe-gateway', b'ELF oe-gateway nc ' + define.encode() + b' ' + self.world.m['repos']['gateway'].encode())
             put(d + '/CMakeCache.txt', f'CMAKE_CXX_FLAGS:STRING=-D{define}\n'.encode())
         shim = (Path(mk_manifests.__file__).resolve().with_name('gateway_shim.py')).read_bytes()
+        stub = (Path(mk_manifests.__file__).resolve().with_name('projector_stub.py')).read_bytes()
         blob = self.world.blob
         def blob_with_shim(repo, commit, rel):
             if repo == 'tools' and rel == mk_manifests.release_cut.GATEWAY_SHIM and commit == self.world.m['harness_commit']:
                 return shim
+            if repo == 'tools' and rel == mk_manifests.release_cut.PROJECTOR_STUB and commit == self.world.m['harness_commit']:
+                return stub
             return blob(repo, commit, rel)
         patch = mock.patch.object(mk_manifests.release_cut, 'git_blob', blob_with_shim); patch.start(); self.addCleanup(patch.stop)
         self.cfg = mk_manifests.Config(
             runs=root / 'runs', bin_a=self.bin_a, driver_properties=dp,
             driver_properties_sha256=hashlib.sha256(DP_TEXT.encode()).hexdigest(), netfilter_helper=root / 'helper',
             harness_commit='e' * 40, harness_dirty=False, image='sha256:' + 'e' * 64, cut_nc_dir=root / 'ct-test',
-            **nc)
+            core_probe_source=Path(self.world.m['harness']['core_probe']['source_path']), **nc)
 
     def tearDown(self):
         self.temp.cleanup()

@@ -408,6 +408,14 @@ class SlotEnvTest(unittest.TestCase):
                 g = gateway_fixture(self.dir, driver, slots)
                 for slot in core_contracts.GATEWAY_SLOTS:
                     names |= set(g.gateway_slot_env(slot))
+        # The projection kinds: the stand-in in both projection slots, its settings named, both driver modes
+        from test_projection import projection_fixture
+        import projector_stub
+        for driver in ('external', 'embedded'):
+            p = projection_fixture(self.dir, driver)
+            p.projection_stub_settings = dict(projector_stub.SETTINGS)
+            for slot in core_contracts.PROJECTION_SLOTS:
+                names |= set(p.projection_slot_env(slot))
         f = self.fx()
         self.assertEqual(names, f.allowed_env())
         # every set value passes the guard

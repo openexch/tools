@@ -47,6 +47,11 @@ The gateway kinds (``core_contracts.GATEWAY_KINDS``: gw, gw-ext, gw-slow(-ext), 
 gw-dry-stream-ceiling16m, gw-dry-gateway(-ext), gw-dry-gateway-freshkey) are derived from an rc2-cut/3 cut: the four
 gateway roles at .40-.43, oe-gateway and oe-stream from the cut, the session stub from the cut's cluster-tools test build
 (MK_CUT_NC_DIR), gateway_nc from the MK_GATEWAY_NC* setting of the kind's control define and the HTTP shim from this harness.
+
+The projection kinds (pj-dry, pj-dry-ext, pj-dry-beatalways; gateway kinds with ``projectors``) add the projection roles
+pj0 and pj1 at .44-.45 and the projection stand-in (projector_stub.py) from this harness. The stand-in reads the order-event
+ring with ``CoreProbe order-events fields=full``: on a cut whose probe predates that, the kind takes the probe of
+MK_PROBE_MANIFEST compiled from this tree, and only with --harness-drift (recorded).
 """
 import argparse
 from dataclasses import dataclass, field
@@ -144,6 +149,8 @@ class Config:
                                          "oe-gateway of the cut's gateway commit built with GW_NC_NO_ASSET_CHECK")
     shm_mb: dict = field(default_factory=dict)                 # per-role overrides of SHM_MB (settings)
     harness_drift: str = None                                  # A named waiver (rig kinds only), recorded
+    # The CoreProbe.java a projection kind's probe must be compiled from (this tree's; a test points it elsewhere)
+    core_probe_source: Path = Path(__file__).resolve().parent / 'java' / 'CoreProbe.java'
     memory_mb: dict = field(default_factory=dict)
 
 
@@ -320,6 +327,10 @@ SHIM_MEMORY_MB = 2048
 GATEWAY_NC_BUILDS = {'GW_NC_FRESH_KEY': ('gateway_nc', 'MK_GATEWAY_NC'),
                      'GW_NC_NO_CANCEL_REOFFER_RULE': ('gateway_nc_no_reoffer', 'MK_GATEWAY_NC_NO_CANCEL_REOFFER_RULE'),
                      'GW_NC_NO_ASSET_CHECK': ('gateway_nc_no_asset', 'MK_GATEWAY_NC_NO_ASSET_CHECK')}
+# The projection slots' addresses (after the gateway roles') and container sizes: settings with defaults. The stand-in
+# runs one CoreProbe JVM per poll, hence its memory.
+PROJECTION_NODE_BASE = 44
+PROJECTION_LIMITS = {'cpu_set': [6, 7, 8, 9], 'cpu_quota': 1.0, 'memory_mb': 2048, 'shm_mb': 256}
 # The replica's container on the replica kinds: settings with defaults (the slots' CPUs, one CPU of quota, 2 GiB)
 REPLICA_LIMITS = {'cpu_set': [6, 7, 8, 9], 'cpu_quota': 1.0, 'memory_mb': 2048, 'shm_mb': 1024}
 def cut_roles(cut):
@@ -453,6 +464,8 @@ def build_from_cut(kind, tag, cut_path, cfg=None, old_pins=None):
     for key, name in CUT_HARNESS.items():
         e = harness[name]
         m[key] = {'path': e['path'], 'sha256': e['sha256'], 'source_path': e['source_path'], 'source_sha256': e['source_sha256']}
+    if kind in core_contracts.PROJECTION_KINDS:
+        m['core_probe'] = projection_probe(cfg, harness['core_probe'])
     if engine_driver == 'external':
         m['engine_driver'] = 'external'
         libs = _engine_libs(cfg)
@@ -513,15 +526,62 @@ def add_gateway_slots(m, kind, cut, cfg, cut_libs, harness_commit):
         limits['shm_mb_by_role'][role] = cfg.shm_mb.get(role, GATEWAY_LIMITS['shm_mb'])
     if spec['core_jvm']:
         m['core_jvm_properties'] = dict(spec['core_jvm'])
+    if spec.get('projectors'):
+        add_projection_slots(m, kind, cfg, harness_commit)
     m['profile_note'] += (f'; gateway slots {driver} ({", ".join(f"{k}={v}" for k, v in sorted(spec["slots"].items()))})'
                           + (f'; core {", ".join(f"{k}={v}" for k, v in sorted(spec["core_jvm"].items()))}' if spec['core_jvm'] else ''))
+
+
+def projection_probe(cfg, cut_probe):
+    """The core probe of a projection kind: the cut's, when the cut's probe was compiled from this harness tree's
+    CoreProbe.java; otherwise (a drifted harness, which the stand-in's ``order-events fields=full`` needs until the next cut)
+    the probe of MK_PROBE_MANIFEST compiled from this tree, under the manifest's named harness_drift waiver only."""
+    here = sha(cfg.core_probe_source)
+    keys = ('path', 'sha256', 'source_path', 'source_sha256')
+    if cut_probe.get('source_sha256') == here:
+        return {k: cut_probe[k] for k in keys}
+    if not cfg.harness_drift:
+        raise Violation('a projection kind needs a core probe compiled from this harness tree\'s CoreProbe.java (order-events '
+                        'fields=full); the cut\'s is another source: run with --harness-drift REASON and MK_PROBE_MANIFEST')
+    probe = json.loads(Path(cfg.probe_manifest).read_text())['core_probe']
+    if probe.get('source_sha256') != here or sha(_need(probe['path'], 'core_probe')) != probe['sha256'] \
+            or sha(_need(probe['source_path'], 'core_probe source')) != here:
+        raise Violation(f'MK_PROBE_MANIFEST core_probe is not compiled from this tree\'s CoreProbe.java ({here[:12]})')
+    return {k: probe[k] for k in keys}
+
+
+def add_projection_slots(m, kind, cfg, harness_commit):
+    """The projection kind's two roles, port, artifacts, slot plan and limits (core_contracts.GATEWAY_KINDS 'projectors')."""
+    spec = core_contracts.GATEWAY_KINDS[kind]
+    used = set(spec['projectors'].values()) - {None}
+    art = {name: None for name in core_contracts.PROJECTION_BINARIES}
+    if 'history_projector' in used:
+        raise Violation(f'{kind}: the history projector binary is not in a cut yet')
+    if 'projector_stub' in used:
+        path = Path(__file__).resolve().with_name('projector_stub.py')
+        art['projector_stub'] = {'path': str(path), 'sha256': sha(path), 'source_sha': harness_commit, 'driver': 'embedded',
+                                 'target': 'projector_stub', 'mode': spec['stub_mode']}
+    m['artifacts'].update(art)
+    octet = m['network']['subnet'].split('.')[2]
+    m['nodes'].update({role: f'172.30.{octet}.{PROJECTION_NODE_BASE + j}'
+                       for j, role in enumerate(sorted(core_contracts.PROJECTION_ROLES))})
+    m['ports'].update(core_contracts.PROJECTION_PORTS)
+    m['slot_artifacts'].update(spec['projectors'])
+    limits = m['limits']
+    for role in core_contracts.PROJECTION_ROLES:
+        limits['cpu_set_by_role'][role] = list(PROJECTION_LIMITS['cpu_set'])
+        limits['cpu_quota_by_role'][role] = PROJECTION_LIMITS['cpu_quota']
+        limits['memory_mb_by_role'][role] = cfg.memory_mb.get(role, PROJECTION_LIMITS['memory_mb'])
+        limits['shm_mb_by_role'][role] = cfg.shm_mb.get(role, PROJECTION_LIMITS['shm_mb'])
+    m['profile_note'] += '; projection slots ' + ', '.join(f'{k}={v}' for k, v in sorted(spec['projectors'].items())) + (
+        f' (stand-in mode {spec["stub_mode"]})' if 'projector_stub' in used else '')
 
 
 def _sizes(pairs):
     sizes = {}
     for pair in pairs or []:
         role, _, value = pair.partition('=')
-        if role not in core_contracts.ROLES | core_contracts.GATEWAY_ROLES or not value.isdigit():
+        if role not in core_contracts.ROLES | core_contracts.GATEWAY_ROLES | core_contracts.PROJECTION_ROLES or not value.isdigit():
             raise SystemExit('a size override is ROLE=MB, got ' + pair)
         sizes[role] = int(value)
     return sizes

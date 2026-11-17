@@ -247,7 +247,7 @@ public final class CoreProbe {
                 case "deposit", "withdraw" -> funding(verb.equals("deposit"));
                 case "create", "cancel", "amend" -> order(verb);
                 case "order-dump" -> orderDump();
-                case "order-events" -> orderEvents();
+                case "order-events" -> orderEvents(credentials.sessionClass());
                 case "user-balances" -> userBalances();
                 case "config-report" -> configReport();
                 case "core-limits" -> coreLimits();
@@ -575,13 +575,24 @@ public final class CoreProbe {
      * the head probe, one End and no events; a negative value is sent as is and the core refuses it). Pages are requested
      * until the bound or the head is reached. An overrun (the ring no longer holds the next event) is never a silent short
      * reply: the range it lost is reported in {@code lost} and the replay continues from the oldest event the ring holds.
+     * {@code fields=full} adds every other field of the event block to each row ({@link #fullFields}); the default row
+     * shape is the tap's. A GATEWAY session registers first (acks and control only; the core refuses a query from an
+     * unregistered GATEWAY session); an ADMIN session needs no registration.
      */
-    private int orderEvents() {
+    private int orderEvents(final SessionClass sessionClass) {
         final long until = args.containsKey("until") ? num("until") : Long.MAX_VALUE;
         final int max = args.containsKey("max") ? (int) num("max") : EventReplay.PAGE_MAX;
+        final String fields = args.getOrDefault("fields", "tap");
+        if (!fields.equals("tap") && !fields.equals("full")) {
+            throw new IllegalArgumentException("order-events fields= is tap or full, got " + fields);
+        }
         final EventReplay replay = new EventReplay(num("from"), until, max);
+        if (sessionClass == SessionClass.GATEWAY) {
+            register(corr(), SessionClass.GATEWAY, false, false);
+        }
         listener.reset();
         listener.replay = replay;
+        listener.fullRows = fields.equals("full");
         while (replay.next()) {
             listener.nextPage();
             offer(HEADER + new RequestOrderEventsEncoder().wrapAndApplyHeader(buffer, 0, headerEncoder)
@@ -2359,6 +2370,7 @@ public final class CoreProbe {
         StorySink story;
         boolean reregister;
         EventReplay replay;
+        boolean fullRows;            // order-events fields=full
         final Map<String, String> balances = new java.util.LinkedHashMap<>();
         final Map<Long, String> holds = new java.util.LinkedHashMap<>();
 
@@ -2556,9 +2568,13 @@ public final class CoreProbe {
                     for (final OrderEventsPageDecoder.EventsDecoder e : d.events()) {
                         if (replay.wanted(e.eventSeq())) {
                             replay.events++;
-                            rows.add(eventRow(e.eventSeq(), e.orderId(), e.eventKind().name(), e.status().name(), e.reason().name(),
-                                    e.filledQty(), e.quantity(), e.remainingQty(), e.tradeId(), e.meOrderId(), e.holdAmount(),
-                                    e.holdRemaining(), e.logPosition()));
+                            final String row = eventRow(e.eventSeq(), e.orderId(), e.eventKind().name(), e.status().name(),
+                                    e.reason().name(), e.filledQty(), e.quantity(), e.remainingQty(), e.tradeId(), e.meOrderId(),
+                                    e.holdAmount(), e.holdRemaining(), e.logPosition());
+                            rows.add(fullRows ? row.substring(0, row.length() - 1) + fullFields(e.userId(), e.marketId(),
+                                    e.side().name(), e.orderType().name(), e.timeInForce().name(), e.price(), e.stopPrice(),
+                                    e.lastPrice(), e.lastQty(), e.holdAssetId(), e.clientOrderIdHigh(), e.clientOrderIdLow(),
+                                    e.createdAtMs(), e.updatedAtMs(), e.meReason()) + "}" : row);
                         }
                     }
                 }
@@ -2706,6 +2722,21 @@ public final class CoreProbe {
                              final long holdAmount, final long holdRemaining, final long logPosition) {
             return "{\"tap\":\"order_event\",\"row\":" + eventRow(seq, order, kind, status, reason, filled, qty, remaining, trade,
                     leg, holdAmount, holdRemaining, logPosition) + "}";
+        }
+
+        /**
+         * The fields of the event block the tap's row leaves out, as a JSON key list that starts with a comma
+         * ({@code order-events fields=full}): what a stand-in history projection needs to fill the read relations.
+         */
+        static String fullFields(final long user, final int market, final String side, final String type, final String tif,
+                                 final long price, final long stopPrice, final long lastPrice, final long lastQty,
+                                 final int holdAsset, final long clientHigh, final long clientLow, final long createdMs,
+                                 final long updatedMs, final short meReason) {
+            return ",\"user\":" + user + ",\"market\":" + market + ",\"side\":" + q(side) + ",\"type\":" + q(type)
+                    + ",\"tif\":" + q(tif) + ",\"price\":" + price + ",\"stop_price\":" + stopPrice + ",\"last_price\":"
+                    + lastPrice + ",\"last_qty\":" + lastQty + ",\"hold_asset\":" + holdAsset + ",\"client_order_id_high\":"
+                    + clientHigh + ",\"client_order_id_low\":" + clientLow + ",\"created_ms\":" + createdMs
+                    + ",\"updated_ms\":" + updatedMs + ",\"me_reason\":" + meReason;
         }
 
         /** One order event in the tap's row shape; {@code order-events} replays use the same keys. */
