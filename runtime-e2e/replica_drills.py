@@ -303,6 +303,15 @@ def line_promotion_observed(w):
     return _line(False, f'promotion not observed in {len(attempts)} attempts', inconclusive=True)
 
 
+def snapshot_position_of(metrics):
+    """One member's last snapshot position from its metrics, counted only when it took a snapshot in this process
+    life (age >= 0)."""
+    age = gauge(metrics, 'core_snapshot_age_seconds')
+    if age is None or age < 0:
+        return None
+    return gauge(metrics, 'core_snapshot_last_log_position')
+
+
 def snapshot_positions(raw):
     """The distinct member snapshot positions a run saw, ascending. The gauge reads -1 before the first snapshot and an
     unreadable leader gives None; neither is a snapshot, so only positive positions count."""
@@ -635,8 +644,11 @@ class ReplicaDrillRun(DrillRun):
         return None
 
     def snapshot_position(self):
+        """The leader's last snapshot position, or None when the leader took no snapshot in this process life
+        (``core_snapshot_age_seconds`` -1): a member restarted from an older image reports that image's position until
+        it snapshots, which is not a snapshot this run saw."""
         leader = self.leader()
-        return gauge(self.try_read(lambda: self.mm(leader)), 'core_snapshot_last_log_position') if leader else None
+        return snapshot_position_of(self.try_read(lambda: self.mm(leader))) if leader else None
 
     def until(self, probe, bound_s, period_s=0.25):
         """``probe()`` until it returns a truthy value or the bound runs out: (value, elapsed_s); (None, elapsed) at the bound."""

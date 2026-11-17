@@ -235,6 +235,14 @@ class PromotionLineTest(unittest.TestCase):
         self.assertFalse(holds(rd.line_aligned_per_snapshot(w(snapshots={'positions': [10, 20, 30], 'aligned_delta': 1}))))
         self.assertTrue(rd.line_aligned_per_snapshot(w(snapshots={'positions': []}))['inconclusive'])
 
+    def test_a_position_counts_only_after_a_snapshot_in_this_life(self):
+        # a member restarted from an older image reports that image's position (age -1) until it snapshots
+        self.assertIsNone(rd.snapshot_position_of({'core_snapshot_age_seconds': -1, 'core_snapshot_last_log_position': 4096}))
+        self.assertIsNone(rd.snapshot_position_of({'core_snapshot_last_log_position': 4096}))
+        self.assertIsNone(rd.snapshot_position_of(None))
+        self.assertEqual(rd.snapshot_position_of({'core_snapshot_age_seconds': 0, 'core_snapshot_last_log_position': 4096}), 4096)
+        self.assertEqual(rd.snapshot_position_of({'core_snapshot_age_seconds': 12, 'core_snapshot_last_log_position': 8192}), 8192)
+
     def test_no_snapshot_yet_is_not_a_snapshot_position(self):
         # the gauge reads -1 before the first snapshot, an unreadable leader gives None; neither counts as a P_cm
         self.assertEqual(rd.snapshot_positions({-1, None, 0, 4096, 8192.0}), [4096, 8192])
