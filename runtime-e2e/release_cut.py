@@ -51,14 +51,17 @@ import zipfile
 
 from machine_paths import env_path
 
-SCHEMA = 'rc2-cut/2'                      # what a new cut manifest declares
-# The cut manifest layouts the checker reads. rc2-cut/2 names the core repo ``core`` and its jars ``core-*``; rc2-cut/1
-# (cuts written before the rename) names them ``assets`` / ``assets-*`` and stays readable as written.
+SCHEMA = 'rc2-cut/3'                      # what a new cut manifest declares
+# The cut manifest layouts the checker reads. rc2-cut/3 adds the gateway repo and its two binaries (oe-gateway,
+# oe-stream) to rc2-cut/2; rc2-cut/2 names the core repo ``core`` and its jars ``core-*``; rc2-cut/1 (cuts written
+# before the rename) names them ``assets`` / ``assets-*``. Every older layout stays readable as written.
 LAYOUTS = {
     'rc2-cut/1': {'repo': 'assets', 'cluster': 'assets-cluster.jar', 'projector': 'assets-projector.jar',
                   'retired': {'assets-bridge', 'oms-app', 'match-gateway'}},
     'rc2-cut/2': {'repo': 'core', 'cluster': 'core-cluster.jar', 'projector': 'core-projector.jar',
                   'retired': {'core-bridge', 'oms-app', 'match-gateway'}},
+    'rc2-cut/3': {'repo': 'core', 'cluster': 'core-cluster.jar', 'projector': 'core-projector.jar',
+                  'retired': {'core-bridge', 'oms-app', 'match-gateway'}, 'gateway': True},
 }
 SCHEMAS = tuple(LAYOUTS)
 RULES = tuple(f'K{n}' for n in range(1, 11))
@@ -85,6 +88,13 @@ _PRODUCT_REST = {
     'libaeron_driver.so': {'repo': 'cluster-tools', 'lang': 'cpp', 'schemas': ()},
     'libaeron.so': {'repo': 'cluster-tools', 'lang': 'cpp', 'schemas': ()},
 }
+# The gateway repo's two binaries (rc2-cut/3): C++, stamped with the gateway commit (GW_BUILD_SOURCE_SHA, /health
+# "build"), carrying the money schema sha256 the gateway lock pins
+GATEWAY_PRODUCT = {
+    'oe-gateway': {'repo': 'gateway', 'lang': 'cpp', 'stamped': True, 'schemas': ('money',)},
+    'oe-stream': {'repo': 'gateway', 'lang': 'cpp', 'stamped': True, 'schemas': ('money',)},
+}
+GATEWAY_SHIM = 'runtime-e2e/gateway_shim.py'
 # Every retired artifact name of every layout: an old assets-bridge jar stays retired in a new cut, as core-bridge does.
 RETIRED = set().union(*(layout['retired'] for layout in LAYOUTS.values()))
 RETIRED_FILE = re.compile(r'(assets-bridge|core-bridge|oms-app|match-gateway)[^/]*$')
@@ -126,7 +136,7 @@ def layout(schema):
 
 
 def repos_of(schema):
-    return (layout(schema)['repo'],) + OTHER_REPOS
+    return (layout(schema)['repo'],) + OTHER_REPOS + (('gateway',) if layout(schema).get('gateway') else ())
 
 
 def product(schema=SCHEMA):
@@ -135,6 +145,8 @@ def product(schema=SCHEMA):
     core = {'repo': lay['repo'], 'lang': 'java', 'engine': True, 'schemas': {'money': MONEY_SCHEMA_MEMBER}}
     out = {'match-cluster.jar': _PRODUCT_REST['match-cluster.jar'], lay['cluster']: dict(core), lay['projector']: dict(core)}
     out.update((k, v) for k, v in _PRODUCT_REST.items() if k != 'match-cluster.jar')
+    if lay.get('gateway'):
+        out.update(GATEWAY_PRODUCT)
     return out
 
 
@@ -146,9 +158,12 @@ def aeron_roles(schema=SCHEMA):
 def fixture_names(schema=SCHEMA):
     """Fixture artifact role -> the cut artifact name it stages."""
     lay = layout(schema)
-    return {'me': 'match-cluster.jar', 'ae': lay['cluster'], 'projector': lay['projector'], 'forwarder': 'ct-forwarder',
-            'bridge': 'ct-bridge', 'forwarder_b': 'ct-forwarder', 'bridge_b': 'ct-bridge',
-            'shadow': lay['cluster']}            # the replica is CORE_ROLE=replica of the core jar
+    names = {'me': 'match-cluster.jar', 'ae': lay['cluster'], 'projector': lay['projector'], 'forwarder': 'ct-forwarder',
+             'bridge': 'ct-bridge', 'forwarder_b': 'ct-forwarder', 'bridge_b': 'ct-bridge',
+             'shadow': lay['cluster']}            # the replica is CORE_ROLE=replica of the core jar
+    if lay.get('gateway'):
+        names.update(gateway='oe-gateway', stream='oe-stream')
+    return names
 
 
 def core_repo(cut):
@@ -647,6 +662,7 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
     """A fixture manifest derived from the cut stages only the cut's bytes. Every staged file is found in the cut by sha256:
     a product artifact (its role and source must agree), a harness program, or, in a rig kind only, a pinned upgrade_from /
     old_artifacts entry; a ``*_b`` or negative target is refused in a product kind."""
+    import core_contracts
     f = Findings(rules)
     old_pins = load_old_pins(old_pins_path()) if old_pins is None else old_pins
     cut_findings = check_cut(cut, rules, cls=cut.get('class'), old_pins=old_pins)
@@ -698,6 +714,11 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
         if entry is None:
             continue
         what = 'artifacts.' + key
+        if key in core_contracts.GATEWAY_TEST_ARTIFACTS:
+            _gateway_test_artifact(f, what, key, entry, m, cut, cls)
+            for lib, lentry in ((entry or {}).get('libs') or {}).items():
+                staged(f'{what}.libs.{lib}', lentry, lib)
+            continue
         if key.endswith('_b') and cls == 'product':
             f.add('K3', f'{what}: a second build ({key}) in a product kind')
         target = entry.get('target') if isinstance(entry, dict) else None
@@ -716,7 +737,6 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
     # In a rig kind a negative target is a RED's (a s17-red* kind) or the declared A03 phase 1
     # (an A03 kind, ct_forwarder_nc_norelease as forwarder_b in both forwarder slots, build A as forwarder);
     # any other GREEN kind stages real builds only
-    import core_contracts
     kind = str(m.get('manifest_kind') or '')
     negatives = sorted(k for k, e in artifacts.items() if isinstance(e, dict) and e.get('target')
                        and TEST_BUILD.search(str(e['target'])))
@@ -751,6 +771,60 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
             if m.get(key, 'embedded') == 'embedded' and m.get('topology') == 'core':
                 f.add('K7', f'{key}: embedded in a product kind (production is external aeronmd)')
     return f
+
+
+def build_tree_setting(path, key):
+    """The value of ``key`` in the CMakeCache.txt of the build tree that holds ``path`` (the nearest parent that has one),
+    or None: how a test build that carries no stamp names the commit and the options it was configured with."""
+    for parent in Path(path).resolve().parents:
+        cache = parent / 'CMakeCache.txt'
+        if cache.is_file():
+            for line in cache.read_text(errors='replace').splitlines():
+                name, _, value = line.partition('=')
+                if name.split(':', 1)[0] == key:
+                    return value
+            return None
+    return None
+
+
+def _gateway_test_artifact(f, what, key, entry, m, cut, cls):
+    """A test-only gateway slot artifact (core_contracts.GATEWAY_TEST_ARTIFACTS): refused in a product kind (K3); in a rig
+    kind it must be a build of the cut's own commit: gateway_nc carries the cut's gateway sha (its stamp), the session
+    stub sits in a cluster-tools build tree configured at the cut's commit with CT_SESSION_STUB=ON, and the HTTP shim is
+    the byte copy of gateway_shim.py at the harness commit (a rig manifest's harness_drift waiver covers a shim of an
+    uncommitted harness, recorded)."""
+    if cls == 'product':
+        f.add('K3', f'{what}: a test-only build ({key}) in a product kind')
+        return
+    if not _rehash(f, what, entry):
+        return
+    repos = cut.get('repos') or {}
+    if key == 'gateway_nc':
+        want = repos.get('gateway')
+        if not want or entry.get('source_sha') != want or want.encode() not in Path(entry['path']).read_bytes():
+            f.add('K4', f'{what}: gateway_nc is not a build of the cut\'s gateway {want}')
+        # The build tree that holds the binary was configured with the control defines the entry names, nothing else
+        flags = (build_tree_setting(entry['path'], 'CMAKE_CXX_FLAGS') or '').split()
+        named = sorted('-D' + d for d in entry.get('defines') or [])
+        if sorted(flags) != named:
+            f.add('K4', f'{what}: gateway_nc build tree CMAKE_CXX_FLAGS {flags} is not the defines {named}')
+    elif key == 'session_stub':
+        want = repos.get('cluster-tools')
+        configured = build_tree_setting(entry['path'], 'CT_BUILD_SOURCE_SHA')
+        stub = build_tree_setting(entry['path'], 'CT_SESSION_STUB')
+        if not want or entry.get('source_sha') != want or configured != want or stub != 'ON':
+            f.add('K4', f'{what}: session_stub is not a CT_SESSION_STUB build of the cut\'s cluster-tools {want} '
+                        f'(build tree CT_BUILD_SOURCE_SHA {configured}, CT_SESSION_STUB {stub})')
+    elif key == 'gateway_stub':
+        blob = git_blob('tools', m.get('harness_commit'), GATEWAY_SHIM) if m.get('harness_commit') else None
+        same = blob is not None and hashlib.sha256(blob).hexdigest() == entry.get('sha256')
+        if not same:
+            text = f'{what}: the shim is not {GATEWAY_SHIM} at harness_commit {m.get("harness_commit")}'
+            waiver = m.get('harness_drift')
+            if isinstance(waiver, dict) and waiver.get('reason') and cls in ('rig', 'rig-xver'):
+                f.waived.append(text)
+            else:
+                f.add('K4', text)
 
 
 def check(manifest, cut=None, cls=None, rules=RULES, old_pins=None):

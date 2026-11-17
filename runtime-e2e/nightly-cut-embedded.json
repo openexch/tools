@@ -1,6 +1,6 @@
 {
  "money_schema_version": 8,
- "note": "Alternate-night plan, the embedded set (nightly.py --alternate, first file): the default plan (nightly-cut.json) in its order, then five replica drills with the engines and the replica embedded (re-bootstrap on shadow-anyverified). The other four embedded replica drills (member kill -9, peer loss, the shadow catalog and leader loss) run in the external set, which has the room: the sets are balanced by measured walls. Night bound NIGHTLY_BOUND_S.",
+ "note": "Alternate-night plan, the embedded set (nightly.py --alternate, first file): the default plan (nightly-cut.json) in its order, then five replica drills with the engines and the replica embedded (re-bootstrap on shadow-anyverified). The other four embedded replica drills (member kill -9, peer loss, the shadow catalog and leader loss) run in the external set, which has the room: the sets are balanced by measured walls. Night bound NIGHTLY_BOUND_S. The gateway session drills (gateway-kill-restart, stream-slow-consumer, gateway-session-timeout) run here embedded; the external set runs all five gateway drills external plus fill-visibility-core and tick-live-path embedded, so every gateway drill runs in both modes every 48 h.",
  "entries": [
   {
    "kind": "s17",
@@ -145,6 +145,18 @@
   {
    "kind": "shadow-anyverified",
    "scenario": "core-drill-replica-rebootstrap"
+  },
+  {
+   "kind": "gw",
+   "scenario": "gateway-kill-restart"
+  },
+  {
+   "kind": "gw-slow",
+   "scenario": "stream-slow-consumer"
+  },
+  {
+   "kind": "gw",
+   "scenario": "gateway-session-timeout"
   }
  ]
 }

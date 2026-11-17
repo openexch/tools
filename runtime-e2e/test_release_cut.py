@@ -15,7 +15,8 @@ import zipfile
 
 import release_cut
 
-SHAS = {'core': 'a' * 40, 'match': 'b' * 40, 'cluster-kit': 'c' * 40, 'cluster-tools': 'd' * 40, 'tools': 'e' * 40}
+SHAS = {'core': 'a' * 40, 'match': 'b' * 40, 'cluster-kit': 'c' * 40, 'cluster-tools': 'd' * 40, 'tools': 'e' * 40,
+        'gateway': 'f' * 40}
 TAG = {'match': '1' * 40, 'core': '2' * 40}
 CLUSTER, PROJECTOR = 'core-cluster.jar', 'core-projector.jar'      # the core jars of a current (rc2-cut/2) cut
 OLD_SCHEMA = 'rc2-cut/1'        # cuts written before the rename: repo key assets, assets-* jars
@@ -61,7 +62,9 @@ class World:
         self.record = {}
         art = {}
         lay = release_cut.layout(schema)
-        shas = {**{k: v for k, v in SHAS.items() if k != 'core'}, lay['repo']: SHAS['core']}
+        shas = {**{k: v for k, v in SHAS.items() if k not in ('core', 'gateway')}, lay['repo']: SHAS['core']}
+        if lay.get('gateway'):
+            shas['gateway'] = SHAS['gateway']
         for name in ('match-cluster.jar', lay['cluster'], lay['projector']):
             data = engine_jar(name)
             repo = release_cut.product(schema)[name]['repo']
@@ -74,6 +77,12 @@ class World:
             p = self.put('artifacts/' + name, data)
             self.build(name, 'cluster-tools', ct, data, 1)
             art[name] = self.entry(p, ct, 'binary-build-info')
+        if lay.get('gateway'):
+            for name in ('oe-gateway', 'oe-stream'):
+                data = b'ELF ' + name.encode() + b' ' + SHAS['gateway'].encode() + b' ' + SCHEMAS['money'].encode()
+                p = self.put('artifacts/' + name, data)
+                self.build(name, 'gateway', SHAS['gateway'], data, 1)
+                art[name] = self.entry(p, SHAS['gateway'], 'binary-build-info')
         for name in ('aeronmd', 'libaeron_driver.so', 'libaeron.so'):
             data = b'ELF ' + name.encode() + b' aeron 1.53.1'
             p = self.put('artifacts/' + name, data)
@@ -205,9 +214,9 @@ class CutLayoutTest(CheckerBase):
         patch = mock.patch.object(release_cut, 'git_blob', w.blob); patch.start(); self.addCleanup(patch.stop)
         return w
 
-    def test_a_new_cut_is_rc2_cut_2_with_repo_key_core(self):
-        self.assertEqual(release_cut.SCHEMA, 'rc2-cut/2')
-        self.assertEqual(self.w.m['schema'], 'rc2-cut/2')
+    def test_a_new_cut_is_rc2_cut_3_with_repo_key_core(self):
+        self.assertEqual(release_cut.SCHEMA, 'rc2-cut/3')
+        self.assertEqual(self.w.m['schema'], 'rc2-cut/3')
         self.assertIn('core', self.w.m['repos']); self.assertNotIn('assets', self.w.m['repos'])
         self.assertLessEqual({CLUSTER, PROJECTOR}, set(self.w.m['artifacts']))
         self.assertEqual(self.check(self.w.m).items, [])
@@ -235,9 +244,9 @@ class CutLayoutTest(CheckerBase):
         self.assertIn('K9', self.check(m).by_rule())
 
     def test_an_unknown_schema_is_refused(self):
-        m = copy.deepcopy(self.w.m); m['schema'] = 'rc2-cut/3'
+        m = copy.deepcopy(self.w.m); m['schema'] = 'rc2-cut/4'
         found = release_cut.check_cut(m, old_pins=self.w.pins)
-        self.assertIn(('K9', "schema must be one of rc2-cut/1, rc2-cut/2, got 'rc2-cut/3'"), found.items)
+        self.assertIn(('K9', "schema must be one of rc2-cut/1, rc2-cut/2, rc2-cut/3, got 'rc2-cut/4'"), found.items)
 
     def test_core_bridge_is_retired_in_a_new_cut_and_assets_bridge_stays_retired(self):
         for name in ('core-bridge', 'assets-bridge'):

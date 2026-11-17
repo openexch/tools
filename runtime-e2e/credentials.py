@@ -25,14 +25,29 @@ PRINCIPALS = [
 ]
 REPLICA_PRINCIPAL = ('shadow0', 'ae', 'REPLICA', 41)
 RESERVED = {'shadow0': 'this manifest runs no replica (slot_artifacts.shadow0 null): no REPLICA key is minted'}
+# The gateway and stream slots (minted only for a manifest that runs them): one GATEWAY key each. A stream serves
+# exchange-wide order events (the replay query needs an any-user principal), so its key is a GATEWAY key with users=*, as
+# every fixture key is. The gateway_stub (the test-only HTTP shim) runs in gw0/gw1 on the slot's own key.
+# Each gateway also holds a TREASURY key (the gateway's treasury lane: deposit and withdraw on their own TREASURY
+# session); like every key of the table it sits in CORE_AUTH_KEYS on all three members.
+GATEWAY_PRINCIPALS = [('gw0', 'ae', 'GATEWAY', 51), ('gw1', 'ae', 'GATEWAY', 52), ('st0', 'ae', 'GATEWAY', 53),
+                      ('st1', 'ae', 'GATEWAY', 54), ('gw0-treasury', 'ae', 'TREASURY', 55),
+                      ('gw1-treasury', 'ae', 'TREASURY', 56)]
+# A user API key of the gateway's api-key auth mode (GATEWAY_API_KEYS_FILE, one ``key:userId`` per line): 32 random
+# bytes as 64 hex characters (the gateway's floor is 16 characters)
+API_KEY_BYTES = 32
 
 
 class KeyRing:
-    def __init__(self, secret_source=None, replica=False):
+    def __init__(self, secret_source=None, replica=False, gateway=False):
         source = secret_source or (lambda: secrets.token_bytes(32))
+        self.source = source
         self.keys = {}
+        self.user_keys = {}
+        self.gateway = gateway
         self.reserved = {} if replica else dict(RESERVED)
-        for principal, cluster, cls, key_id in PRINCIPALS + ([REPLICA_PRINCIPAL] if replica else []):
+        for principal, cluster, cls, key_id in (PRINCIPALS + ([REPLICA_PRINCIPAL] if replica else [])
+                                                + (GATEWAY_PRINCIPALS if gateway else [])):
             if cls not in (AE_CLASSES if cluster == 'ae' else ME_CLASSES):
                 raise ValueError(f'{principal}: class {cls} not valid on {cluster}')
             secret = source()
@@ -52,13 +67,38 @@ class KeyRing:
         return f'{key_id}:{cls}:{secret}'
 
     def secrets(self):
-        return {secret for _, _, secret in self.keys.values()}
+        return {secret for _, _, secret in self.keys.values()} | set(getattr(self, 'user_keys', {}).values())
+
+    def api_keys(self, users):
+        """The gateway API key of each user (minted on first use, then fixed for the run): {user: key}. Only a keyring
+        of a manifest that runs the gateway slots mints them."""
+        if not self.gateway:
+            raise ValueError('this manifest runs no gateway slot: no user API key is minted')
+        out = {}
+        for user in users:
+            if type(user) is not int or user < 1:
+                raise ValueError('a user id is a positive integer: ' + repr(user))
+            if user not in self.user_keys:
+                secret = self.source()
+                if len(secret) != API_KEY_BYTES:
+                    raise ValueError('an API key is 32 random bytes')
+                self.user_keys[user] = secret.hex()
+            out[user] = self.user_keys[user]
+        return out
+
+    def api_keys_file(self, users):
+        """The text of GATEWAY_API_KEYS_FILE for ``users``: one ``key:userId`` per line, sorted by user."""
+        keys = self.api_keys(users)
+        return ''.join(f'{keys[u]}:{u}\n' for u in sorted(keys))
 
     def evidence(self):
         """Key ids and classes only; never a secret."""
         rows = [{'principal': p, 'cluster': c, 'key_id': k, 'class': cls}
                 for (p, c), (k, cls, _) in sorted(self.keys.items())]
-        return {'keys': rows, 'reserved': dict(getattr(self, 'reserved', RESERVED))}
+        out = {'keys': rows, 'reserved': dict(getattr(self, 'reserved', RESERVED))}
+        if getattr(self, 'gateway', False):
+            out['api_key_users'] = sorted(self.user_keys)
+        return out
 
 
 def redact(text, values):

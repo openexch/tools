@@ -95,6 +95,24 @@ def parse_prometheus(text):
     return values
 
 
+STUB_TOKEN = re.compile(r'([a-z_]+)=("[^"]*"|\S+)')
+
+
+def parse_stub_line(line):
+    """One ct_session_stub output line (``[docker timestamp] [ts] event=<name> k=v ...``) as a dict, or None. The docker
+    timestamp, when present, is kept as ``ts``."""
+    if 'event=' not in line:
+        return None
+    head, _, rest = line.partition('event=')
+    row = {'event': rest.split()[0] if rest.split() else ''}
+    for key, value in STUB_TOKEN.findall(rest[len(row['event']):]):
+        row[key] = value[1:-1] if value.startswith('"') else value
+    stamp = head.strip().split(' ', 1)[0]
+    if re.fullmatch(r'\d{4}-\d\d-\d\dT[0-9:.]+Z', stamp):
+        row['ts'] = stamp
+    return row
+
+
 def check_genesis_order(phases, expected=GENESIS_PHASES):
     """The empty snapshot and the tap come first; no deposit may precede either. ``expected`` is the phase
     list of the life being checked (LIFE2_CORE_PHASES for a core re-genesis on an already re-genesised ME)."""
@@ -250,6 +268,7 @@ def archive_listing(state_root, member):
 class CoreFixture(Fixture):
     # time seams: the fault helpers wait on real time, the unit tests on a fake clock
     clock = staticmethod(time.time)
+    gateway_slots = False            # a manifest without the gateway roles (set in __init__)
     sleep = staticmethod(time.sleep)
 
     def __init__(self, manifest_path, attach=False, keyring=None, drill=False):
@@ -268,7 +287,8 @@ class CoreFixture(Fixture):
         if type(self.pg_port) is not int or not 1024 < self.pg_port < 65536:
             raise Violation('invalid fixture postgres port')
         # The REPLICA key only when this manifest runs the replica (an older core refuses a table naming the class)
-        self.keys = keyring or KeyRing(replica=self.m['slot_artifacts'].get('shadow0') == 'shadow')
+        self.gateway_slots = core_contracts.gateway_manifest(self.m)
+        self.keys = keyring or KeyRing(replica=self.m['slot_artifacts'].get('shadow0') == 'shadow', gateway=self.gateway_slots)
         self.secret_values = self.keys.secrets()
         self.slots = {}
         if attach:
@@ -334,7 +354,7 @@ class CoreFixture(Fixture):
         for role in core_contracts.REQUIRED_JARS:
             artifact = self.m['artifacts'][role]
             self._stage(artifact['path'], dest / (role + '.jar'), artifact['sha256'], 'artifact changed while staging: ' + role, 0o644)
-        for role in core_contracts.OPTIONAL_BINARIES:
+        for role in core_contracts.OPTIONAL_BINARIES + (core_contracts.GATEWAY_BINARIES if self.gateway_slots else []):
             artifact = self.m['artifacts'][role]
             if artifact is None:
                 continue
@@ -376,6 +396,28 @@ class CoreFixture(Fixture):
         self.registry['pg_started'] = True
         self.registry['pg_pid'] = int((data / 'postmaster.pid').read_text().splitlines()[0]); self.save()
         self.create_money_database()
+        if self.gateway_slots:
+            self.create_gateway_database()
+
+    FIXTURE_DATABASES = {'postgres', 'r01_money', 'r01_gateway'}
+
+    def psql(self, database, sql):
+        """The core fixture's databases only: the money projector's and the gateway's users store."""
+        if database not in self.FIXTURE_DATABASES:
+            raise Violation('unknown fixture database')
+        return self.command([self.pg / 'psql', '-h', self.gateway, '-p', self.pg_port, '-U', 'runtime_fixture',
+                             '-d', database, '-v', 'ON_ERROR_STOP=1', '-tA', '-c', sql]).stdout.strip()
+
+    def create_gateway_database(self):
+        """The gateway's users store, empty: oe-gateway applies its own migration (db/migration, under an advisory lock,
+        its sha256 recorded) and oe-stream only verifies it. History relations are not seeded: no drill of this
+        harness reads history (the history read contract is the projection's, a later slice)."""
+        self.psql('postgres', 'CREATE DATABASE r01_gateway')
+        self.registry['gateway_database'] = {'name': 'r01_gateway', 'migration': 'applied by oe-gateway', 'history': None}
+        self.save()
+
+    def gateway_pg_url(self):
+        return f'postgresql://runtime_fixture@{self.gateway}:{self.pg_port}/r01_gateway'
 
     def create_money_database(self):
         """The run's money database and the projector jar's packaged migrations (start_database, and reset_projection)."""
@@ -388,14 +430,20 @@ class CoreFixture(Fixture):
 
     # ---------------------------------------------------------------- processes
 
-    def spawn(self, name, command, environment=None):
-        if name not in self.m['nodes'] or name in self.registry['containers']:
+    def spawn(self, name, command, environment=None, *, join=None):
+        """Create and start one fixture container. A gateway slot's driver sidecar (``<slot>-driver``) holds the slot's
+        address and a shareable IPC namespace; ``join`` (the sidecar's container id) starts the slot binary in the
+        sidecar's network and IPC namespaces, so the two share the slot's address and the Aeron directory and nothing
+        else: each has its own pid namespace, filesystem, limits and lifetime."""
+        sidecar = self.sidecar_slot(name)
+        if (name not in self.m['nodes'] and sidecar is None) or name in self.registry['containers']:
             raise Violation('unknown or duplicate fixture process')
         assert_production_timeouts(environment or {}, self.allowed_env())
         if any(core_contracts.JVM_TIMEOUT.search(str(a)) for a in command):
             raise Violation('refusing a JVM timeout override for ' + name)
         # A seeded member (seed_state) or a slot replaced with keep_state starts on the dir already in place
-        prepared = name in (self.registry.get('seeded') or {}) or name in (self.registry.get('kept_state') or {})
+        prepared = (name in (self.registry.get('seeded') or {}) or name in (self.registry.get('kept_state') or {})
+                    or name in (self.registry.get('prepared_state') or {}))
         bound = (self.registry.get('bound_state') or {}).get(name)     # A member bound to another fixture's root
         state = self.root / 'state' / name
         if bound:
@@ -403,18 +451,23 @@ class CoreFixture(Fixture):
         else:
             state.mkdir(parents=True, exist_ok=prepared)
         limits = self.m['limits']
-        memory_mb = (limits.get('memory_mb_by_role') or {}).get(name, limits['memory_mb'])
-        shm_mb = (limits.get('shm_mb_by_role') or {}).get(name, limits['shm_mb'])
-        cpus = limits['cpu_set_by_role'].get(name, self.m['cpu_set'])
-        args = ['docker', 'create', '--name', self.run_id + '-' + name,
-                '--network', self.registry['network_id'], '--ip', self.m['nodes'][name],
+        role = sidecar or name           # a sidecar runs on its slot's CPUs, memory and shm settings
+        memory_mb = (limits.get('memory_mb_by_role') or {}).get(name, (limits.get('memory_mb_by_role') or {}).get(role, limits['memory_mb']))
+        shm_mb = (limits.get('shm_mb_by_role') or {}).get(role, limits['shm_mb'])
+        cpus = limits['cpu_set_by_role'].get(role, self.m['cpu_set'])
+        if join is not None:
+            namespaces = ['--network', 'container:' + join, '--ipc', 'container:' + join]
+        else:
+            namespaces = ['--network', self.registry['network_id'], '--ip', self.m['nodes'][role]]
+            namespaces += ['--ipc', 'shareable', '--shm-size', str(shm_mb) + 'm'] if sidecar else ['--shm-size', str(shm_mb) + 'm']
+        args = ['docker', 'create', '--name', self.run_id + '-' + name, *namespaces,
                 '--label', LABEL + '=' + self.run_id, '--label', LABEL + '.token=' + self.token,
                 '--user', f'{os.getuid()}:{os.getgid()}', '--workdir', '/data', '--read-only',
                 '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--pids-limit', '256',
                 '--memory', str(memory_mb) + 'm', '--memory-swap', str(memory_mb) + 'm',
                 '--cpuset-cpus', ','.join(map(str, cpus)),
-                '--cpus', str(limits.get('cpu_quota_by_role', {}).get(name, 1)),
-                '--shm-size', str(shm_mb) + 'm', '--tmpfs', '/tmp:rw,nosuid,size=128m',
+                '--cpus', str(limits.get('cpu_quota_by_role', {}).get(role, 1)),
+                '--tmpfs', '/tmp:rw,nosuid,size=128m',
                 '--log-opt', 'max-size=32m', '--log-opt', 'max-file=3',
                 '--mount', f'type=bind,src={state},dst=/data',
                 '--mount', f'type=bind,src={self.root / "artifacts"},dst=/artifacts,readonly']
@@ -578,7 +631,8 @@ class CoreFixture(Fixture):
         awaitExternalDriver is the second wait, TC:266-283, ATC:117-131). A member named by ENGINE_DRIVER_SKIP (control
         edk-cnctimeout only) starts java with no driver at all."""
         role = engine + str(index)
-        jar = JAVA + ['-jar', f'/artifacts/{engine}.jar']
+        props = [f'-D{k}={v}' for k, v in sorted((self.m.get('core_jvm_properties') or {}).items())] if engine == 'ae' else []
+        jar = JAVA + props + ['-jar', f'/artifacts/{engine}.jar']
         if self.engine_driver() != 'external':
             return jar
         d = '/dev/shm/aeron-' + role
@@ -866,6 +920,15 @@ class CoreFixture(Fixture):
                 self.slots[slot] = self.start_slot(slot)
         else:
             self.genesis(plan)
+        if self.gateway_slots:
+            if plan is None:
+                # A bare boot has no CoreConfig: a gateway never reads ready on it (config_loaded), so none is started
+                for slot in sorted(core_contracts.GATEWAY_SLOTS):
+                    self.slots[slot] = {'state': 'NOT_STARTED', 'reason': 'bare boot: no CoreConfig, a gateway is never ready'}
+            else:
+                self.core_behavior_step()
+                self.start_gateway_slots()
+                boot['phases']['gateway_slots_ns'] = time.time_ns()
         boot['phases']['complete_ns'] = time.time_ns()
         self.registry['slots'] = self.slots; self.registry['boot'] = boot
         self.registry['startup_complete'] = True; self.save()
@@ -1346,6 +1409,8 @@ class CoreFixture(Fixture):
             return ports[role[:2] + '_metrics'], '/ready'
         if role == 'shadow0' and self.slot_artifact('shadow0') == 'shadow':
             return ports['shadow_metrics'], '/ready'
+        if role in core_contracts.GATEWAY_SLOTS and self.slot_artifact(role):
+            return self.gateway_ready_target(role)
         raise Violation('no readiness target for ' + role)
 
     def start_slot(self, slot):
@@ -1385,10 +1450,300 @@ class CoreFixture(Fixture):
 
     def driver_identity(self, role):
         """cnc.dat mtime (ns) of the role's staged aeronmd plus the container's StartedAt. Inside a container the aeronmd
-        pid is always 9 and the inode always 6, so neither can tell two drivers apart."""
+        pid is always 9 and the inode always 6, so neither can tell two drivers apart. A slot with a driver sidecar: the
+        sidecar's container and StartedAt (its pid 1 is the driver, so the same StartedAt while running is the same
+        driver process)."""
+        if self.driver_sidecar(role):
+            d = self.slot_driver(role)
+            return {'sidecar': d['container'], 'started_at': d['started_at'], 'cnc_mtime': d.get('cnc_mtime')}
         out = self.execute(role, ['stat', '-c', '%.9Y', f'/dev/shm/aeron-{role}/cnc.dat'], timeout=15)
         started = self.inspect('container', self.registry['containers'][role])['State']['StartedAt']
         return {'cnc_mtime': out.stdout.strip(), 'started_at': started}
+
+    # ---------------------------------------------------------------- gateway and stream slots
+
+    # The gateway slots' channels name term-length and mtu (the binaries refuse a channel without them); the fixture's
+    # 4 MiB term and 8192 MTU, the forwarders' values. Settings of the fixture, not limits of the binaries.
+    GATEWAY_CHANNEL_PARAMS = 'term-length=4m|mtu=8192'
+    GATEWAY_AUTH_MODES = 'api-key'
+    # The response endpoint's port of a gateway or stream slot (each slot has its own address): a fixed port, so a drill
+    # can name the core's egress to one slot on the network (the slow-consumer drill thins it). A setting of the fixture.
+    GATEWAY_RESPONSE_PORT = 20480
+    # The session stub's channel mask (the stream's: acks, orders, balances, control) and its status cadence
+    STUB_CHANNELS = 'acks,orders,balances,control'
+    STUB_STATUS_INTERVAL_MS = 1000
+    STUB_COMMAND_FILE = '/data/stub.cmd'
+    STUB_READY_BOUND_S = 60
+    # The gateway's treasury lane (deposit and withdraw), on in every gateway kind: the gateway's own switch and its
+    # TREASURY credential (whose key every core member holds in CORE_AUTH_KEYS, the core's way of admitting a TREASURY
+    # session; the principal rides the replicated SessionOpen). The faucet caps are settings of the gateway: asset 0, and
+    # GATEWAY_FUZZ_UNKNOWN_ASSET, an asset id the core's config does not list, capped so that the gateway's asset check
+    # is the only rule between a deposit of an unknown asset and the core (the fuzz sends it).
+    GATEWAY_FUZZ_UNKNOWN_ASSET = 999
+    GATEWAY_FAUCET_CAPS = {0: '1', GATEWAY_FUZZ_UNKNOWN_ASSET: '1'}
+
+    def core_behavior_step(self):
+        """A gateway kind runs the core at its kind's behaviour version (default 4: a create's requestId lookup runs before
+        the gate, so a stored acceptance is answered again under a closed gate). The genesis ladder ends at 3; the step to 4
+        is one more CoreConfig with the same tables, taken with the gate open (CoreConfigStateMachine: no precondition).
+        Recorded with the core's answer; a kind that names 3 stays there (the control of the stored-acceptance rule)."""
+        spec = core_contracts.GATEWAY_KINDS.get(self.m.get('manifest_kind')) or {}
+        target = spec.get('behavior', core_contracts.GATEWAY_CORE_BEHAVIOR)
+        steps = [self.core_config(v) for v in range(4, target + 1)]
+        bad = [r for r in steps if r[1] != 'ACCEPTED']
+        self.registry['core_behavior'] = {'target': target, 'steps': steps}
+        self.save()
+        if bad:
+            raise Inconclusive(f'core behaviour step refused: {bad}')
+        return steps
+
+    def gateway_users(self):
+        """The users whose API keys the gateway and stream slots load (GATEWAY_API_KEYS_FILE): the drill's, set before
+        start (``self.gateway_user_ids``), else none."""
+        return sorted(getattr(self, 'gateway_user_ids', None) or [])
+
+    def gateway_slot_env(self, slot):
+        """The environment of a gateway or stream slot (gateway README "Run"; everything else on the binary's defaults)."""
+        nodes, ports = self.m['nodes'], self.m['ports']
+        name = self.slot_artifact(slot)
+        artifact = self.m['artifacts'][name]
+        ingress = ','.join(f'{i}={nodes[f"ae{i}"]}:{ports["ae_base"] + i * ports["stride"] + 2}' for i in range(3))
+        cred = self.keys.credential(slot, 'ae')
+        instance = str(self.keys.keys[(slot, 'ae')][0])
+        if name == 'gateway_stub':
+            return {'SHIM_HTTP_BIND': f'{nodes[slot]}:{ports["shim_http"]}', 'SHIM_API_KEYS_FILE': '/data/api-keys',
+                    'SHIM_MODE': artifact['mode'], 'SHIM_CORE_PROBE': '/artifacts/core-probe.jar:/artifacts/ae.jar',
+                    **self.probe_env(None), 'CORE_LOCAL_HOST': nodes[slot], 'CORE_AUTH_CREDENTIAL': cred}
+        if name == 'session_stub':
+            return {'CORE_AUTH_CREDENTIAL': cred}
+        prefix = 'GATEWAY' if core_contracts.GATEWAY_SLOTS[slot] == 'gateway' else 'STREAM'
+        env = {f'{prefix}_DRIVER_MODE': artifact['driver'], f'{prefix}_CORE_INGRESS': ingress,
+               f'{prefix}_CORE_INGRESS_CHANNEL': 'aeron:udp?' + self.GATEWAY_CHANNEL_PARAMS,
+               f'{prefix}_CORE_RESPONSE_CHANNEL': f'aeron:udp?endpoint={nodes[slot]}:{self.GATEWAY_RESPONSE_PORT}|'
+                                                   + self.GATEWAY_CHANNEL_PARAMS,
+               'CORE_AUTH_CREDENTIAL': cred, f'{prefix}_INSTANCE_ID': instance,
+               f'{prefix}_AUTH_MODES': self.GATEWAY_AUTH_MODES, 'GATEWAY_API_KEYS_FILE': '/data/api-keys'}
+        if artifact['driver'] == 'external':
+            env['AERON_DIR'] = '/dev/shm/aeron-' + slot
+        else:
+            env[f'{prefix}_DRIVER_DIR'] = '/dev/shm'
+        if prefix == 'GATEWAY':
+            env.update(GATEWAY_HTTP_BIND=f'{nodes[slot]}:{ports["gateway_http"]}',
+                       GATEWAY_ADMIN_BIND=f'{nodes[slot]}:{ports["gateway_admin"]}', GATEWAY_PG_URL=self.gateway_pg_url(),
+                       GATEWAY_ALLOW_TREASURY_LANE='1', GATEWAY_TREASURY_CREDENTIAL=self.keys.credential(slot + '-treasury', 'ae'),
+                       GATEWAY_FAUCET_MAX_AMOUNT=','.join(f'{a}:{v}' for a, v in sorted(self.GATEWAY_FAUCET_CAPS.items())))
+        else:
+            # The engine status feed polls each node's own endpoint over the network (never a shared disk)
+            env.update(STREAM_WS_BIND=f'{nodes[slot]}:{ports["stream_ws"]}', STREAM_ADMIN_BIND=f'{nodes[slot]}:{ports["stream_admin"]}',
+                       STREAM_CORE_NODE_ENDPOINTS=','.join(f'{i}@{nodes[f"ae{i}"]}:{ports["ae_metrics"]}' for i in range(3)),
+                       STREAM_ME_NODE_ENDPOINTS=','.join(f'{i}@{nodes[f"me{i}"]}:{ports["me_metrics"]}' for i in range(3)))
+        return env
+
+    def stub_arguments(self, slot):
+        """ct_session_stub's command line (StubOptions.h): one GATEWAY session, the stream's channel mask, status lines."""
+        nodes, ports = self.m['nodes'], self.m['ports']
+        artifact = self.m['artifacts'][self.slot_artifact(slot)]
+        ingress = ','.join(f'{i}={nodes[f"ae{i}"]}:{ports["ae_base"] + i * ports["stride"] + 2}' for i in range(3))
+        args = ['--driver-mode', artifact['driver'], '--instance-id', str(self.keys.keys[(slot, 'ae')][0]),
+                '--ingress-endpoints', ingress, '--ingress-channel', 'aeron:udp?' + self.GATEWAY_CHANNEL_PARAMS,
+                '--response-channel', f'aeron:udp?endpoint={nodes[slot]}:0|' + self.GATEWAY_CHANNEL_PARAMS,
+                '--channels', self.STUB_CHANNELS, '--status-interval-ms', str(self.STUB_STATUS_INTERVAL_MS)]
+        if artifact['driver'] == 'external':
+            args += ['--aeron-dir', '/dev/shm/aeron-' + slot]
+        else:
+            args += ['--driver-dir', '/dev/shm']
+        return args
+
+    def gateway_slot_command(self, slot):
+        """oe-gateway / oe-stream exec'd directly (embedded) or behind the staged aeronmd (external, the slot wrapper's
+        shape); the shim under python3; the session stub reading its script from /data/stub.cmd (the fixture appends a
+        line to steer it: throttle, status, quit)."""
+        name = self.slot_artifact(slot)
+        artifact = self.m['artifacts'][name]
+        binary = f'/artifacts/{name}/bin'
+        if name == 'gateway_stub':
+            return ['python3', '-I', binary]
+        if name == 'session_stub':
+            run = (f'touch {self.STUB_COMMAND_FILE}; tail -n +1 -f {self.STUB_COMMAND_FILE} | '
+                   f'{binary} {shlex.join(self.stub_arguments(slot))}')
+        else:
+            run = f'exec {binary}'
+        if artifact['driver'] != 'external':
+            return ['sh', '-c', run]
+        d = '/dev/shm/aeron-' + slot
+        if self.driver_sidecar(slot):
+            # The driver runs in the slot's sidecar (gateway_driver_command); the binary waits for its cnc.dat in the
+            # shared Aeron directory, then execs as pid 1 of its own container
+            return ['sh', '-c', f'i=0; while [ ! -f {d}/cnc.dat ] && [ $i -lt {DRIVER_WAIT_TENTHS} ]; do sleep 0.1; i=$((i+1)); done; '
+                                f'[ -f {d}/cnc.dat ] || {{ echo "no driver cnc.dat at {d} in 30 s" >&2; exit 1; }}; ' + run]
+        env = ' '.join(f'{k}={v}' for k, v in sorted(DRIVER_ENV.items()))
+        alive = '"$(cat /data/aeronmd.pid)"'
+        script = (f'rm -rf {d}; mkdir -p {d}; AERON_DIR={d} {env} LD_LIBRARY_PATH=/artifacts/{name} /artifacts/{name}/aeronmd & '
+                  f'echo $! > /data/aeronmd.pid; i=0; '
+                  f'while {{ [ ! -f {d}/cnc.dat ] || ! kill -0 {alive} 2>/dev/null; }} && [ $i -lt {DRIVER_WAIT_TENTHS} ]; '
+                  f'do sleep 0.1; i=$((i+1)); done; '
+                  f'[ -f {d}/cnc.dat ] && kill -0 {alive} 2>/dev/null || {{ echo "aeronmd did not come up in 30 s" >&2; exit 1; }}; '
+                  + run)
+        return ['sh', '-c', script]
+
+    # ------------------------------------------------ the external driver of a gateway or stream slot: its own container
+    # In external mode oe-gateway and oe-stream attach to an aeronmd that has its own lifetime, as production runs aeronmd
+    # as its own service on the host: the driver is pid 1 of the slot's sidecar container ``<slot>-driver``, which holds
+    # the slot's address (the driver does the slot's UDP) and a shareable IPC namespace (its /dev/shm holds the Aeron
+    # directory). The binary's container joins those two namespaces and nothing else, so a kill, a SIGSTOP or a restart
+    # of the binary leaves the driver running, and the restarted binary attaches to the same driver. The session stub
+    # (a dry-run tool) keeps its driver in its own container.
+    DRIVER_SIDECAR = '-driver'
+    SIDECAR_BINARIES = ('gateway', 'gateway_nc', 'stream')
+
+    def sidecar_slot(self, name):
+        """The slot whose driver sidecar ``name`` is, or None."""
+        if not name.endswith(self.DRIVER_SIDECAR):
+            return None
+        slot = name[:-len(self.DRIVER_SIDECAR)]
+        return slot if slot in core_contracts.GATEWAY_SLOTS and self.driver_sidecar(slot) else None
+
+    def driver_sidecar(self, slot):
+        """True when ``slot`` runs a product binary on an external driver (the driver in its sidecar)."""
+        if slot not in core_contracts.GATEWAY_SLOTS or not self.gateway_slots:
+            return False
+        name = self.slot_artifact(slot)
+        return name in self.SIDECAR_BINARIES and self.m['artifacts'][name]['driver'] == 'external'
+
+    def gateway_driver_command(self, slot):
+        """The sidecar's aeronmd (the slot artifact's staged driver) as pid 1, on a fresh dir (DRIVER_ENV)."""
+        name = self.slot_artifact(slot)
+        d = '/dev/shm/aeron-' + slot
+        env = ' '.join(f'{k}={v}' for k, v in sorted(DRIVER_ENV.items()))
+        return ['sh', '-c', f'rm -rf {d}; mkdir -p {d}; AERON_DIR={d} {env} LD_LIBRARY_PATH=/artifacts/{name} '
+                            f'exec /artifacts/{name}/aeronmd']
+
+    def start_slot_driver(self, slot):
+        """Start the slot's sidecar and wait for its cnc.dat; returns the sidecar's container id."""
+        name = slot + self.DRIVER_SIDECAR
+        cid = self.spawn(name, self.gateway_driver_command(slot))
+        deadline = time.monotonic() + DRIVER_WAIT_TENTHS / 10
+        while True:
+            if not self.inspect('container', cid)['State']['Running']:
+                raise Inconclusive(f'{name}: aeronmd exited before its cnc.dat')
+            if self.execute(name, ['test', '-f', f'/dev/shm/aeron-{slot}/cnc.dat'], timeout=15, check=False).returncode == 0:
+                return cid
+            if time.monotonic() >= deadline:
+                raise Inconclusive(f'{name}: no cnc.dat within {DRIVER_WAIT_TENTHS / 10} s')
+            self.sleep(0.1)
+
+    def slot_driver(self, slot):
+        """The sidecar driver of ``slot`` as observed now: container id, StartedAt, Running, restarts, the state letter
+        of its pid 1, that process's name (aeronmd) and its cnc.dat's inode and mtime (informational)."""
+        name = slot + self.DRIVER_SIDECAR
+        cid = self.registry['containers'][name]
+        row = self.inspect('container', cid)
+        state = row['State']
+        out = {'container': cid[:12], 'started_at': state['StartedAt'], 'running': state['Running'],
+               'restart_count': row.get('RestartCount', 0)}
+        if state['Running']:
+            probe = self.execute(name, ['sh', '-c', 'read -r a b c r < /proc/1/stat; echo "$c"; cat /proc/1/comm; '
+                                                    f'stat -c "%i %.9Y" /dev/shm/aeron-{slot}/cnc.dat'],
+                                 timeout=15, check=False)
+            lines = (probe.stdout or '').split('\n')
+            out['state'] = lines[0].strip() or None
+            out['comm'] = (lines[1] if len(lines) > 1 else '').strip() or None
+            inode, _, mtime = (lines[2] if len(lines) > 2 else '').strip().partition(' ')
+            out['cnc_inode'], out['cnc_mtime'] = inode or None, mtime or None
+        return out
+
+    def gateway_ready_target(self, role):
+        """(port, path): oe-gateway and oe-stream /ready on the admin bind, the shim's /ready; the session stub has no
+        listener and reads ready on its own ``event=registration state=REGISTERED`` line (port None)."""
+        ports = self.m['ports']
+        name = self.slot_artifact(role)
+        if name == 'session_stub':
+            return None, 'log:registered'
+        if name == 'gateway_stub':
+            return ports['shim_http'], '/ready'
+        return (ports['gateway_admin'], '/ready') if core_contracts.GATEWAY_SLOTS[role] == 'gateway' else (ports['stream_admin'], '/ready')
+
+    def wait_role_ready(self, name, port, path, timeout=90, since=None):
+        """wait_http, or for the session stub its registration line in the container log after ``since``."""
+        if port is not None:
+            return self.wait_http(name, port, path, timeout=timeout)
+        deadline = time.monotonic() + timeout
+        cid = self.registry['containers'][name]
+        while time.monotonic() < deadline:
+            args = ['docker', 'logs'] + (['--since', since] if since else []) + [cid]
+            out = self.command(args, check=False)
+            if 'event=registration state=REGISTERED' in (out.stdout or '') + (out.stderr or ''):
+                return {'status': 200, 'body': 'registered'}
+            if not self.inspect('container', cid)['State']['Running']:
+                raise Inconclusive(f'fixture process {name} exited before its session registered')
+            self.sleep(0.5)
+        raise Inconclusive(f'{name}: no registration within {timeout} s')
+
+    def prepare_gateway_state(self, slot):
+        """The slot's /data before its first start: the API keys file of the drill's users (secrets: redacted from every
+        retained file). Written by the fixture into the slot's own state dir; no role reads another's."""
+        state = self.root / 'state' / slot
+        state.mkdir(parents=True, exist_ok=True)
+        users = self.gateway_users()
+        text = self.keys.api_keys_file(users) if users else ''
+        path = state / 'api-keys'
+        path.write_text(text)
+        path.chmod(0o600)
+        self.secret_values = self.keys.secrets()
+        self.registry.setdefault('prepared_state', {})[slot] = {'api_key_users': users}
+        self.save()
+
+    def start_gateway_slots(self, slots=None):
+        """Start the gateway and stream slots after the core genesis (a gateway reads ready only on a loaded config);
+        a declared slot whose artifact is null is SKIPPED_ABSENT, never faked."""
+        for slot in slots or sorted(core_contracts.GATEWAY_SLOTS):
+            name = self.slot_artifact(slot)
+            if name is None:
+                self.slots[slot] = {'state': 'SKIPPED_ABSENT', 'reason': 'this manifest stages nothing in ' + slot}
+                continue
+            self.prepare_gateway_state(slot)
+            join = self.start_slot_driver(slot) if self.driver_sidecar(slot) else None
+            self.spawn(slot, self.gateway_slot_command(slot), self.gateway_slot_env(slot), join=join)
+            port, path = self.ready_target(slot)
+            self.wait_role_ready(slot, port, path, timeout=self.STUB_READY_BOUND_S if port is None else 90)
+            self.slots[slot] = self.gateway_slot_row(slot, name)
+        self.registry['slots'] = self.slots
+        self.save()
+        return {s: self.slots.get(s) for s in sorted(core_contracts.GATEWAY_SLOTS)}
+
+    def gateway_slot_row(self, slot, name):
+        artifact = self.m['artifacts'][name]
+        port, path = self.ready_target(slot)
+        row = {'state': 'STARTED', 'artifact': name, 'sha256': artifact['sha256'], 'source_sha': artifact['source_sha'],
+               'driver': artifact['driver'], 'target': artifact['target'], 'readiness': path}
+        if artifact.get('defines'):
+            row['defines'] = list(artifact['defines'])
+        if port is not None and name in ('gateway', 'gateway_nc', 'stream'):
+            try:
+                row['health'] = json.loads(self.http(slot, self.m['ports']['gateway_admin' if slot.startswith('gw') else 'stream_admin'],
+                                                     '/health')['body'])
+            except (ValueError, KeyError, TypeError):
+                row['health'] = None
+        if artifact['driver'] == 'external' and name != 'gateway_stub':
+            self.registry.setdefault('driver_identity', {})[slot] = self.driver_identity(slot)
+            self.save()
+        return row
+
+    def stub_command(self, slot, line):
+        """Append one script line to the session stub's command file (StubCommands.h: throttle, status, reconnect, quit)."""
+        if self.slot_artifact(slot) != 'session_stub':
+            raise Violation(f'{slot} runs no session stub')
+        if '\n' in line or not re.fullmatch(r'[a-z]+( [a-z0-9]+){0,2}', line):
+            raise Violation('a stub command is one short script line: ' + repr(line))
+        with (self.root / 'state' / slot / 'stub.cmd').open('a') as f:
+            f.write(line + '\n')
+        self.record_fault({'kind': 'stub_command', 'target': slot, 'line': line})
+
+    def stub_events(self, slot, since=None):
+        """The session stub's ``event=...`` lines as dicts (key=value tokens; quoted values kept whole), in order."""
+        cid = self.registry['containers'][slot]
+        out = self.command(['docker', 'logs', '--timestamps'] + (['--since', since] if since else []) + [cid], check=False)
+        return [e for e in (parse_stub_line(l) for l in ((out.stdout or '') + (out.stderr or '')).splitlines()) if e]
 
     # ---------------------------------------------------------------- faults
 
@@ -1414,7 +1769,8 @@ class CoreFixture(Fixture):
         return witness
 
     def _fault_target(self, name):
-        if name not in set(ENGINES) | set(SLOTS) | {'projector'} or name not in self.registry['containers']:
+        if (name not in set(ENGINES) | set(SLOTS) | core_contracts.GATEWAY_ROLES | {'projector'}
+                or name not in self.registry['containers']):
             raise Violation('unsupported or unstarted fault target: ' + name)
         return self.registry['containers'][name]
 
@@ -1454,6 +1810,58 @@ class CoreFixture(Fixture):
         return self.record_fault({'kind': 'unpause', 'target': name, 'container_id': cid, 'before_paused': True,
                                   'after_paused': False})
 
+    # The state letter (proc(5) field 3) of the container's pid 1 and, when the slot runs a staged aeronmd, of that
+    # driver. Shell builtins only: the slot image need not carry cut or awk.
+    PROCESS_STATES = ('read -r a b c r < /proc/1/stat; echo "main $c"; '
+                      'if [ -f /data/aeronmd.pid ]; then read -r p < /data/aeronmd.pid; '
+                      'if [ -r /proc/$p/stat ]; then read -r a b c r < /proc/$p/stat; echo "driver $c"; '
+                      'else echo "driver gone"; fi; fi')
+
+    def process_states(self, name):
+        """{'main': letter, 'driver': letter | 'gone'} of a running container (no 'driver' without a staged aeronmd). A
+        slot with a driver sidecar: the driver's letter is its sidecar's pid 1, 'gone' when the sidecar is not running."""
+        out = self.execute(name, ['sh', '-c', self.PROCESS_STATES], timeout=15, check=False)
+        states = {}
+        for text in (out.stdout or '').splitlines():
+            key, _, value = text.strip().partition(' ')
+            if key in ('main', 'driver') and value:
+                states[key] = value
+        if self.driver_sidecar(name):
+            d = self.slot_driver(name)
+            states['driver'] = (d.get('state') or 'gone') if d['running'] else 'gone'
+            states['driver_sidecar'] = d['container']
+        return states
+
+    def freeze_main(self, name, duration_s=15, heal_bound_s=60):
+        """SIGSTOP the container's pid 1 (the slot command execs oe-gateway or oe-stream, so pid 1 is the binary). The
+        daemon sends it (``docker kill --signal=STOP``): a signal from inside the container cannot stop its own pid 1. An
+        external driver (the slot's sidecar, or the session stub's staged aeronmd) is a separate process and keeps
+        running; an embedded driver is part of the stopped process. The witness records both states as observed."""
+        cid = self._fault_target(name)
+        before = self.inspect('container', cid)['State']
+        if not before['Running'] or before['Paused']:
+            raise Inconclusive('fault target is not running: ' + name)
+        self.command(['docker', 'kill', '--signal=STOP', cid])
+        states = self.process_states(name)
+        if states.get('main') != 'T':
+            raise Inconclusive(f'SIGSTOP of {name} pid 1 was not observed: {states}')
+        row_id = self.open_fault(name, duration_s, heal_bound_s)
+        return self.record_fault({'kind': 'sigstop', 'row_id': row_id, 'target': name, 'container_id': cid, 'pid': 1,
+                                  'main_state': states['main'], 'driver_state': states.get('driver'),
+                                  'declared_duration_s': duration_s})
+
+    def thaw_main(self, name):
+        """SIGCONT the container's pid 1. The fault row stays open: whether the process reconnects or exits 70 is the
+        drill's branch."""
+        cid = self._fault_target(name)
+        self.command(['docker', 'kill', '--signal=CONT', cid])
+        running = self.inspect('container', cid)['State']['Running']
+        states = self.process_states(name) if running else {}
+        if states.get('main') == 'T':
+            raise Inconclusive(f'SIGCONT of {name} pid 1 was not observed: {states}')
+        return self.record_fault({'kind': 'sigcont', 'target': name, 'container_id': cid, 'pid': 1, 'running': running,
+                                  'main_state': states.get('main'), 'driver_state': states.get('driver')})
+
     def exec_kill(self, name, pidfile, signal='KILL', heal_bound_s=60):
         """Kill the process whose pid a file in the container's /data holds (the staged aeronmd, C13)."""
         if signal not in {'KILL', 'TERM'}:
@@ -1489,7 +1897,8 @@ class CoreFixture(Fixture):
     def restart(self, name, ready_timeout=60, readiness=None, wait_ready=True):
         """``docker start`` a killed or exited container (same state dir, same env) and return once /ready answers 200.
         An AE member is not started before 12.5 s after its kill (measured: earlier it hangs on the old archive mark
-        file with the container Up). An external slot must come back on a NEW driver."""
+        file with the container Up). A gateway or stream slot on a sidecar driver must come back on that SAME driver;
+        any other external slot (the session stub's in-container driver included) must come back on a NEW driver."""
         cid = self._fault_target(name)
         before = self.inspect('container', cid)['State']
         if before['Running']: raise Inconclusive('restart target is still running: ' + name)
@@ -1513,12 +1922,18 @@ class CoreFixture(Fixture):
             return self.record_fault(witness)
         port, path = self.ready_target(name)
         path = readiness or path
-        self.wait_http(name, port, path, timeout=ready_timeout)
+        self.wait_role_ready(name, port, path, timeout=ready_timeout, since=started['StartedAt'])
         witness = {'kind': 'restart', 'target': name, 'container_id': cid, 'before_running': False, 'exit_code': before['ExitCode'],
                    'after_running': True, 'started_at': started['StartedAt'], 'ready': True, 'readiness': path}
         if waited is not None:
             witness['waited_after_kill_s'] = waited
-        if old is not None:
+        if old is not None and self.driver_sidecar(name):
+            # The driver has its own lifetime: the restarted binary must attach to the same sidecar driver
+            new = self.driver_identity(name)
+            if (new['sidecar'], new['started_at']) != (old['sidecar'], old['started_at']):
+                raise Inconclusive(f'{name} came back on another driver: {old} -> {new}')
+            witness['driver'] = {'reused': True, 'identity': new}
+        elif old is not None:
             new = self.driver_identity(name)
             if new['cnc_mtime'] == old['cnc_mtime'] or new['started_at'] == old['started_at']:
                 raise Inconclusive(f'{name} driver identity did not change across the restart: {old} -> {new}')
@@ -1885,7 +2300,8 @@ class CoreFixture(Fixture):
         return outputs
 
     def netfilter(self, target, arguments):
-        cid = self.registry['containers'][target]
+        # A slot with a driver sidecar has the sidecar's network namespace (the sidecar holds the slot's address)
+        cid = self.registry['containers'][target + self.DRIVER_SIDECAR if self.driver_sidecar(target) else target]
         state = self.inspect('container', cid)
         if not state['State']['Running'] or state['HostConfig']['NetworkMode'] != self.registry['network_id']:
             raise Inconclusive('netfilter target is not in its owned private network')
