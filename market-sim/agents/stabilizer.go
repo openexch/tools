@@ -2,7 +2,6 @@ package agents
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"math/rand"
 	"time"
@@ -18,8 +17,8 @@ import (
 // stale levels the organic depth bots could not re-ladder past in time. It does
 // two things a real DMM/arb does:
 //
-//  1. Clears stale crossed levels — bids resting ABOVE the fair price (or asks
-//     resting BELOW it) — by hitting them with marketable IOC orders, i.e. it
+//  1. Clears stale crossed levels: bids resting ABOVE the fair price (or asks
+//     resting BELOW it): by hitting them with marketable IOC orders, i.e. it
 //     arbitrages them away. This is what unwinds the "20 bids / 0 asks with the
 //     top bid above the last trade" state seen after a dump.
 //  2. Backfills the thin side with a small resting ladder around the fair price
@@ -78,16 +77,16 @@ func NewStabilizer(bot int64, p MarketParams, env Env) *Stabilizer {
 func (s *Stabilizer) Due(now time.Time) bool { return now.After(s.nextAt) }
 
 // OnOrderEvent drops our resting backfill orders once they fill or otherwise
-// terminate (fed from the OMS user-WS, same as the maker/depth keepers).
+// terminate (fed from the gateway user stream, same as the maker/depth keepers).
 func (s *Stabilizer) OnOrderEvent(o oms.OrderResponse) {
-	if _, ok := s.orders[o.OmsOrderID]; !ok {
+	if _, ok := s.orders[o.OrderID]; !ok {
 		return
 	}
 	if oms.IsTerminalStatus(o.Status) {
 		if o.Status == "FILLED" {
 			s.Env.Stats.Fills.Add(1)
 		}
-		delete(s.orders, o.OmsOrderID)
+		delete(s.orders, o.OrderID)
 	}
 }
 
@@ -104,7 +103,7 @@ func (s *Stabilizer) Step(ctx context.Context) {
 	book := s.Env.Feed.View(s.Params.ID)
 	now := time.Now()
 
-	// A halted market is an admin decision — never add flow into it; just let
+	// A halted market is an admin decision: never add flow into it; just let
 	// our resting orders age out and re-check later.
 	if s.Env.Health != nil && s.Env.Health.Paused() {
 		s.retire(ctx, now, true)
@@ -196,7 +195,6 @@ func (s *Stabilizer) hit(ctx context.Context, side string, price oms.Money, leve
 	resp, err := s.Env.Client.CreateOrder(ctx, oms.CreateOrderRequest{
 		UserID: s.Bot, MarketID: s.Params.ID, Side: side, OrderType: "LIMIT",
 		TimeInForce: "IOC", Price: &p, Quantity: oms.MoneyFromFloat(qty),
-		ClientOrderID: fmt.Sprintf("stab-%d-%d", s.Bot, s.seq),
 	})
 	if err != nil {
 		s.Env.Stats.Errors.Add(1)
@@ -226,7 +224,7 @@ func (s *Stabilizer) backfill(ctx context.Context, side string, fair oms.Money, 
 		return 0
 	}
 
-	// spacing in ticks (~0.03% of price), at least 1 — same convention as Depth.
+	// spacing in ticks (~0.03% of price), at least 1: same convention as Depth.
 	spacingTicks := int(fair.Float() * 0.0003 / s.Params.Tick.Float())
 	if spacingTicks < 1 {
 		spacingTicks = 1
@@ -280,7 +278,6 @@ func (s *Stabilizer) backfill(ctx context.Context, side string, fair oms.Money, 
 		resp, err := s.Env.Client.CreateOrder(ctx, oms.CreateOrderRequest{
 			UserID: s.Bot, MarketID: s.Params.ID, Side: side, OrderType: "LIMIT",
 			TimeInForce: "GTC", Price: &price, Quantity: oms.MoneyFromFloat(qty),
-			ClientOrderID: fmt.Sprintf("stab-%d-%d", s.Bot, s.seq),
 		})
 		if err != nil {
 			s.Env.Stats.Errors.Add(1)
@@ -294,7 +291,7 @@ func (s *Stabilizer) backfill(ctx context.Context, side string, fair oms.Money, 
 		budget--
 		placed++
 		ttl := 45*time.Second + time.Duration(rand.Int63n(30))*time.Second
-		s.orders[resp.OmsOrderID] = &stabOrder{side: side, price: price, placedAt: time.Now(), ttl: ttl}
+		s.orders[resp.OrderID] = &stabOrder{side: side, price: price, placedAt: time.Now(), ttl: ttl}
 	}
 	return placed
 }

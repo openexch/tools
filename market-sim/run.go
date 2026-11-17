@@ -32,7 +32,7 @@ func pump(in <-chan oms.OrderResponse, out chan<- oms.OrderResponse) {
 }
 
 // passiveChecks derives health from the flow the agents already generate:
-// OMS reachability, market-data freshness, and recent fills.
+// gateway readiness (/api/v2/status), market-data freshness, and recent fills.
 func passiveChecks(ctx context.Context, cfg *Config, client *oms.Client, feedClient *feed.Client,
 	stats *agents.Stats, registry *health.Registry) {
 	ticker := time.NewTicker(10 * time.Second)
@@ -52,7 +52,7 @@ func passiveChecks(ctx context.Context, cfg *Config, client *oms.Client, feedCli
 			if err != nil {
 				detail = err.Error()
 			}
-			registry.Set("oms_reachable", err == nil, detail, true)
+			registry.Set("gateway_ready", err == nil, detail, true)
 
 			stale := ""
 			for _, m := range cfg.Markets {
@@ -63,7 +63,7 @@ func passiveChecks(ctx context.Context, cfg *Config, client *oms.Client, feedCli
 			registry.Set("market_data_fresh", stale == "", strings.TrimSpace(stale), true)
 
 			// The takers guarantee steady fills; silence means the trade
-			// path (engine -> OMS -> user WS) stopped working end-to-end.
+			// path (core -> gateway -> user stream) stopped working end-to-end.
 			if f := stats.Fills.Load(); f != lastFills {
 				lastFills = f
 				lastFillAt = time.Now()
@@ -103,7 +103,7 @@ const (
 type HealthOpts struct {
 	Addr            string // health server listen address ("" = disabled)
 	CORSOrigin      string // demo UI origin asserted by the CORS canary
-	PublicOMSURL    string // public edge to probe ("" = local only)
+	PublicURL       string // public gateway edge to probe ("" = local only)
 	EdgeWSURL       string // public market-data WS (the edge relay path) ("" = check disabled)
 	BridgeHealthURL string // settlement bridge health endpoint ("" = check disabled)
 }
@@ -112,7 +112,7 @@ type HealthOpts struct {
 // diffing: the local and edge feed clients both see every BOOK_DELTA of the
 // watched market, identified by its unique v4 bookVersion, and both run on
 // this process's clock. Replayed deltas (subscribe/refresh re-sends after a
-// reconnect) would pair a fresh edge arrival with a stale local one — the
+// reconnect) would pair a fresh edge arrival with a stale local one: the
 // first edge arrival consumes the pair, and samples over lagMaxSample are
 // discarded rather than poisoning the average.
 type edgeLagTracker struct {
@@ -181,7 +181,7 @@ func (t *edgeLagTracker) LagMs() float64 {
 // edgeFeedCheck proves the path real viewers use: the public market WS
 // (market.openexch.io/ws → the market-relay Worker → Durable Object). The
 // local feed staying fresh while this one stalls is exactly the half-open
-// publisher failure seen live on 2026-07-07 — the gateway was healthy but
+// publisher failure seen live on 2026-07-07: the gateway was healthy but
 // the edge served a frozen feed. Critical: a stale edge IS a demo outage,
 // so it pages through admin_demo_healthy / DemoUnhealthy.
 func edgeFeedCheck(ctx context.Context, edgeFeed *feed.Client, market MarketSpec, lag *edgeLagTracker, registry *health.Registry) {
@@ -217,13 +217,13 @@ const settlementStallStrikes = 3
 // settlementCheck watches the settlement bridge two ways, because a bridge that
 // settles NOTHING does not necessarily look unhealthy.
 //
-//  1. HALTED (it latches on a detected journal gap) — it forwards nothing, so
+//  1. HALTED (it latches on a detected journal gap): it forwards nothing, so
 //     fills never draw down their holds. Money stops settling, every filled
 //     order's collateral leaks, and the bots drain within ~an hour until the book
 //     goes one-sided. That stall (ME restored a stale snapshot while the AE reset
 //     to genesis) caused the 2026-07-15 outage.
 //
-//  2. LOOPING WITHOUT SETTLING — the 2026-07-25 outage, and the reason watching
+//  2. LOOPING WITHOUT SETTLING: the 2026-07-25 outage, and the reason watching
 //     halted alone is not enough. /dev/shm filled up, the bridge's media driver
 //     could not map a journal replay image, so every epoch died on a connect
 //     timeout and resynced. halted was false and the AE session was up the whole
@@ -265,7 +265,7 @@ func settlementCheck(ctx context.Context, healthURL string, registry *health.Reg
 				strings.Contains(string(body), "\"halted\":true")
 			if halted {
 				registry.Set("settlement_flowing", false,
-					"settlement bridge HALTED — no money settling, holds leaking: "+
+					"settlement bridge HALTED: no money settling, holds leaking: "+
 						strings.TrimSpace(string(body)), true)
 				strikes, prevEpochs, prevTrades = 0, -1, -1
 				continue
@@ -274,7 +274,7 @@ func settlementCheck(ctx context.Context, healthURL string, registry *health.Reg
 			epochs, trades, ok := bridgeProgress(ctx, client, metricsURL)
 			if !ok {
 				// Not halted, but progress is unknowable. Say so rather than imply
-				// settlement was verified — that wording is the whole 07-25 lesson.
+				// settlement was verified: that wording is the whole 07-25 lesson.
 				registry.Set("settlement_flowing", true,
 					"bridge not halted (forward progress UNVERIFIED: metrics unreadable)", true)
 				strikes, prevEpochs, prevTrades = 0, -1, -1
@@ -288,7 +288,7 @@ func settlementCheck(ctx context.Context, healthURL string, registry *health.Reg
 			prevEpochs, prevTrades = epochs, trades
 			if strikes >= settlementStallStrikes {
 				registry.Set("settlement_flowing", false, fmt.Sprintf(
-					"settlement bridge is LOOPING WITHOUT SETTLING — epoch %d and climbing, "+
+					"settlement bridge is LOOPING WITHOUT SETTLING: epoch %d and climbing, "+
 						"forwarded trades stuck at %d. Holds are piling up and maker collateral "+
 						"is freezing; check the bridge log and /dev/shm on the cluster hosts",
 					epochs, trades), true)
@@ -376,11 +376,11 @@ func saveAnchors(path string, router *refprice.Router) {
 	}
 }
 
-// run wires the whole sim: reference-price router -> agents -> OMS, with the
+// run wires the whole sim: reference-price router -> agents -> gateway, with the
 // observed book closing the loop, and blocks until ctx is cancelled.
 func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceURL string, globalOps float64, hOpts HealthOpts, anchorFile string) error {
 	if err := client.Health(ctx); err != nil {
-		return fmt.Errorf("OMS not reachable: %w", err)
+		return fmt.Errorf("gateway not ready: %w", err)
 	}
 	if err := seed(ctx, cfg, client); err != nil {
 		return fmt.Errorf("seeding bots: %w", err)
@@ -431,15 +431,22 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 	feedClient.Start()
 	defer feedClient.Stop()
 
-	// Per-bot ceiling stays far under the OMS user limits (100/s, 1000/min);
+	// Per-bot ceiling stays under the gateway per-principal budget (GATEWAY_PRINCIPAL_RATE);
 	// the depth keepers need burst room to re-ladder through a price move.
 	governor := agents.NewGovernor(globalOps, globalOps, 8, 20)
 	stats := agents.NewStats()
 
-	// OMS user-WS base URL derives from the REST base (path /ws/v1; the
-	// API.md shorthand "/ws" is the unversioned spelling).
-	wsBase := strings.Replace(cfg.OMSBaseURL, "http://", "ws://", 1)
-	wsBase = strings.Replace(wsBase, "https://", "wss://", 1) + "/ws/v1"
+	// User stream followers (oe-stream /ws/v2), one per followed bot; each
+	// authenticates with its own credential in a header.
+	follow := func(bot int64, s *agents.Scheduler) *oms.UserWS {
+		if cfg.StreamURL == "" {
+			return nil
+		}
+		f := oms.NewUserWS(cfg.StreamURL, client.Creds, bot, 128)
+		f.Start()
+		go pump(f.Out, s.Fills)
+		return f
+	}
 
 	var schedulers []*agents.Scheduler
 	var followers []*oms.UserWS
@@ -461,10 +468,9 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 			s.Makers = append(s.Makers, agents.NewMaker(bots[j], params, env))
 			// Follow this maker's order updates so fills leave the ladder
 			// promptly (reconcile remains the safety net for drops).
-			f := oms.NewUserWS(wsBase, fmt.Sprintf(cfg.AuthTemplate, bots[j]), bots[j], 128)
-			f.Start()
-			followers = append(followers, f)
-			go pump(f.Out, s.Fills)
+			if f := follow(bots[j], s); f != nil {
+				followers = append(followers, f)
+			}
 		}
 		for j := makersPerMarket; j < makersPerMarket+takersPerMarket && j < len(bots); j++ {
 			s.Takers = append(s.Takers, agents.NewTaker(bots[j], params, env))
@@ -478,10 +484,9 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 			s.Depth = append(s.Depth, agents.NewDepth(bots[j], side, params, env))
 			// Follow depth-bot order updates too: eaten rungs must leave the
 			// ladder immediately or the keeper can't refill through a move.
-			f := oms.NewUserWS(wsBase, fmt.Sprintf(cfg.AuthTemplate, bots[j]), bots[j], 128)
-			f.Start()
-			followers = append(followers, f)
-			go pump(f.Out, s.Fills)
+			if f := follow(bots[j], s); f != nil {
+				followers = append(followers, f)
+			}
 			j++
 		}
 		for k := 0; k < noisePerMarket && j < len(bots); k++ {
@@ -495,10 +500,9 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 		if cfg.StabilizerEnabled {
 			stabBot := cfg.StabilizerBot(i)
 			s.Stabilizer = agents.NewStabilizer(stabBot, params, env)
-			f := oms.NewUserWS(wsBase, fmt.Sprintf(cfg.AuthTemplate, stabBot), stabBot, 128)
-			f.Start()
-			followers = append(followers, f)
-			go pump(f.Out, s.Fills)
+			if f := follow(stabBot, s); f != nil {
+				followers = append(followers, f)
+			}
 		}
 		schedulers = append(schedulers, s)
 		s.Start()
@@ -511,7 +515,7 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 	log.Printf("[run] simulating %d markets, %d makers + %d takers + %d noise each, source=%s",
 		len(cfg.Markets), makersPerMarket, takersPerMarket, noisePerMarket, router.ActiveSource())
 
-	// Phase 3: observability — the sim doubles as the demo canary.
+	// Phase 3: observability: the sim doubles as the demo canary.
 	if hOpts.Addr != "" {
 		registry := health.NewRegistry()
 		cm := cfg.Markets[len(cfg.Markets)-1] // least-visible market hosts the canary
@@ -522,9 +526,9 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 		}
 		go canary.Run(ctx)
 
-		targets := []health.Target{{Name: "local", BaseURL: cfg.OMSBaseURL, Critical: true}}
-		if hOpts.PublicOMSURL != "" {
-			targets = append(targets, health.Target{Name: "public", BaseURL: hOpts.PublicOMSURL, Critical: true})
+		targets := []health.Target{{Name: "local", BaseURL: cfg.GatewayURL, Critical: true}}
+		if hOpts.PublicURL != "" {
+			targets = append(targets, health.Target{Name: "public", BaseURL: hOpts.PublicURL, Critical: true})
 		}
 		cors := &health.CORSProbe{Registry: registry, Origin: hOpts.CORSOrigin, Targets: targets}
 		go cors.Run(ctx)
@@ -532,7 +536,7 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 		go passiveChecks(ctx, cfg, client, feedClient, stats, registry)
 
 		// Watch the PUBLIC viewer path (edge relay) with its own feed client,
-		// subscribed to the first market only — one edge connection suffices
+		// subscribed to the first market only: one edge connection suffices
 		// to prove publisher->DO->viewer freshness.
 		var edgeFeed *feed.Client
 		if hOpts.EdgeWSURL != "" {

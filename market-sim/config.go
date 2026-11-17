@@ -2,14 +2,14 @@ package main
 
 import (
 	"strings"
+	"time"
 
 	"github.com/openexch/tools/market-sim/oms"
 )
 
 // MarketSpec carries per-market engine constraints and sim tuning. Band and
-// tick mirror the engine's MarketConfig (documented in order-management/
-// docs/API.md; not yet discoverable via the API, match#64) — orders off-tick
-// or out-of-band are engine-rejected with an empty rejectReason.
+// tick mirror the core's market config; at start the simulator compares them
+// with GET /api/v2/markets and refuses to run on a mismatch (checkMarkets).
 type MarketSpec struct {
 	ID          int
 	Symbol      string
@@ -73,9 +73,9 @@ func DefaultMarkets() []MarketSpec {
 
 // Config is the full sim configuration (populated from flags in main.go).
 type Config struct {
-	OMSBaseURL    string
+	GatewayURL    string // oe-gateway REST base (scheme://host:port; the client adds /api/v2)
+	StreamURL     string // oe-stream user stream, e.g. ws://127.0.0.1:8081/ws/v2 ("" = no followers)
 	MarketWSURL   string
-	AuthTemplate  string
 	Markets       []MarketSpec
 	BotBase       int64 // first bot userId; population is contiguous from here
 	BotsPerMarket int   // makers+takers+noise share this pool per market
@@ -91,6 +91,16 @@ type Config struct {
 	// Funding targets per bot (quote side; base side is per-market BaseFloat).
 	USDFloat oms.Money
 
+	// Gateway client settings (flags in main.go).
+	Retry            oms.RetryPolicy
+	HTTPTimeout      time.Duration
+	KeyedCancels     bool
+	KeyedWindow      time.Duration // 0 = the gateway's idempotencyWindowMs
+	KeyedStatsFile   string
+	KeyedStatsEvery  time.Duration
+	KeyedWindowsKept int
+	FaucetMax        map[int]oms.Money // per-request deposit cap per asset
+
 	// bandMarginPct keeps the anchor this % inside the hard band so the 10%
 	// price collar and band rejects never fire at the edges.
 	BandMarginPct float64
@@ -98,15 +108,14 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		OMSBaseURL:    "http://127.0.0.1:8080",
+		GatewayURL:    "http://127.0.0.1:8080",
 		MarketWSURL:   "ws://127.0.0.1:8081/ws",
-		AuthTemplate:  "dev:%d",
 		Markets:       DefaultMarkets(),
 		BotBase:       900001,
 		BotsPerMarket: 10,
 		CanaryBot:     900999,
 
-		StabilizerEnabled:  false, // DISABLED 2026-07-15: pro-cyclical clearStale crashed BTC to the band floor in a downmove; needs redesign before re-enabling
+		StabilizerEnabled:  false,  // DISABLED 2026-07-15: pro-cyclical clearStale crashed BTC to the band floor in a downmove; needs redesign before re-enabling
 		StabilizerBase:     900900, // one per market: 900900..; clear of the 900001-900050 pool and the 900999 canary
 		StabilizerFundMult: 50,
 
@@ -152,4 +161,16 @@ func (c *Config) AllBots() []int64 {
 		out = append(out, c.Bots(i)...)
 	}
 	return out
+}
+
+// Users returns every bot user this configuration drives: the trading bots,
+// the stabilizers when enabled, and the canary.
+func (c *Config) Users() []int64 {
+	out := c.AllBots()
+	if c.StabilizerEnabled {
+		for i := range c.Markets {
+			out = append(out, c.StabilizerBot(i))
+		}
+	}
+	return append(out, c.CanaryBot)
 }

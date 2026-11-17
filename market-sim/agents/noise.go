@@ -2,7 +2,6 @@ package agents
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"math/rand"
 	"time"
@@ -76,7 +75,6 @@ func (n *Noise) place(ctx context.Context) {
 	resp, err := n.Env.Client.CreateOrder(ctx, oms.CreateOrderRequest{
 		UserID: n.Bot, MarketID: n.Params.ID, Side: side, OrderType: "LIMIT",
 		TimeInForce: "GTC", Price: &price, Quantity: oms.MoneyFromFloat(qty),
-		ClientOrderID: fmt.Sprintf("sim-%d-%d", n.Bot, n.seq),
 	})
 	if err != nil {
 		n.Env.Stats.Errors.Add(1)
@@ -88,7 +86,7 @@ func (n *Noise) place(ctx context.Context) {
 		return
 	}
 	n.Env.Stats.Placed.Add(1)
-	n.orders = append(n.orders, noiseOrder{id: resp.OmsOrderID, placedAt: time.Now()})
+	n.orders = append(n.orders, noiseOrder{id: resp.OrderID, placedAt: time.Now()})
 	// Occasional flicker: cancel-shortly-after-place.
 	if rand.Float64() < 0.15 {
 		n.nextAt = time.Now().Add(500 * time.Millisecond)
