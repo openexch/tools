@@ -39,6 +39,14 @@ build needs stops it with a message naming the variable when it is unset. A ``Co
   MK_AE_JAR, MK_ME_JAR, MK_PROJECTOR_JAR   the engine jars of the base kinds (their source commits are pinned below)
   MK_PROBE_MANIFEST     the ``probe-manifest.json`` written by ``build_core_probes.py``
   MK_NETFILTER_HELPER   the netfilter helper directory (``iptables-legacy`` and its extensions)
+  MK_GATEWAY_NC         oe-gateway of the cut's gateway commit built with GW_NC_FRESH_KEY (the gateway kinds' gateway_nc)
+  MK_GATEWAY_NC_NO_CANCEL_REOFFER_RULE, MK_GATEWAY_NC_NO_ASSET_CHECK   the same commit built with that control define (the
+                        gateway_nc of the kinds whose ``nc_define`` names it)
+
+The gateway kinds (``core_contracts.GATEWAY_KINDS``: gw, gw-ext, gw-slow(-ext), gw-freshkey(-ext), gw-dry-stream(-ext),
+gw-dry-stream-ceiling16m, gw-dry-gateway(-ext), gw-dry-gateway-freshkey) are derived from an rc2-cut/3 cut: the four
+gateway roles at .40-.43, oe-gateway and oe-stream from the cut, the session stub from the cut's cluster-tools test build
+(MK_CUT_NC_DIR), gateway_nc from the MK_GATEWAY_NC* setting of the kind's control define and the HTTP shim from this harness.
 """
 import argparse
 from dataclasses import dataclass, field
@@ -129,6 +137,11 @@ class Config:
     pg_port: int = 55481
     seed: int = SEED
     cut_nc_dir: Path = _setting('MK_CUT_NC_DIR', "the test-config build of the cut's cluster-tools commit (nc targets)")
+    gateway_nc: Path = _setting('MK_GATEWAY_NC', "oe-gateway of the cut's gateway commit built with GW_NC_FRESH_KEY")
+    gateway_nc_no_reoffer: Path = _setting('MK_GATEWAY_NC_NO_CANCEL_REOFFER_RULE',
+                                           "oe-gateway of the cut's gateway commit built with GW_NC_NO_CANCEL_REOFFER_RULE")
+    gateway_nc_no_asset: Path = _setting('MK_GATEWAY_NC_NO_ASSET_CHECK',
+                                         "oe-gateway of the cut's gateway commit built with GW_NC_NO_ASSET_CHECK")
     shm_mb: dict = field(default_factory=dict)                 # per-role overrides of SHM_MB (settings)
     harness_drift: str = None                                  # A named waiver (rig kinds only), recorded
     memory_mb: dict = field(default_factory=dict)
@@ -294,7 +307,19 @@ CUT_KINDS = {
     'shadow-query-ext': ('external', 'external', 'CUT', 'A', {}),
     'shadow-anyverified-ext': ('external', 'external', 'CUT', 'A', {}),
     'full': ('external', 'embedded', 'CUT', 'A', {}),
+    # The gateway kinds: forwarders and bridges on the cut, external as in the dev profile; engines, projector and the
+    # gateway slots on the kind's driver mode (core_contracts.GATEWAY_KINDS)
+    **{kind: ('external', spec['driver'], 'CUT', 'A', {}) for kind, spec in core_contracts.GATEWAY_KINDS.items()},
 }
+# The gateway roles' addresses (after every other role's, so a gateway kind keeps the other roles' addresses) and their
+# container sizes: settings with defaults, never acceptance limits. The shim runs CoreProbe JVMs, hence its memory.
+GATEWAY_NODE_BASE = 40
+GATEWAY_LIMITS = {'cpu_set': [6, 7, 8, 9], 'cpu_quota': 1.0, 'memory_mb': 1024, 'shm_mb': 512}
+SHIM_MEMORY_MB = 2048
+# The control define of a gateway_nc build -> (the Config field holding its binary, its setting name)
+GATEWAY_NC_BUILDS = {'GW_NC_FRESH_KEY': ('gateway_nc', 'MK_GATEWAY_NC'),
+                     'GW_NC_NO_CANCEL_REOFFER_RULE': ('gateway_nc_no_reoffer', 'MK_GATEWAY_NC_NO_CANCEL_REOFFER_RULE'),
+                     'GW_NC_NO_ASSET_CHECK': ('gateway_nc_no_asset', 'MK_GATEWAY_NC_NO_ASSET_CHECK')}
 # The replica's container on the replica kinds: settings with defaults (the slots' CPUs, one CPU of quota, 2 GiB)
 REPLICA_LIMITS = {'cpu_set': [6, 7, 8, 9], 'cpu_quota': 1.0, 'memory_mb': 2048, 'shm_mb': 1024}
 def cut_roles(cut):
@@ -423,6 +448,8 @@ def build_from_cut(kind, tag, cut_path, cfg=None, old_pins=None):
     if kind in LEGACY_LAYOUT_KINDS:
         m['nodes'] = legacy_nodes(roles, cfg.octet)
         m['node_layout'] = 'legacy'
+    if kind in core_contracts.GATEWAY_KINDS:
+        add_gateway_slots(m, kind, cut, cfg, cut_libs, commit)
     for key, name in CUT_HARNESS.items():
         e = harness[name]
         m[key] = {'path': e['path'], 'sha256': e['sha256'], 'source_path': e['source_path'], 'source_sha256': e['source_sha256']}
@@ -441,11 +468,60 @@ def build_from_cut(kind, tag, cut_path, cfg=None, old_pins=None):
     return out, m
 
 
+def add_gateway_slots(m, kind, cut, cfg, cut_libs, harness_commit):
+    """The gateway kind's four roles, ports, artifacts, slot plan and limits (core_contracts.GATEWAY_KINDS). Only the
+    artifacts the kind's slots run are staged; the rest are declared null."""
+    spec = core_contracts.GATEWAY_KINDS[kind]
+    if not release_cut.layout(cut.get('schema')).get('gateway'):
+        raise Violation(f'{kind} stages the gateway binaries: the cut must be {release_cut.SCHEMA} (has {cut.get("schema")})')
+    driver, a = spec['driver'], cut['artifacts']
+    libs = (lambda: json.loads(json.dumps(cut_libs))) if driver == 'external' else (lambda: None)
+    used = set(spec['slots'].values()) - {None}
+    art = {name: None for name in core_contracts.GATEWAY_BINARIES}
+    for name, product in (('gateway', 'oe-gateway'), ('stream', 'oe-stream')):
+        if name in used:
+            art[name] = {k: a[product][k] for k in ('path', 'sha256', 'source_sha')}
+            art[name].update(driver=driver, target=product)
+    if 'gateway_nc' in used:
+        define = core_contracts.nc_define(kind)
+        attr, setting = GATEWAY_NC_BUILDS[define]
+        path = _need(getattr(cfg, attr), f'gateway_nc ({setting})')
+        art['gateway_nc'] = {'path': str(path), 'sha256': sha(path), 'source_sha': cut['repos']['gateway'], 'driver': driver,
+                             'target': 'oe-gateway', 'defines': [define]}
+    if 'session_stub' in used:
+        path = _need(Path(cfg.cut_nc_dir) / 'app' / 'session-stub' / 'ct_session_stub', 'session_stub (MK_CUT_NC_DIR)')
+        art['session_stub'] = {'path': str(path), 'sha256': sha(path), 'source_sha': cut['repos']['cluster-tools'],
+                               'driver': driver, 'target': 'ct_session_stub'}
+    if 'gateway_stub' in used:
+        path = Path(__file__).resolve().with_name('gateway_shim.py')
+        art['gateway_stub'] = {'path': str(path), 'sha256': sha(path), 'source_sha': harness_commit, 'driver': 'embedded',
+                               'target': 'gateway_shim', 'mode': spec['shim_mode']}
+    for name, entry in art.items():
+        if entry is not None and name != 'gateway_stub' and driver == 'external':
+            entry['libs'] = libs()
+    m['artifacts'].update(art)
+    octet = m['network']['subnet'].split('.')[2]
+    m['nodes'].update({role: f'172.30.{octet}.{GATEWAY_NODE_BASE + j}' for j, role in enumerate(sorted(core_contracts.GATEWAY_ROLES))})
+    m['ports'].update(core_contracts.GATEWAY_PORTS)
+    m['slot_artifacts'].update(spec['slots'])
+    limits = m['limits']
+    for role in core_contracts.GATEWAY_ROLES:
+        limits['cpu_set_by_role'][role] = list(GATEWAY_LIMITS['cpu_set'])
+        limits['cpu_quota_by_role'][role] = GATEWAY_LIMITS['cpu_quota']
+        shim = spec['slots'].get(role) == 'gateway_stub'
+        limits['memory_mb_by_role'][role] = cfg.memory_mb.get(role, SHIM_MEMORY_MB if shim else GATEWAY_LIMITS['memory_mb'])
+        limits['shm_mb_by_role'][role] = cfg.shm_mb.get(role, GATEWAY_LIMITS['shm_mb'])
+    if spec['core_jvm']:
+        m['core_jvm_properties'] = dict(spec['core_jvm'])
+    m['profile_note'] += (f'; gateway slots {driver} ({", ".join(f"{k}={v}" for k, v in sorted(spec["slots"].items()))})'
+                          + (f'; core {", ".join(f"{k}={v}" for k, v in sorted(spec["core_jvm"].items()))}' if spec['core_jvm'] else ''))
+
+
 def _sizes(pairs):
     sizes = {}
     for pair in pairs or []:
         role, _, value = pair.partition('=')
-        if role not in core_contracts.ROLES or not value.isdigit():
+        if role not in core_contracts.ROLES | core_contracts.GATEWAY_ROLES or not value.isdigit():
             raise SystemExit('a size override is ROLE=MB, got ' + pair)
         sizes[role] = int(value)
     return sizes

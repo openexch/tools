@@ -47,8 +47,10 @@ def main():
                 shutil.copyfile(source, sources / source.name)
         if (Path(__file__).parent / 'java').is_dir():
             shutil.copytree(Path(__file__).parent / 'java', sources / 'java')
-        if core_topology != args.scenario.startswith('core-'):
-            raise Inconclusive('core-* scenarios need a schema v2 core manifest and only they accept one')
+        import gateway_drills
+        gateway = gateway_drills.is_scenario(args.scenario)
+        if core_topology != (args.scenario.startswith('core-') or gateway):
+            raise Inconclusive('core-* and gateway scenarios need a schema v2 core manifest and only they accept one')
         if args.scenario.startswith('core-boots-'):
             from core_scenarios import consecutive_boots
             count = int(args.scenario.rsplit('-', 1)[1])
@@ -62,6 +64,13 @@ def main():
             # core-boot checks the EMPTY genesis; core-smoke runs the genesis phases
             fixture.start(core_scenarios.SMOKE_PLAN if args.scenario == 'core-smoke' else None)
             result.update({'core-boot': core_scenarios.core_boot, 'core-smoke': core_scenarios.core_smoke}[args.scenario](fixture))
+        elif gateway:
+            # The gateway and stream drills: refused before any container when not implemented (exit non-zero)
+            gateway_drills.check_scenario(manifest, args.scenario)
+            from core_fixture import CoreFixture
+            fixture = CoreFixture(args.manifest, drill=True)
+            result['state_root'] = str(fixture.root)
+            result.update(gateway_drills.scenario(fixture, args.scenario, args.output))
         elif args.scenario.startswith(('core-drill-', 'core-control-', 'core-red-')):
             # The core-topology drills, the controls and the two REDs; drill=True refuses a non-enforced ME
             from core_fixture import CoreFixture

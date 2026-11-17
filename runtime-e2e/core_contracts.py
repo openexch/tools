@@ -27,6 +27,46 @@ SLOT_ARTIFACTS = {'fwd0': {'forwarder', 'forwarder_b'}, 'fwd1': {'forwarder', 'f
 PORT_PROFILE = {'me_base': 9000, 'ae_base': 19300, 'stride': 100, 'me_metrics': 19500, 'ae_metrics': 19700,
                 'bridge_http': 9600, 'projector_http': 9601, 'forwarder_http': 9700, 'journal_replay': 19820,
                 'shadow_metrics': 19703}
+# The user-facing slots: two order gateways (oe-gateway) and two user streams (oe-stream), each in its own 1-CPU container
+# and its own cluster session. A manifest declares all four roles or none (older manifests have none); a declared slot
+# may be null (skipped, never faked). Each slot may run the product binary or, in a rig kind, a test-only alternative:
+#   gateway_nc    oe-gateway of the cut's gateway commit built with one control define (the kind's ``nc_define``)
+#   gateway_stub  the test-only HTTP shim over CoreProbe verbs (gateway_shim.py, never published): gateway dry runs
+#   session_stub  ct_session_stub of the cut's cluster-tools commit (never published): stream dry runs
+GATEWAY_SLOTS = {'gw0': 'gateway', 'gw1': 'gateway', 'st0': 'stream', 'st1': 'stream'}
+GATEWAY_ROLES = set(GATEWAY_SLOTS)
+GATEWAY_BINARIES = ['gateway', 'gateway_nc', 'stream', 'gateway_stub', 'session_stub']
+GATEWAY_SLOT_ARTIFACTS = {'gw0': {'gateway', 'gateway_nc', 'gateway_stub'}, 'gw1': {'gateway', 'gateway_nc', 'gateway_stub'},
+                          'st0': {'stream', 'session_stub'}, 'st1': {'stream', 'session_stub'}}
+# The test-only alternatives: refused in a product kind (release_cut K3), each checked against the cut it claims
+GATEWAY_TEST_ARTIFACTS = {'gateway_nc', 'gateway_stub', 'session_stub'}
+# The control defines a gateway_nc build may carry (the gateway's own control names, CoreSession.h and GatewayRoutes.cpp)
+GATEWAY_NC_DEFINES = {'GW_NC_FRESH_KEY', 'GW_NC_NO_CANCEL_REOFFER_RULE', 'GW_NC_NO_ASSET_CHECK'}
+# Ports of the gateway roles (every role has its own address, so gw0 and gw1 share the numbers)
+GATEWAY_PORTS = {'gateway_http': 8080, 'gateway_admin': 8081, 'stream_ws': 8090, 'stream_admin': 8091, 'shim_http': 8085}
+# JVM system properties a manifest may set on the core members (core_jvm_properties): the per-session egress ceiling of
+# the slow-consumer drill. A setting of the core (SessionEgressQueue), never a timeout.
+CORE_JVM_PROPERTIES = {'core.egress.max.capacity.bytes'}
+
+
+def gateway_manifest(manifest):
+    """True when ``manifest`` declares the gateway roles (all four), False when it declares none of them."""
+    present = GATEWAY_ROLES & set((manifest or {}).get('nodes') or {})
+    if present and present != GATEWAY_ROLES:
+        raise Violation('the gateway roles are declared together: ' + ', '.join(sorted(GATEWAY_ROLES)) + '; got '
+                        + ', '.join(sorted(present)))
+    return bool(present)
+
+
+def roles_of(manifest):
+    """The roles a manifest must declare: ROLES, plus the gateway roles on a gateway manifest."""
+    return ROLES | (GATEWAY_ROLES if gateway_manifest(manifest) else set())
+
+
+def slots_of(manifest):
+    return {**SLOTS, **(GATEWAY_SLOTS if gateway_manifest(manifest) else {})}
+
+
 # The replica's port slot (CLUSTER_REPLICA_SLOT): its ports are ae_base + slot x stride + offset, like a member's
 REPLICA_SLOT = 3
 # A replica restarted right after a kill or an exit meets its own archive's mark file, as an AE member does (the same
@@ -66,7 +106,9 @@ OPTIONAL_MANIFEST_KEYS = {'netfilter_helper', 'host_loss_acceptance', 'profile_n
                           # The money projector's driver profile and its staged driver
                           'projector_driver', 'projector_libs', 'node_layout',
                           # A rig manifest's named waiver of the harness pin (smokes before a cut regeneration)
-                          'harness_drift'}
+                          'harness_drift',
+                          # The core members' JVM properties (CORE_JVM_PROPERTIES), the slow-consumer kinds' egress ceiling
+                          'core_jvm_properties'}
 DRIVER_MODES = {'embedded', 'external'}
 LIB_KEYS = {'path', 'sha256', 'exec'}
 # Pinned single-file helper programs, checked like core_probe / journal_probe (path + source_path hashes).
@@ -103,7 +145,17 @@ PROCESS_ENV = {
     'REPLICA_CATCHUP_RCV_WND', 'SHADOW_RETAIN_N', 'REPLICA_BACKUP_COOLDOWN_MS', 'SHADOW_REBOOTSTRAP_REPLAY_FAILURES',
     'REPLICA_BACKUP_QUERY_INTERVAL_MS',
     # the core's archive segment length (members and replica of the replica and full drill kinds; core README)
-    'ARCHIVE_SEGMENT_LENGTH'}
+    'ARCHIVE_SEGMENT_LENGTH'} | {
+    # oe-gateway and oe-stream (gateway README "Run"; strict: every problem in one pass, exit 78). Timeouts, stale bounds and
+    # cadences are never set: the binaries run on their defaults, as the engines run on production timeouts.
+    'GATEWAY_DRIVER_MODE', 'GATEWAY_DRIVER_DIR', 'GATEWAY_CORE_INGRESS', 'GATEWAY_CORE_INGRESS_CHANNEL',
+    'GATEWAY_CORE_RESPONSE_CHANNEL', 'GATEWAY_INSTANCE_ID', 'GATEWAY_HTTP_BIND', 'GATEWAY_ADMIN_BIND', 'GATEWAY_AUTH_MODES',
+    'GATEWAY_API_KEYS_FILE', 'GATEWAY_PG_URL', 'GATEWAY_ALLOW_TREASURY_LANE', 'GATEWAY_TREASURY_CREDENTIAL',
+    'GATEWAY_FAUCET_MAX_AMOUNT', 'STREAM_DRIVER_MODE', 'STREAM_DRIVER_DIR', 'STREAM_CORE_INGRESS',
+    'STREAM_CORE_INGRESS_CHANNEL', 'STREAM_CORE_RESPONSE_CHANNEL', 'STREAM_INSTANCE_ID', 'STREAM_WS_BIND',
+    'STREAM_ADMIN_BIND', 'STREAM_AUTH_MODES', 'STREAM_CORE_NODE_ENDPOINTS', 'STREAM_ME_NODE_ENDPOINTS',
+    # the test-only HTTP shim (gateway_shim.py): its listener and its users file
+    'SHIM_HTTP_BIND', 'SHIM_API_KEYS_FILE', 'SHIM_MODE', 'SHIM_CORE_PROBE'}
 # Only `execute` on the probe container may carry these (the pinned T1 drivers). The values are
 # session secrets except T1_ME_MARKETS and T1_LOCAL_HOST. T1_BRIDGE_KEY, T1_TAP_KEY and T1_ME_FORWARDER_KEY are
 # never set: the via-bridge genesis needs no bridge key and the capture/resend verbs are not run from the probe.
@@ -172,7 +224,86 @@ DRILL_CADENCE_ENV = {'SNAPSHOT_INTERVAL_MINUTES': '1'}
 # is the replica's own (it never reads TRANSPORT_LOG_RCV_WINDOW); the term is the members' (the lag default reads it)
 REPLICA_ENV = {'CORE_ROLE': 'replica', 'CLUSTER_REPLICA_SLOT': str(REPLICA_SLOT), 'REPLICA_BACKUP_SOURCE': 'FOLLOWER',
                'REPLICA_SHADOW_BUFFER_MB': '64', 'REPLICA_CATCHUP_RCV_WND': '512k', 'SHADOW_RETAIN_N': '3'}
-CUT_KINDS = CUT_KINDS | set(REPLICA_KINDS) | FULL_KINDS
+# The gateway kinds, derived from the cut like the s17 kinds; each declares the four gateway roles. ``driver`` is the
+# gateway and stream slots' driver mode and the engines' (one mode per kind, so every drill runs as an embedded and an
+# external entry); ``slots`` the artifact of each gateway slot (None: the slot is declared and empty); ``core_jvm``
+# the core members' JVM properties (CORE_JVM_PROPERTIES); ``shim_mode`` the HTTP shim's mode (gateway dry runs).
+#   gw, gw-ext                  the product binaries in all four slots
+#   gw-slow, gw-slow-ext        the slow-consumer drill: the core's egress ceiling lowered so the story reaches it
+#   gw-freshkey(-ext)           the kill-restart control: gw0 runs oe-gateway built with GW_NC_FRESH_KEY
+#   gw-noreoffer                the kill-restart control of the cancel re-offer rule: gw1 (the cancel phase's gateway)
+#                               runs oe-gateway built with GW_NC_NO_CANCEL_REOFFER_RULE
+#   gw-noassetcheck             the fill-visibility control of the asset check: gw1 (the fuzz's gateway) runs oe-gateway
+#                               built with GW_NC_NO_ASSET_CHECK
+# ``nc_define`` names the control define of the kind's gateway_nc build (default GW_NC_FRESH_KEY).
+#   gw-dry-stream(-ext)         stream dry run: st0 = ct_session_stub, the ceiling lowered, no gateway binary
+#   gw-dry-stream-ceiling16m    its control: the ceiling left at the core's 16 MiB default
+#   gw-dry-gateway(-ext)        gateway dry run: gw0 and gw1 = the HTTP shim over CoreProbe verbs
+#   gw-dry-gateway-freshkey     its control: the shim mints a fresh request id on every attempt
+DRILL_EGRESS_CEILING_BYTES = 262144        # a setting of the slow-consumer kinds (256 KiB), never a limit
+_LOWERED = {'core.egress.max.capacity.bytes': str(DRILL_EGRESS_CEILING_BYTES)}
+_ALL = {'gw0': 'gateway', 'gw1': 'gateway', 'st0': 'stream', 'st1': 'stream'}
+GATEWAY_KINDS = {
+    'gw': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}},
+    'gw-ext': {'driver': 'external', 'slots': dict(_ALL), 'core_jvm': {}},
+    'gw-slow': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': dict(_LOWERED)},
+    'gw-slow-ext': {'driver': 'external', 'slots': dict(_ALL), 'core_jvm': dict(_LOWERED)},
+    'gw-freshkey': {'driver': 'embedded', 'slots': dict(_ALL, gw0='gateway_nc'), 'core_jvm': {}},
+    'gw-freshkey-ext': {'driver': 'external', 'slots': dict(_ALL, gw0='gateway_nc'), 'core_jvm': {}},
+    'gw-dry-stream': {'driver': 'embedded', 'slots': {'gw0': None, 'gw1': None, 'st0': 'session_stub', 'st1': None},
+                      'core_jvm': dict(_LOWERED)},
+    'gw-dry-stream-ext': {'driver': 'external', 'slots': {'gw0': None, 'gw1': None, 'st0': 'session_stub', 'st1': None},
+                          'core_jvm': dict(_LOWERED)},
+    'gw-dry-stream-ceiling16m': {'driver': 'embedded', 'slots': {'gw0': None, 'gw1': None, 'st0': 'session_stub', 'st1': None},
+                                 'core_jvm': {}},
+    'gw-dry-gateway': {'driver': 'embedded', 'slots': {'gw0': 'gateway_stub', 'gw1': 'gateway_stub', 'st0': None, 'st1': None},
+                       'core_jvm': {}, 'shim_mode': 'stored'},
+    'gw-dry-gateway-ext': {'driver': 'external', 'core_jvm': {}, 'shim_mode': 'stored',
+                           'slots': {'gw0': 'gateway_stub', 'gw1': 'gateway_stub', 'st0': None, 'st1': None}},
+    'gw-dry-gateway-freshkey': {'driver': 'embedded', 'core_jvm': {}, 'shim_mode': 'fresh-key',
+                                'slots': {'gw0': 'gateway_stub', 'gw1': 'gateway_stub', 'st0': None, 'st1': None}},
+}
+# The control kinds of the five drills: ``control`` names the scenario whose line must fail, ``control_text`` overrides
+# the scenario's text (gateway_drills.CONTROL_TEXT), ``drill`` sets drill sizes (gateway_drills.SETTINGS names) and
+# ``behavior`` the core behaviour version (default GATEWAY_CORE_BEHAVIOR).
+#   gw-freshkey(-ext)          gateway-kill-restart: gw0 mints a fresh request id per attempt (GW_NC_FRESH_KEY)
+#   gw-b3                      gateway-kill-restart: the core left at behaviour 3, where the gate is checked before the
+#                              requestId lookup, so a stored acceptance sent again under a closed gate is refused
+#   gw-slow-ceiling16m         stream-slow-consumer: the egress ceiling left at the core's 16 MiB
+#   gw-timeout-shortfreeze     gateway-session-timeout: gw0 frozen for less than the core's session timeout, so its
+#                              keepalives resume before the core closes the session
+#   gw-fill-muted              fill-visibility-core: both streams frozen while the pairs run
+#   gw-tick-nofwd              tick-live-path: the forwarders stopped before the pass leg
+#   gw-noreoffer               gateway-kill-restart: a re-offered unkeyed cancel answered by its reject
+#   gw-noassetcheck            fill-visibility-core: a deposit of an unknown assetId sent to the core, which drops it
+GATEWAY_CORE_BEHAVIOR = 4
+GATEWAY_KINDS.update({
+    'gw-freshkey': dict(GATEWAY_KINDS['gw-freshkey'], control='gateway-kill-restart'),
+    'gw-freshkey-ext': dict(GATEWAY_KINDS['gw-freshkey-ext'], control='gateway-kill-restart'),
+    'gw-b3': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'behavior': 3, 'control': 'gateway-kill-restart',
+              'control_text': 'stored acceptance answered ADMISSION_CLOSED'},
+    'gw-slow-ceiling16m': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'control': 'stream-slow-consumer'},
+    'gw-timeout-shortfreeze': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'control': 'gateway-session-timeout',
+                               'drill': {'TIMEOUT_FREEZE_S': 4}},
+    'gw-fill-muted': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'control': 'fill-visibility-core',
+                      'drill': {'FILL_PAIRS': 2}},
+    'gw-tick-nofwd': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'control': 'tick-live-path',
+                      'drill': {'TICK_REFERENCE_BOUND_S': 20, 'TICK_COMPLETE_BOUND_S': 10}},
+    'gw-noreoffer': {'driver': 'embedded', 'slots': dict(_ALL, gw1='gateway_nc'), 'core_jvm': {},
+                     'nc_define': 'GW_NC_NO_CANCEL_REOFFER_RULE', 'control': 'gateway-kill-restart',
+                     'control_text': 'successful cancel answered NOT_FOUND'},
+    'gw-noassetcheck': {'driver': 'embedded', 'slots': dict(_ALL, gw1='gateway_nc'), 'core_jvm': {},
+                        'nc_define': 'GW_NC_NO_ASSET_CHECK', 'control': 'fill-visibility-core',
+                        'control_text': 'request unanswered: decode drop', 'drill': {'FILL_PAIRS': 20}},
+})
+GATEWAY_NC_DEFAULT_DEFINE = 'GW_NC_FRESH_KEY'
+
+
+def nc_define(kind):
+    """The control define of a gateway kind's gateway_nc build."""
+    return (GATEWAY_KINDS.get(kind) or {}).get('nc_define', GATEWAY_NC_DEFAULT_DEFINE)
+SHIM_MODES = {'stored', 'fresh-key'}
+CUT_KINDS = CUT_KINDS | set(REPLICA_KINDS) | FULL_KINDS | set(GATEWAY_KINDS)
 KINDS = BASE_KINDS | CUT_KINDS
 
 
@@ -411,8 +542,9 @@ def validate_cpus(manifest, cpu_count):
     if not isinstance(cpu_set, list) or not cpu_set or len(set(cpu_set)) != len(cpu_set):
         raise Violation('cpu_set must be an explicit list of distinct CPUs')
     by_role = limits.get('cpu_set_by_role', {})
+    roles = roles_of(manifest)
     for role, cpus in by_role.items():
-        if role not in ROLES:
+        if role not in roles:
             raise Violation('cpu set for an unknown role: ' + role)
         if (not isinstance(cpus, list) or not cpus or len(set(cpus)) != len(cpus)
                 or any(type(c) is not int or c < 0 or c >= cpu_count for c in cpus)):
@@ -433,7 +565,7 @@ def validate_cpus(manifest, cpu_count):
         raise Violation('probe CPUs must be explicit and separate from service CPUs')
     for role, quota in limits.get('cpu_quota_by_role', {}).items():
         cpus = by_role.get(role, cpu_set)
-        if role not in ROLES or type(quota) not in (int, float) or not 0 < quota <= len(cpus):
+        if role not in roles or type(quota) not in (int, float) or not 0 < quota <= len(cpus):
             raise Violation('invalid bounded CPU quota for ' + str(role))
 
 
@@ -460,11 +592,72 @@ def validate_replica_slot(manifest):
         raise Violation('artifacts.shadow stages no libs: an external replica runs on engine_libs')
 
 
-def validate_role_limits(limits):
+GATEWAY_ARTIFACT_KEYS = {'path', 'sha256', 'source_sha', 'driver', 'target', 'libs', 'defines', 'mode'}
+GATEWAY_TARGETS = {'gateway': 'oe-gateway', 'gateway_nc': 'oe-gateway', 'stream': 'oe-stream', 'gateway_stub': 'gateway_shim',
+                   'session_stub': 'ct_session_stub'}
+
+
+def validate_gateway_artifacts(manifest):
+    """The gateway binaries of a gateway manifest: each declared (null when absent), pinned like a slot binary (path,
+    sha256, 40-hex source commit, driver mode, the libraries an external one stages), its target fixed by its key. A
+    gateway_nc names its control defines; the HTTP shim runs CoreProbe JVMs (each on its own embedded driver), so it is
+    embedded and names its mode."""
+    artifacts = manifest['artifacts']
+    for name in GATEWAY_BINARIES:
+        if name not in artifacts:
+            raise Violation('a gateway manifest declares every gateway artifact explicitly (null when absent): ' + name)
+        entry = artifacts[name]
+        if entry is None:
+            continue
+        if not isinstance(entry, dict) or set(entry) - GATEWAY_ARTIFACT_KEYS:
+            raise Violation(f'{name}: artifact keys are ' + ', '.join(sorted(GATEWAY_ARTIFACT_KEYS)))
+        _source(entry, name); _file(entry, name)
+        if entry.get('target') != GATEWAY_TARGETS[name]:
+            raise Violation(f'{name}: target must be {GATEWAY_TARGETS[name]}, got {entry.get("target")!r}')
+        if entry.get('driver') not in DRIVER_MODES:
+            raise Violation(name + ': driver must be embedded or external')
+        if name == 'gateway_stub' and (entry['driver'] != 'embedded' or entry.get('mode') not in SHIM_MODES):
+            raise Violation('gateway_stub: the shim runs CoreProbe on its embedded driver (driver embedded) and names its '
+                            'mode: ' + ', '.join(sorted(SHIM_MODES)))
+        if name != 'gateway_stub' and 'mode' in entry:
+            raise Violation(name + ': only the shim has a mode')
+        defines = entry.get('defines')
+        if name == 'gateway_nc':
+            if not isinstance(defines, list) or not defines or not set(defines) <= GATEWAY_NC_DEFINES:
+                raise Violation('gateway_nc names its control defines, a non-empty subset of ' + ', '.join(sorted(GATEWAY_NC_DEFINES)))
+            kind = manifest.get('manifest_kind')
+            if kind in GATEWAY_KINDS and defines != [nc_define(kind)]:
+                raise Violation(f'gateway_nc of kind {kind} is the {nc_define(kind)} build, got defines {defines}')
+        elif defines is not None:
+            raise Violation(name + ': only gateway_nc carries control defines')
+        libs = entry.get('libs') or {}
+        if entry['driver'] == 'external' and name != 'gateway_stub' and set(libs) != {'aeronmd', 'libaeron_driver.so', 'libaeron.so'}:
+            raise Violation(f'{name}: an external slot stages aeronmd, libaeron_driver.so and libaeron.so')
+        for lib_name, lib in libs.items():
+            if '/' in lib_name:
+                raise Violation(name + ': library names are flat file names')
+            _lib(lib, name + ' library ' + lib_name)
+
+
+def validate_core_jvm_properties(manifest):
+    """``core_jvm_properties``: {name: positive integer string} over CORE_JVM_PROPERTIES; never a timeout."""
+    props = manifest.get('core_jvm_properties')
+    if props is None:
+        return
+    if not isinstance(props, dict):
+        raise Violation('core_jvm_properties must be an object')
+    for key, value in props.items():
+        if key not in CORE_JVM_PROPERTIES:
+            raise Violation('core_jvm_properties is an allowlist; refused ' + str(key))
+        if not (isinstance(value, str) and re.fullmatch(r'[1-9][0-9]{0,11}', value)):
+            raise Violation(f'core_jvm_properties.{key} must be a positive integer string, got {value!r}')
+
+
+def validate_role_limits(limits, roles=ROLES):
     """Optional per-role overrides of shm_mb / memory_mb (an ME member needs 1.5 GiB of tmpfs)."""
     for key in ('shm_mb_by_role', 'memory_mb_by_role'):
         for role, value in (limits.get(key) or {}).items():
-            if role not in ROLES:
+            if role not in roles:
                 raise Violation(key + ' names an unknown role: ' + str(role))
             if integer(value) <= 0:
                 raise Violation(key + ' must be positive and explicit: ' + role)
@@ -504,25 +697,27 @@ def validate_core_manifest(manifest, manifest_path, cpu_count=None, profiles=jou
         legacy = LEGACY_ROLES & set(nodes)
         if legacy:
             raise Violation('legacy roles are absent from the core topology: ' + ', '.join(sorted(legacy)))
-        if set(nodes) != ROLES:
-            raise Violation('core topology roles are exactly ' + ', '.join(sorted(ROLES)) + '; got '
-                            + ', '.join(sorted(set(nodes) ^ ROLES)))
+        gateway = gateway_manifest(manifest)
+        roles = roles_of(manifest)
+        if set(nodes) != roles:
+            raise Violation('core topology roles are exactly ' + ', '.join(sorted(roles)) + '; got '
+                            + ', '.join(sorted(set(nodes) ^ roles)))
         if len(set(nodes.values())) != len(nodes):
             raise Violation('two roles share an address')
         for value in nodes.values():
             address = ipaddress.ip_address(value)
             if address not in net or address in {net.network_address, net.broadcast_address, net.network_address + 1}:
                 raise Violation('endpoint is outside the fixture or collides with its gateway')
-        if manifest['ports'] != PORT_PROFILE:
+        if manifest['ports'] != ({**PORT_PROFILE, **GATEWAY_PORTS} if gateway else PORT_PROFILE):
             raise Violation('core port profile differs from the fixture contract')
         for field in ['shm_mb', 'memory_mb', 'disk_min_free_mb']:
             if integer(manifest['limits'][field]) <= 0:
                 raise Violation('resource limits must be positive and explicit')
-        validate_role_limits(manifest['limits'])
+        validate_role_limits(manifest['limits'], roles)
         validate_cpus(manifest, cpu_count)
         integer(manifest['seed'])
         artifacts = manifest['artifacts']
-        unknown = set(artifacts) - set(REQUIRED_JARS) - set(OPTIONAL_BINARIES)
+        unknown = set(artifacts) - set(REQUIRED_JARS) - set(OPTIONAL_BINARIES) - (set(GATEWAY_BINARIES) if gateway else set())
         if unknown:
             raise Violation('unknown artifacts: ' + ', '.join(sorted(unknown)))
         for role in REQUIRED_JARS:
@@ -544,12 +739,17 @@ def validate_core_manifest(manifest, manifest_path, cpu_count=None, profiles=jou
                 if '/' in name:
                     raise Violation(role + ': library names are flat file names')
                 _lib(lib, role + ' library ' + name)
+        if gateway:
+            validate_gateway_artifacts(manifest)
         slots = manifest['slot_artifacts']
-        if set(slots) != set(SLOTS):
-            raise Violation('slot_artifacts must name every slot role: ' + ', '.join(sorted(SLOTS)))
+        if set(slots) != set(slots_of(manifest)):
+            raise Violation('slot_artifacts must name every slot role: ' + ', '.join(sorted(slots_of(manifest))))
         for slot, name in slots.items():
-            if name is not None and name not in SLOT_ARTIFACTS[slot]:
+            if name is not None and name not in {**SLOT_ARTIFACTS, **GATEWAY_SLOT_ARTIFACTS}[slot]:
                 raise Violation(f'slot {slot} cannot run artifact {name}')
+            if name is not None and slot in GATEWAY_SLOTS and artifacts.get(name) is None:
+                raise Violation(f'slot {slot} runs {name}, but artifacts.{name} is null')
+        validate_core_jvm_properties(manifest)
         validate_replica_slot(manifest)
         for key in PINNED_PROGRAMS + [k for k in OPTIONAL_PROGRAMS if k in manifest]:
             helper = manifest[key]

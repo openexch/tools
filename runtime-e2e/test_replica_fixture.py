@@ -363,6 +363,15 @@ class PlanSetTest(unittest.TestCase):
         base = nightly.parse_plan(json.loads((HERE / 'nightly-cut.json').read_text()))
         self.assertEqual(embedded[:len(base)], base)
         self.assertTrue(all(not e['kind'].endswith('-ext') for e in embedded[len(base):]))
+        # the gateway drills: every one in both modes every 48 h (the embedded set takes the three session drills)
+        import gateway_drills
+        gateway = [e for e in embedded + external if gateway_drills.is_scenario(e['scenario'])]
+        for name in gateway_drills.SCENARIOS:
+            modes = sorted(core_contracts.GATEWAY_KINDS[e['kind']]['driver'] for e in gateway if e['scenario'] == name)
+            self.assertEqual(modes, ['embedded', 'external'], name)
+        self.assertEqual(len([e for e in embedded if gateway_drills.is_scenario(e['scenario'])]), 3)
+        embedded = [e for e in embedded if not gateway_drills.is_scenario(e['scenario'])]
+        external = [e for e in external if not gateway_drills.is_scenario(e['scenario'])]
         external_drills = {e['scenario'] for e in external if e['kind'].endswith('-ext')}
         embedded_drills = {e['scenario'] for e in embedded[len(base):]} | {
             e['scenario'] for e in external if e['scenario'].startswith('core-drill-') and not e['kind'].endswith('-ext')}

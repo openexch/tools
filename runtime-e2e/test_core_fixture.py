@@ -310,6 +310,8 @@ class Docker:
         elif argv[:2] == ['docker', 'start']:
             st = self.state[argv[2]]
             st.update(Running=True, ExitCode=0, StartedAt='S%d' % (len(self.calls)))
+        elif argv[:2] == ['docker', 'kill'] and argv[2] in ('--signal=STOP', '--signal=CONT'):
+            self.state[argv[3]]['Stopped'] = argv[2] == '--signal=STOP'      # pid 1 stopped; the container still runs
         elif argv[:2] == ['docker', 'kill']:
             self.state[argv[3]].update(Running=False, ExitCode=137, FinishedAt='2026-11-02T10:00:00Z')
         return types.SimpleNamespace(stdout='', stderr='', returncode=0)
@@ -399,6 +401,13 @@ class SlotEnvTest(unittest.TestCase):
                 m['slot_artifacts'] = dict(m['slot_artifacts'], shadow0='shadow')
                 f = fixture_for(m, self.dir); f.keys = KeyRing(replica=True)
                 names |= set(f.engine_env('ae', 0)) | set(f.replica_env())
+        # The gateway kinds: the four gateway slots with every artifact a slot can run, both driver modes
+        from test_gateway_fixture import gateway_fixture
+        for driver in ('external', 'embedded'):
+            for slots in (None, {'gw0': 'gateway_stub', 'gw1': 'gateway_nc', 'st0': 'session_stub', 'st1': 'stream'}):
+                g = gateway_fixture(self.dir, driver, slots)
+                for slot in core_contracts.GATEWAY_SLOTS:
+                    names |= set(g.gateway_slot_env(slot))
         f = self.fx()
         self.assertEqual(names, f.allowed_env())
         # every set value passes the guard

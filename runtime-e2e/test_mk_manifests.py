@@ -147,10 +147,28 @@ class CutManifestBuilderTest(unittest.TestCase):
         for sub, target in (('forwarder', 'ct_forwarder_nc_norelease'), ('bridge', 'ct_bridge_nc_noepoch'),
                             ('forwarder', 'ct_forwarder_nc_noresync'), ('bridge', 'ct_bridge_nc_legacy')):
             put(f'ct-test/app/{sub}/{target}', b'ELF nc ' + target.encode() + b' ' + ct.encode())
+        # the gateway kinds: the session stub of the cut's ct test build (no stamp: its build tree names the commit), the
+        # gateway control build stamped with the cut's gateway commit, the shim at the harness commit
+        put('ct-test/app/session-stub/ct_session_stub', b'ELF stub')
+        put('ct-test/CMakeCache.txt', f'CT_BUILD_SOURCE_SHA:STRING={ct}\nCT_SESSION_STUB:BOOL=ON\n'.encode())
+        # one test-config build tree per control define (release_cut reads its CMAKE_CXX_FLAGS)
+        nc = {}
+        for define, (attr, _) in mk_manifests.GATEWAY_NC_BUILDS.items():
+            d = 'gw-nc-' + define.lower()
+            nc[attr] = put(d + '/bin/oe-gateway', b'ELF oe-gateway nc ' + define.encode() + b' ' + self.world.m['repos']['gateway'].encode())
+            put(d + '/CMakeCache.txt', f'CMAKE_CXX_FLAGS:STRING=-D{define}\n'.encode())
+        shim = (Path(mk_manifests.__file__).resolve().with_name('gateway_shim.py')).read_bytes()
+        blob = self.world.blob
+        def blob_with_shim(repo, commit, rel):
+            if repo == 'tools' and rel == mk_manifests.release_cut.GATEWAY_SHIM and commit == self.world.m['harness_commit']:
+                return shim
+            return blob(repo, commit, rel)
+        patch = mock.patch.object(mk_manifests.release_cut, 'git_blob', blob_with_shim); patch.start(); self.addCleanup(patch.stop)
         self.cfg = mk_manifests.Config(
             runs=root / 'runs', bin_a=self.bin_a, driver_properties=dp,
             driver_properties_sha256=hashlib.sha256(DP_TEXT.encode()).hexdigest(), netfilter_helper=root / 'helper',
-            harness_commit='e' * 40, harness_dirty=False, image='sha256:' + 'e' * 64, cut_nc_dir=root / 'ct-test')
+            harness_commit='e' * 40, harness_dirty=False, image='sha256:' + 'e' * 64, cut_nc_dir=root / 'ct-test',
+            **nc)
 
     def tearDown(self):
         self.temp.cleanup()

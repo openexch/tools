@@ -129,6 +129,9 @@ def scenario_known(scenario):
     import core_drills
     if scenario in ('core-boot', 'core-smoke'):
         return True
+    import gateway_drills
+    if gateway_drills.is_scenario(scenario):              # the gateway and stream drills (gateway_scenarios.DRILLS)
+        return True
     m = re.fullmatch(r'core-boots-(\d+)', scenario)
     if m:
         return 1 <= int(m.group(1)) <= 20           # runner.py's bound
