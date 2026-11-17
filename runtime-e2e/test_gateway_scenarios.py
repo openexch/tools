@@ -424,5 +424,32 @@ class KeyOracleNotLiveTest(unittest.TestCase):
         self.assertEqual(gateway_probe.key_oracle(rows, attempts, live, nothing_fills=True)['verdict'], 'PASS')
 
 
+
+class ReofferCreateLineTest(unittest.TestCase):
+    def row(self, key, user, qty, status, reply):
+        return {'tag': 'reoffer-create', 'key': key, 'user': user, 'body': {'quantity': qty}, 'status': status, 'reply': reply}
+
+    def test_one_order_per_key_and_a_duplicate_witness(self):
+        log = {'requests': [self.row('k1', 7, '0.02', 200, {'orderId': '1', 'duplicate': True}),
+                            self.row('k2', 7, '0.021', 201, {'orderId': '2'})]}
+        orders = [{'user': 7, 'market': 1, 'quantity': gs.units('0.02'), 'order': 1},
+                  {'user': 7, 'market': 1, 'quantity': gs.units('0.021'), 'order': 2}]
+        self.assertTrue(gs.reoffer_create_line(log, orders)['holds'])
+
+    def test_a_second_order_fails_with_the_control_text(self):
+        log = {'requests': [self.row('k1', 7, '0.02', 201, {'orderId': '3'})]}
+        orders = [{'user': 7, 'market': 1, 'quantity': gs.units('0.02'), 'order': n} for n in (1, 3)]
+        row = gs.reoffer_create_line(log, orders)
+        self.assertEqual((row['holds'], row['text']), (False, gateway_probe.SECOND_ORDER))
+
+    def test_no_witness_is_inconclusive_and_a_lost_answer_fails(self):
+        orders = [{'user': 7, 'market': 1, 'quantity': gs.units('0.02'), 'order': 1}]
+        row = gs.reoffer_create_line({'requests': [self.row('k1', 7, '0.02', 201, {'orderId': '1'})]}, orders)
+        self.assertTrue(row['inconclusive'])
+        row = gs.reoffer_create_line({'requests': [self.row('k1', 7, '0.02', 0, None)]}, orders)
+        self.assertEqual(row['text'], 'a re-offered create unanswered or without its order')
+        row = gs.reoffer_create_line({'requests': [self.row('k1', 7, '0.02', 201, {'orderId': '1'})]}, [])
+        self.assertEqual(row['text'], 'a re-offered create unanswered or without its order')
+
 if __name__ == '__main__':
     unittest.main()

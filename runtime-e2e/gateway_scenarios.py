@@ -60,6 +60,8 @@ DISCARD_CLOSED = 'core_egress_discard_closes_total'
 GATE_AFTER = [['SUSPENDED', 'ADMIN'], ['OPEN', 'ADMIN']]
 # Prices of market 1 (BTC-USD, units of 10^-8): resting load BUYs far below the crossing pairs and the tick asks
 REST_PRICE = 50 * FP
+REOFFER_QUANTITY_BASE = 20              # the re-offered creates' quantities in UNITs: no other order of the side users has one
+CUT_GATEWAYS = ('gw0', 'gw1')
 PAIR_PRICE = 90 * FP
 UNIT = FP // 1000
 DRILL_RISK = {'per_sec': 1000, 'max_open': 5000, 'slippage_bps': 100, 'collar_bps': 5000}
@@ -582,6 +584,7 @@ class KillRestart(GatewayDrill):
                                        'no new core leader', inconclusive=leader.get('new_leader') is None)
         lines['stored_acceptance_answered'] = stored_line(gate)
         lines.update(cancel_lines(leader.get('cancels') or {}, leader.get('egress_cut')))
+        lines['create_reoffer_once'] = reoffer_create_line(leader.get('cancels') or {}, orders)
         lines['streams_converge'] = streams_line
         lines['load_finished'] = line(done, {'attempts': len(attempts), 'requests': len(rows)}, 'load did not finish inside its bound',
                                       inconclusive=not done)
@@ -667,7 +670,9 @@ class KillRestart(GatewayDrill):
             (signals / name).unlink(missing_ok=True)
         plan = {'gw': self.gw('gw1'), 'users': side_users, 'market': 1, 'rest_price': REST_PRICE, 'stop_price': 200 * FP,
                 'quantity': 10 * UNIT, 'per_user': s['CANCEL_PER_USER'], 'signal_dir': '/data', 'window_s': s['CANCEL_WINDOW_S'],
-                'wait_go_s': 120, 'request_bound_s': 90, 'unknown_order': 9_000_000_000}
+                'wait_go_s': 120, 'request_bound_s': 90, 'unknown_order': 9_000_000_000, 'reoffer_gw': self.gw('gw0'),
+                'reoffer_creates': [{'user': u, 'quantity': (REOFFER_QUANTITY_BASE + n) * UNIT} for u in side_users
+                                    for n in range(s['REOFFER_CREATES_PER_USER'])]}
         (self.probe_dir / 'cancels-plan.json').write_text(json.dumps(plan))
         self.probe_bg(['python3', '-I', '/data/gateway_probe.py', 'cancels', '--plan', '/data/cancels-plan.json', '--keys',
                        '/data/gw-keys.json', '--out', '/data/cancels.json'], 'cancels')
@@ -685,11 +690,15 @@ class KillRestart(GatewayDrill):
         # applied, its answer never reaches gw1, and gw1 offers it again to the new leader, where it meets its own
         # effect. That re-offer is the case the cancel re-offer rule exists for. The rule names the old leader's
         # address, so the new leader's egress passes; it is deleted once the new leader is known.
+        # The same cut at gw0, which sends keyed creates once each in the same window: a create committed before the kill
+        # is offered again by gw0 to the new leader under its own request id, which must meet its stored decision.
         cut = ['-w', '2', '-{}', 'INPUT', '-p', 'udp', '-s', f.m['nodes'][old], '--dport', str(f.GATEWAY_RESPONSE_PORT),
                '-j', 'DROP']
-        f.netfilter('gw1', [a.replace('{}', 'A') if a == '-{}' else a for a in cut])
-        out['egress_cut'] = {'member': old, 'to': f'gw1 {f.m["nodes"]["gw1"]}:{f.GATEWAY_RESPONSE_PORT}', 'at_ns': time.time_ns()}
-        f.record_fault({'kind': 'egress_cut', 'target': 'gw1', 'from': old})
+        for g in CUT_GATEWAYS:
+            f.netfilter(g, [a.replace('{}', 'A') if a == '-{}' else a for a in cut])
+            f.record_fault({'kind': 'egress_cut', 'target': g, 'from': old})
+        out['egress_cut'] = {'member': old, 'to': [f'{g} {f.m["nodes"][g]}:{f.GATEWAY_RESPONSE_PORT}' for g in CUT_GATEWAYS],
+                             'at_ns': time.time_ns()}
         (signals / 'cancels.go').write_text('go\n')
         self.sleep(s['CANCEL_KILL_AT_S'])
         killed_ns = time.time_ns()
@@ -703,9 +712,10 @@ class KillRestart(GatewayDrill):
                 break
             self.sleep(0.2)
         out.update(killed_ns=killed_ns, new_leader=new, election_s=election)
-        out['egress_cut']['rule_counters'] = [l for l in f.netfilter('gw1', ['-w', '2', '-L', 'INPUT', '-v', '-n', '-x']).splitlines()
-                                              if 'DROP' in l][:2]
-        f.netfilter('gw1', [a.replace('{}', 'D') if a == '-{}' else a for a in cut])
+        out['egress_cut']['rule_counters'] = {g: [l for l in f.netfilter(g, ['-w', '2', '-L', 'INPUT', '-v', '-n', '-x']).splitlines()
+                                                  if 'DROP' in l][:2] for g in CUT_GATEWAYS}
+        for g in CUT_GATEWAYS:
+            f.netfilter(g, [a.replace('{}', 'D') if a == '-{}' else a for a in cut])
         out['egress_cut']['lifted_ns'] = time.time_ns()
         ready_at = None
         while self.clock() - started < s['ELECTION_BOUND_S'] + s['GW_READY_BOUND_S']:
@@ -817,6 +827,31 @@ def stored_line(gate):
     if not stored or not witness:
         return line(False, detail, inconclusive=True)
     return line(not other, detail, 'stored acceptance not answered 200')
+
+
+def reoffer_create_line(cancels, orders, market=1):
+    """Keyed creates sent once each through gw0 across the leader kill, the old leader's egress to gw0 cut: one live order
+    per key (a re-offer under a new request id makes a second order); every create answered; holds only when at least
+    one re-offer met its own stored decision (an answer 200 ``duplicate``), else the rule was never exercised
+    (INCONCLUSIVE)."""
+    sent = [r for r in cancels.get('requests') or [] if r.get('tag') == 'reoffer-create']
+    owned = {}
+    for o in orders:
+        if o.get('market') == market:
+            owned.setdefault((o.get('user'), o.get('quantity')), []).append(o)
+    counts = {r['key']: len(owned.get((r['user'], units(r['body']['quantity'])), [])) for r in sent}
+    second = sorted(k for k, n in counts.items() if n > 1)
+    unanswered = [r['key'] for r in sent if not gateway_probe.settled(r['status'])]
+    accepted = [r for r in sent if 200 <= r['status'] < 300]
+    not_live = [r['key'] for r in accepted if counts[r['key']] == 0]
+    met = [r for r in accepted if isinstance(r.get('reply'), dict) and r['reply'].get('duplicate')]
+    detail = {'sent': len(sent), 'statuses': sorted({r['status'] for r in sent}), 'duplicate_answers': len(met),
+              'second_order_keys': len(second), 'unanswered': len(unanswered), 'not_live': len(not_live)}
+    if second:
+        return line(False, detail, gateway_probe.SECOND_ORDER)
+    if unanswered or not_live:
+        return line(False, detail, 'a re-offered create unanswered or without its order')
+    return line(bool(met), detail, 'no re-offered create met its stored decision', inconclusive=not met)
 
 
 def cancel_lines(cancels, egress_cut=None):

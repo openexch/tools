@@ -60,7 +60,7 @@ SETTINGS = {
     'GW_DOWN_S': 5, 'GW_READY_BOUND_S': 60, 'GW_LOAD_BOUND_S': 900, 'GW_RETRY_BOUND_S': 180, 'GW_ATTEMPT_S': 30,
     'GW_TAP_S': 1800, 'GW_STREAM_USERS': 4, 'GW_P99_BOUND_MS': 1000, 'GW1_WINDOW_SLACK_S': 2, 'GW1_MIN_REQUESTS': 10,
     'GW_GATE_RESEND': 24, 'GW_GATE_FRESH': 4, 'GW_GATE_HOLD_S': 3, 'GW_GATE_SETTLE_BOUND_S': 60, 'CANCEL_USERS': 2, 'CANCEL_PER_USER': 6,
-    'CANCEL_WINDOW_S': 3, 'CANCEL_KILL_AT_S': 1, 'ELECTION_BOUND_S': 60, 'CONVERGE_BOUND_S': 60,
+    'CANCEL_WINDOW_S': 3, 'CANCEL_KILL_AT_S': 1, 'REOFFER_CREATES_PER_USER': 6, 'ELECTION_BOUND_S': 60, 'CONVERGE_BOUND_S': 60,
     # stream-slow-consumer (SlowConsumer): st0's inbound core egress thinned on the network
     'SLOW_STREAM_USERS': 4, 'SLOW_THROTTLE_AFTER_S': 10, 'SLOW_DROP_PERCENT': 99,
     # resting orders per stream user that nothing in the story crosses, and how long st0 may take to show the close

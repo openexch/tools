@@ -764,7 +764,8 @@ def place(rows, target, keys, out):
 def cancels(plan, keys, out):
     """``plan``: {gw, users, market, rest_price, stop_price, quantity, per_user, signal_dir, window_s}. Rest orders and
     arm stops, write ``cancels.ready``; on ``cancels.go`` send an unkeyed DELETE for every one of them, spread over
-    ``window_s`` (the fixture kills the core leader inside that window), then a keyed cancel of one more resting order
+    ``window_s`` (the fixture kills the core leader inside that window), interleaved with one keyed create per
+    ``reoffer_creates`` row ({user, quantity}) sent once through ``reoffer_gw``, then a keyed cancel of one more resting order
     twice (the replay must be PENDING_CANCEL) and a first-offer cancel of an unknown id (404)."""
     client = Client(keys)
     targets = []
@@ -785,11 +786,17 @@ def cancels(plan, keys, out):
     deadline = time.monotonic() + plan['wait_go_s']
     while not (signal / 'cancels.go').exists() and time.monotonic() < deadline:
         time.sleep(0.05)
-    gap = plan['window_s'] / max(1, len(targets))
+    sends = [(client.call, ('DELETE', plan['gw'], f'/api/v2/orders/{oid}', user), {'tag': 'cancel-' + what})
+             for user, oid, what in targets]
+    creates = [(client.create, (plan['reoffer_gw'], c['user'], order_body(plan['market'], 'BUY', 'LIMIT', 'GTC',
+                                                                          plan['rest_price'], c['quantity'])),
+                {'tag': 'reoffer-create'}) for c in plan.get('reoffer_creates') or []]
+    for n, item in enumerate(creates):                  # interleaved, so creates are offered on both sides of the kill
+        sends.insert(min(len(sends), 2 * n + 1), item)
+    gap = plan['window_s'] / max(1, len(sends))
     threads = []
-    for user, oid, what in targets:
-        t = threading.Thread(target=client.call, args=('DELETE', plan['gw'], f'/api/v2/orders/{oid}', user),
-                             kwargs={'tag': 'cancel-' + what}, daemon=True)
+    for fn, args, kwargs in sends:
+        t = threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True)
         t.start()
         threads.append(t)
         time.sleep(gap)
