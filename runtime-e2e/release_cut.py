@@ -1270,6 +1270,9 @@ def projection_rows(f):
 
 ADMIN_RESULTS = {0: 'ACCEPTED', 1: 'DUPLICATE', 2: 'REJECTED', 3: 'ADOPTED', 4: 'STALE'}
 CONFIG_OK = {'ACCEPTED', 'DUPLICATE', 'ADOPTED'}
+# The genesis ladder: every genesis run takes CoreConfig 1, 2 and 3. A version past it is a per-kind behaviour step
+# taken after the genesis (a gateway kind's step to its behaviour version), never a genesis invariant.
+GENESIS_LADDER = (1, 2, 3)
 ME_JOURNAL_SCHEMA = Path(__file__).resolve().parent / 'schemas' / 'me-journal-schema-4.xml'
 SOURCES = {'me_genesis_id': 'ME journal record 5 (JournalProbe dump)',
            'core_genesis_id': 'AE log recordings, CoreConfig frames (release_cut.genesis_reader)',
@@ -1351,7 +1354,8 @@ INVARIANTS = (('me', 'record5', 'behavior_version'), ('me', 'record5', 'max_wire
 
 def check_record_set(records):
     """Activation step 7: a genesisId that repeats across genesis runs is a refused record; the invariant fields
-    (behaviour 2, maxWireVersion 12, journalSeq 1 FRESH, the CoreConfig 1-2-3 acceptance, the gate transition) are equal."""
+    (behaviour 2, maxWireVersion 12, journalSeq 1 FRESH, the CoreConfig 1-2-3 acceptance, the gate transition) are equal.
+    A CoreConfig past the genesis ladder is a per-kind behaviour step and stays out of the comparison."""
     seen, out = {}, []
     records = [r for r in records if r.get('record_kind', 'final') == 'final']
     for i, record in enumerate(records):
@@ -1369,8 +1373,8 @@ def check_record_set(records):
         values = {json.dumps(value(r, path)) for r in records}
         if len(values) > 1:
             out.append(f'invariant {".".join(path)} differs across records: {sorted(values)}')
-    accepted = {json.dumps(sorted({v for v, res in ((r.get('core') or {}).get('config_sequence') or []) if res in CONFIG_OK}))
-                for r in records}
+    accepted = {json.dumps(sorted({v for v, res in ((r.get('core') or {}).get('config_sequence') or [])
+                                   if res in CONFIG_OK and v in GENESIS_LADDER})) for r in records}
     if len(accepted) > 1:
         out.append(f'invariant CoreConfig acceptance differs across records: {sorted(accepted)}')
     gates = {json.dumps([g[:2] for g in (r.get('gate') or [])][:1] + ([['OPEN', 'ADMIN']] if any(g[:2] == ['OPEN', 'ADMIN']
@@ -1595,7 +1599,7 @@ def activation_record(run_dir, journal_schema=None, state_root=None, audit=None,
     core['driver_exit'] = driver_exit
     accepted = {v for v, result in sequence if result in CONFIG_OK}
     refused = [[v, result] for v, result in sequence if result not in CONFIG_OK]
-    for v in (1, 2, 3):
+    for v in GENESIS_LADDER:
         if v not in accepted:
             status = 'ABORTED' if refused or (driver_exit not in (None, 0)) else 'INCOMPLETE'
             rec.say(status, f'CoreConfig {v} not accepted' + (f' (refused: {refused})' if refused else ''))
