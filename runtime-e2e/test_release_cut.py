@@ -1111,6 +1111,14 @@ class ActivationRecordTest(unittest.TestCase):
         self.assertEqual(release_cut.check_record_set([r1, r2]), [])
         self.assertTrue((d.run / 'rc2-activation-record-life2.json').is_file())
 
+    def test_a_behaviour_step_past_the_genesis_ladder_is_not_a_set_difference(self):
+        def rec(seq):
+            return {'core': {'config_sequence': [[v, 'ACCEPTED'] for v in seq]}}
+        self.assertEqual(release_cut.check_record_set([rec([1, 2, 3]), rec([1, 2, 3, 4])]), [])
+        self.assertIn('CoreConfig acceptance differs', ' '.join(release_cut.check_record_set([rec([1, 2, 3]), rec([1, 2])])))
+        refused = {'core': {'config_sequence': [[1, 'ACCEPTED'], [2, 'ACCEPTED'], [3, 'REFUSED']]}}
+        self.assertIn('CoreConfig acceptance differs', ' '.join(release_cut.check_record_set([rec([1, 2, 3, 4]), refused])))
+
     def test_a_regenesis_without_its_life_evidence_is_refused(self):
         rid = 'rc2-000000000001'
         g1 = int(core_contracts.derive_genesis_id(rid, 1), 16)
