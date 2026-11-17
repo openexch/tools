@@ -50,6 +50,7 @@ CASES = ['a01_request_log_is_a_function_of_the_seed', 'a02_request_log_is_a_func
          'order_events_pages_to_the_head', 'order_events_overrun_reports_the_lost_range_and_continues',
          'order_events_head_probe_is_one_end', 'order_events_stops_at_the_bound',
          'order_events_cursor_ahead_of_the_core_is_not_complete', 'order_events_listener_decodes_pages_and_end',
+         'order_events_full_fields_only_on_request',
          'user_balances_reply_is_decoded', 'config_report_reply_is_decoded']
 # the sample's request rows (oracle_model docstring; core_scenarios._create writes the same create keys)
 CREATE_KEYS = {'request', 'user', 'market', 'side', 'type', 'tif', 'price', 'quantity', 'budget', 'stop_price', 'display_qty',

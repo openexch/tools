@@ -33,13 +33,16 @@ RESERVED = {'shadow0': 'this manifest runs no replica (slot_artifacts.shadow0 nu
 GATEWAY_PRINCIPALS = [('gw0', 'ae', 'GATEWAY', 51), ('gw1', 'ae', 'GATEWAY', 52), ('st0', 'ae', 'GATEWAY', 53),
                       ('st1', 'ae', 'GATEWAY', 54), ('gw0-treasury', 'ae', 'TREASURY', 55),
                       ('gw1-treasury', 'ae', 'TREASURY', 56)]
+# The projection slots (minted only for a manifest that runs them): one GATEWAY key each, the class of the projector's
+# head probe (an any-user order-event query), as a stream's key is
+PROJECTION_PRINCIPALS = [('pj0', 'ae', 'GATEWAY', 57), ('pj1', 'ae', 'GATEWAY', 58)]
 # A user API key of the gateway's api-key auth mode (GATEWAY_API_KEYS_FILE, one ``key:userId`` per line): 32 random
 # bytes as 64 hex characters (the gateway's floor is 16 characters)
 API_KEY_BYTES = 32
 
 
 class KeyRing:
-    def __init__(self, secret_source=None, replica=False, gateway=False):
+    def __init__(self, secret_source=None, replica=False, gateway=False, projection=False):
         source = secret_source or (lambda: secrets.token_bytes(32))
         self.source = source
         self.keys = {}
@@ -47,7 +50,8 @@ class KeyRing:
         self.gateway = gateway
         self.reserved = {} if replica else dict(RESERVED)
         for principal, cluster, cls, key_id in (PRINCIPALS + ([REPLICA_PRINCIPAL] if replica else [])
-                                                + (GATEWAY_PRINCIPALS if gateway else [])):
+                                                + (GATEWAY_PRINCIPALS if gateway else [])
+                                                + (PROJECTION_PRINCIPALS if projection else [])):
             if cls not in (AE_CLASSES if cluster == 'ae' else ME_CLASSES):
                 raise ValueError(f'{principal}: class {cls} not valid on {cluster}')
             secret = source()

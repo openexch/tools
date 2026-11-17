@@ -57,7 +57,7 @@ LIFE2_CORE_ORDER = [step for step in GENESIS_ORDER if step[0] != 'me_genesis']
 # stop(): the polite-stop bound per role (docker stop -t). Forwarder: exit 0, contract <= 1 s (RUN:465-472);
 # bridge: exit 0 within 10 s (RUN:1768-1770); engines: 15 s then kill is the escalation bound only; on jars with the
 # polite-stop fix the code and time are judged by the drills' engine_polite_stop line (143 within ENGINE_SHUTDOWN_TIMEOUT_S + slack).
-STOP_BOUND_S = {'forwarder': 3, 'bridge': 10, 'engine': 15, 'projector': 10, 'replica': 15}
+STOP_BOUND_S = {'forwarder': 3, 'bridge': 10, 'engine': 15, 'projector': 10, 'replica': 15, 'projection': 10}
 FORWARDER_STOP_CONTRACT_S = 1.0
 SESSION_WINDOW_S = 10.0          # the core's session timeout a killed forwarder's session outlives it by
 READY_AFTER_KILL_S = 5.0         # The ready_after_kill bound, a setting (measured 1.12 s in DR-A05)
@@ -148,6 +148,8 @@ def role_kind(name):
         return 'bridge'
     if name == 'shadow0':
         return 'replica'
+    if name in core_contracts.PROJECTION_ROLES:
+        return 'projection'
     return 'projector' if name == 'projector' else None
 
 
@@ -269,6 +271,7 @@ class CoreFixture(Fixture):
     # time seams: the fault helpers wait on real time, the unit tests on a fake clock
     clock = staticmethod(time.time)
     gateway_slots = False            # a manifest without the gateway roles (set in __init__)
+    projection_slots = False         # a manifest without the projection roles (set in __init__)
     sleep = staticmethod(time.sleep)
 
     def __init__(self, manifest_path, attach=False, keyring=None, drill=False):
@@ -288,7 +291,9 @@ class CoreFixture(Fixture):
             raise Violation('invalid fixture postgres port')
         # The REPLICA key only when this manifest runs the replica (an older core refuses a table naming the class)
         self.gateway_slots = core_contracts.gateway_manifest(self.m)
-        self.keys = keyring or KeyRing(replica=self.m['slot_artifacts'].get('shadow0') == 'shadow', gateway=self.gateway_slots)
+        self.projection_slots = core_contracts.projection_manifest(self.m)
+        self.keys = keyring or KeyRing(replica=self.m['slot_artifacts'].get('shadow0') == 'shadow', gateway=self.gateway_slots,
+                                       projection=self.projection_slots)
         self.secret_values = self.keys.secrets()
         self.slots = {}
         if attach:
@@ -354,7 +359,8 @@ class CoreFixture(Fixture):
         for role in core_contracts.REQUIRED_JARS:
             artifact = self.m['artifacts'][role]
             self._stage(artifact['path'], dest / (role + '.jar'), artifact['sha256'], 'artifact changed while staging: ' + role, 0o644)
-        for role in core_contracts.OPTIONAL_BINARIES + (core_contracts.GATEWAY_BINARIES if self.gateway_slots else []):
+        for role in (core_contracts.OPTIONAL_BINARIES + (core_contracts.GATEWAY_BINARIES if self.gateway_slots else [])
+                     + (core_contracts.PROJECTION_BINARIES if self.projection_slots else [])):
             artifact = self.m['artifacts'][role]
             if artifact is None:
                 continue
@@ -398,8 +404,10 @@ class CoreFixture(Fixture):
         self.create_money_database()
         if self.gateway_slots:
             self.create_gateway_database()
+        if self.projection_slots:
+            self.create_projection_databases()
 
-    FIXTURE_DATABASES = {'postgres', 'r01_money', 'r01_gateway'}
+    FIXTURE_DATABASES = {'postgres', 'r01_money', 'r01_gateway', 'r01_history_b'}
 
     def psql(self, database, sql):
         """The core fixture's databases only: the money projector's and the gateway's users store."""
@@ -418,6 +426,29 @@ class CoreFixture(Fixture):
 
     def gateway_pg_url(self):
         return f'postgresql://runtime_fixture@{self.gateway}:{self.pg_port}/r01_gateway'
+
+    def create_projection_databases(self):
+        """The projection databases: pj0 writes the gateways' database (created above, empty of history); pj1 a second,
+        empty one. The projection creates its own schema in each (the stand-in under an advisory lock, as the projector
+        binary will)."""
+        self.psql('postgres', 'CREATE DATABASE r01_history_b')
+        self.registry['projection_databases'] = dict(core_contracts.PROJECTION_DATABASES)
+        self.save()
+
+    def recreate_projection_database(self, database):
+        """Drop and create one projection database, empty (a projection from genesis into an empty database). The
+        projection that writes it is stopped first by the drill; the gateways' database is never recreated (it holds the
+        gateways' users store)."""
+        if database not in set(core_contracts.PROJECTION_DATABASES.values()) - {'r01_gateway'}:
+            raise Violation('only a second projection database is recreated: ' + str(database))
+        self.psql('postgres', f'DROP DATABASE {database} WITH (FORCE)')
+        self.psql('postgres', f'CREATE DATABASE {database}')
+        return self.record_fault({'kind': 'recreate_projection_database', 'database': database})
+
+    def projection_pg_url(self, database):
+        if database not in set(core_contracts.PROJECTION_DATABASES.values()):
+            raise Violation('unknown projection database ' + str(database))
+        return f'postgresql://runtime_fixture@{self.gateway}:{self.pg_port}/{database}'
 
     def create_money_database(self):
         """The run's money database and the projector jar's packaged migrations (start_database, and reset_projection)."""
@@ -929,6 +960,9 @@ class CoreFixture(Fixture):
                 self.core_behavior_step()
                 self.start_gateway_slots()
                 boot['phases']['gateway_slots_ns'] = time.time_ns()
+                if self.projection_slots and not getattr(self, 'projection_deferred', False):
+                    self.start_projection_slots()
+                    boot['phases']['projection_slots_ns'] = time.time_ns()
         boot['phases']['complete_ns'] = time.time_ns()
         self.registry['slots'] = self.slots; self.registry['boot'] = boot
         self.registry['startup_complete'] = True; self.save()
@@ -1411,6 +1445,9 @@ class CoreFixture(Fixture):
             return ports['shadow_metrics'], '/ready'
         if role in core_contracts.GATEWAY_SLOTS and self.slot_artifact(role):
             return self.gateway_ready_target(role)
+        if role in core_contracts.PROJECTION_SLOTS and self.slot_artifact(role):
+            # /health, not /ready: a standby copy is never ready, and a writer is ready only after its first probe
+            return self.m['ports']['projector_admin'], '/health'
         raise Violation('no readiness target for ' + role)
 
     def start_slot(self, slot):
@@ -1745,6 +1782,72 @@ class CoreFixture(Fixture):
         out = self.command(['docker', 'logs', '--timestamps'] + (['--since', since] if since else []) + [cid], check=False)
         return [e for e in (parse_stub_line(l) for l in ((out.stdout or '') + (out.stderr or '')).splitlines()) if e]
 
+    # ---------------------------------------------------------------- projection slots
+
+    # The database each projection slot writes: core_contracts.PROJECTION_DATABASES unless a drill names another before
+    # the slot's first start (the freshness drill's standby copy writes pj0's database)
+    projection_targets = None
+
+    def projection_database(self, slot):
+        return (self.projection_targets or {}).get(slot, core_contracts.PROJECTION_DATABASES[slot])
+
+    def projection_slot_env(self, slot):
+        """The stand-in's environment: its listener, its database, its own GATEWAY key, the members' metrics endpoints
+        (read over the network to name the leader it follows). The stand-in's settings stay at its defaults unless the
+        fixture's PROJECTION_STUB_SETTINGS names one."""
+        nodes, ports = self.m['nodes'], self.m['ports']
+        name = self.slot_artifact(slot)
+        if name != 'projector_stub':
+            raise Inconclusive(f'{slot}: the projector binary ({name}) is not runnable by this harness yet')
+        artifact = self.m['artifacts'][name]
+        env = {'STUB_ADMIN_BIND': f'{nodes[slot]}:{ports["projector_admin"]}',
+               'STUB_PG_URL': self.projection_pg_url(self.projection_database(slot)), 'STUB_INSTANCE': slot,
+               'STUB_MODE': artifact['mode'], 'STUB_CORE_PROBE': '/artifacts/core-probe.jar:/artifacts/ae.jar',
+               'STUB_MEMBER_METRICS': ','.join(f'ae{i}@{nodes[f"ae{i}"]}:{ports["ae_metrics"]}' for i in range(3)),
+               **self.probe_env(None), 'CORE_LOCAL_HOST': nodes[slot], 'CORE_AUTH_CREDENTIAL': self.keys.credential(slot, 'ae')}
+        env.update({k: str(v) for k, v in (getattr(self, 'projection_stub_settings', None) or {}).items()})
+        return env
+
+    def start_projection_slots(self, slots=None):
+        """Start the projection slots after the gateway slots (a declared slot whose artifact is null is SKIPPED_ABSENT).
+        Waits for the slot's /health, not its readiness: a standby copy is never ready."""
+        for slot in slots or sorted(core_contracts.PROJECTION_SLOTS):
+            name = self.slot_artifact(slot)
+            if name is None:
+                self.slots[slot] = {'state': 'SKIPPED_ABSENT', 'reason': 'this manifest stages nothing in ' + slot}
+                continue
+            self.spawn(slot, ['python3', '-I', f'/artifacts/{name}/bin'], self.projection_slot_env(slot))
+            port, path = self.ready_target(slot)
+            self.wait_http(slot, port, path, timeout=60)
+            artifact = self.m['artifacts'][name]
+            self.slots[slot] = {'state': 'STARTED', 'artifact': name, 'sha256': artifact['sha256'],
+                                'source_sha': artifact['source_sha'], 'driver': artifact['driver'], 'target': artifact['target'],
+                                'mode': artifact.get('mode'), 'database': self.projection_database(slot), 'readiness': path}
+        self.registry['slots'] = self.slots
+        self.save()
+        return {s: self.slots.get(s) for s in (slots or sorted(core_contracts.PROJECTION_SLOTS))}
+
+    def projection_health(self, slot):
+        """The slot's own /health as JSON, or {'error': ...} when it does not answer."""
+        response = self.http(slot, self.m['ports']['projector_admin'], '/health')
+        try:
+            return json.loads(response.get('body') or 'null') if response.get('status') == 200 else {'error': response}
+        except ValueError:
+            return {'error': response}
+
+    def replay_count(self, member, streams):
+        """The replay-count probe of one core member (replay_count.py inside the member's container): its driver's network
+        publications on the given replay streams and the bytes of its /dev/shm."""
+        if member not in ENGINES or not member.startswith('ae'):
+            raise Violation('the replay-count probe reads a core member: ' + str(member))
+        script = Path(__file__).with_name('replay_count.py').read_text()
+        r = self.execute(member, ['python3', '-I', '-', ','.join(str(s) for s in streams)], input=script, timeout=30,
+                         check=False)
+        lines = [l for l in (r.stdout or '').splitlines() if l.startswith('{')]
+        if r.returncode != 0 or not lines:
+            return {'error': f'exit {r.returncode}: {(r.stderr or "")[-200:]}'}
+        return json.loads(lines[-1])
+
     # ---------------------------------------------------------------- faults
 
     def open_fault(self, role, duration_s, heal_bound_s=60, reason=None):
@@ -1769,7 +1872,7 @@ class CoreFixture(Fixture):
         return witness
 
     def _fault_target(self, name):
-        if (name not in set(ENGINES) | set(SLOTS) | core_contracts.GATEWAY_ROLES | {'projector'}
+        if (name not in set(ENGINES) | set(SLOTS) | core_contracts.GATEWAY_ROLES | core_contracts.PROJECTION_ROLES | {'projector'}
                 or name not in self.registry['containers']):
             raise Violation('unsupported or unstarted fault target: ' + name)
         return self.registry['containers'][name]

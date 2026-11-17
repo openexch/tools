@@ -44,6 +44,23 @@ GATEWAY_TEST_ARTIFACTS = {'gateway_nc', 'gateway_stub', 'session_stub'}
 GATEWAY_NC_DEFINES = {'GW_NC_FRESH_KEY', 'GW_NC_NO_CANCEL_REOFFER_RULE', 'GW_NC_NO_ASSET_CHECK'}
 # Ports of the gateway roles (every role has its own address, so gw0 and gw1 share the numbers)
 GATEWAY_PORTS = {'gateway_http': 8080, 'gateway_admin': 8081, 'stream_ws': 8090, 'stream_admin': 8091, 'shim_http': 8085}
+# The history projection's slots: two projector copies, each in its own container, each on its own GATEWAY key (the head
+# probe's session class). A manifest declares both or neither, and only on a gateway manifest (pj0 writes the database the
+# gateways read history from). A declared slot may be null. A slot runs the projector binary (history_projector,
+# oe-projector of the cut's gateway commit) or, in a rig kind, the test-only stand-in:
+#   projector_stub  projector_stub.py (never published): the projection drills' dry runs before the binary exists
+PROJECTION_SLOTS = {'pj0': 'history_projector', 'pj1': 'history_projector'}
+PROJECTION_ROLES = set(PROJECTION_SLOTS)
+PROJECTION_BINARIES = ['history_projector', 'projector_stub']
+PROJECTION_SLOT_ARTIFACTS = {'pj0': {'history_projector', 'projector_stub'}, 'pj1': {'history_projector', 'projector_stub'}}
+PROJECTION_TEST_ARTIFACTS = {'projector_stub'}
+PROJECTION_TARGETS = {'history_projector': 'oe-projector', 'projector_stub': 'projector_stub'}
+PROJECTION_PORTS = {'projector_admin': 8095}
+# The stand-in's modes: ``follow`` beats only at the core's head; ``beat-always`` beats whatever the head (the freshness
+# drill's control: stale history then reads fresh)
+STUB_MODES = {'follow', 'beat-always'}
+# The projection databases (the fixture's PostgreSQL): pj0 writes the gateways' database, pj1 a second one
+PROJECTION_DATABASES = {'pj0': 'r01_gateway', 'pj1': 'r01_history_b'}
 # JVM system properties a manifest may set on the core members (core_jvm_properties): the per-session egress ceiling of
 # the slow-consumer drill. A setting of the core (SessionEgressQueue), never a timeout.
 CORE_JVM_PROPERTIES = {'core.egress.max.capacity.bytes'}
@@ -58,13 +75,34 @@ def gateway_manifest(manifest):
     return bool(present)
 
 
+def projection_manifest(manifest):
+    """True when ``manifest`` declares the projection roles (both), False when it declares neither. They need the gateway
+    roles: pj0 writes the database the gateways read history from."""
+    present = PROJECTION_ROLES & set((manifest or {}).get('nodes') or {})
+    if present and present != PROJECTION_ROLES:
+        raise Violation('the projection roles are declared together: ' + ', '.join(sorted(PROJECTION_ROLES)) + '; got '
+                        + ', '.join(sorted(present)))
+    if present and not gateway_manifest(manifest):
+        raise Violation('the projection roles need the gateway roles (pj0 writes the gateways\' history database)')
+    return bool(present)
+
+
 def roles_of(manifest):
-    """The roles a manifest must declare: ROLES, plus the gateway roles on a gateway manifest."""
-    return ROLES | (GATEWAY_ROLES if gateway_manifest(manifest) else set())
+    """The roles a manifest must declare: ROLES, plus the gateway roles on a gateway manifest and the projection roles on
+    a projection manifest."""
+    return (ROLES | (GATEWAY_ROLES if gateway_manifest(manifest) else set())
+            | (PROJECTION_ROLES if projection_manifest(manifest) else set()))
 
 
 def slots_of(manifest):
-    return {**SLOTS, **(GATEWAY_SLOTS if gateway_manifest(manifest) else {})}
+    return {**SLOTS, **(GATEWAY_SLOTS if gateway_manifest(manifest) else {}),
+            **(PROJECTION_SLOTS if projection_manifest(manifest) else {})}
+
+
+def ports_of(manifest):
+    """The port profile a manifest must carry."""
+    return {**PORT_PROFILE, **(GATEWAY_PORTS if gateway_manifest(manifest) else {}),
+            **(PROJECTION_PORTS if projection_manifest(manifest) else {})}
 
 
 # The replica's port slot (CLUSTER_REPLICA_SLOT): its ports are ae_base + slot x stride + offset, like a member's
@@ -155,7 +193,10 @@ PROCESS_ENV = {
     'STREAM_CORE_INGRESS_CHANNEL', 'STREAM_CORE_RESPONSE_CHANNEL', 'STREAM_INSTANCE_ID', 'STREAM_WS_BIND',
     'STREAM_ADMIN_BIND', 'STREAM_AUTH_MODES', 'STREAM_CORE_NODE_ENDPOINTS', 'STREAM_ME_NODE_ENDPOINTS',
     # the test-only HTTP shim (gateway_shim.py): its listener and its users file
-    'SHIM_HTTP_BIND', 'SHIM_API_KEYS_FILE', 'SHIM_MODE', 'SHIM_CORE_PROBE'}
+    'SHIM_HTTP_BIND', 'SHIM_API_KEYS_FILE', 'SHIM_MODE', 'SHIM_CORE_PROBE',
+    # the test-only projection stand-in (projector_stub.py): its listener, database, mode, member endpoints and settings
+    'STUB_ADMIN_BIND', 'STUB_PG_URL', 'STUB_INSTANCE', 'STUB_CORE_PROBE', 'STUB_MEMBER_METRICS', 'STUB_MODE',
+    'STUB_POLL_MS', 'STUB_PAGE_EVENTS', 'STUB_LEASE_MS', 'STUB_LEASE_POLL_MS', 'STUB_PROBE_BOUND_MS'}
 # Only `execute` on the probe container may carry these (the pinned T1 drivers). The values are
 # session secrets except T1_ME_MARKETS and T1_LOCAL_HOST. T1_BRIDGE_KEY, T1_TAP_KEY and T1_ME_FORWARDER_KEY are
 # never set: the via-bridge genesis needs no bridge key and the capture/resend verbs are not run from the probe.
@@ -297,6 +338,19 @@ GATEWAY_KINDS.update({
                         'control_text': 'request unanswered: decode drop', 'drill': {'FILL_PAIRS': 20}},
 })
 GATEWAY_NC_DEFAULT_DEFINE = 'GW_NC_FRESH_KEY'
+# The projection kinds: gateway kinds with the projection slots. ``projectors`` names the artifact of pj0 and pj1 and
+# ``stub_mode`` the stand-in's mode. The product gateway and stream binaries of the cut run in the gateway slots.
+#   pj-dry, pj-dry-ext          the projection drills' dry runs: pj0 and pj1 = projector_stub (follow)
+#   pj-dry-beatalways           the freshness drill's dry-run control: pj0 beats whatever the head
+_PJ_STUB = {'pj0': 'projector_stub', 'pj1': 'projector_stub'}
+GATEWAY_KINDS.update({
+    'pj-dry': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_STUB), 'stub_mode': 'follow'},
+    'pj-dry-ext': {'driver': 'external', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_STUB),
+                   'stub_mode': 'follow'},
+    'pj-dry-beatalways': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_STUB),
+                          'stub_mode': 'beat-always', 'projection_control': 'history-freshness'},
+})
+PROJECTION_KINDS = {k for k, v in GATEWAY_KINDS.items() if v.get('projectors')}
 
 
 def nc_define(kind):
@@ -597,6 +651,41 @@ GATEWAY_TARGETS = {'gateway': 'oe-gateway', 'gateway_nc': 'oe-gateway', 'stream'
                    'session_stub': 'ct_session_stub'}
 
 
+PROJECTION_ARTIFACT_KEYS = {'path', 'sha256', 'source_sha', 'driver', 'target', 'libs', 'mode'}
+
+
+def validate_projection_artifacts(manifest):
+    """The projection binaries of a projection manifest: each declared (null when absent), pinned like a slot binary,
+    its target fixed by its key. The stand-in runs CoreProbe JVMs (each on its own embedded driver), so it is embedded
+    and names its mode; the projector binary names its driver mode and stages the external driver's libraries."""
+    artifacts = manifest['artifacts']
+    for name in PROJECTION_BINARIES:
+        if name not in artifacts:
+            raise Violation('a projection manifest declares every projection artifact explicitly (null when absent): ' + name)
+        entry = artifacts[name]
+        if entry is None:
+            continue
+        if not isinstance(entry, dict) or set(entry) - PROJECTION_ARTIFACT_KEYS:
+            raise Violation(f'{name}: artifact keys are ' + ', '.join(sorted(PROJECTION_ARTIFACT_KEYS)))
+        _source(entry, name); _file(entry, name)
+        if entry.get('target') != PROJECTION_TARGETS[name]:
+            raise Violation(f'{name}: target must be {PROJECTION_TARGETS[name]}, got {entry.get("target")!r}')
+        if entry.get('driver') not in DRIVER_MODES:
+            raise Violation(name + ': driver must be embedded or external')
+        if name == 'projector_stub' and (entry['driver'] != 'embedded' or entry.get('mode') not in STUB_MODES):
+            raise Violation('projector_stub: the stand-in runs CoreProbe on its embedded driver (driver embedded) and names '
+                            'its mode: ' + ', '.join(sorted(STUB_MODES)))
+        if name != 'projector_stub' and 'mode' in entry:
+            raise Violation(name + ': only the stand-in has a mode')
+        libs = entry.get('libs') or {}
+        if entry['driver'] == 'external' and name != 'projector_stub' and set(libs) != {'aeronmd', 'libaeron_driver.so', 'libaeron.so'}:
+            raise Violation(f'{name}: an external slot stages aeronmd, libaeron_driver.so and libaeron.so')
+        for lib_name, lib in libs.items():
+            if '/' in lib_name:
+                raise Violation(name + ': library names are flat file names')
+            _lib(lib, name + ' library ' + lib_name)
+
+
 def validate_gateway_artifacts(manifest):
     """The gateway binaries of a gateway manifest: each declared (null when absent), pinned like a slot binary (path,
     sha256, 40-hex source commit, driver mode, the libraries an external one stages), its target fixed by its key. A
@@ -708,7 +797,8 @@ def validate_core_manifest(manifest, manifest_path, cpu_count=None, profiles=jou
             address = ipaddress.ip_address(value)
             if address not in net or address in {net.network_address, net.broadcast_address, net.network_address + 1}:
                 raise Violation('endpoint is outside the fixture or collides with its gateway')
-        if manifest['ports'] != ({**PORT_PROFILE, **GATEWAY_PORTS} if gateway else PORT_PROFILE):
+        projection = projection_manifest(manifest)
+        if manifest['ports'] != ports_of(manifest):
             raise Violation('core port profile differs from the fixture contract')
         for field in ['shm_mb', 'memory_mb', 'disk_min_free_mb']:
             if integer(manifest['limits'][field]) <= 0:
@@ -717,7 +807,8 @@ def validate_core_manifest(manifest, manifest_path, cpu_count=None, profiles=jou
         validate_cpus(manifest, cpu_count)
         integer(manifest['seed'])
         artifacts = manifest['artifacts']
-        unknown = set(artifacts) - set(REQUIRED_JARS) - set(OPTIONAL_BINARIES) - (set(GATEWAY_BINARIES) if gateway else set())
+        unknown = (set(artifacts) - set(REQUIRED_JARS) - set(OPTIONAL_BINARIES) - (set(GATEWAY_BINARIES) if gateway else set())
+                   - (set(PROJECTION_BINARIES) if projection else set()))
         if unknown:
             raise Violation('unknown artifacts: ' + ', '.join(sorted(unknown)))
         for role in REQUIRED_JARS:
@@ -741,13 +832,15 @@ def validate_core_manifest(manifest, manifest_path, cpu_count=None, profiles=jou
                 _lib(lib, role + ' library ' + name)
         if gateway:
             validate_gateway_artifacts(manifest)
+        if projection:
+            validate_projection_artifacts(manifest)
         slots = manifest['slot_artifacts']
         if set(slots) != set(slots_of(manifest)):
             raise Violation('slot_artifacts must name every slot role: ' + ', '.join(sorted(slots_of(manifest))))
         for slot, name in slots.items():
-            if name is not None and name not in {**SLOT_ARTIFACTS, **GATEWAY_SLOT_ARTIFACTS}[slot]:
+            if name is not None and name not in {**SLOT_ARTIFACTS, **GATEWAY_SLOT_ARTIFACTS, **PROJECTION_SLOT_ARTIFACTS}[slot]:
                 raise Violation(f'slot {slot} cannot run artifact {name}')
-            if name is not None and slot in GATEWAY_SLOTS and artifacts.get(name) is None:
+            if name is not None and (slot in GATEWAY_SLOTS or slot in PROJECTION_SLOTS) and artifacts.get(name) is None:
                 raise Violation(f'slot {slot} runs {name}, but artifacts.{name} is null')
         validate_core_jvm_properties(manifest)
         validate_replica_slot(manifest)

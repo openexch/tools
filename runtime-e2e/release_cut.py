@@ -95,6 +95,8 @@ GATEWAY_PRODUCT = {
     'oe-stream': {'repo': 'gateway', 'lang': 'cpp', 'stamped': True, 'schemas': ('money',)},
 }
 GATEWAY_SHIM = 'runtime-e2e/gateway_shim.py'
+PROJECTOR_STUB = 'runtime-e2e/projector_stub.py'
+CORE_PROBE_SOURCE = Path(__file__).resolve().parent / 'java' / 'CoreProbe.java'
 # Every retired artifact name of every layout: an old assets-bridge jar stays retired in a new cut, as core-bridge does.
 RETIRED = set().union(*(layout['retired'] for layout in LAYOUTS.values()))
 RETIRED_FILE = re.compile(r'(assets-bridge|core-bridge|oms-app|match-gateway)[^/]*$')
@@ -714,7 +716,7 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
         if entry is None:
             continue
         what = 'artifacts.' + key
-        if key in core_contracts.GATEWAY_TEST_ARTIFACTS:
+        if key in core_contracts.GATEWAY_TEST_ARTIFACTS | core_contracts.PROJECTION_TEST_ARTIFACTS:
             _gateway_test_artifact(f, what, key, entry, m, cut, cls)
             for lib, lentry in ((entry or {}).get('libs') or {}).items():
                 staged(f'{what}.libs.{lib}', lentry, lib)
@@ -750,6 +752,10 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
                 staged(f'{block}.{lib}', lentry, lib)
     for key in ('core_probe', 'journal_probe', 't1_me_driver', 't1_core_driver'):
         if key in m:
+            waived = drifted_probe(m, cut, cls, key)
+            if waived:
+                f.waived.append(waived)
+                continue
             staged(key, {'path': m[key]['path'], 'sha256': m[key]['sha256']})
     if m.get('manifest_kind') and not core_contracts.cut_derived(m['manifest_kind']):
         f.add('K9', f'manifest_kind {m["manifest_kind"]} is not derived from a cut')
@@ -787,12 +793,36 @@ def build_tree_setting(path, key):
     return None
 
 
+def drifted_probe(m, cut, cls, key, source=CORE_PROBE_SOURCE):
+    """The waiver text when a rig manifest with a named harness_drift waiver stages a core probe that is not the cut's but
+    was compiled from this harness tree's CoreProbe.java (its recorded source equals that file byte for byte and the jar
+    is the bytes it names); else None. A probe of a drifted harness is part of that drift: a product or nightly manifest
+    never carries the waiver, and a probe that matches neither the cut nor this tree stays refused."""
+    if key != 'core_probe' or cls not in ('rig', 'rig-xver'):
+        return None
+    waiver, entry = m.get('harness_drift'), m.get(key)
+    if not (isinstance(waiver, dict) and waiver.get('reason')) or not isinstance(entry, dict):
+        return None
+    if entry.get('sha256') == ((cut.get('harness') or {}).get(key) or {}).get('sha256'):
+        return None
+    try:
+        jar = hashlib.sha256(Path(entry['path']).read_bytes()).hexdigest()
+        here = hashlib.sha256(Path(source).read_bytes()).hexdigest()
+        compiled = hashlib.sha256(Path(entry['source_path']).read_bytes()).hexdigest()
+    except (OSError, KeyError, TypeError):
+        return None
+    if jar != entry.get('sha256') or compiled != entry.get('source_sha256') or compiled != here:
+        return None
+    return (f'{key}: compiled from this harness tree\'s CoreProbe.java ({here[:12]}), not the cut\'s probe '
+            f'(harness_drift: {waiver["reason"]})')
+
+
 def _gateway_test_artifact(f, what, key, entry, m, cut, cls):
     """A test-only gateway slot artifact (core_contracts.GATEWAY_TEST_ARTIFACTS): refused in a product kind (K3); in a rig
     kind it must be a build of the cut's own commit: gateway_nc carries the cut's gateway sha (its stamp), the session
     stub sits in a cluster-tools build tree configured at the cut's commit with CT_SESSION_STUB=ON, and the HTTP shim is
-    the byte copy of gateway_shim.py at the harness commit (a rig manifest's harness_drift waiver covers a shim of an
-    uncommitted harness, recorded)."""
+    the byte copy of gateway_shim.py at the harness commit, the projection stand-in of projector_stub.py (a rig manifest's
+    harness_drift waiver covers a shim or stand-in of an uncommitted harness, recorded)."""
     if cls == 'product':
         f.add('K3', f'{what}: a test-only build ({key}) in a product kind')
         return
@@ -815,11 +845,12 @@ def _gateway_test_artifact(f, what, key, entry, m, cut, cls):
         if not want or entry.get('source_sha') != want or configured != want or stub != 'ON':
             f.add('K4', f'{what}: session_stub is not a CT_SESSION_STUB build of the cut\'s cluster-tools {want} '
                         f'(build tree CT_BUILD_SOURCE_SHA {configured}, CT_SESSION_STUB {stub})')
-    elif key == 'gateway_stub':
-        blob = git_blob('tools', m.get('harness_commit'), GATEWAY_SHIM) if m.get('harness_commit') else None
+    elif key in ('gateway_stub', 'projector_stub'):
+        rel = GATEWAY_SHIM if key == 'gateway_stub' else PROJECTOR_STUB
+        blob = git_blob('tools', m.get('harness_commit'), rel) if m.get('harness_commit') else None
         same = blob is not None and hashlib.sha256(blob).hexdigest() == entry.get('sha256')
         if not same:
-            text = f'{what}: the shim is not {GATEWAY_SHIM} at harness_commit {m.get("harness_commit")}'
+            text = f'{what}: the {"shim" if key == "gateway_stub" else "stand-in"} is not {rel} at harness_commit {m.get("harness_commit")}'
             waiver = m.get('harness_drift')
             if isinstance(waiver, dict) and waiver.get('reason') and cls in ('rig', 'rig-xver'):
                 f.waived.append(text)

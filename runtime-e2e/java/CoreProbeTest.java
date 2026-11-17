@@ -63,6 +63,7 @@ public final class CoreProbeTest {
         run("order_events_stops_at_the_bound", CoreProbeTest::replayBound);
         run("order_events_cursor_ahead_of_the_core_is_not_complete", CoreProbeTest::replayAhead);
         run("order_events_listener_decodes_pages_and_end", CoreProbeTest::replayListener);
+        run("order_events_full_fields_only_on_request", CoreProbeTest::replayFullFields);
         run("user_balances_reply_is_decoded", CoreProbeTest::userBalancesReply);
         run("config_report_reply_is_decoded", CoreProbeTest::configReportReply);
         System.out.println(failures.isEmpty() ? "ALL PASS" : "FAILED " + failures);
@@ -1028,6 +1029,31 @@ public final class CoreProbeTest {
         p.listener.onMessage(1, 1, BUF, 0, n, null);
         check(p.listener.replay.requests == 1 && p.listener.replay.lastSeq == 40 && p.listener.replay.complete()
                 && p.listener.replay.events == 2, "end frame " + CoreProbe.json(p.listener.replay.json()));
+    }
+
+    private static void replayFullFields() {
+        final CoreProbe p = new CoreProbe();
+        p.listener = p.new Listener();
+        p.listener.replay = new CoreProbe.EventReplay(10, 12, 4096);
+        p.listener.expectCorrelation = 9;
+        p.listener.fullRows = true;
+        p.listener.onMessage(1, 1, BUF, 0, eventsPage(9, 11), null);
+        final String row = p.rows.get(0);
+        check(row.startsWith("{\"seq\":11,\"order\":111,\"kind\":\"ACK_NEW\"") && row.endsWith("\"me_reason\":255}"),
+                "full row " + row);
+        for (final String k : new String[] {"user", "market", "side", "type", "tif", "price", "stop_price", "last_price",
+                "last_qty", "hold_asset", "client_order_id_high", "client_order_id_low", "created_ms", "updated_ms", "me_reason",
+                "log_position"}) {
+            check(row.contains("\"" + k + "\":"), "full row lacks " + k);
+        }
+        check(row.contains("\"side\":\"BUY\"") && row.contains("\"type\":\"LIMIT\"") && row.contains("\"tif\":\"GTC\""),
+                "enum names " + row);
+        final CoreProbe q = new CoreProbe();
+        q.listener = q.new Listener();
+        q.listener.replay = new CoreProbe.EventReplay(10, 12, 4096);
+        q.listener.expectCorrelation = 9;
+        q.listener.onMessage(1, 1, BUF, 0, eventsPage(9, 11), null);
+        check(!q.rows.get(0).contains("\"user\":"), "the default row is the tap's " + q.rows.get(0));
     }
 
     private static void userBalancesReply() {
