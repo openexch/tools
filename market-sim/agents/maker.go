@@ -2,11 +2,8 @@ package agents
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log"
 	"math/rand"
-	"strings"
 	"time"
 
 	"github.com/openexch/tools/market-sim/dist"
@@ -68,17 +65,17 @@ func (m *Maker) HasOrder(id string) bool {
 	return ok
 }
 
-// OnOrderEvent applies a pushed order update (OMS user-WS): terminal orders
+// OnOrderEvent applies a pushed order update (gateway user stream): terminal orders
 // leave the ladder immediately instead of waiting for TTL + cancel-404.
 func (m *Maker) OnOrderEvent(o oms.OrderResponse) {
-	if _, ok := m.orders[o.OmsOrderID]; !ok {
+	if _, ok := m.orders[o.OrderID]; !ok {
 		return
 	}
 	if oms.IsTerminalStatus(o.Status) {
 		if o.Status == "FILLED" {
 			m.Env.Stats.Fills.Add(1)
 		}
-		delete(m.orders, o.OmsOrderID)
+		delete(m.orders, o.OrderID)
 	}
 }
 
@@ -86,7 +83,7 @@ func (m *Maker) OnOrderEvent(o oms.OrderResponse) {
 func (m *Maker) Due(now time.Time) bool { return now.After(m.nextAt) }
 
 // Step reconciles the ladder once: drop stale quotes, top up missing ones.
-// Every OMS op passes the governor; when throttled the rest of the step is
+// Every gateway op passes the governor; when throttled the rest of the step is
 // skipped (retried on the next due cycle).
 func (m *Maker) Step(ctx context.Context) {
 	defer m.reschedule()
@@ -118,7 +115,7 @@ func (m *Maker) Step(ctx context.Context) {
 			log.Printf("[maker %d %s] cancel %s: %v", m.Bot, m.Params.Symbol, id, err)
 			continue
 		}
-		// Cancelled — or 404: already filled/terminal, equally gone.
+		// Cancelled: or 404: already filled/terminal, equally gone.
 		m.Env.Stats.Cancelled.Add(1)
 		delete(m.orders, id)
 	}
@@ -181,7 +178,6 @@ func (m *Maker) place(ctx context.Context, side string, center oms.Money) bool {
 	req := oms.CreateOrderRequest{
 		UserID: m.Bot, MarketID: m.Params.ID, Side: side, OrderType: "LIMIT",
 		TimeInForce: "GTC", Price: &price, Quantity: oms.MoneyFromFloat(qty),
-		ClientOrderID: fmt.Sprintf("sim-%d-%d", m.Bot, m.seq),
 	}
 	resp, err := m.Env.Client.CreateOrder(ctx, req)
 	if err != nil {
@@ -204,7 +200,7 @@ func (m *Maker) place(ctx context.Context, side string, center oms.Money) bool {
 	if ttl < 3*time.Second {
 		ttl = 3 * time.Second
 	}
-	m.orders[resp.OmsOrderID] = &makerOrder{side: side, price: price, placedAt: time.Now(), ttl: ttl}
+	m.orders[resp.OrderID] = &makerOrder{side: side, price: price, placedAt: time.Now(), ttl: ttl}
 	return true
 }
 
@@ -217,8 +213,10 @@ func (m *Maker) reschedule() {
 func (m *Maker) ReconcileDue(now time.Time) bool { return now.After(m.nextRecAt) }
 
 // Reconcile syncs local intended state with the server (closing the drift
-// between the two): cancel server-side orphans that carry our
-// clientOrderId prefix, drop local entries the server no longer has, refresh
+// between the two): cancel server-side orphans on this maker's market (the
+// bot user belongs to the sim alone, so any open order there that the maker
+// does not track is a lost response or a previous run's quote), drop local
+// entries the server no longer has, refresh
 // inventory from balances, and rebalance runaway inventory with a reducing
 // order. Runs on the scheduler goroutine (same as Step).
 func (m *Maker) Reconcile(ctx context.Context) {
@@ -233,16 +231,15 @@ func (m *Maker) Reconcile(ctx context.Context) {
 		return
 	}
 	server := map[string]bool{}
-	prefix := fmt.Sprintf("sim-%d-", m.Bot)
 	for _, o := range active {
-		server[o.OmsOrderID] = true
-		if _, known := m.orders[o.OmsOrderID]; known {
+		server[o.OrderID] = true
+		if _, known := m.orders[o.OrderID]; known {
 			continue
 		}
 		// Server-side orphan from a lost response or a previous run: cancel
-		// anything with our idempotency prefix that we no longer intend.
-		if o.MarketID == m.Params.ID && strings.HasPrefix(o.ClientOrderID, prefix) {
-			if err := m.Env.Client.CancelOrder(ctx, m.Bot, o.OmsOrderID); err == nil || isGone(err) {
+		// anything on this market that we no longer intend.
+		if int(o.MarketID) == m.Params.ID {
+			if err := m.Env.Client.CancelOrder(ctx, m.Bot, o.OrderID); err == nil || isGone(err) {
 				m.Env.Stats.Orphans.Add(1)
 			}
 		}
@@ -260,7 +257,7 @@ func (m *Maker) Reconcile(ctx context.Context) {
 		return
 	}
 	for _, a := range acct.Assets {
-		if a.AssetID == m.Params.BaseAssetID {
+		if int(a.AssetID) == m.Params.BaseAssetID {
 			m.invDelta = a.Total.Float() - m.Params.BaseFloat
 		}
 	}
@@ -299,7 +296,6 @@ func (m *Maker) rebalance(ctx context.Context) {
 	resp, err := m.Env.Client.CreateOrder(ctx, oms.CreateOrderRequest{
 		UserID: m.Bot, MarketID: m.Params.ID, Side: side, OrderType: "LIMIT",
 		TimeInForce: "IOC", Price: &price, Quantity: oms.MoneyFromFloat(qty),
-		ClientOrderID: fmt.Sprintf("sim-%d-%d", m.Bot, m.seq),
 	})
 	if err != nil {
 		m.Env.Stats.Errors.Add(1)
@@ -331,9 +327,8 @@ func (m *Maker) CancelAll(ctx context.Context) {
 	}
 }
 
-// isGone treats NOT_FOUND as convergence: the order is already terminal
-// (usually filled between our snapshot and the cancel).
+// isGone treats an order that is no longer open as convergence: 404
+// NOT_FOUND or 409 NOT_OPEN (already terminal or unknown).
 func isGone(err error) bool {
-	var apiErr *oms.APIError
-	return errors.As(err, &apiErr) && apiErr.Code == "NOT_FOUND"
+	return oms.IsGone(err)
 }

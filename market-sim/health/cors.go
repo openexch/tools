@@ -5,13 +5,15 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/openexch/tools/market-sim/oms"
 )
 
-// CORSProbe replays exactly the class of regression that broke the demo for
-// a day (oms#37 default-deny + unset OMS_CORS_ORIGINS): a browser-origin
-// preflight plus a real GET, asserting Access-Control-Allow-Origin echoes
-// the demo UI's origin. It probes BOTH the local OMS and the public edge —
-// the outage lived at the edge, where nobody was looking.
+// CORSProbe replays the class of regression that once broke the demo for a
+// day (default-deny CORS with no origin configured): a browser-origin
+// preflight plus a real GET against the gateway REST API, asserting
+// Access-Control-Allow-Origin echoes the demo UI's origin. It probes both the
+// local gateway and the public edge, where that outage lived.
 type CORSProbe struct {
 	Registry *Registry
 	Origin   string   // e.g. https://trade.openexch.io
@@ -50,13 +52,13 @@ func (p *CORSProbe) Run(ctx context.Context) {
 
 func (p *CORSProbe) probe(ctx context.Context, base string) (bool, string) {
 	// 1. Preflight: what the browser sends before POST /orders.
-	req, err := http.NewRequestWithContext(ctx, http.MethodOptions, base+"/api/v1/orders", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodOptions, base+oms.APIPrefix+"/orders", nil)
 	if err != nil {
 		return false, err.Error()
 	}
 	req.Header.Set("Origin", p.Origin)
 	req.Header.Set("Access-Control-Request-Method", "POST")
-	req.Header.Set("Access-Control-Request-Headers", "content-type,authorization")
+	req.Header.Set("Access-Control-Request-Headers", "content-type,authorization,idempotency-key")
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return false, "preflight: " + err.Error()
@@ -68,8 +70,8 @@ func (p *CORSProbe) probe(ctx context.Context, base string) (bool, string) {
 	}
 
 	// 2. Real cross-origin GET (CorsPolicy applies to responses too).
-	// /api/v1/health is auth-exempt, so this asserts pure CORS behavior.
-	req, err = http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/v1/health", nil)
+	// /status is public, so this asserts pure CORS behavior.
+	req, err = http.NewRequestWithContext(ctx, http.MethodGet, base+oms.APIPrefix+"/status", nil)
 	if err != nil {
 		return false, err.Error()
 	}

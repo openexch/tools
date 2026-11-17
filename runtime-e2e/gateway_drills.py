@@ -94,7 +94,9 @@ def settings(environ=os.environ):
 
 
 def is_scenario(name):
-    return name in SCENARIOS
+    """A drill id, or a measurement id (gateway_measure.MEASUREMENTS: data on the product binaries, in no night plan)."""
+    import gateway_measure
+    return name in SCENARIOS or name in gateway_measure.MEASUREMENTS
 
 
 def dry_run_of(manifest, name):
@@ -144,6 +146,9 @@ def check_scenario(manifest, name):
 def scenario(fixture, name, out_dir):
     """runner.py entry for the gateway scenario ids."""
     dry = check_scenario(fixture.m, name)
+    import gateway_measure
+    if name in gateway_measure.MEASUREMENTS:
+        return gateway_measure.run(fixture, name, Path(out_dir) / 'measure')
     if dry is None:
         import gateway_scenarios
         return gateway_scenarios.run(fixture, name, Path(out_dir) / 'drill')

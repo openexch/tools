@@ -1,6 +1,6 @@
 // Package agents implements the trading population: makers quote ladders
 // around the reference anchor, takers cross the observed spread. All flow
-// goes through the real OMS path (risk, balances, holds) at human-watchable
+// goes through the real gateway and core path (risk, balances, holds) at human-watchable
 // rates under a token-bucket governor.
 package agents
 
@@ -40,9 +40,9 @@ type Env struct {
 	Health   *MarketHealth
 }
 
-// MarketHealth is per-market shared backoff state. When the server reports
-// CIRCUIT_BREAKER_OPEN or MARKET_HALTED the whole market's agents pause new
-// flow (cancels keep working) and never auto-reset the breaker — that is an
+// MarketHealth is per-market shared backoff state. When the core answers
+// CIRCUIT_BREAKER or GATE_CLOSED (order entry closed) the whole market's agents pause new
+// flow (cancels keep working) and never auto-reset the breaker: that is an
 // admin action.
 type MarketHealth struct {
 	Symbol string
@@ -84,7 +84,7 @@ func (h *MarketHealth) Paused() bool {
 func (e Env) handleReject(reason string) bool {
 	e.Stats.Reject(reason)
 	switch reason {
-	case "CIRCUIT_BREAKER_OPEN", "MARKET_HALTED":
+	case "CIRCUIT_BREAKER", "GATE_CLOSED":
 		if e.Health != nil {
 			e.Health.PauseFor(30*time.Second, reason)
 		}

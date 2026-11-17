@@ -2,7 +2,6 @@ package agents
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"math/rand"
 	"time"
@@ -63,19 +62,19 @@ func NewDepth(bot int64, side string, p MarketParams, env Env) *Depth {
 
 func (d *Depth) Due(now time.Time) bool { return now.After(d.nextAt) }
 
-// OnOrderEvent applies a pushed order update (OMS user-WS). Without this,
+// OnOrderEvent applies a pushed order update (gateway user stream). Without this,
 // rungs eaten by takers during a pump/dump stayed in d.orders as zombies
-// until the 45s reconcile — the keeper believed the ladder was full and
+// until the 45s reconcile: the keeper believed the ladder was full and
 // placed NOTHING while the visible side drained (the drained-book bug).
 func (d *Depth) OnOrderEvent(o oms.OrderResponse) {
-	if _, ok := d.orders[o.OmsOrderID]; !ok {
+	if _, ok := d.orders[o.OrderID]; !ok {
 		return
 	}
 	if oms.IsTerminalStatus(o.Status) {
 		if o.Status == "FILLED" {
 			d.Env.Stats.Fills.Add(1)
 		}
-		delete(d.orders, o.OmsOrderID)
+		delete(d.orders, o.OrderID)
 	}
 }
 
@@ -94,7 +93,7 @@ func (d *Depth) Step(ctx context.Context) {
 
 	// Safety net for dropped WS events: if OUR side of the visible book is
 	// thin while the local ladder claims to be full, some entries are
-	// zombies (filled orders we never heard about) — reconcile against the
+	// zombies (filled orders we never heard about): reconcile against the
 	// server now instead of waiting for the 45s sweep, so the refill below
 	// works from real occupancy.
 	if len(d.orders) >= d.Levels*3/4 && now.Sub(d.lastForcedRec) > 3*time.Second {
@@ -116,7 +115,7 @@ func (d *Depth) Step(ctx context.Context) {
 	minOff := 4
 	maxOff := minOff + (d.Levels-1)*d.spacing
 
-	// 1. Trim rungs that expired or slid outside the window — but ONLY
+	// 1. Trim rungs that expired or slid outside the window: but ONLY
 	// while the ladder is full. A deep rung left behind by a pump is still
 	// one of the top-20 visible levels; removing it before its replacement
 	// exists is exactly how the visible book thins out mid-move.
@@ -208,7 +207,6 @@ func (d *Depth) place(ctx context.Context, center oms.Money, off int) bool {
 	resp, err := d.Env.Client.CreateOrder(ctx, oms.CreateOrderRequest{
 		UserID: d.Bot, MarketID: d.Params.ID, Side: d.Side, OrderType: "LIMIT",
 		TimeInForce: "GTC", Price: &price, Quantity: oms.MoneyFromFloat(qty),
-		ClientOrderID: fmt.Sprintf("sim-%d-%d", d.Bot, d.seq),
 	})
 	if err != nil {
 		d.Env.Stats.Errors.Add(1)
@@ -224,12 +222,12 @@ func (d *Depth) place(ctx context.Context, center oms.Money, off int) bool {
 	if ttl < 30*time.Second {
 		ttl = 30 * time.Second
 	}
-	d.orders[resp.OmsOrderID] = &depthOrder{side: d.Side, price: price, offset: off, placedAt: time.Now(), ttl: ttl}
+	d.orders[resp.OrderID] = &depthOrder{side: d.Side, price: price, offset: off, placedAt: time.Now(), ttl: ttl}
 	return true
 }
 
 // Reconcile drops local entries the server no longer has (fills/losses);
-// orphan cleanup happens via the maker-style prefix sweep in its own pass.
+// server orders the keeper does not track are left alone here.
 func (d *Depth) Reconcile(ctx context.Context) {
 	active, err := d.Env.Client.ActiveOrders(ctx, d.Bot)
 	if err != nil {
@@ -237,7 +235,7 @@ func (d *Depth) Reconcile(ctx context.Context) {
 	}
 	server := map[string]bool{}
 	for _, o := range active {
-		server[o.OmsOrderID] = true
+		server[o.OrderID] = true
 	}
 	for id := range d.orders {
 		if !server[id] {

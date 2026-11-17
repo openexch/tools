@@ -2,7 +2,6 @@ package agents
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"math/rand"
 	"time"
@@ -50,7 +49,7 @@ func (t *Taker) Tick(ctx context.Context, dt time.Duration) {
 	}
 
 	// Direction: live taker bias + the regime trend (pumps get bought,
-	// dumps get sold — volume confirms the move, like a real market).
+	// dumps get sold: volume confirms the move, like a real market).
 	pBuy := clamp01(0.5 + 0.3*state.TakerBias + 400*state.Drift)
 	side := "SELL"
 	if rand.Float64() < pBuy {
@@ -58,7 +57,7 @@ func (t *Taker) Tick(ctx context.Context, dt time.Duration) {
 	}
 
 	// Cross the observed touch; back off entirely when the opposite side is
-	// thin — real takers face slippage on a thin book and stand down, and
+	// thin: real takers face slippage on a thin book and stand down, and
 	// this keeps a pump from eating the visible book to zero faster than
 	// the depth keepers can re-ladder.
 	book := t.Env.Feed.View(t.Params.ID)
@@ -89,7 +88,6 @@ func (t *Taker) Tick(ctx context.Context, dt time.Duration) {
 	resp, err := t.Env.Client.CreateOrder(ctx, oms.CreateOrderRequest{
 		UserID: t.Bot, MarketID: t.Params.ID, Side: side, OrderType: "LIMIT",
 		TimeInForce: "IOC", Price: &price, Quantity: oms.MoneyFromFloat(qty),
-		ClientOrderID: fmt.Sprintf("sim-%d-%d", t.Bot, t.seq),
 	})
 	if err != nil {
 		t.Env.Stats.Errors.Add(1)

@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync/atomic"
@@ -13,7 +14,8 @@ import (
 
 // Canary actively proves the order lifecycle end-to-end on a dedicated bot:
 // create a resting far-from-touch order (inside the 10% price collar!),
-// see it reach NEW, cancel it, see it CANCELLED. The passive agents prove
+// see it reach NEW (201 is PENDING_NEW; NEW is the matching engine's ack),
+// cancel it, see it CANCELLED. The passive agents prove
 // fills; the canary proves the path even when the market is quiet.
 type Canary struct {
 	Client   *oms.Client
@@ -78,7 +80,6 @@ func (c *Canary) cycle(ctx context.Context) (bool, string) {
 	resp, err := c.Client.CreateOrder(ctx, oms.CreateOrderRequest{
 		UserID: c.Bot, MarketID: c.MarketID, Side: "BUY", OrderType: "LIMIT",
 		TimeInForce: "GTC", Price: &price, Quantity: oms.MoneyFromFloat(c.MinQty),
-		ClientOrderID: fmt.Sprintf("sim-canary-%d", c.seq),
 	})
 	if err != nil {
 		return false, "create: " + err.Error()
@@ -87,27 +88,45 @@ func (c *Canary) cycle(ctx context.Context) (bool, string) {
 		return false, "create rejected: " + resp.RejectReason
 	}
 
-	if ok, why := c.awaitStatus(ctx, resp.OmsOrderID, "NEW"); !ok {
+	if ok, why := c.awaitStatus(ctx, resp.OrderID, "NEW"); !ok {
 		// Best-effort cleanup before reporting.
-		c.Client.CancelOrder(ctx, c.Bot, resp.OmsOrderID)
+		c.Client.CancelOrder(ctx, c.Bot, resp.OrderID)
 		return false, "await NEW: " + why
 	}
-	if err := c.Client.CancelOrder(ctx, c.Bot, resp.OmsOrderID); err != nil {
+	if err := c.Client.CancelOrder(ctx, c.Bot, resp.OrderID); err != nil {
 		return false, "cancel: " + err.Error()
 	}
-	if ok, why := c.awaitStatus(ctx, resp.OmsOrderID, "CANCELLED"); !ok {
+	ok, why := c.awaitStatus(ctx, resp.OrderID, "CANCELLED")
+	if !ok {
 		return false, "await CANCELLED: " + why
 	}
 	rt := time.Since(start).Milliseconds()
 	c.lastRoundtripMs.Store(rt)
-	return true, fmt.Sprintf("roundtrip %dms", rt)
+	detail := fmt.Sprintf("roundtrip %dms", rt)
+	if why != "" {
+		detail += ", " + why
+	}
+	return true, detail
 }
 
+// awaitStatus polls GET /orders/{id} until want. A closed order is read from
+// the gateway's history; a gateway without history answers 503
+// HISTORY_UNAVAILABLE for it. Only for want CANCELLED, after the cancel was
+// acknowledged, and only on exactly that answer, the order's absence from
+// the open orders counts as closed (the canary's far-from-touch order cannot
+// have filled inside the collar band it was priced in, but this cannot tell
+// CANCELLED from EXPIRED: the detail says so).
 func (c *Canary) awaitStatus(ctx context.Context, id, want string) (bool, string) {
 	deadline := time.Now().Add(c.SLA)
 	last := ""
 	for time.Now().Before(deadline) {
 		o, err := c.Client.GetOrder(ctx, c.Bot, id)
+		var apiErr *oms.APIError
+		if want == "CANCELLED" && errors.As(err, &apiErr) && apiErr.Code == "HISTORY_UNAVAILABLE" {
+			if open, lerr := c.Client.ActiveOrders(ctx, c.Bot); lerr == nil && !containsOrder(open, id) {
+				return true, "closed (not open; no history to read its final status)"
+			}
+		}
 		if err == nil {
 			last = o.Status
 			if o.Status == want {
@@ -124,4 +143,13 @@ func (c *Canary) awaitStatus(ctx context.Context, id, want string) (bool, string
 		}
 	}
 	return false, fmt.Sprintf("SLA %s exceeded (last status %q)", c.SLA, last)
+}
+
+func containsOrder(list []oms.OrderResponse, id string) bool {
+	for _, o := range list {
+		if o.OrderID == id {
+			return true
+		}
+	}
+	return false
 }
