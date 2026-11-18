@@ -1,5 +1,5 @@
 {
- "money_schema_version": 8,
+ "money_schema_version": 9,
  "note": "Alternate-night plan, the external set (nightly.py --alternate, second file): the nine replica drills with the engines and the replica on the staged aeronmd (the shadow catalog and leader loss on shadow-query-ext, re-bootstrap on shadow-anyverified-ext), the four embedded replica drills the embedded set has no room for (member kill -9, peer loss, the shadow catalog and leader loss on shadow-query), and the five controls in one mode each. The gateway drills: all five in external mode, plus fill-visibility-core and tick-live-path embedded (the embedded set runs the three session drills).",
  "entries": [
   {

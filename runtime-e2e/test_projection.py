@@ -248,6 +248,19 @@ class StubCycleTest(unittest.TestCase):
         s.cycle()
         self.assertEqual(s.health()['beats'], 1)
 
+    def test_the_genesis_id_of_a_reply_is_recorded_when_present(self):
+        s = self.stub({'last_seq': 2, 'events': [self.event(1), self.event(2)], 'lost': [], 'genesis_id': 4242424242424242})
+        s.cycle()
+        self.assertEqual(s.health()['genesis_id'], 4242424242424242)
+        self.assertTrue(any('epoch = 4242424242424242' in q for q in s.pg.sent))
+        s = self.stub({'last_seq': 2, 'events': [self.event(1), self.event(2)], 'lost': []})
+        s.cycle()
+        self.assertEqual(s.health()['genesis_id'], 0)
+        self.assertTrue(any('epoch = 0' in q for q in s.pg.sent))
+        s = self.stub({'last_seq': 2, 'events': [self.event(1), self.event(2)], 'lost': [], 'genesis_id': -9223372036854775808})
+        s.cycle()
+        self.assertEqual(s.health()['genesis_id'], 0)       # the SBE null value of a pre-v9 reply is not a genesis
+
     def test_no_answer_no_beat_and_an_overrun_parks(self):
         s = self.stub(None)
         s.cycle()

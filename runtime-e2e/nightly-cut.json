@@ -1,5 +1,5 @@
 {
- "money_schema_version": 8,
+ "money_schema_version": 9,
  "note": "Default nightly plan on the cut, fixed order (RED-1, RED-2 on s17-red1 / s17-red2, and A05-keep).",
  "entries": [
   {

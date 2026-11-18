@@ -40,7 +40,7 @@ import java.util.function.Predicate;
 import java.util.function.UnaryOperator;
 
 /**
- * Core probe: the fixture's only client of the OMS + ledger core (money-schema v8: the version of the core jar it is
+ * Core probe: the fixture's only client of the OMS + ledger core (money-schema v9: the version of the core jar it is
  * compiled against, the cut's jar).
  * Compiled separately against the frozen core jar and run with it on the class path; never linked into a
  * product artifact. One verb per process, one authenticated session, one JSON line on stdout (the LAST
@@ -2202,6 +2202,7 @@ public final class CoreProbe {
         long cursor;
         int requests;
         long firstAvailable = -1, lastSeq = -1, nextFrom = -1;
+        long genesisId;                            // the core's genesisId as the last OrderEventsEnd carried it (0: none)
         final List<long[]> lost = new ArrayList<>();
         long events;
         boolean ahead;
@@ -2240,6 +2241,12 @@ public final class CoreProbe {
         }
 
         void onEnd(final int count, final long firstAvailableSeq, final long lastSeqNow, final long nextFromSeq) {
+            onEnd(count, firstAvailableSeq, lastSeqNow, nextFromSeq, genesisId);
+        }
+
+        void onEnd(final int count, final long firstAvailableSeq, final long lastSeqNow, final long nextFromSeq,
+                final long genesisIdNow) {
+            genesisId = genesisIdNow;
             requests++;
             firstAvailable = firstAvailableSeq;
             lastSeq = lastSeqNow;
@@ -2271,7 +2278,7 @@ public final class CoreProbe {
 
         Map<String, Object> json() {
             return map("from", from, "until", until == Long.MAX_VALUE ? null : until, "page", max, "requests", requests,
-                    "events_count", events, "first_available", firstAvailable, "last_seq", lastSeq, "next_from", nextFrom,
+                    "events_count", events, "first_available", firstAvailable, "last_seq", lastSeq, "next_from", nextFrom, "genesis_id", genesisId,
                     "cursor", cursor, "lost", lost, "ahead", ahead, "complete", complete());
         }
     }
@@ -2581,7 +2588,7 @@ public final class CoreProbe {
                 case OrderEventsEndDecoder.TEMPLATE_ID -> {
                     final OrderEventsEndDecoder d = new OrderEventsEndDecoder().wrapAndApplyHeader(b, offset, header);
                     if (d.correlationId() != expectCorrelation || replay == null) return;
-                    replay.onEnd(d.count(), d.firstAvailableSeq(), d.lastSeq(), d.nextFromSeq());
+                    replay.onEnd(d.count(), d.firstAvailableSeq(), d.lastSeq(), d.nextFromSeq(), d.genesisId());
                     finish(t);
                 }
                 case UserBalancesDecoder.TEMPLATE_ID -> {
@@ -2754,6 +2761,7 @@ public final class CoreProbe {
                     .append(",\"behaviorVersion\":").append(d.behaviorVersion()).append(",\"limitsVersion\":").append(d.limitsVersion())
                     .append(",\"requestTtlMs\":").append(d.requestTtlMs()).append(",\"requestPerUserCap\":").append(d.requestPerUserCap())
                     .append(",\"orderEventRingCapacity\":").append(d.orderEventRingCapacity())
+                    .append(",\"genesisId\":").append(d.genesisId())
                     .append(",\"gateState\":").append(q(d.gateState().name())).append(",\"gateReasons\":").append(d.gateReasons().getRaw())
                     .append(",\"asOfLogPosition\":").append(d.asOfLogPosition()).append(",\"markets\":[");
             boolean first = true;

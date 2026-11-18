@@ -341,7 +341,7 @@ class NightlyPinTest(unittest.TestCase):
         here = Path(self.nightly.__file__).parent
         versions = {n: self.nightly.plan_money_schema(json.loads((here / n).read_text()))
                     for n in ('nightly-cut.json', 'nightly-cut-embedded.json', 'nightly-cut-external.json')}
-        self.assertEqual(set(versions.values()), {8}, versions)
+        self.assertEqual(set(versions.values()), {9}, versions)
         with self.assertRaisesRegex(Violation, 'names no money_schema_version'):
             self.nightly.plan_money_schema({'entries': []})
         with self.assertRaisesRegex(Violation, 'names no money_schema_version'):
