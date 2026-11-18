@@ -32,7 +32,7 @@ HISTORY_TABLES = {
 }
 # The money projection's two tables without ingested_at (its insert time, a wall clock)
 MONEY_TABLES = {
-    'money_journal': (['journal_seq', 'movement_type', 'cluster_time_ms', 'user_id', 'asset_id', 'amount', 'balance_after',
+    'money_journal': (['journal_seq', 'log_position', 'movement_type', 'cluster_time_ms', 'user_id', 'asset_id', 'amount', 'balance_after',
                        'trade_id', 'market_id', 'price', 'quantity', 'buyer_user_id', 'seller_user_id', 'taker_is_buy'],
                       ['journal_seq']),
     'money_journal_leg': (['journal_seq', 'leg_no', 'user_id', 'asset_id', 'asset_role', 'balance_after', 'delta'],
