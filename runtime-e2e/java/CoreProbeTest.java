@@ -1025,10 +1025,11 @@ public final class CoreProbeTest {
             check(p.rows.get(0).contains("\"" + k + "\":"), "replayed row lacks the tap key " + k);
         }
         final int n = MessageHeaderEncoder.ENCODED_LENGTH + new OrderEventsEndEncoder().wrapAndApplyHeader(BUF, 0, HDR).correlationId(9)
-                .count(3).firstAvailableSeq(1).lastSeq(40).nextFromSeq(13).encodedLength();
+                .count(3).firstAvailableSeq(1).lastSeq(40).nextFromSeq(13).genesisId(0x0102030405060708L).encodedLength();
         p.listener.onMessage(1, 1, BUF, 0, n, null);
         check(p.listener.replay.requests == 1 && p.listener.replay.lastSeq == 40 && p.listener.replay.complete()
-                && p.listener.replay.events == 2, "end frame " + CoreProbe.json(p.listener.replay.json()));
+                && p.listener.replay.events == 2 && p.listener.replay.genesisId == 0x0102030405060708L
+                && CoreProbe.json(p.listener.replay.json()).contains("\"genesis_id\":72623859790382856"), "end frame " + CoreProbe.json(p.listener.replay.json()));
     }
 
     private static void replayFullFields() {
@@ -1074,7 +1075,7 @@ public final class CoreProbeTest {
         p.listener.expectCorrelation = 6;
         final CoreConfigReportEncoder e = new CoreConfigReportEncoder().wrapAndApplyHeader(BUF, 0, HDR).correlationId(6)
                 .configVersion(3).behaviorVersion(3).limitsVersion(0).requestTtlMs(900_000).requestPerUserCap(256)
-                .orderEventRingCapacity(65_536).gateState(GateState.OPEN).asOfLogPosition(128);
+                .orderEventRingCapacity(65_536).gateState(GateState.OPEN).asOfLogPosition(128).genesisId(4242424242424242L);
         e.gateReasons().clear();
         final CoreConfigReportEncoder.MarketsEncoder m = e.marketsCount(1).next().marketId(1).symbol("BTC-USD").baseAssetId(1)
                 .quoteAssetId(0).tickSize(1).minPrice(1).maxPrice(100).lotSize(1).minQuantity(1).maxQuantity(10).minNotional(0)
@@ -1086,6 +1087,6 @@ public final class CoreProbeTest {
         check(row.contains("\"requestTtlMs\":900000") && row.contains("\"requestPerUserCap\":256")
                 && row.contains("\"orderEventRingCapacity\":65536") && row.contains("\"symbol\":\"BTC-USD\"")
                 && row.contains("\"minQuantity\":1") && row.contains("\"riskConfigVersion\":2") && row.contains("\"code\":\"USD\"")
-                && row.contains("\"gateState\":\"OPEN\""), "config report " + p.rows);
+                && row.contains("\"gateState\":\"OPEN\"") && row.contains("\"genesisId\":4242424242424242"), "config report " + p.rows);
     }
 }

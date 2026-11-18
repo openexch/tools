@@ -37,7 +37,7 @@ runtime-e2e/run.sh --manifest /abs/manifest.json --scenario core-smoke --output 
 
 Copy the program entries from the probe directory's `probe-manifest.json` into the fixture manifest.
 
-`CoreProbe` verbs added for money schema v8: `order-events from= [until=] [max=]` (order-event replay; pages to the bound or the head, and on an overrun records the lost range and continues from the oldest event the ring still holds), `user-balances user=`, `config-report` and `core-limits version= ttl_ms= cap= ring=` (an ADMIN config write, answered by AdminAck).
+`CoreProbe` verbs added for money schema v8 (v9 adds the core's genesisId to the order-events end frame and the config report, printed as `genesis_id` and `genesisId`): `order-events from= [until=] [max=]` (order-event replay; pages to the bound or the head, and on an overrun records the lost range and continues from the oldest event the ring still holds), `user-balances user=`, `config-report` and `core-limits version= ttl_ms= cap= ring=` (an ADMIN config write, answered by AdminAck).
 
 `sbe_layout.py` reads the money schema from the cut's core jar and refuses a schema file of any other version; the genesis reader refuses a config frame of another wire version. The nightly plans name `money_schema_version`, both plan sets must name the same one, and a night refuses a cut whose core jar carries another version.
 

@@ -22,8 +22,9 @@ What it does, every ``STUB_POLL_MS``:
 
 What it does not do (the projector's job, stated so nobody reads a stub result as one): no Archive replay, no chain
 following, no source list (its only source is the cluster session; the "attached source" it reports is the core member
-that was leader at its last poll, read from the members' own metrics endpoints), no genesis check (wire v8 carries no
-genesis id on a reply, so ``epoch`` stays 0), no ME cause on a record. ``liquidity`` is taken from the apply order of a
+that was leader at its last poll, read from the members' own metrics endpoints), no genesis check (it reads the core's
+genesis id off the reply when the wire carries one (v9) and records it in ``epoch``, 0 while the reply has none, and
+compares nothing against it), no ME cause on a record. ``liquidity`` is taken from the apply order of a
 trade's two FILL records (the first is the taker), which the projector must not do.
 
 Settings (environment, positive integers, defaults in ``SETTINGS``): STUB_POLL_MS, STUB_PAGE_EVENTS, STUB_LEASE_MS,
@@ -312,7 +313,7 @@ class Stub:
         self.pg = Pg(environ['STUB_PG_URL'])
         self.lock = threading.Lock()
         self.h = {'instance': self.instance, 'mode': self.mode, 'settings': self.s, 'role': 'starting',
-                  'applied_seq': None, 'head_seq': None, 'halt': None, 'source': None, 'source_switches': 0,
+                  'applied_seq': None, 'head_seq': None, 'genesis_id': 0, 'halt': None, 'source': None, 'source_switches': 0,
                   'polls': 0, 'probe_unanswered': 0, 'probe_ms_total': 0, 'batches': 0, 'events_applied': 0, 'skips': 0, 'beats': 0,
                   'pg_failures': 0, 'fence_lost': 0, 'last_probe_sent_ns': None, 'last_probe_answered_ns': None, 'last_beat_ns': None,
                   'started_ns': time.time_ns(), 'driver': 'embedded (CoreProbe, one JVM per poll)',
@@ -449,8 +450,11 @@ class Stub:
             self.count('probe_unanswered')
             return self.s['STUB_POLL_MS']
         head = reply.get('last_seq')
-        self.note(head_seq=head, last_probe_answered_ns=time.time_ns())
-        self.pg.query(f'UPDATE oe_projection_state SET head_seq = {lit(head)} WHERE writer_token = {lit(self.token)}')
+        g = reply.get('genesis_id')
+        genesis = g if isinstance(g, int) and g > 0 else 0       # a pre-v9 reply decodes to the SBE null value
+        self.note(head_seq=head, genesis_id=genesis, last_probe_answered_ns=time.time_ns())
+        self.pg.query(f'UPDATE oe_projection_state SET head_seq = {lit(head)}, epoch = {lit(genesis)} '
+                      f'WHERE writer_token = {lit(self.token)}')
         if reply.get('lost'):
             self.halt('GAP', json.dumps(reply['lost']))
             return self.s['STUB_POLL_MS']
