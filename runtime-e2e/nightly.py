@@ -132,6 +132,9 @@ def scenario_known(scenario):
     import gateway_drills
     if gateway_drills.is_scenario(scenario):              # the gateway and stream drills (gateway_scenarios.DRILLS)
         return True
+    import projection_drills
+    if projection_drills.is_scenario(scenario):           # the history projection drills
+        return True
     m = re.fullmatch(r'core-boots-(\d+)', scenario)
     if m:
         return 1 <= int(m.group(1)) <= 20           # runner.py's bound

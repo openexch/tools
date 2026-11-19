@@ -1,6 +1,6 @@
 {
  "money_schema_version": 9,
- "note": "Alternate-night plan, the external set (nightly.py --alternate, second file): the nine replica drills with the engines and the replica on the staged aeronmd (the shadow catalog and leader loss on shadow-query-ext, re-bootstrap on shadow-anyverified-ext), the four embedded replica drills the embedded set has no room for (member kill -9, peer loss, the shadow catalog and leader loss on shadow-query), and the five controls in one mode each. The gateway drills: all five in external mode, plus fill-visibility-core and tick-live-path embedded (the embedded set runs the three session drills).",
+ "note": "Alternate-night plan, the external set (nightly.py --alternate, second file): the nine replica drills with the engines and the replica on the staged aeronmd (the shadow catalog and leader loss on shadow-query-ext, re-bootstrap on shadow-anyverified-ext), the four embedded replica drills the embedded set has no room for (member kill -9, peer loss, the shadow catalog and leader loss on shadow-query), and the five controls in one mode each. The gateway drills: all five in external mode, plus fill-visibility-core and tick-live-path embedded (the embedded set runs the three session drills). The three history projection drills on the projector binary in both modes (pj-ext, pj): every 48 h, as the embedded set is full.",
  "entries": [
   {
    "kind": "shadow-ext",
@@ -101,6 +101,30 @@
   {
    "kind": "gw",
    "scenario": "tick-live-path"
+  },
+  {
+   "kind": "pj-ext",
+   "scenario": "projector-me-restart-follow"
+  },
+  {
+   "kind": "pj-ext",
+   "scenario": "projection-byte-equal-replay"
+  },
+  {
+   "kind": "pj-ext",
+   "scenario": "history-freshness"
+  },
+  {
+   "kind": "pj",
+   "scenario": "projector-me-restart-follow"
+  },
+  {
+   "kind": "pj",
+   "scenario": "projection-byte-equal-replay"
+  },
+  {
+   "kind": "pj",
+   "scenario": "history-freshness"
   }
  ]
 }

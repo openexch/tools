@@ -1179,3 +1179,16 @@ class LeaderlessWindowTest(unittest.TestCase):
         # no new leader seen, or no death time: no window
         self.assertIsNone(projection_drills.leaderless_rows(rows[:3], 100.7)[1])
         self.assertIsNone(projection_drills.leaderless_rows(rows, None)[1])
+
+
+class NightPlanProjectionTest(unittest.TestCase):
+    def test_the_external_night_runs_the_three_drills_in_both_modes(self):
+        import nightly
+        plan = nightly.parse_plan(json.loads((Path(nightly.__file__).with_name('nightly-cut-external.json')).read_text()))
+        entries = {(e['kind'], e['scenario']) for e in plan if e['scenario'] in projection_drills.SCENARIOS}
+        self.assertEqual(entries, {(k, s) for k in ('pj', 'pj-ext') for s in projection_drills.SCENARIOS})
+        self.assertEqual(len(plan), 31)
+        embedded = nightly.parse_plan(json.loads((Path(nightly.__file__).with_name('nightly-cut-embedded.json')).read_text()))
+        self.assertFalse([e for e in embedded if e['scenario'] in projection_drills.SCENARIOS])
+
+
