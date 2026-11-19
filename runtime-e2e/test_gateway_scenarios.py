@@ -389,6 +389,30 @@ class SlowCloseLineTest(unittest.TestCase):
         self.assertTrue(gs.st0_close_line(samples, self.first, None, 30, self.clean).get('inconclusive'))
 
 
+class SessionClosesTest(unittest.TestCase):
+    def test_a_close_on_either_path_counts(self):
+        first = {'resumable_closed': 0.0, 'discard_closed': 0.0}
+        # night 20261119T150409Z entry 20: the core closed st0 through the NOT_CONNECTED path, discard_closed 0 -> 1
+        discard = gs.session_closes(first, {'resumable_closed': 0.0, 'discard_closed': 1.0})
+        self.assertEqual((discard['total'], discard['resumable_closed'], discard['discard_closed']), (1.0, 0.0, 1.0))
+        self.assertEqual(discard['path'], [gs.CLOSE_PATHS['discard_closed']])
+        ceiling = gs.session_closes(first, {'resumable_closed': 1.0, 'discard_closed': 0.0})
+        self.assertEqual((ceiling['total'], ceiling['path']), (1.0, [gs.CLOSE_PATHS['resumable_closed']]))
+        both = gs.session_closes(first, {'resumable_closed': 1.0, 'discard_closed': 1.0})
+        self.assertEqual(both['total'], 2.0)                # two closes: the delta == 1 check fails
+        none = gs.session_closes(first, dict(first))
+        self.assertEqual((none['total'], none['path']), (0.0, None))
+
+    def test_an_unreadable_counter_is_not_a_close(self):
+        self.assertIsNone(gs.session_closes({'resumable_closed': None, 'discard_closed': None},
+                                            {'resumable_closed': 1.0, 'discard_closed': 1.0})['total'])
+        one = gs.session_closes({'resumable_closed': 0.0, 'discard_closed': None},
+                                {'resumable_closed': 1.0, 'discard_closed': 1.0})
+        self.assertEqual((one['total'], one['discard_closed']), (1.0, None))
+        self.assertEqual(gs.session_closes({'resumable_closed': 0.0, 'discard_closed': 0.0},
+                                           {'resumable_closed': None, 'discard_closed': 0.0})['total'], 0.0)
+
+
 class GateSettleTest(unittest.TestCase):
     def test_a_refused_fresh_key_is_resent_until_decided(self):
         answers = iter([(503, {'code': 'ADMISSION_CLOSED'}, None), (503, {'code': 'ADMISSION_CLOSED'}, None),

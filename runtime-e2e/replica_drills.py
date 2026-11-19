@@ -48,7 +48,8 @@ SETTINGS_SPEC = {
     # (1 minute) plus one backup query (60 s default) plus the compare. 3.1 to 62.1 s measured; 60 s failed one run
     'REPLICA_RESTART_READY_BOUND_S': (130, 1, 600),
     'PEERLOSS_PULLS_BEFORE_KILL': (2, 1, 10),             # pulls the peer-loss target counted before the kills
-    'PROMOTION_ATTEMPTS': (3, 1, 10),           # leader-loss attempts to see the supplier promoted
+    'PROMOTION_ATTEMPTS': (6, 1, 10),           # leader-loss attempts to see the supplier promoted (the supplier wins
+    # an election about 1 in 2: 3 attempts missed it about 1 run in 8, 6 about 1 in 64)
     'KILL_HEAL_BOUND_S': (core_fixture.KILL_HEAL_BOUND_S, 1, 3600),   # the fixture's kill heal bound, plus the drill's waits
     'STORY_SECONDS': (120, 10, 600),                # the story under which two member snapshots land
     'STORY_RATE': (100, 1, 1000),                   # CoreProbe sends rate x 1.2
@@ -319,10 +320,13 @@ def snapshot_position_of(metrics):
     return gauge(metrics, 'core_snapshot_last_log_position')
 
 
-def snapshot_positions(raw):
+def snapshot_positions(raw, above=None):
     """The distinct member snapshot positions a run saw, ascending. The gauge reads -1 before the first snapshot and an
-    unreadable leader gives None; neither is a snapshot, so only positive positions count."""
-    return sorted({int(p) for p in raw if p is not None and int(p) > 0})
+    unreadable leader gives None; neither is a snapshot, so only positive positions count. ``above``: the snapshot
+    position read before the ALIGNED baseline; that snapshot (and any below it) had its ALIGNED counted before the
+    baseline, so only positions strictly above it are this run's snapshots."""
+    floor = int(above) if above is not None and int(above) > 0 else 0
+    return sorted({int(p) for p in raw if p is not None and int(p) > floor})
 
 
 def line_aligned_per_snapshot(w):
@@ -332,8 +336,11 @@ def line_aligned_per_snapshot(w):
     seen, written = x.get('positions') or [], x.get('aligned_delta')
     if not seen:
         return _line(False, 'snapshot not triggered', inconclusive=True)
+    base = x.get('baseline_position')
     return _line(written is not None and written >= len(seen) - 1,
-                 f'{len(seen)} member snapshot positions, replica ALIGNED +{written}')
+                 f'{len(seen)} member snapshot positions'
+                 + (f' above the baseline snapshot {base}' if base is not None else '')
+                 + f', replica ALIGNED +{written}')
 
 
 def line_replica_restart_local(w):
@@ -1507,6 +1514,9 @@ class ReplicaDrillRun(DrillRun):
         query_s = self.rm_setting('REPLICA_BACKUP_QUERY_INTERVAL_MS') / 1000
         cooldown_s = self.rm_setting('REPLICA_BACKUP_COOLDOWN_MS') / 1000
         attempts, positions = [], set()
+        # the snapshot already taken before the baseline: its ALIGNED (if any) is inside aligned0, so it is read first and
+        # only positions above it count as this drill's snapshots
+        baseline_position = self.snapshot_position()
         aligned0 = self.aligned_counts()
         for attempt in range(1, s['PROMOTION_ATTEMPTS'] + 1):
             supplier, before = self.need(self.supplier, s['SUPPLIER_WAIT_S'], 'the replica names no follower as its supplier')
@@ -1587,7 +1597,9 @@ class ReplicaDrillRun(DrillRun):
                 break
         aligned1 = self.aligned_counts()
         self.rw.update(promotion=attempts, expect_cycles=len(attempts),
-                       snapshots={'positions': snapshot_positions(positions),
+                       snapshots={'positions': snapshot_positions(positions, above=baseline_position),
+                                  'baseline_position': baseline_position,
+                                  'seen_positions': snapshot_positions(positions),
                                   'aligned_delta': None if aligned1['aligned'] is None or aligned0['aligned'] is None
                                   else aligned1['aligned'] - aligned0['aligned']})
 

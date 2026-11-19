@@ -11,7 +11,8 @@ stream id, so a run shows what else the driver holds.
 
 Usage: replay_count.py <replay stream id>[,<id>...]  -> one JSON line:
   {"drivers": [{"dir", "cnc_version", "publications": [{"stream", "session", "registration", "channel"}],
-                "replays": {stream: n}}], "replays": {stream: n}, "shm_bytes": n, "shm_dirs": {dir: bytes}}
+                "replays": {stream: n}}], "replays": {stream: n}, "shm_bytes": n, "shm_dirs": {dir: bytes},
+   "shm_files": [[path, bytes]] (the SHM_FILES largest, largest first)}
 
 CnC layout (Aeron CncFileDescriptor, version 0.2.x): five int32 buffer lengths at 4..20 (to-driver, to-clients, counter
 metadata, counter values, error log), client liveness int64 at 24, start timestamp at 32, pid at 40, file page size at 48;
@@ -29,6 +30,7 @@ METADATA_RECORD = 512
 VALUE_RECORD = 128
 RECORD_ALLOCATED = 1
 SENDER_POSITION = 2
+SHM_FILES = 40              # the largest files under /dev/shm listed (path, allocated bytes)
 
 
 def counters(data):
@@ -71,6 +73,20 @@ def du(path):
     return total
 
 
+def largest_files(path, limit):
+    """[[path, allocated bytes]] of the ``limit`` largest files under ``path``, largest first (ties by path)."""
+    files = []
+    for root, _, names in os.walk(path):
+        for name in names:
+            full = os.path.join(root, name)
+            try:
+                files.append([full, os.lstat(full).st_blocks * 512])
+            except OSError:
+                pass
+    files.sort(key=lambda f: (-f[1], f[0]))
+    return files[:limit]
+
+
 def main(argv):
     streams = sorted({int(s) for s in argv[1].split(',') if s}) if len(argv) > 1 else []
     drivers, total = [], {str(s): 0 for s in streams}
@@ -98,7 +114,8 @@ def main(argv):
             top[name] = du(os.path.join(shm, name))
     except OSError:
         pass
-    print(json.dumps({'drivers': drivers, 'replays': total, 'shm_bytes': du(shm), 'shm_dirs': top}, sort_keys=True))
+    print(json.dumps({'drivers': drivers, 'replays': total, 'shm_bytes': du(shm), 'shm_dirs': top,
+                      'shm_files': largest_files(shm, SHM_FILES)}, sort_keys=True))
 
 
 if __name__ == '__main__':

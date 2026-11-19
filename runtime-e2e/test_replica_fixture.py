@@ -378,7 +378,7 @@ class DrillTableTest(unittest.TestCase):
         s = replica_drills.settings({})
         self.assertEqual((s['CATALOG_ALIGNED_BOUND_S'], s['SUPPLIER_LOSS_RECOVERY_BOUND_S'], s['MEMBER_RESTART_READY_BOUND_S'],
                           s['REPLICA_RESTART_READY_BOUND_S'], s['PEERLOSS_PULLS_BEFORE_KILL'], s['PROMOTION_ATTEMPTS']),
-                         (5, 30, 30, 130, 2, 3))
+                         (5, 30, 30, 130, 2, 6))
         self.assertEqual(replica_drills.settings({'CATALOG_ALIGNED_BOUND_S': '7'})['CATALOG_ALIGNED_BOUND_S'], 7)
         with self.assertRaises(Violation) as caught:
             replica_drills.settings({'CATALOG_ALIGNED_BOUND_S': '0'})

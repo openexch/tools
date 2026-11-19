@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import struct
 import tempfile
@@ -472,6 +473,17 @@ class ReplayCountTest(unittest.TestCase):
         self.assertEqual([(p['stream'], p['session'], p['registration']) for p in pubs], [(9161, 5, 11), (102, 6, 12)])
         self.assertEqual(pubs[0]['channel'], 'aeron:udp?endpoint=10.0.0.9:20121')
 
+    def test_the_probe_lists_the_largest_shm_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            os.makedirs(os.path.join(temp, 'aeron-ae0', 'publications'))
+            for name, size in (('aeron-ae0/cnc.dat', 4096), ('aeron-ae0/publications/7.logbuffer', 3 * 65536),
+                               ('stray.bin', 65536)):
+                with open(os.path.join(temp, name), 'wb') as f:
+                    f.write(b'\1' * size)
+            files = replay_count.largest_files(temp, 2)
+            self.assertEqual([os.path.relpath(p, temp) for p, _ in files], ['aeron-ae0/publications/7.logbuffer', 'stray.bin'])
+            self.assertGreaterEqual(files[0][1], files[1][1])
+
     def test_the_fixture_runs_the_probe_inside_the_member(self):
         f = projection_fixture(tempfile.mkdtemp())
         calls = []
@@ -655,6 +667,47 @@ class DrillLogicTest(unittest.TestCase):
         health = {'pj0': {'role': 'writer', 'source': {'member': 'ae1'}, 'replays_open': None},
                   'pj1': {'role': 'standby', 'source': {'member': 'ae2'}, 'replays_open': 0}, 'gw': {'error': 'down'}}
         self.assertEqual(projection_drills.replay_readers(health), [('ae1', 1), ('ae2', 0)])
+
+    def test_the_shm_line_names_its_own_failure(self):
+        # night 20261119T150409Z entry 26: the replay counts were back, /dev/shm grew 276 MB over a 64 MB slack, and the
+        # line read "orphan replay remains on core member"
+        mb = 1024 * 1024
+        base = {'ae0': {'replays': {'9161': 0}, 'shm_bytes': 330186752}, 'ae1': {'replays': {'9161': 0}, 'shm_bytes': 437166080},
+                'ae2': {'replays': {'9161': 0}, 'shm_bytes': 380497920}}
+        now = {'ae0': {'replays': {'9161': 0}, 'shm_bytes': 456077312}, 'ae1': {'replays': {'9161': 0}, 'shm_bytes': 393080832},
+               'ae2': {'replays': {'9161': 0}, 'shm_bytes': 588226560}}
+        out = projection_drills.baseline_back(base, now, (), 64 * mb)
+        self.assertEqual((out['count_back'], out['shm_back']), (True, False))
+        self.assertEqual(out['shm']['growth'], {'ae0': 125890560, 'ae1': -44085248, 'ae2': 207728640})
+        text = projection_drills.shm_text(out)
+        self.assertNotEqual(text, projection_drills.ORPHAN_TEXT)
+        self.assertEqual(text, 'core member /dev/shm above baseline: ae2 +198.1 MB, ae0 +120.1 MB, ae1 -42.0 MB; '
+                               'members together +276.1 MB > slack 64.0 MB')
+        # a probe error names itself
+        err = projection_drills.baseline_back(base, dict(now, ae1={'error': 'exit 1'}), (), 64 * mb)
+        self.assertEqual(projection_drills.shm_text(err), 'core member /dev/shm not probed: probe error')
+        # an orphan's log buffers grow /dev/shm: while the replay line fails the shm line is its consequence, so the
+        # no-stop-replay control still fails only on its own text
+        lines = {'replay_baseline_after_writer_kill': {'holds': False, 'detail': {}, 'text': projection_drills.ORPHAN_TEXT},
+                 'shm_baseline_after_writer_kill': projection_drills.consequence(
+                     {'holds': False, 'detail': {}, 'text': text}, 'replay_baseline_after_writer_kill')}
+        self.assertEqual(projection_drills.dry_verdict(lines, projection_drills.ORPHAN_TEXT)[0], 'PASS')
+        lines['replay_baseline_after_writer_kill']['holds'] = True
+        self.assertEqual(projection_drills.dry_verdict(lines, None)[0], 'FAIL')
+
+    def test_the_shm_sources_list_what_is_new_since_the_baseline(self):
+        pub = lambda reg, stream: {'stream': stream, 'session': reg, 'registration': reg, 'channel': 'aeron:udp?x'}
+        base = {'ae0': {'shm_dirs': {'aeron-ae0': 100}, 'drivers': [{'dir': '/dev/shm/aeron-ae0', 'publications': [pub(1, 20)]}]},
+                'ae1': {'shm_dirs': {}, 'drivers': []}}
+        probe = {'ae0': {'shm_dirs': {'aeron-ae0': 300, 'stray': 50}, 'shm_files': [['/dev/shm/aeron-ae0/p/9.logbuffer', 200]],
+                         'drivers': [{'dir': '/dev/shm/aeron-ae0', 'publications': [pub(1, 20), pub(9, 9161)]}]},
+                 'ae1': {'error': 'exit 1'}}
+        out = projection_drills.shm_sources(base, probe)
+        self.assertEqual(out['ae0']['shm_dirs'], {'aeron-ae0': [100, 300], 'stray': [None, 50]})
+        self.assertEqual(out['ae0']['shm_files'], [['/dev/shm/aeron-ae0/p/9.logbuffer', 200]])
+        self.assertEqual((out['ae0']['publications'], out['ae0']['publications_new_count']), (2, 1))
+        self.assertEqual(out['ae0']['publications_new'][0]['registration'], 9)
+        self.assertEqual(out['ae1'], {'error': 'exit 1'})
 
     def test_the_successor_text_needs_a_new_recording_and_a_stuck_projection(self):
         verdict = projection_drills.successor_verdict
