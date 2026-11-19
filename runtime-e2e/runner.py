@@ -147,6 +147,8 @@ def main():
             raise Inconclusive('unsupported scenario decision: ' + str(result['status']))
     except Violation as error:
         result.update(status='FAIL', error=str(error), traceback=traceback.format_exc())
+        if getattr(error, 'defect', None):
+            result['product_defect'] = error.defect
     except Exception as error:
         result.update(status='INCONCLUSIVE', error=str(error), traceback=traceback.format_exc())
     finally:

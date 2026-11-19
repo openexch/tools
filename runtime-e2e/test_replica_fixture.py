@@ -195,18 +195,48 @@ class ReplicaFixtureTest(unittest.TestCase):
                                      'any-verified' if kind in ('shadow-anyverified', 'shadow-anyverified-ext',
                                                                 'shadow-detectoronly') else None)
                     self.assertEqual(env['ARCHIVE_SEGMENT_LENGTH'], '1m')
-                    core_contracts.assert_production_timeouts(env, f.allowed_env())
+                    # the rejoin wait only when a peer-loss drill recorded it (replica_drills.rejoin_wait_env)
+                    self.assertNotIn('ENGINE_REJOIN_WAIT_MS', env)
+                    core_contracts.assert_production_timeouts(env, f.allowed_env(), f.timeout_exempt())
                 me = f.engine_env('me', 0)
                 for key in ('SNAPSHOT_MODE', 'SHADOW_PULL_SOURCES', 'SHADOW_ANCHOR_RULE'):
                     self.assertNotIn(key, me)
         f = bare_fixture(dict(test_core_fixture.manifest(self.dir), manifest_kind='full'), KeyRing())
         env = f.engine_env('ae', 0)
         self.assertNotIn('SNAPSHOT_MODE', env)
+        self.assertNotIn('ENGINE_REJOIN_WAIT_MS', env)     # the full control keeps the kit default
         self.assertEqual(env['SNAPSHOT_INTERVAL_MINUTES'], '1')
         self.assertEqual(env['ARCHIVE_SEGMENT_LENGTH'], '1m')
         # the older kinds keep the core's default segment length (measured on it)
         old = bare_fixture(dict(test_core_fixture.manifest(self.dir), manifest_kind='s17'), KeyRing()).engine_env('ae', 0)
         self.assertNotIn('ARCHIVE_SEGMENT_LENGTH', old)
+
+    def test_the_rejoin_wait_is_a_setting_with_a_default(self):
+        self.assertEqual(core_contracts.member_rejoin_wait_ms({}), core_contracts.REJOIN_WAIT_DEFAULT_MS)
+        self.assertEqual(core_contracts.member_rejoin_wait_ms({'REPLICA_MEMBER_REJOIN_WAIT_MS': '400000'}), 400000)
+        for bad in ('60000', '3600001', '5m', '-1'):
+            with self.assertRaises(Violation):
+                core_contracts.member_rejoin_wait_ms({'REPLICA_MEMBER_REJOIN_WAIT_MS': bad})
+        f = bare_fixture(replica_manifest(self.dir, 'shadow'))
+        f.member_rejoin_wait_env = {'ENGINE_REJOIN_WAIT_MS': '330000'}
+        self.assertNotIn('ENGINE_REJOIN_WAIT_MS', f.engine_env('me', 0))   # the ME members are not in these quorum losses
+        env = f.engine_env('ae', 1)
+        self.assertEqual(env['ENGINE_REJOIN_WAIT_MS'], '330000')
+        core_contracts.assert_production_timeouts(env, f.allowed_env(), f.timeout_exempt())
+
+    def test_the_rejoin_wait_passes_the_timeout_guard_only_at_its_recorded_value(self):
+        f = bare_fixture(replica_manifest(self.dir, 'shadow'))
+        env = dict(f.engine_env('ae', 0), ENGINE_REJOIN_WAIT_MS='330000')
+        # no drill recorded a wait: the name is a timeout and is refused
+        with self.assertRaisesRegex(Violation, 'timeout setting.*ENGINE_REJOIN_WAIT_MS'):
+            core_contracts.assert_production_timeouts(env, f.allowed_env(), f.timeout_exempt())
+        f.member_rejoin_wait_env = {'ENGINE_REJOIN_WAIT_MS': '400000'}
+        with self.assertRaisesRegex(Violation, 'timeout setting.*ENGINE_REJOIN_WAIT_MS'):
+            core_contracts.assert_production_timeouts(env, f.allowed_env(), f.timeout_exempt())
+        f.member_rejoin_wait_env = {'ENGINE_REJOIN_WAIT_MS': '330000'}
+        core_contracts.assert_production_timeouts(env, f.allowed_env(), f.timeout_exempt())
+        # the driver pair stays exempt beside it
+        self.assertEqual(f.timeout_exempt()['FWD_DRIVER_TIMEOUT_MS'], '5000')
 
     def test_the_control_kinds_carry_their_one_replica_setting(self):
         want = {'shadow-cooldown30': ('REPLICA_BACKUP_COOLDOWN_MS', '30000'),
@@ -330,8 +360,8 @@ class PortKindTest(unittest.TestCase):
 class DrillTableTest(unittest.TestCase):
     DRILLS = ('member-kill9', 'peerloss', 'peerloss-loud', 'shadow-catalog', 'supplierloss', 'leaderloss-promotion',
               'replica-restart', 'replica-wipe', 'replica-rebootstrap')
-    CONTROLS = ('kill9-fullmode', 'peerloss-loud-unblocked', 'supplierloss-cooldown30', 'rebootstrap-detectoronly',
-                'rebootstrap-nowitness')
+    CONTROLS = ('kill9-fullmode', 'peerloss-loud-unblocked', 'peerloss-loud-unblocked-kitwait', 'supplierloss-cooldown30',
+                'rebootstrap-detectoronly', 'rebootstrap-nowitness')
 
     def test_the_drills_and_controls_parse(self):
         import core_drills

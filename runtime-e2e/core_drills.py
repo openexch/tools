@@ -28,7 +28,7 @@ import core_scenarios
 import journal_decode
 import order_oracle
 from core_fixture import PROBE_AERON_DIR, READY_AFTER_KILL_S
-from oracle_model import BARRIER_COLLECTIONS, RELEASE_KIND, TERMINAL, Model, integer, seq_gaps
+from oracle_model import BARRIER_COLLECTIONS, RELEASE_COUNTER_METRICS, RELEASE_KIND, TERMINAL, Model, integer, seq_gaps
 
 A01_USERS = list(range(73001, 73041))         # A7: 256 retained requests per user per 15 min; a01 at 100/s needs >= 29
 A02_USERS = [74001, 74002, 74003, 74004]
@@ -195,6 +195,22 @@ def declared_block(ledger, genesis_id, ordering_exception=None, gate_sequence=No
 
 
 # ------------------------------------------------------------------ tap backfill
+
+
+def release_counters(scrape):
+    """The core's release mint counters per AE member from a barrier scrape, for the superseded-release arithmetic of a
+    dispatch gap (oracle_model.superseded_account): {role: {minted_up_to, minted_order, superseded, abandoned}},
+    ``superseded`` or ``abandoned`` None when the core does not export it (an older cut). Members that export no mint counter are left out."""
+    out = {}
+    for role, metrics in sorted((scrape or {}).items()):
+        if not role.startswith('ae') or not isinstance(metrics, dict):
+            continue
+        names = RELEASE_COUNTER_METRICS
+        if names['minted_up_to'] not in metrics or names['minted_order'] not in metrics:
+            continue
+        out[role] = {k: (int(metrics[m]) if m in metrics else None) for k, m in names.items()}
+    return out
+
 
 
 def backfill(tap_rows, pending_entries, me_journal, known_orders, head):
@@ -3007,7 +3023,8 @@ class DrillRun(ScheduleDrills):
                                              **declared_for(self.name, self.variant, getattr(self, 'life_no', 1))),
                   'tap_continuity': {'transitions': tap_summary['transitions'], 'summary': tap_summary['summary'],
                                      'line': tap_summary['line'], 'backfill': second['backfill'],
-                                     'event_replay': getattr(self, 'event_replay', None)},
+                                     'event_replay': getattr(self, 'event_replay', None),
+                                     'release_counters': release_counters(second.get('scrape'))},
                   'story': {'line': story['line'], 'summary': story['summary'], 'unsent': lists['unsent']},
                   'pre_barrier': pre, 'fault_rows': self.ledger.rows}
         return sample
@@ -3319,7 +3336,7 @@ def _replica_story(seconds=120, rate=100):
 # catalog and leader loss on shadow-query and shadow-query-ext (a 13 s backup query: the catalog bound adds the interval,
 # the promotion is re-validated at the next query); re-bootstrap on shadow-anyverified and shadow-anyverified-ext (the
 # members must purge below the stopped replica, which the two-producer rule refuses by design). A control runs in one
-# mode, on its own kind.
+# mode, on its own kind, unless it names ``kinds`` (the two peer-loss controls run on shadow and shadow-ext).
 _SHADOW_DRILL_KINDS = ['shadow', 'shadow-ext']
 _QUERY_DRILL_KINDS = ['shadow-query', 'shadow-query-ext']
 _ANYVERIFIED_DRILL_KINDS = ['shadow-anyverified', 'shadow-anyverified-ext']
@@ -3330,7 +3347,8 @@ DRILLS.update({
     'peerloss': {'replica': 'peerloss', 'faults': 'replica', 'cycles': 3, 'story': _replica_story(),
                  'kinds': _SHADOW_DRILL_KINDS, 'lines': ['peerloss_restore', 'aligned_after_fault']},
     'peerloss-loud': {'replica': 'peerloss_loud', 'faults': 'replica', 'cycles': 3, 'story': _replica_story(),
-                      'kinds': _SHADOW_DRILL_KINDS, 'netfilter': True, 'lines': ['peerloss_loud_halt', 'filters_removed']},
+                      'kinds': _SHADOW_DRILL_KINDS, 'netfilter': True,
+                      'lines': ['peerloss_loud_halt', 'filters_removed', 'survivor_outlasts_quorum_loss']},
     'shadow-catalog': {'replica': 'shadow_catalog', 'faults': 'replica', 'cycles': 1, 'story': _replica_story(rate=20),
                        'kinds': _QUERY_DRILL_KINDS, 'lines': ['sampler_saw_pause', 'catalog_bound', 'lag_within_term']},
     'supplierloss': {'replica': 'supplierloss', 'faults': 'replica', 'cycles': 1, 'story': _replica_story(),
@@ -3352,7 +3370,14 @@ DRILLS.update({
 # must carry and the lines that must still HOLD (a control that fails for another reason is not the control).
 CONTROLS.update({
     'kill9-fullmode': ('member-kill9', {'kind': 'full'}, ['restore_path_shadow']),
-    'peerloss-loud-unblocked': ('peerloss-loud', {'kind': 'shadow', 'unblocked': True}, []),
+    'peerloss-loud-unblocked': ('peerloss-loud', {'kind': 'shadow', 'kinds': _SHADOW_DRILL_KINDS, 'unblocked': True}, []),
+    # the unblocked peer loss on the kit-default rejoin wait (60 s): the survivor, the target's restore source, exits 1
+    # on the watchdog before the target is ready; the expected outcome this control pins (see rejoin_wait_env). On a
+    # kit that gates its watchdog during a genuine quorum loss the survivor outlasts it instead
+    # (replica_drills.control_expect)
+    'peerloss-loud-unblocked-kitwait': ('peerloss-loud', {'kind': 'shadow', 'kinds': _SHADOW_DRILL_KINDS, 'unblocked': True,
+                                                          'rejoin_wait': 'kit'},
+                                        ['survivor_outlasts_quorum_loss']),
     'supplierloss-cooldown30': ('supplierloss', {'kind': 'shadow-cooldown30'}, ['supplier_loss_recovery']),
     'rebootstrap-detectoronly': ('replica-rebootstrap', {'kind': 'shadow-detectoronly', 'detector_only': True},
                                  ['rebootstrap_exit3']),
@@ -3361,6 +3386,7 @@ CONTROLS.update({
 REPLICA_CONTROL_EXPECT = {
     'kill9-fullmode': {'fail': {'restore_path_shadow': 'restore path FULL on ae'}, 'hold': ['ready_after_start']},
     'peerloss-loud-unblocked': {'fail': {}, 'hold': ['pull_skip_unchanged', 'filters_removed']},
+    'peerloss-loud-unblocked-kitwait': {'fail': {'survivor_outlasts_quorum_loss': 'rejoin watchdog'}, 'hold': []},
     'supplierloss-cooldown30': {'fail': {'supplier_loss_recovery': 'supplier loss recovery'}, 'hold': []},
     'rebootstrap-detectoronly': {'fail': {'rebootstrap_exit3': 're-bootstrap missed'},
                                  'hold': ['anchor_rule_any_verified', 'members_purged', 'rebootstrap_refusals_counted',

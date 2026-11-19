@@ -409,6 +409,9 @@ def run_rules(sample, rules):
     statuses = {r['status'] for r in results.values()}
     status = 'FAIL' if 'FAIL' in statuses else 'INCONCLUSIVE' if 'INCONCLUSIVE' in statuses else 'PASS'
     out = {'status': status, 'rules': results}
+    if getattr(model, 'superseded', None):
+        # the superseded-release arithmetic a gap after a new_leader note was judged on (closed or not)
+        out['tap_superseded'] = model.superseded
     if getattr(model, 'untapped', None) or getattr(model, 'untapped_orders', None):
         # a declared untappable window (declared.untappable): what it left unjudged, recorded with the verdict
         unjudged = getattr(model, 'untapped_orders', [])

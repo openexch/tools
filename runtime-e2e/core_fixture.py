@@ -523,7 +523,7 @@ class CoreFixture(Fixture):
         sidecar = self.sidecar_slot(name)
         if (name not in self.m['nodes'] and sidecar is None) or name in self.registry['containers']:
             raise Violation('unknown or duplicate fixture process')
-        assert_production_timeouts(environment or {}, self.allowed_env())
+        assert_production_timeouts(environment or {}, self.allowed_env(), self.timeout_exempt())
         if any(core_contracts.JVM_TIMEOUT.search(str(a)) for a in command):
             raise Violation('refusing a JVM timeout override for ' + name)
         # A seeded member (seed_state) or a slot replaced with keep_state starts on the dir already in place
@@ -563,6 +563,11 @@ class CoreFixture(Fixture):
         self.inspect('container', resource_id)
         self.command(['docker', 'start', resource_id])
         return resource_id
+
+    def timeout_exempt(self):
+        """The timeout names a process may receive, at their exact values: the driver pair, plus the members' rejoin wait
+        when a peer-loss drill recorded one (member_rejoin_wait_env)."""
+        return {**core_contracts.DRIVER_TIMEOUT_EXEMPT, **(getattr(self, 'member_rejoin_wait_env', None) or {})}
 
     def allowed_env(self):
         me = self.m['credentials']['me']
@@ -631,7 +636,8 @@ class CoreFixture(Fixture):
     def member_shadow_env(self, index):
         """The AE member's shadow block on a replica kind (core_contracts.REPLICA_KINDS): SNAPSHOT_MODE=shadow, pull sources
         = the replica's archive then the two peers' (spelled as CLUSTER_ADDRESSES spells them; the member's own endpoint is
-        refused at boot), the producer buffer, the witness alarm, a 1-minute cadence and the kind's own member settings. A
+        refused at boot), the producer buffer, the witness alarm, a 1-minute cadence, the kind's own member settings and,
+        on a peer-loss drill only, the rejoin watchdog wait it recorded (member_rejoin_wait_env). A
         full-mode kind keeps SNAPSHOT_MODE unset and takes the cadence only. No TRANSPORT_LOG_RCV_WINDOW: the member derives
         its window from the term and logs it at boot."""
         kind = self.m.get('manifest_kind')
@@ -644,7 +650,8 @@ class CoreFixture(Fixture):
             return {}
         sources = [self.archive_endpoint('shadow0')] + [self.archive_endpoint(f'ae{j}') for j in range(3) if j != index]
         return {**core_contracts.MEMBER_SHADOW_ENV, **core_contracts.DRILL_CADENCE_ENV, **segment,
-                'SHADOW_PULL_SOURCES': ','.join(sources), **core_contracts.REPLICA_KINDS[kind]['members']}
+                'SHADOW_PULL_SOURCES': ','.join(sources), **core_contracts.REPLICA_KINDS[kind]['members'],
+                **(getattr(self, 'member_rejoin_wait_env', None) or {})}
 
     def archive_endpoint(self, role):
         """``host:port`` of an AE member's or the replica's archive control channel (port offset 1)."""

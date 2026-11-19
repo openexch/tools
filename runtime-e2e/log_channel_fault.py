@@ -81,7 +81,10 @@ def log_filter(fixture, target, action, port_kind='log'):
     arguments = filter_arguments(fixture.m, target, action, port_kind)
     cid = fixture.registry['containers'][target]
     target_state = fixture.inspect('container', cid)
-    if not target_state['State']['Running'] or target_state['HostConfig']['NetworkMode'] != fixture.registry['network_id']:
+    if not target_state['State']['Running']:
+        raise Inconclusive(f'log filter target {target} is not running (exit code {target_state["State"]["ExitCode"]}): '
+                           f'a stopped container has no network namespace to filter in')
+    if target_state['HostConfig']['NetworkMode'] != fixture.registry['network_id']:
         raise Inconclusive('log filter target is not in its owned private network')
     fixture.inspect('network', fixture.registry['network_id'])
     helper = fixture.m.get('netfilter_helper')

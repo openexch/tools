@@ -202,7 +202,10 @@ PROCESS_ENV = {
     'REPLICA_CATCHUP_RCV_WND', 'SHADOW_RETAIN_N', 'REPLICA_BACKUP_COOLDOWN_MS', 'SHADOW_REBOOTSTRAP_REPLAY_FAILURES',
     'REPLICA_BACKUP_QUERY_INTERVAL_MS',
     # the core's archive segment length (members and replica of the replica and full drill kinds; core README)
-    'ARCHIVE_SEGMENT_LENGTH'} | {
+    'ARCHIVE_SEGMENT_LENGTH',
+    # the AE members' rejoin watchdog wait, on the peer-loss drills only (member_rejoin_wait_ms; a timeout name:
+    # it passes the guard only at the exact value the drill recorded)
+    'ENGINE_REJOIN_WAIT_MS'} | {
     # oe-gateway and oe-stream (gateway README "Run"; strict: every problem in one pass, exit 78). Timeouts, stale bounds and
     # cadences are never set: the binaries run on their defaults, as the engines run on production timeouts. The one
     # exception is the history stale bound and its /health probe cadence, which the history-freshness drill sets on
@@ -242,7 +245,9 @@ DRIVER_TIMEOUT_EXEMPT = {'FWD_DRIVER_TIMEOUT_MS': '5000', 'BRIDGE_DRIVER_TIMEOUT
 # driver refuses otherwise). Exact values only; the drill records them and judges the stop rule under them.
 PROJECTION_DRIVER_LIVENESS_EXEMPT = {'AERON_CLIENT_LIVENESS_TIMEOUT': '60s', 'AERON_PUBLICATION_UNBLOCK_TIMEOUT': '75s'}
 IMAGE_ENV = {'PATH', 'JAVA_HOME', 'JAVA_VERSION', 'LANG', 'LANGUAGE', 'LC_ALL', 'HOME', 'TZ'}
-TIMEOUT_WORDS = re.compile(r'TIMEOUT|HEARTBEAT|ELECTION|LIVENESS', re.IGNORECASE)
+# REJOIN_WAIT: the members' rejoin watchdog wait is an election bound too; it passes only at the exact value a peer
+# loss drill recorded (CoreFixture.member_rejoin_wait_env, timeout_exempt)
+TIMEOUT_WORDS = re.compile(r'TIMEOUT|HEARTBEAT|ELECTION|LIVENESS|REJOIN_WAIT', re.IGNORECASE)
 JVM_TIMEOUT = re.compile(r'-D\S*(timeout|heartbeat|election|liveness)', re.IGNORECASE)
 
 # The engine container's staged driver. driver.properties is a byte copy of me/deploy/media-driver/driver.properties
@@ -298,6 +303,125 @@ FULL_KINDS = {'full'}
 # The members' shadow block of every replica kind and the cadence every replica and full kind runs (settings)
 MEMBER_SHADOW_ENV = {'SNAPSHOT_MODE': 'shadow', 'SHADOW_PRODUCER_BUFFER_MB': '64', 'SHADOW_WITNESS_ALARM_MS': '120000'}
 DRILL_CADENCE_ENV = {'SNAPSHOT_INTERVAL_MINUTES': '1'}
+# The rejoin watchdog (cluster-kit RejoinWatchdog, ENGINE_REJOIN_WAIT_MS): a member that has known a leader and then
+# stays in one leaderless election for the wait exits 1 for a supervised restart. The kit default is 60 s. The peer
+# loss drills (REJOIN_WAIT_DRILLS) hold a deliberate quorum loss with one member alone for longer than that (110 to
+# 152 s measured), and the fixture restarts nobody, so on the default the lone survivor exits in the middle of the
+# drill and the drill loses the member it observes. Those two drills alone run the AE members on a wait above their
+# longest quorum-loss bound (replica_drills.quorum_loss_bound_s) and refuse to start when their own settings would
+# reach it; every other drill and kind keeps the kit default. The value passes the fixture's timeout guard only as the
+# exact value the drill recorded, and reaches the witness. REPLICA_MEMBER_REJOIN_WAIT_MS overrides the default. The
+# kit-default behaviour under the same quorum loss is pinned by the control peerloss-loud-unblocked-kitwait.
+KIT_REJOIN_WAIT_DEFAULT_MS = 60000
+REJOIN_WAIT_SETTING = 'REPLICA_MEMBER_REJOIN_WAIT_MS'
+REJOIN_WAIT_DEFAULT_MS = 330000
+REJOIN_WAIT_RANGE_MS = (61000, 3600000)
+REJOIN_WAIT_DRILLS = ('peerloss', 'peerloss_loud')          # replica_drills steps whose quorum loss outlasts 60 s
+
+
+def member_rejoin_wait_ms(env=None):
+    """The replica kinds' ENGINE_REJOIN_WAIT_MS: REPLICA_MEMBER_REJOIN_WAIT_MS when set (range-checked), else the default."""
+    env = os.environ if env is None else env
+    raw = env.get(REJOIN_WAIT_SETTING)
+    if raw is None or raw == '':
+        return REJOIN_WAIT_DEFAULT_MS
+    if not re.fullmatch(r'[0-9]+', raw):
+        raise Violation(f'{REJOIN_WAIT_SETTING} must be a whole number of milliseconds, got {raw!r}')
+    value = int(raw)
+    low, high = REJOIN_WAIT_RANGE_MS
+    if not low <= value <= high:
+        raise Violation(f'{REJOIN_WAIT_SETTING} {value} is outside {low}..{high}')
+    return value
+
+
+# The kit after the rejoin kit gates its watchdog during a genuine quorum loss (the watchdog no longer trips while a
+# majority of the members is unreachable). The cut's kit is the pin its core jar carries (release_cut.kit_pin_of). On a
+# kit newer than this pin, the peer-loss drills need no rejoin-wait override and the kit-default control expects the
+# survivor to outlast the quorum loss; on this pin (or an older kit) both keep the watchdog behaviour. Pins are ordered
+# by X.Y.Z, then, on one X.Y.Z, by the runtime build date of the qualifier (X.Y.Z-runtime.YYYYMMDD...): the repo has
+# shipped two builds of one X.Y.Z before. Two builds of one X.Y.Z that the date cannot order are INCONCLUSIVE.
+KIT_WATCHDOG_UNGATED_PIN = '0.1.23-runtime.20261118.rejoin.g8a6fb55'
+KIT_PIN_RE = re.compile(r'(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?')
+KIT_BUILD_DATE_RE = re.compile(r'runtime\.(\d{8})(?:\.|$)')
+
+
+def kit_version(pin):
+    """(X, Y, Z) of a cluster-kit pin such as 0.1.23-runtime.20261118.rejoin.g8a6fb55; Inconclusive when unreadable."""
+    found = KIT_PIN_RE.fullmatch(pin) if isinstance(pin, str) else None
+    if not found:
+        raise Inconclusive(f'cluster-kit pin {pin!r} is not X.Y.Z[-qualifier]: the drill cannot tell which kit it runs')
+    return tuple(int(found.group(i)) for i in (1, 2, 3))
+
+
+def kit_build_date(pin):
+    """The runtime build date (YYYYMMDD) of a pin's qualifier, or None."""
+    found = KIT_PIN_RE.fullmatch(pin) if isinstance(pin, str) else None
+    date = KIT_BUILD_DATE_RE.match(found.group(4) or '') if found else None
+    return date.group(1) if date else None
+
+
+def kit_newer(pin, than):
+    """True when ``pin`` is a newer kit than ``than``: a higher X.Y.Z, or on one X.Y.Z a later runtime build date.
+    Inconclusive when the two are different builds of one X.Y.Z the date cannot order."""
+    mine, theirs = kit_version(pin), kit_version(than)
+    if mine != theirs:
+        return mine > theirs
+    if pin == than:
+        return False
+    a, b = kit_build_date(pin), kit_build_date(than)
+    if a is None or b is None or a == b:
+        raise Inconclusive(f'cluster-kit pin {pin!r} and {than!r} are two builds of {".".join(map(str, mine))}: the '
+                           f'drill cannot order them (no distinct runtime build date)')
+    return a > b
+
+
+def kit_watchdog_gated(pin):
+    """True when the kit ``pin`` gates its rejoin watchdog during a genuine quorum loss (newer than the rejoin kit)."""
+    return kit_newer(pin, KIT_WATCHDOG_UNGATED_PIN)
+
+
+# A member stranded below the leader's log start. A kit that holds its retention floor for a down member lets it catch
+# up. The leader writes a member off when it held the floor past the bound (RETENTION_MEMBER_WAIT_MS since the member
+# last moved, or RETENTION_MEMBER_WAIT_BYTES behind the newest snapshot): one CRITICAL "member <id> STRANDED" line, and
+# the purge proceeds. With RETENTION_FLOOR=report the floor is only logged, never applied. A member that then returns
+# below the leader's log start is exited by its catch-up watchdog (after ENGINE_CATCHUP_REFUSALS failed catch-ups or
+# ENGINE_CATCHUP_REFUSAL_WAIT_MS of them) with a CRITICAL line and a FATAL reason, both naming its log position, the
+# leader's log start and the leader's member id. Names, texts, defaults and ranges are the kit's
+# (SnapshotLogPruner, CatchupWatchdog).
+LOUD_STRAND_RES = (
+    re.compile(r"CRITICAL catch-up watchdog: .*?this member's log position (\d+) is below the log start position (\d+) "
+               r"of the leader \(member (\d+)\)"),
+    re.compile(r"member cannot catch up: its log position (\d+) is below the leader's log start position (\d+) "
+               r"\(leader member (\d+)\)"))
+WRITTEN_OFF_RE = re.compile(r'\bmember (\d+) STRANDED: it has held the retention floor past the bound')
+FLOOR_GIVEN_UP_TEXT = 'the retention floor has been unknown for'
+RETENTION_FLOOR_SETTING = 'RETENTION_FLOOR'
+RETENTION_FLOOR_MODES = ('apply', 'report')
+RETENTION_FLOOR_DEFAULT = 'apply'
+RETENTION_MEMBER_WAIT_BYTES_SETTING = 'RETENTION_MEMBER_WAIT_BYTES'
+RETENTION_MEMBER_WAIT_BYTES_DEFAULT = 2 << 30           # SnapshotLogPruner.DEFAULT_MEMBER_WAIT_BYTES
+RETENTION_MEMBER_WAIT_BYTES_RANGE = (1 << 20, 1 << 40)
+RETENTION_MEMBER_WAIT_MS_SETTING = 'RETENTION_MEMBER_WAIT_MS'
+RETENTION_MEMBER_WAIT_MS_DEFAULT = 30 * 60 * 1000       # SnapshotLogPruner.DEFAULT_MEMBER_WAIT_MS
+RETENTION_MEMBER_WAIT_MS_RANGE = (1000, 7 * 24 * 3600 * 1000)
+
+
+def loud_strand_of(line):
+    """{position, log_start, leader_member} of the kit's catch-up watchdog CRITICAL line or FATAL reason, else None."""
+    for pattern in LOUD_STRAND_RES:
+        found = pattern.search(line or '')
+        if found:
+            return {'position': int(found.group(1)), 'log_start': int(found.group(2)),
+                    'leader_member': int(found.group(3))}
+    return None
+
+
+def written_off(line, member_id):
+    """True when ``line`` is the leader's CRITICAL STRANDED line for cluster member ``member_id``."""
+    found = WRITTEN_OFF_RE.search(line or '')
+    return bool(found) and int(found.group(1)) == member_id
+
+
 # The replica's settings on the fixture (core README "Replica"): FOLLOWER keeps replay off the leader; the catch-up window
 # is the replica's own (it never reads TRANSPORT_LOG_RCV_WINDOW); the term is the members' (the lag default reads it)
 REPLICA_ENV = {'CORE_ROLE': 'replica', 'CLUSTER_REPLICA_SLOT': str(REPLICA_SLOT), 'REPLICA_BACKUP_SOURCE': 'FOLLOWER',
