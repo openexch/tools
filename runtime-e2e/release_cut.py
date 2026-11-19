@@ -51,10 +51,12 @@ import zipfile
 
 from machine_paths import env_path
 
-SCHEMA = 'rc2-cut/3'                      # what a new cut manifest declares
-# The cut manifest layouts the checker reads. rc2-cut/3 adds the gateway repo and its two binaries (oe-gateway,
-# oe-stream) to rc2-cut/2; rc2-cut/2 names the core repo ``core`` and its jars ``core-*``; rc2-cut/1 (cuts written
-# before the rename) names them ``assets`` / ``assets-*``. Every older layout stays readable as written.
+SCHEMA = 'rc2-cut/4'                      # what a new cut manifest declares
+# The cut manifest layouts the checker reads. rc2-cut/4 adds the gateway's history projector (oe-projector) and requires
+# ``substrate.aeron_patches`` (the cluster-tools lock's Aeron patch files); rc2-cut/3 adds the gateway repo and its two
+# binaries (oe-gateway, oe-stream) to rc2-cut/2; rc2-cut/2 names the core repo ``core`` and its jars ``core-*``;
+# rc2-cut/1 (cuts written before the rename) names them ``assets`` / ``assets-*``. Every older layout stays readable as
+# written.
 LAYOUTS = {
     'rc2-cut/1': {'repo': 'assets', 'cluster': 'assets-cluster.jar', 'projector': 'assets-projector.jar',
                   'retired': {'assets-bridge', 'oms-app', 'match-gateway'}},
@@ -62,6 +64,9 @@ LAYOUTS = {
                   'retired': {'core-bridge', 'oms-app', 'match-gateway'}},
     'rc2-cut/3': {'repo': 'core', 'cluster': 'core-cluster.jar', 'projector': 'core-projector.jar',
                   'retired': {'core-bridge', 'oms-app', 'match-gateway'}, 'gateway': True},
+    'rc2-cut/4': {'repo': 'core', 'cluster': 'core-cluster.jar', 'projector': 'core-projector.jar',
+                  'retired': {'core-bridge', 'oms-app', 'match-gateway'}, 'gateway': True, 'projector_binary': True,
+                  'aeron_patches': True},
 }
 SCHEMAS = tuple(LAYOUTS)
 RULES = tuple(f'K{n}' for n in range(1, 11))
@@ -94,6 +99,8 @@ GATEWAY_PRODUCT = {
     'oe-gateway': {'repo': 'gateway', 'lang': 'cpp', 'stamped': True, 'schemas': ('money',)},
     'oe-stream': {'repo': 'gateway', 'lang': 'cpp', 'stamped': True, 'schemas': ('money',)},
 }
+# The gateway repo's history projector (rc2-cut/4): C++, stamped like the other two
+GATEWAY_PROJECTOR = {'oe-projector': {'repo': 'gateway', 'lang': 'cpp', 'stamped': True, 'schemas': ('money',)}}
 GATEWAY_SHIM = 'runtime-e2e/gateway_shim.py'
 PROJECTOR_STUB = 'runtime-e2e/projector_stub.py'
 CORE_PROBE_SOURCE = Path(__file__).resolve().parent / 'java' / 'CoreProbe.java'
@@ -120,7 +127,11 @@ TOOLS = {'core-dump': {'file': 'core-bridge.jar', 'lang': 'java', 'main': 'com.o
 ARTIFACT_KEYS = {'path', 'sha256', 'source_sha', 'derivation', 'tree_dirty', 'kind'}
 OLD_KEYS = {'path', 'sha256', 'source_sha', 'derivation', 'tree_dirty', 'kind', 'role'}
 HARNESS_KEYS = {'path', 'sha256', 'kind', 'driver_mode', 'source_path', 'source_sha256'}
-SUBSTRATE_KEYS = {'aeron', 'kit_pin', 'kit_jar', 'sbe'}
+SUBSTRATE_KEYS = {'aeron', 'kit_pin', 'kit_jar', 'sbe', 'aeron_patches'}
+# One Aeron patch file of the cluster-tools lock (``aeron_patches``): ``lock_path`` the path the lock names (relative to
+# the cluster-tools tree), ``path`` the file the cut's driver build applied, ``sha256`` its digest
+AERON_PATCH_KEYS = {'lock_path', 'path', 'sha256'}
+CT_LOCK = 'dependencies.lock'
 KIT_JAR_KEYS = {'path', 'sha256', 'source_sha', 'derivation', 'tree_dirty'}
 GENESIS_KEYS = {'me', 'core', 'order'}
 ME_GENESIS_KEYS = {'configVersion', 'behaviorVersion', 'commandLedgerCapacity', 'maxWireVersion', 'genesisId'}
@@ -149,6 +160,8 @@ def product(schema=SCHEMA):
     out.update((k, v) for k, v in _PRODUCT_REST.items() if k != 'match-cluster.jar')
     if lay.get('gateway'):
         out.update(GATEWAY_PRODUCT)
+    if lay.get('projector_binary'):
+        out.update(GATEWAY_PROJECTOR)
     return out
 
 
@@ -165,6 +178,8 @@ def fixture_names(schema=SCHEMA):
              'shadow': lay['cluster']}            # the replica is CORE_ROLE=replica of the core jar
     if lay.get('gateway'):
         names.update(gateway='oe-gateway', stream='oe-stream')
+    if lay.get('projector_binary'):
+        names.update(history_projector='oe-projector')
     return names
 
 
@@ -416,6 +431,42 @@ def load_record(f, ref):
     return record
 
 
+def _aeron_patches(f, substrate, repos, lay):
+    """``substrate.aeron_patches`` (required by a layout with ``aeron_patches``): every Aeron patch file the cluster-tools
+    lock at ``repos.cluster-tools`` names, each re-hashed (K1), and exactly the lock's set of (path, sha256) (K4: the
+    cut's driver files are derived from those patches and no other)."""
+    if 'aeron_patches' not in substrate:
+        if lay.get('aeron_patches'):
+            f.add('K9', 'substrate.aeron_patches: missing (the cluster-tools lock\'s Aeron patch files, path and sha256)')
+        return
+    patches = substrate['aeron_patches']
+    if not isinstance(patches, list):
+        f.add('K9', 'substrate.aeron_patches: must be a list of {lock_path, path, sha256}')
+        return
+    have = set()
+    for i, entry in enumerate(patches):
+        what = f'substrate.aeron_patches[{i}]'
+        if not _unknown(f, what, entry, AERON_PATCH_KEYS, AERON_PATCH_KEYS):
+            continue
+        if not (isinstance(entry.get('sha256'), str) and HEX64.fullmatch(entry['sha256'])):
+            f.add('K9', f'{what}: sha256 is not 64 hex ({entry.get("sha256")!r})')
+            continue
+        _rehash(f, what, entry, need_source=False)
+        have.add((str(entry['lock_path']), entry['sha256']))
+    ct = repos.get('cluster-tools')
+    blob = git_blob('cluster-tools', ct, CT_LOCK) if ct else None
+    try:
+        lock = json.loads(blob) if blob is not None else None
+    except ValueError:
+        lock = None
+    if not isinstance(lock, dict):
+        f.add('K4', f'substrate.aeron_patches: the cluster-tools lock at {ct} is not readable ({CT_LOCK})')
+        return
+    want = {(str(p.get('path')), p.get('sha256')) for p in lock.get('aeron_patches') or [] if isinstance(p, dict)}
+    if have != want:
+        f.add('K4', f'substrate.aeron_patches: {sorted(have)} is not the cluster-tools lock\'s {sorted(want)} at {ct}')
+
+
 def _old_entries(f, m, cls, old_pins):
     for block in ('upgrade_from', 'old_artifacts'):
         entries = m.get(block)
@@ -516,7 +567,7 @@ def check_cut(m, rules=RULES, cls=None, old_pins=None):
             f.add('K9', f'schemas.{name}: not a 64-hex sha256 ({value!r})')
 
     substrate = m.get('substrate') if isinstance(m.get('substrate'), dict) else {}
-    _unknown(f, 'substrate', substrate, SUBSTRATE_KEYS)
+    _unknown(f, 'substrate', substrate, SUBSTRATE_KEYS, SUBSTRATE_KEYS - {'aeron_patches'})
     aeron = substrate.get('aeron') if isinstance(substrate.get('aeron'), dict) else {}
     _unknown(f, 'substrate.aeron', aeron, SUBSTRATE_AERON)
     versions = sorted(set(map(str, aeron.values())))
@@ -530,6 +581,8 @@ def check_cut(m, rules=RULES, cls=None, old_pins=None):
         _shas(f, 'substrate.kit_jar', kit_jar)
         _rehash(f, 'substrate.kit_jar', kit_jar)
         _derived_k4(f, 'cluster-kit.jar', kit_jar, {'repo': 'cluster-kit', 'lang': 'java'}, repos, record, aeron_version, cls)
+
+    _aeron_patches(f, substrate, repos, lay)
 
     artifacts = m.get('artifacts') if isinstance(m.get('artifacts'), dict) else {}
     pins = {}
@@ -822,7 +875,8 @@ def _gateway_test_artifact(f, what, key, entry, m, cut, cls):
     kind it must be a build of the cut's own commit: gateway_nc carries the cut's gateway sha (its stamp), the session
     stub sits in a cluster-tools build tree configured at the cut's commit with CT_SESSION_STUB=ON, and the HTTP shim is
     the byte copy of gateway_shim.py at the harness commit, the projection stand-in of projector_stub.py (a rig manifest's
-    harness_drift waiver covers a shim or stand-in of an uncommitted harness, recorded)."""
+    harness_drift waiver covers a shim or stand-in of an uncommitted harness, recorded). history_projector_nc carries the
+    cut's gateway sha and sits in a gateway build tree configured with OE_PROJECTOR_CONTROL = its one define."""
     if cls == 'product':
         f.add('K3', f'{what}: a test-only build ({key}) in a product kind')
         return
@@ -838,6 +892,14 @@ def _gateway_test_artifact(f, what, key, entry, m, cut, cls):
         named = sorted('-D' + d for d in entry.get('defines') or [])
         if sorted(flags) != named:
             f.add('K4', f'{what}: gateway_nc build tree CMAKE_CXX_FLAGS {flags} is not the defines {named}')
+    elif key == 'history_projector_nc':
+        want = repos.get('gateway')
+        if not want or entry.get('source_sha') != want or want.encode() not in Path(entry['path']).read_bytes():
+            f.add('K4', f'{what}: history_projector_nc is not a build of the cut\'s gateway {want}')
+        control = build_tree_setting(entry['path'], 'OE_PROJECTOR_CONTROL')
+        named = '+'.join(entry.get('defines') or [])
+        if not named or control != named:
+            f.add('K4', f'{what}: history_projector_nc build tree OE_PROJECTOR_CONTROL {control!r} is not the defines {named!r}')
     elif key == 'session_stub':
         want = repos.get('cluster-tools')
         configured = build_tree_setting(entry['path'], 'CT_BUILD_SOURCE_SHA')

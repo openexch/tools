@@ -370,8 +370,10 @@ class PlanSetTest(unittest.TestCase):
             modes = sorted(core_contracts.GATEWAY_KINDS[e['kind']]['driver'] for e in gateway if e['scenario'] == name)
             self.assertEqual(modes, ['embedded', 'external'], name)
         self.assertEqual(len([e for e in embedded if gateway_drills.is_scenario(e['scenario'])]), 3)
+        import projection_drills
         embedded = [e for e in embedded if not gateway_drills.is_scenario(e['scenario'])]
-        external = [e for e in external if not gateway_drills.is_scenario(e['scenario'])]
+        external = [e for e in external if not gateway_drills.is_scenario(e['scenario'])
+                    and not projection_drills.is_scenario(e['scenario'])]
         external_drills = {e['scenario'] for e in external if e['kind'].endswith('-ext')}
         embedded_drills = {e['scenario'] for e in embedded[len(base):]} | {
             e['scenario'] for e in external if e['scenario'].startswith('core-drill-') and not e['kind'].endswith('-ext')}

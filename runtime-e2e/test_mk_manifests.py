@@ -157,6 +157,14 @@ class CutManifestBuilderTest(unittest.TestCase):
             d = 'gw-nc-' + define.lower()
             nc[attr] = put(d + '/bin/oe-gateway', b'ELF oe-gateway nc ' + define.encode() + b' ' + self.world.m['repos']['gateway'].encode())
             put(d + '/CMakeCache.txt', f'CMAKE_CXX_FLAGS:STRING=-D{define}\n'.encode())
+        # one control build tree of oe-projector per control define (its install tree's bin/oe-projector; release_cut
+        # reads the build tree's OE_PROJECTOR_CONTROL)
+        nc['projector_nc'] = {}
+        for define in sorted(core_contracts.PROJECTION_NC_DEFINES):
+            d = 'pj-nc-' + define.lower()
+            nc['projector_nc'][define] = put(d + '/inst/bin/oe-projector', b'ELF oe-projector nc ' + define.encode() + b' '
+                                             + self.world.m['repos']['gateway'].encode())
+            put(d + '/CMakeCache.txt', f'OE_PROJECTOR_CONTROL:STRING={define}\n'.encode())
         shim = (Path(mk_manifests.__file__).resolve().with_name('gateway_shim.py')).read_bytes()
         stub = (Path(mk_manifests.__file__).resolve().with_name('projector_stub.py')).read_bytes()
         blob = self.world.blob

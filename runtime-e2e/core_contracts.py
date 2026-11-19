@@ -41,21 +41,40 @@ GATEWAY_SLOT_ARTIFACTS = {'gw0': {'gateway', 'gateway_nc', 'gateway_stub'}, 'gw1
 # The test-only alternatives: refused in a product kind (release_cut K3), each checked against the cut it claims
 GATEWAY_TEST_ARTIFACTS = {'gateway_nc', 'gateway_stub', 'session_stub'}
 # The control defines a gateway_nc build may carry (the gateway's own control names, CoreSession.h and GatewayRoutes.cpp)
-GATEWAY_NC_DEFINES = {'GW_NC_FRESH_KEY', 'GW_NC_NO_CANCEL_REOFFER_RULE', 'GW_NC_NO_ASSET_CHECK'}
+GATEWAY_NC_DEFINES = {'GW_NC_FRESH_KEY', 'GW_NC_NO_CANCEL_REOFFER_RULE', 'GW_NC_NO_ASSET_CHECK', 'GW_NC_NO_STALE_LABEL'}
 # Ports of the gateway roles (every role has its own address, so gw0 and gw1 share the numbers)
 GATEWAY_PORTS = {'gateway_http': 8080, 'gateway_admin': 8081, 'stream_ws': 8090, 'stream_admin': 8091, 'shim_http': 8085}
 # The history projection's slots: two projector copies, each in its own container, each on its own GATEWAY key (the head
 # probe's session class). A manifest declares both or neither, and only on a gateway manifest (pj0 writes the database the
 # gateways read history from). A declared slot may be null. A slot runs the projector binary (history_projector,
-# oe-projector of the cut's gateway commit) or, in a rig kind, the test-only stand-in:
-#   projector_stub  projector_stub.py (never published): the projection drills' dry runs before the binary exists
+# oe-projector of the cut's gateway commit) or, in a rig kind, a test-only alternative:
+#   history_projector_nc  oe-projector of the cut's gateway commit built with one control define
+#                         (-DOE_PROJECTOR_CONTROL=<PROJ_NC_...>, an install tree holding oe-projector alone; never
+#                         published). The drop control also reads PROJ_NC_DROP_SEQ from its environment (default 2: the
+#                         journalSeq it acknowledges and never writes); the fixture leaves it at that default.
+#   projector_stub        projector_stub.py (never published): the projection drills' dry runs before the binary existed
 PROJECTION_SLOTS = {'pj0': 'history_projector', 'pj1': 'history_projector'}
 PROJECTION_ROLES = set(PROJECTION_SLOTS)
-PROJECTION_BINARIES = ['history_projector', 'projector_stub']
-PROJECTION_SLOT_ARTIFACTS = {'pj0': {'history_projector', 'projector_stub'}, 'pj1': {'history_projector', 'projector_stub'}}
-PROJECTION_TEST_ARTIFACTS = {'projector_stub'}
-PROJECTION_TARGETS = {'history_projector': 'oe-projector', 'projector_stub': 'projector_stub'}
+PROJECTION_BINARIES = ['history_projector', 'history_projector_nc', 'projector_stub']
+PROJECTION_SLOT_ARTIFACTS = {s: {'history_projector', 'history_projector_nc', 'projector_stub'} for s in ('pj0', 'pj1')}
+PROJECTION_TEST_ARTIFACTS = {'history_projector_nc', 'projector_stub'}
+PROJECTION_TARGETS = {'history_projector': 'oe-projector', 'history_projector_nc': 'oe-projector',
+                      'projector_stub': 'projector_stub'}
+# The control defines a history_projector_nc build may carry (the gateway's own names, projector/*.h)
+PROJECTION_NC_DEFINES = {'PROJ_NC_PIN_RECORDING', 'PROJ_NC_NO_STOP_REPLAY', 'PROJ_NC_WALLCLOCK_COLUMN', 'PROJ_NC_DROP_ONE',
+                         'PROJ_NC_BEAT_ALWAYS'}
 PROJECTION_PORTS = {'projector_admin': 8095}
+# The projector binary's journal and session settings on the fixture (gateway README "History projector"): the core's
+# order journal (stream 4102 on the archive's control stream 10, recorded over IPC at the members' IPC MTU), the replay
+# stream the members' replay gauge counts (CORE_ARCHIVE_REPLAY_PROBE_STREAM on the core members). Settings with
+# defaults: leases, probes, back-offs and timeouts are never set, the binary runs on its own defaults.
+HISTORY_PROJECTOR_JOURNAL = {'HISTORY_PROJECTOR_JOURNAL_CONTROL_STREAM': '10', 'HISTORY_PROJECTOR_JOURNAL_STREAM': '4102',
+                             'HISTORY_PROJECTOR_JOURNAL_CHANNEL': 'aeron:ipc', 'HISTORY_PROJECTOR_JOURNAL_MTU': '1408',
+                             'HISTORY_PROJECTOR_REPLAY_STREAM': '4302'}
+# The login role the gateways read a projection database through on a kind that runs the projector binary: a member of
+# the schema's reader group role (sql/history_projection_v1.sql), SELECT on the four read relations and nothing else
+HISTORY_READER_GROUP = 'oe_history_reader'
+HISTORY_READER_LOGIN = 'runtime_history_reader'
 # The stand-in's modes: ``follow`` beats only at the core's head; ``beat-always`` beats whatever the head (the freshness
 # drill's control: stale history then reads fresh)
 STUB_MODES = {'follow', 'beat-always'}
@@ -185,18 +204,31 @@ PROCESS_ENV = {
     # the core's archive segment length (members and replica of the replica and full drill kinds; core README)
     'ARCHIVE_SEGMENT_LENGTH'} | {
     # oe-gateway and oe-stream (gateway README "Run"; strict: every problem in one pass, exit 78). Timeouts, stale bounds and
-    # cadences are never set: the binaries run on their defaults, as the engines run on production timeouts.
+    # cadences are never set: the binaries run on their defaults, as the engines run on production timeouts. The one
+    # exception is the history stale bound and its /health probe cadence, which the history-freshness drill sets on
+    # the gateway slots (recorded with the run) so that a freeze below the projector's driver bound reads stale.
     'GATEWAY_DRIVER_MODE', 'GATEWAY_DRIVER_DIR', 'GATEWAY_CORE_INGRESS', 'GATEWAY_CORE_INGRESS_CHANNEL',
     'GATEWAY_CORE_RESPONSE_CHANNEL', 'GATEWAY_INSTANCE_ID', 'GATEWAY_HTTP_BIND', 'GATEWAY_ADMIN_BIND', 'GATEWAY_AUTH_MODES',
     'GATEWAY_API_KEYS_FILE', 'GATEWAY_PG_URL', 'GATEWAY_ALLOW_TREASURY_LANE', 'GATEWAY_TREASURY_CREDENTIAL',
-    'GATEWAY_FAUCET_MAX_AMOUNT', 'STREAM_DRIVER_MODE', 'STREAM_DRIVER_DIR', 'STREAM_CORE_INGRESS',
+    'GATEWAY_FAUCET_MAX_AMOUNT', 'GATEWAY_HISTORY_STALE_MS', 'GATEWAY_HISTORY_PROBE_MS', 'STREAM_DRIVER_MODE', 'STREAM_DRIVER_DIR', 'STREAM_CORE_INGRESS',
     'STREAM_CORE_INGRESS_CHANNEL', 'STREAM_CORE_RESPONSE_CHANNEL', 'STREAM_INSTANCE_ID', 'STREAM_WS_BIND',
     'STREAM_ADMIN_BIND', 'STREAM_AUTH_MODES', 'STREAM_CORE_NODE_ENDPOINTS', 'STREAM_ME_NODE_ENDPOINTS',
     # the test-only HTTP shim (gateway_shim.py): its listener and its users file
     'SHIM_HTTP_BIND', 'SHIM_API_KEYS_FILE', 'SHIM_MODE', 'SHIM_CORE_PROBE',
     # the test-only projection stand-in (projector_stub.py): its listener, database, mode, member endpoints and settings
     'STUB_ADMIN_BIND', 'STUB_PG_URL', 'STUB_INSTANCE', 'STUB_CORE_PROBE', 'STUB_MEMBER_METRICS', 'STUB_MODE',
-    'STUB_POLL_MS', 'STUB_PAGE_EVENTS', 'STUB_LEASE_MS', 'STUB_LEASE_POLL_MS', 'STUB_PROBE_BOUND_MS'}
+    'STUB_POLL_MS', 'STUB_PAGE_EVENTS', 'STUB_LEASE_MS', 'STUB_LEASE_POLL_MS', 'STUB_PROBE_BOUND_MS',
+    # oe-projector (gateway README "History projector"; strict, exit 78): only the required settings, the rest on defaults
+    'HISTORY_PROJECTOR_DRIVER_MODE', 'HISTORY_PROJECTOR_DRIVER_DIR', 'HISTORY_PROJECTOR_INSTANCE_ID',
+    'HISTORY_PROJECTOR_ADMIN_BIND', 'HISTORY_PROJECTOR_JOURNAL_ARCHIVES', 'HISTORY_PROJECTOR_JOURNAL_CONTROL_STREAM',
+    'HISTORY_PROJECTOR_JOURNAL_STREAM', 'HISTORY_PROJECTOR_JOURNAL_CHANNEL', 'HISTORY_PROJECTOR_REPLAY_STREAM',
+    'HISTORY_PROJECTOR_JOURNAL_MTU', 'HISTORY_PROJECTOR_LOCAL_HOST', 'HISTORY_PROJECTOR_JOURNAL_NODE_ENDPOINTS',
+    'HISTORY_PROJECTOR_CLUSTER_MEMBERS', 'HISTORY_PROJECTOR_CLUSTER_KEY_FILE', 'HISTORY_PROJECTOR_CORE_INGRESS_CHANNEL',
+    'HISTORY_PROJECTOR_CORE_RESPONSE_CHANNEL', 'HISTORY_PROJECTOR_PG_URL',
+    # one setting a drill may set (projection-byte-equal-replay C: the rebuild's batch size, recorded with the run)
+    'HISTORY_PROJECTOR_BATCH_EVENTS',
+    # the core members' replay gauge (core README): the replay stream core_archive_replays_active counts
+    'CORE_ARCHIVE_REPLAY_PROBE_STREAM'}
 # Only `execute` on the probe container may carry these (the pinned T1 drivers). The values are
 # session secrets except T1_ME_MARKETS and T1_LOCAL_HOST. T1_BRIDGE_KEY, T1_TAP_KEY and T1_ME_FORWARDER_KEY are
 # never set: the via-bridge genesis needs no bridge key and the capture/resend verbs are not run from the probe.
@@ -204,6 +236,11 @@ PROBE_ENV = {'T1_ADMIN_KEY', 'T1_TOOL_KEY', 'T1_GATEWAY_KEY', 'T1_ME_ADMIN_KEY',
 # The two names the C++ binaries require (no default, DT:28-35) and the one value the fixture
 # passes. It is the client's liveness bound on its own media driver, not an election, heartbeat or session timeout.
 DRIVER_TIMEOUT_EXEMPT = {'FWD_DRIVER_TIMEOUT_MS': '5000', 'BRIDGE_DRIVER_TIMEOUT_MS': '5000'}
+# The one driver setting pair a drill gives a projection slot's staged aeronmd (projector-me-restart-follow, the hung
+# writer): an external driver keeps a stopped client this long, so the replay the hung copy recorded stays served and
+# the standby's stop-on-takeover rule is what ends it. The unblock timeout must lie above the client liveness (the
+# driver refuses otherwise). Exact values only; the drill records them and judges the stop rule under them.
+PROJECTION_DRIVER_LIVENESS_EXEMPT = {'AERON_CLIENT_LIVENESS_TIMEOUT': '60s', 'AERON_PUBLICATION_UNBLOCK_TIMEOUT': '75s'}
 IMAGE_ENV = {'PATH', 'JAVA_HOME', 'JAVA_VERSION', 'LANG', 'LANGUAGE', 'LC_ALL', 'HOME', 'TZ'}
 TIMEOUT_WORDS = re.compile(r'TIMEOUT|HEARTBEAT|ELECTION|LIVENESS', re.IGNORECASE)
 JVM_TIMEOUT = re.compile(r'-D\S*(timeout|heartbeat|election|liveness)', re.IGNORECASE)
@@ -350,7 +387,47 @@ GATEWAY_KINDS.update({
     'pj-dry-beatalways': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_STUB),
                           'stub_mode': 'beat-always', 'projection_control': 'history-freshness'},
 })
+# The kinds of the projector binary (the drills on oe-projector of the cut): pj0 and pj1 = history_projector.
+#   pj, pj-ext                  the three drills, embedded and external (engines, slots and projectors in that mode)
+# Their controls (one mode each, as the other drills' controls; ``projection_control`` names the drill whose line must
+# fail and ``control_text`` its text; ``projector_define`` the control define of the kind's history_projector_nc build,
+# which runs in every slot that drill compares or follows):
+#   pj-nc-pinrecording          projector-me-restart-follow: pj0 reads only the first recording it read (the successor
+#                               after the attached member's restart is never followed); pj1 is the product standby
+#   pj-nc-nostopreplay-ext      projector-me-restart-follow: neither copy stops a recorded replay of an earlier writer
+#                               (external: only a live driver keeps a hung copy's replay served past the takeover)
+#   pj-nc-wallclock             projection-byte-equal-replay: every compared projection carries a wall-clock column
+#   pj-nc-dropone               projection-byte-equal-replay: every compared projection acknowledges journalSeq
+#                               PROJ_NC_DROP_SEQ (default 2) and never writes it
+#   pj-nc-beatalways            history-freshness: pj0 beats at every fence whatever the head
+#   pj-nc-nostale               history-freshness: gw0 runs oe-gateway built with GW_NC_NO_STALE_LABEL
+_PJ_BIN = {'pj0': 'history_projector', 'pj1': 'history_projector'}
+_PJ_NC = {'pj0': 'history_projector_nc', 'pj1': 'history_projector_nc'}
+GATEWAY_KINDS.update({
+    'pj': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_BIN)},
+    'pj-ext': {'driver': 'external', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_BIN)},
+    'pj-nc-pinrecording': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {},
+                           'projectors': {'pj0': 'history_projector_nc', 'pj1': 'history_projector'},
+                           'projector_define': 'PROJ_NC_PIN_RECORDING', 'projection_control': 'projector-me-restart-follow'},
+    'pj-nc-nostopreplay-ext': {'driver': 'external', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_NC),
+                           'projector_define': 'PROJ_NC_NO_STOP_REPLAY', 'projection_control': 'projector-me-restart-follow',
+                           'control_text': 'orphan replay remains on core member'},
+    'pj-nc-wallclock': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_NC),
+                        'projector_define': 'PROJ_NC_WALLCLOCK_COLUMN', 'projection_control': 'projection-byte-equal-replay'},
+    'pj-nc-dropone': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_NC),
+                      'projector_define': 'PROJ_NC_DROP_ONE', 'projection_control': 'projection-byte-equal-replay',
+                      'control_text': 'journalSeq missing in projection'},
+    'pj-nc-beatalways': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {},
+                         'projectors': {'pj0': 'history_projector_nc', 'pj1': 'history_projector'},
+                         'projector_define': 'PROJ_NC_BEAT_ALWAYS', 'projection_control': 'history-freshness'},
+    'pj-nc-nostale': {'driver': 'embedded', 'slots': dict(_ALL, gw0='gateway_nc'), 'core_jvm': {},
+                      'nc_define': 'GW_NC_NO_STALE_LABEL', 'projectors': dict(_PJ_BIN),
+                      'projection_control': 'history-freshness', 'control_text': 'stale label missing'},
+})
 PROJECTION_KINDS = {k for k, v in GATEWAY_KINDS.items() if v.get('projectors')}
+# The kinds whose projection slots run the projector binary (product or control build), not the stand-in
+PROJECTOR_BINARY_KINDS = {k for k in PROJECTION_KINDS
+                          if set(GATEWAY_KINDS[k]['projectors'].values()) & {'history_projector', 'history_projector_nc'}}
 
 
 def nc_define(kind):
@@ -651,7 +728,7 @@ GATEWAY_TARGETS = {'gateway': 'oe-gateway', 'gateway_nc': 'oe-gateway', 'stream'
                    'session_stub': 'ct_session_stub'}
 
 
-PROJECTION_ARTIFACT_KEYS = {'path', 'sha256', 'source_sha', 'driver', 'target', 'libs', 'mode'}
+PROJECTION_ARTIFACT_KEYS = {'path', 'sha256', 'source_sha', 'driver', 'target', 'libs', 'mode', 'defines'}
 
 
 def validate_projection_artifacts(manifest):
@@ -677,6 +754,17 @@ def validate_projection_artifacts(manifest):
                             'its mode: ' + ', '.join(sorted(STUB_MODES)))
         if name != 'projector_stub' and 'mode' in entry:
             raise Violation(name + ': only the stand-in has a mode')
+        defines = entry.get('defines')
+        if name == 'history_projector_nc':
+            if not isinstance(defines, list) or len(defines) != 1 or not set(defines) <= PROJECTION_NC_DEFINES:
+                raise Violation('history_projector_nc names its one control define, one of '
+                                + ', '.join(sorted(PROJECTION_NC_DEFINES)))
+            kind = manifest.get('manifest_kind')
+            want = (GATEWAY_KINDS.get(kind) or {}).get('projector_define')
+            if kind in GATEWAY_KINDS and defines != [want]:
+                raise Violation(f'history_projector_nc of kind {kind} is the {want} build, got defines {defines}')
+        elif defines is not None:
+            raise Violation(name + ': only a control build names defines')
         libs = entry.get('libs') or {}
         if entry['driver'] == 'external' and name != 'projector_stub' and set(libs) != {'aeronmd', 'libaeron_driver.so', 'libaeron.so'}:
             raise Violation(f'{name}: an external slot stages aeronmd, libaeron_driver.so and libaeron.so')
@@ -891,14 +979,16 @@ def validate_core_manifest(manifest, manifest_path, cpu_count=None, profiles=jou
         raise Inconclusive('incomplete core manifest: ' + str(error)) from error
 
 
-def assert_production_timeouts(environment, allowed=PROCESS_ENV):
-    """Fixture-side guard: a process receives only allowlisted names, and no value carries a timeout."""
+def assert_production_timeouts(environment, allowed=PROCESS_ENV, exempt_values=None):
+    """Fixture-side guard: a process receives only allowlisted names, and no value carries a timeout. A timeout name
+    passes only at its exact exempt value (DRIVER_TIMEOUT_EXEMPT, or the map a caller names)."""
+    exempt_values = DRIVER_TIMEOUT_EXEMPT if exempt_values is None else exempt_values
     for key, value in environment.items():
         if key in RETIRED_ENV:
             raise Violation('refusing a retired environment name: ' + retired_env_refusal(key))
         if key not in allowed:
             raise Violation('environment names are an allowlist; refusing ' + key)
-        exempt = key in DRIVER_TIMEOUT_EXEMPT and type(value) is str and value == DRIVER_TIMEOUT_EXEMPT[key]
+        exempt = key in exempt_values and type(value) is str and value == exempt_values[key]
         if (TIMEOUT_WORDS.search(key) and not exempt) or JVM_TIMEOUT.search(str(value)):
             raise Violation('refusing to pass a timeout setting to a fixture process: ' + key)
 

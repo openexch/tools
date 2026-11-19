@@ -408,6 +408,9 @@ class SlotEnvTest(unittest.TestCase):
                 g = gateway_fixture(self.dir, driver, slots)
                 for slot in core_contracts.GATEWAY_SLOTS:
                     names |= set(g.gateway_slot_env(slot))
+                # the two history settings the freshness drill sets on the gateway slots
+                g.gateway_env_overrides = {'gw0': {'GATEWAY_HISTORY_STALE_MS': 3000, 'GATEWAY_HISTORY_PROBE_MS': 2000}}
+                names |= set(g.gateway_slot_env('gw0')) if g.slot_artifact('gw0') not in ('gateway_stub', 'session_stub') else set()
         # The projection kinds: the stand-in in both projection slots, its settings named, both driver modes
         from test_projection import projection_fixture
         import projector_stub
@@ -416,6 +419,14 @@ class SlotEnvTest(unittest.TestCase):
             p.projection_stub_settings = dict(projector_stub.SETTINGS)
             for slot in core_contracts.PROJECTION_SLOTS:
                 names |= set(p.projection_slot_env(slot))
+            # the projector binary in both slots, and the core members' replay gauge of its kinds
+            p.m['slot_artifacts'].update(pj0='history_projector', pj1='history_projector')
+            p.m['manifest_kind'] = 'pj-ext' if driver == 'external' else 'pj'
+            # the one setting a drill sets on a slot (the byte-equal drill's C batch)
+            p.projector_env_overrides = {'pj1': {'HISTORY_PROJECTOR_BATCH_EVENTS': 1}}
+            for slot in core_contracts.PROJECTION_SLOTS:
+                names |= set(p.projection_slot_env(slot))
+            names |= set(p.engine_env('ae', 0))
         f = self.fx()
         self.assertEqual(names, f.allowed_env())
         # every set value passes the guard

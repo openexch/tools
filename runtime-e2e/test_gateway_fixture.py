@@ -361,6 +361,10 @@ class AllowedEnvCoversTheGatewaySlotsTest(unittest.TestCase):
                     f = gateway_fixture(d, driver, slots)
                     for slot in core_contracts.GATEWAY_SLOTS:
                         names |= set(f.gateway_slot_env(slot))
+                    # the freshness drill's two gateway history settings (gateway_env_overrides)
+                    if f.slot_artifact('gw1') not in ('gateway_stub', 'session_stub'):
+                        f.gateway_env_overrides = {'gw1': {'GATEWAY_HISTORY_STALE_MS': 3000, 'GATEWAY_HISTORY_PROBE_MS': 2000}}
+                        names |= set(f.gateway_slot_env('gw1'))
             gateway_names = {n for n in core_contracts.PROCESS_ENV if n.startswith(('GATEWAY_', 'STREAM_', 'SHIM_'))}
             self.assertEqual({n for n in names if n.startswith(('GATEWAY_', 'STREAM_', 'SHIM_'))}, gateway_names)
 
@@ -745,7 +749,7 @@ class GatewayKindBuilderTest(unittest.TestCase):
         old = test_release_cut.World(self.root / 'old-cut', 'rc2-cut/2')
         old.pins.update(self.world.pins)
         path = self.root / 'rc2-cut-2.json'; path.write_text(json.dumps(old.m))
-        with self.assertRaisesRegex(Violation, 'the cut must be rc2-cut/3'):
+        with self.assertRaisesRegex(Violation, 'the cut must be rc2-cut/4'):
             test_mk_manifests.mk_manifests.build_from_cut('gw', 'r1', path, self.cfg, old_pins=old.pins)
 
 

@@ -78,7 +78,7 @@ class World:
             self.build(name, 'cluster-tools', ct, data, 1)
             art[name] = self.entry(p, ct, 'binary-build-info')
         if lay.get('gateway'):
-            for name in ('oe-gateway', 'oe-stream'):
+            for name in ('oe-gateway', 'oe-stream') + (('oe-projector',) if lay.get('projector_binary') else ()):
                 data = b'ELF ' + name.encode() + b' ' + SHAS['gateway'].encode() + b' ' + SCHEMAS['money'].encode()
                 p = self.put('artifacts/' + name, data)
                 self.build(name, 'gateway', SHAS['gateway'], data, 1)
@@ -100,13 +100,22 @@ class World:
         for key in ('probe_aeronmd', 'probe_libaeron_driver.so', 'probe_libaeron.so'):
             p = self.put('harness/' + key, b'old probe ' + key.encode())
             harness[key] = {'path': str(p), 'sha256': h(p.read_bytes()), 'kind': 'harness', 'driver_mode': 'external'}
+        self.ct_lock = None
+        patches = []
+        if lay.get('aeron_patches'):
+            # the cluster-tools lock's Aeron patch file, as the cut's driver build applied it (the git seam serves the lock)
+            data = b'--- a/driver.c\n+++ b/driver.c\n'
+            p = self.put('ct-src/third_party/aeron-patches/0001-fix.patch', data)
+            patches = [{'lock_path': 'third_party/aeron-patches/0001-fix.patch', 'path': str(p), 'sha256': h(data)}]
+            self.ct_lock = json.dumps({'aeron_patches': [{'path': x['lock_path'], 'sha256': x['sha256']} for x in patches]}).encode()
         self.write_record()
         self.m = {
             'schema': schema, 'class': 'product', 'cut_id': 'rc2-cut-1', 'created': '2026-11-04T00:00:00Z',
             'harness_commit': SHAS['tools'], 'repos': shas, 'schemas': dict(SCHEMAS),
             'substrate': {'aeron': {k: '1.53.1' for k in release_cut.SUBSTRATE_AERON}, 'kit_pin': KIT_PIN,
                           'kit_jar': {'path': str(kp), 'sha256': h(kit), 'source_sha': SHAS['cluster-kit'],
-                                      'derivation': 'rebuild-equal', 'tree_dirty': False}, 'sbe': '1.40.1'},
+                                      'derivation': 'rebuild-equal', 'tree_dirty': False}, 'sbe': '1.40.1',
+                          **({'aeron_patches': patches} if patches else {})},
             'artifacts': art, 'harness': harness,
             'genesis': {'me': {'configVersion': 1, 'behaviorVersion': 2, 'commandLedgerCapacity': 100000, 'maxWireVersion': 12,
                                'genesisId': 'per-genesis'},
@@ -133,6 +142,8 @@ class World:
         """The git seam: the harness source at the cut's commit is the source file the World wrote."""
         name = {v[1]: k for k, v in release_cut.HARNESS_SOURCES.items()}.get(rel)
         want = self.m['harness_commit'] if repo == 'tools' else self.m['repos']['cluster-tools']
+        if repo == 'cluster-tools' and rel == release_cut.CT_LOCK:
+            return self.ct_lock if commit == want else None
         if name is None or commit != want:
             return None
         return Path(self.m['harness'][name]['source_path']).read_bytes()
@@ -214,9 +225,9 @@ class CutLayoutTest(CheckerBase):
         patch = mock.patch.object(release_cut, 'git_blob', w.blob); patch.start(); self.addCleanup(patch.stop)
         return w
 
-    def test_a_new_cut_is_rc2_cut_3_with_repo_key_core(self):
-        self.assertEqual(release_cut.SCHEMA, 'rc2-cut/3')
-        self.assertEqual(self.w.m['schema'], 'rc2-cut/3')
+    def test_a_new_cut_is_rc2_cut_4_with_repo_key_core(self):
+        self.assertEqual(release_cut.SCHEMA, 'rc2-cut/4')
+        self.assertEqual(self.w.m['schema'], 'rc2-cut/4')
         self.assertIn('core', self.w.m['repos']); self.assertNotIn('assets', self.w.m['repos'])
         self.assertLessEqual({CLUSTER, PROJECTOR}, set(self.w.m['artifacts']))
         self.assertEqual(self.check(self.w.m).items, [])
@@ -244,9 +255,9 @@ class CutLayoutTest(CheckerBase):
         self.assertIn('K9', self.check(m).by_rule())
 
     def test_an_unknown_schema_is_refused(self):
-        m = copy.deepcopy(self.w.m); m['schema'] = 'rc2-cut/4'
+        m = copy.deepcopy(self.w.m); m['schema'] = 'rc2-cut/5'
         found = release_cut.check_cut(m, old_pins=self.w.pins)
-        self.assertIn(('K9', "schema must be one of rc2-cut/1, rc2-cut/2, rc2-cut/3, got 'rc2-cut/4'"), found.items)
+        self.assertIn(('K9', "schema must be one of rc2-cut/1, rc2-cut/2, rc2-cut/3, rc2-cut/4, got 'rc2-cut/5'"), found.items)
 
     def test_core_bridge_is_retired_in_a_new_cut_and_assets_bridge_stays_retired(self):
         for name in ('core-bridge', 'assets-bridge'):
