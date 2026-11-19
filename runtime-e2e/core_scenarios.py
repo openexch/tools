@@ -220,7 +220,8 @@ def me_journal(fixture):
     return decoded['me0'], profile.has_journal_seq
 
 
-# The counter export of the AE leader -> sample['counters'] (OM:37), so O11 is judged (OO:231-237)
+# The counter export of the AE member with the fullest count (barrier_counters) -> sample['counters'] (OM:37), so O11
+# is judged (OO:231-237)
 COUNTER_METRICS = {'stale_outcomes': 'core_order_stale_outcomes_total', 'redundant_outcomes': 'core_order_redundant_outcomes_total',
                    'stale_terminals': 'core_order_stale_terminals_total', 'conflicts': 'core_order_conflicts_total',
                    'released_late': 'core_released_late_total'}    # U1: RELEASED copies (O11)
@@ -265,6 +266,23 @@ def barrier_scrape(fixture, skip_me=False):
     return scrape
 
 
+def barrier_counters(by_member):
+    """The order engine's outcome counters for O11, all from one member: the one with the largest total. The counters
+    are process-local (not snapshot state): a member counts what it applied in its current process life, and a member
+    restored from a snapshot counts only the log after it. The member that replayed the most log has the largest
+    values, so taking it never hides an over-count (the rule fails on any count above the journal's) and only removes
+    the under-count of a member whose restore point lies inside the run (the barrier leader after every member
+    restarted). Returns (counters, member, every exporting member's counters)."""
+    every = {}
+    for role, metrics in sorted(by_member.items()):
+        if all(metric in metrics for metric in COUNTER_METRICS.values()):
+            every[role] = {name: int(metrics[metric]) for name, metric in COUNTER_METRICS.items()}
+    if not every:
+        raise Inconclusive('no AE member exports the order counters')
+    member = max(every, key=lambda role: (sum(every[role].values()), role))
+    return dict(every[member]), member, every
+
+
 def observe(fixture, frozen=None):
     """One barrier observation. ``frozen``: A04 life 1's ME evidence read BEFORE the wipe
     ({me_journal, me_journal_seq, me_open_legs, scrape_me}); the fresh ME is then never queried."""
@@ -276,19 +294,19 @@ def observe(fixture, frozen=None):
     else:
         journal, has_seq, legs = frozen['me_journal'], frozen['me_journal_seq'], frozen['me_open_legs']
     mj, mlegs = money_journal(fixture)
-    gauges, leaders = {}, []
+    gauges, leaders, by_member = {}, [], {}
     for i in range(3):
         metrics = fixture.metrics(f'ae{i}', fixture.m['ports']['ae_metrics'])
         gauges[f'ae{i}'] = {k: int(metrics[k]) for k in ['core_settle_faults_total', 'core_settle_rejects_total']}
         if metrics.get('core_cluster_role') == 2.0:
             leaders.append(metrics)
+        by_member[f'ae{i}'] = metrics
     if len(leaders) != 1:
         raise Inconclusive(f'no AE leader at the barrier: {len(leaders)} members report role 2')
-    counters = {}
-    for name, metric in COUNTER_METRICS.items():
+    for metric in COUNTER_METRICS.values():
         if metric not in leaders[0]:
             raise Inconclusive('AE leader does not export ' + metric)
-        counters[name] = int(leaders[0][metric])
+    counters, counters_member, counters_by_member = barrier_counters(by_member)
     core = {'balances': sorted(({'user': b['user'], 'asset': b['asset'], 'available': b['available'], 'locked': b['locked']}
                                 for b in money['balances']), key=lambda b: (b['user'], b['asset'])),
             'holds': sorted(money['holds'], key=lambda h: h['order']),
@@ -305,7 +323,7 @@ def observe(fixture, frozen=None):
         scrape.update(frozen.get('scrape_me') or {})
     return {'core': core, 'me_journal': journal, 'me_journal_seq': has_seq, 'me_open_legs': legs,
             'money_journal': mj, 'money_journal_legs': mlegs, 'gauges': gauges, 'pending': pending, 'counters': counters,
-            'scrape': scrape}
+            'counters_member': counters_member, 'counters_by_member': counters_by_member, 'scrape': scrape}
 
 
 def core_smoke(fixture):

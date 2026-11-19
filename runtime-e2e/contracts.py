@@ -32,6 +32,15 @@ class Violation(ValueError):
     pass
 
 
+class ProductDefect(Violation):
+    """A FAIL the product caused and the harness identified (``defect``: a short stable tag, recorded in the result as
+    ``product_defect``), kept apart from harness refusals and from INCONCLUSIVE noise."""
+
+    def __init__(self, defect, message):
+        super().__init__(message)
+        self.defect = defect
+
+
 def check_result(result):
     if result.get('status') != 'PASS' or result.get('skipped') != 0:
         raise Inconclusive('non-PASS or skipped work')

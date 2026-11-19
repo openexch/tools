@@ -421,6 +421,9 @@ class ControlVerdictTest(unittest.TestCase):
             expect = core_drills.REPLICA_CONTROL_EXPECT[control]
             self.assertEqual(sorted(named), sorted(expect['fail']), control)
             self.assertIn(variant['kind'], core_contracts.CUT_KINDS, control)
+            self.assertIn(variant['kind'], variant.get('kinds') or [variant['kind']], control)
+            for kind in variant.get('kinds') or []:
+                self.assertIn(kind, core_contracts.CUT_KINDS, control)
             for name in list(expect['fail']) + expect['hold']:
                 self.assertIn(name, rd.LINES, (control, name))
 
@@ -602,6 +605,188 @@ class DrillFrameTest(unittest.TestCase):
                 self.assertGreater(plan['tap_ms'], (120 + run.spec['tap_extra_s']) * 1000, name)
 
 
+class RejoinWaitTest(unittest.TestCase):
+    """The lone survivor of a peer-loss-loud drill outlasts the drill's quorum loss: the replica kinds' members run a
+    rejoin watchdog wait above the drill's bound, and a drill whose settings would reach the wait refuses to start."""
+
+    def test_the_default_wait_exceeds_both_quorum_loss_bounds(self):
+        for unblocked in (False, True):
+            bound = rd.quorum_loss_bound_s(S, unblocked)
+            self.assertGreater(core_contracts.REJOIN_WAIT_DEFAULT_MS, bound * 1000, unblocked)
+            rd.check_rejoin_wait(core_contracts.REJOIN_WAIT_DEFAULT_MS, bound)
+
+    def test_the_kit_default_wait_is_refused_with_its_reason(self):
+        # 60 s, the kit default, is below the 110 to 152 s quorum losses the drills hold
+        for unblocked in (False, True):
+            with self.assertRaises(Violation) as caught:
+                rd.check_rejoin_wait(core_contracts.KIT_REJOIN_WAIT_DEFAULT_MS, rd.quorum_loss_bound_s(S, unblocked))
+            self.assertIn('lone survivor would exit 1', str(caught.exception))
+            self.assertIn(core_contracts.REJOIN_WAIT_SETTING, str(caught.exception))
+
+    def test_the_bound_follows_the_settings(self):
+        loud = rd.quorum_loss_bound_s(S, False)
+        self.assertEqual(loud, 12.5 + 180 + rd.QUORUM_LOSS_SLACK_S + 3 * 30)
+        self.assertEqual(rd.quorum_loss_bound_s(dict(S, LOUD_EXIT_BOUND_S=400), True),
+                         12.5 + 400 + rd.QUORUM_LOSS_SLACK_S)
+        with self.assertRaises(Violation):
+            rd.check_rejoin_wait(core_contracts.REJOIN_WAIT_DEFAULT_MS, rd.quorum_loss_bound_s(dict(S, LOUD_EXIT_BOUND_S=400), True))
+
+
+class RejoinWaitScopeTest(unittest.TestCase):
+    """Only the peer-loss drills raise the members' rejoin wait; every other drill and the kit-default control keep the
+    kit's 60 s watchdog."""
+
+    def test_only_the_peer_loss_steps_raise_the_wait(self):
+        for step in ('peerloss', 'peerloss_loud'):
+            self.assertEqual(rd.rejoin_wait_env(step, {}, {}), {'ENGINE_REJOIN_WAIT_MS': '330000'}, step)
+            self.assertEqual(rd.rejoin_wait_env(step, {}, {'REPLICA_MEMBER_REJOIN_WAIT_MS': '400000'}),
+                             {'ENGINE_REJOIN_WAIT_MS': '400000'})
+        for step in ('member_kill9', 'leaderloss_promotion', 'supplierloss', 'shadow_catalog', 'replica_restart',
+                     'replica_wipe', 'replica_rebootstrap'):
+            self.assertEqual(rd.rejoin_wait_env(step, {}, {}), {}, step)
+        self.assertEqual(rd.rejoin_wait_env('peerloss_loud', {'unblocked': True, 'rejoin_wait': 'kit'}, {}), {})
+        # every drill table entry with a replica step resolves (no step outside the table)
+        steps = {spec['replica'] for spec in core_drills.DRILLS.values() if spec.get('replica')}
+        self.assertTrue(set(core_contracts.REJOIN_WAIT_DRILLS) <= steps)
+
+    def test_the_kit_default_control_pins_the_watchdog_exit(self):
+        drill, variant, fail = core_drills.CONTROLS['peerloss-loud-unblocked-kitwait']
+        self.assertEqual((drill, variant['rejoin_wait'], fail), ('peerloss-loud', 'kit', ['survivor_outlasts_quorum_loss']))
+        expect = core_drills.REPLICA_CONTROL_EXPECT['peerloss-loud-unblocked-kitwait']
+        watchdog = ('2026-11-19T03:14:19Z [ERROR] RejoinWatchdog - CRITICAL rejoin watchdog: election 2 open for '
+                    '60004 ms without a leader (state CANVASS), exiting 1')
+        failed = rd.line_survivor_outlasts_quorum_loss({'peerloss': {
+            'survivor': 'ae1', 'rejoin_wait_ms': 60000,
+            'survivor_state': {'running': False, 'exit_code': 1, 'fatal': 'FATAL (exit 1)', 'watchdog': watchdog}}})
+        self.assertFalse(failed['holds'])
+        self.assertIn(expect['fail']['survivor_outlasts_quorum_loss'], failed['detail'])
+        held = rd.line_survivor_outlasts_quorum_loss({'peerloss': {'survivor': 'ae1', 'rejoin_wait_ms': 60000,
+                                                                   'survivor_state': {'running': True}}})
+        self.assertTrue(held['holds'])
+        ok = {'status': 'PASS'}
+        cycles = {'holds': True, 'detail': '3 fault rows opened (3 healed), the drill defines 3'}
+        self.assertEqual(rd.replica_control_verdict(ok, ok, {'survivor_outlasts_quorum_loss': failed,
+                                                             'fault_cycles': cycles},
+                                                    'peerloss-loud-unblocked-kitwait')['status'], 'PASS')
+        # a survivor that outlasted the kit wait is not the pinned outcome
+        self.assertEqual(rd.replica_control_verdict(ok, ok, {'survivor_outlasts_quorum_loss': held, 'fault_cycles': cycles},
+                                                    'peerloss-loud-unblocked-kitwait')['status'], 'FAIL')
+
+
+class DiagnosisTest(unittest.TestCase):
+    """A survivor that exited and a member stranded below the leader's log start are named, from the logs, and the
+    stranded member is tied to its own restart."""
+
+    def fake(self, running, logs, started='2026-11-19T04:12:57Z', leader='ae2'):
+        from types import SimpleNamespace
+        calls = []
+
+        def command(argv, check=False):
+            calls.append(argv)
+            text = logs[argv[-1]] if isinstance(logs, dict) else logs
+            if '--since' in argv and isinstance(text, tuple):
+                text = text[1]
+            elif isinstance(text, tuple):
+                text = text[0] + text[1]
+            return SimpleNamespace(stdout=text, stderr='')
+        state = {'Running': running, 'ExitCode': 0 if running else 1, 'StartedAt': started}
+        f = SimpleNamespace(registry={'containers': {'ae0': 'c0', 'ae1': 'c1', 'ae2': 'c2'}},
+                            inspect=lambda kind, cid: {'State': state}, command=command)
+        run = SimpleNamespace(f=f, calls=calls, leader=lambda: leader)
+        run.logs_of = lambda role, since=None: rd.ReplicaDrillRun.logs_of(run, role, since)
+        return run
+
+    def test_an_exited_survivor_reports_its_fatal_and_watchdog_lines(self):
+        watchdog = 'CRITICAL rejoin watchdog: election 2 open for 60004 ms (CANVASS), exiting 1'
+        line = '[ERROR] AeronCluster - Core node FATAL (exit 1): member did not rejoin'
+        out = rd.ReplicaDrillRun.survivor_state(self.fake(False, 'boot\n' + watchdog + '\n' + line + '\n'), 'ae0')
+        self.assertEqual((out['running'], out['exit_code'], out['fatal'], out['watchdog']), (False, 1, line, watchdog))
+        self.assertEqual(rd.ReplicaDrillRun.survivor_state(self.fake(True, ''), 'ae0'), {'running': True, 'exit_code': None})
+
+    REFUSAL = ('ArchiveException: ERROR - response for correlationId=917, error: requested replay start '
+               'position=3092320 is less than recording start position=3145728 for recording 0')
+    CATCHUP = 'TimeoutException: WARN - failed to join catchup log'
+
+    def test_a_stranded_member_needs_its_own_failed_catch_up_and_the_leaders_refusal_after_its_restart(self):
+        run = self.fake(True, {'c1': ('', self.CATCHUP + '\n'), 'c2': ('', 'x\n' + self.REFUSAL + '\n')})
+        out = rd.ReplicaDrillRun.stranded(run, 'ae1')
+        self.assertEqual((out['member'], out['leader'], out['requested_position'], out['leader_log_start']),
+                         ('ae1', 'ae2', 3092320, 3145728))
+        self.assertTrue(all(argv[2:4] == ['--since', '2026-11-19T04:12:57Z'] for argv in run.calls), run.calls)
+        # a refusal from before the restart (another reader's, or an older life) does not count
+        self.assertIsNone(rd.ReplicaDrillRun.stranded(self.fake(True, {'c1': ('', self.CATCHUP),
+                                                                       'c2': (self.REFUSAL, 'nothing')}), 'ae1'))
+        # nor does the leader's refusal without the member's own failed catch-up (a replica's or a backup's replay)
+        self.assertIsNone(rd.ReplicaDrillRun.stranded(self.fake(True, {'c1': ('', 'joined'),
+                                                                       'c2': ('', self.REFUSAL)}), 'ae1'))
+        self.assertIsNone(rd.ReplicaDrillRun.stranded(self.fake(True, {}, leader=None), 'ae1'))
+
+    def test_the_kill9_drill_reports_a_stranded_member_as_a_product_defect(self):
+        from types import SimpleNamespace
+        from contracts import ProductDefect
+        stranded = {'member': 'ae1', 'leader': 'ae2', 'member_line': self.CATCHUP, 'leader_line': self.REFUSAL}
+
+        def restart_role(row):
+            raise Inconclusive('startup deadline exceeded: ae1/ready')
+        run = SimpleNamespace(need=lambda *a: 1, snapshot_position=lambda: 1, s=S, members=lambda: ['ae1'],
+                              kill_role=lambda role: {'target': role}, restart_role=restart_role,
+                              stranded=lambda role: dict(stranded), loud_strand=lambda role: None, rw={},
+                              strand_after_wait=lambda role: (None, 'still running 180 s after the readiness bound'))
+        with self.assertRaises(ProductDefect) as caught:
+            rd.ReplicaDrillRun.replica_member_kill9(run)
+        self.assertEqual(caught.exception.defect, rd.STRANDED_DEFECT)
+        self.assertIsInstance(caught.exception.__cause__, Inconclusive)
+        self.assertIn('never catch up', str(caught.exception))
+        self.assertEqual(run.rw['stranded']['error'], 'startup deadline exceeded: ae1/ready')
+        self.assertIn('still running', run.rw['stranded']['loud_exit_wait'])
+        # without the stranded evidence the readiness failure stays what it was
+        run.stranded = lambda role: None
+        with self.assertRaisesRegex(Inconclusive, 'startup deadline exceeded'):
+            rd.ReplicaDrillRun.replica_member_kill9(run)
+
+
+class SurvivorExitWiringTest(unittest.TestCase):
+    """replica_peerloss_loud names an exited survivor (chaining the error it replaces) and refuses to start below the
+    quorum-loss bound, reading the members' recorded wait (on a scripted run, no fixture)."""
+
+    def run_(self, survivor_running, wait_ms='330000', fail_restart=False):
+        from types import SimpleNamespace
+        events = []
+
+        def restart_role(row, ready_timeout=None):
+            events.append(('restart', row['target']))
+            if fail_restart and row['target'] == 'ae2':
+                raise Inconclusive('fixture process ae1 exited 1 before readiness')
+            return {}, 1.0
+        f = SimpleNamespace(engine_env=lambda engine, i: {'ENGINE_REJOIN_WAIT_MS': wait_ms} if wait_ms else {},
+                            wipe_shadows=lambda role: {'files': 2}, archive_endpoint=lambda role: role,
+                            root=None)
+        run = SimpleNamespace(
+            variant={'unblocked': True}, s=S, f=f, rw={}, peer_roles=lambda both_followers=False: ('ae0', 'ae2', 'ae1'),
+            need=lambda *a: {'log_start_segment': 3}, try_read=lambda read: None, mm=lambda role: None,
+            kill_role=lambda role: {'target': role}, restart_role=restart_role,
+            survivor_state=lambda role: ({'running': True, 'exit_code': None} if survivor_running else
+                                         {'running': False, 'exit_code': 1, 'watchdog': 'CRITICAL rejoin watchdog: x'}),
+            watch_loud_start=lambda target, x: None)
+        run.survivor_exit = lambda survivor, x, gated=False: rd.ReplicaDrillRun.survivor_exit(run, survivor, x, gated)
+        return run, events
+
+    def test_a_survivor_that_exited_is_named_and_the_replaced_error_chained(self):
+        run, _ = self.run_(False, fail_restart=True)
+        with self.assertRaises(Inconclusive) as caught:
+            rd.ReplicaDrillRun.replica_peerloss_loud(run)
+        self.assertIn('the survivor ae1 exited 1 during the quorum loss: CRITICAL rejoin watchdog', str(caught.exception))
+        self.assertIn('before readiness', str(caught.exception.__cause__))
+        self.assertIn('before readiness', run.rw['peerloss']['primary_error'])
+
+    def test_the_drill_refuses_to_start_on_a_wait_below_its_bound(self):
+        run, events = self.run_(True, wait_ms='60000')
+        with self.assertRaisesRegex(Violation, 'lone survivor would exit 1'):
+            rd.ReplicaDrillRun.replica_peerloss_loud(run)
+        self.assertEqual(events, [])                 # nothing was killed
+        self.assertEqual(run.rw['peerloss']['rejoin_wait_ms'], 60000)
+
+
 class EarlyTapEndTest(unittest.TestCase):
     """The tap ends at the drill's last step plus TAP_SETTLE_S, not at its summed worst-case window (on a virtual clock)."""
 
@@ -691,6 +876,7 @@ def test_core_fixture_manifest(temp):
 class NamingTest(unittest.TestCase):
     """No plan ids and no em-dash in the files and names this change adds (naming by content)."""
     FILES = ['replica_drills.py', 'lag_sampler.py', 'test_replica_drills.py', 'test_replica_fixture.py',
+             'test_superseded_gap.py', 'test_kit_gating.py',
              'nightly-cut-embedded.json', 'nightly-cut-external.json']
     PLAN_ID = re.compile(r'\b(RCS?\d*|S9|S-A0\d|D-S9[-\w]*|T-PL\d|PL[1-5]|FIX-\d+|BLOCKER-\d|NOTE-\d+|W[0-6]|Q-R\d*)\b'
                          r'|\b(PL\d*|S_A0\d|A0\d)_[A-Z]')

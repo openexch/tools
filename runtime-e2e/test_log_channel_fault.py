@@ -31,4 +31,28 @@ class LogFilterTest(unittest.TestCase):
         with self.assertRaises(Violation): filter_arguments(m, 'me0', 'flush')
 
 
+class LogFilterTargetTest(unittest.TestCase):
+    """A filter on a stopped target names the stop and its exit code, not the network."""
+
+    class Fixture:
+        def __init__(self, running, network='net-1'):
+            self.m = {'ports': {'me_base': 9000, 'ae_base': 19300, 'stride': 100}}
+            self.registry = {'containers': {'ae0': 'cid-ae0'}, 'network_id': 'net-1'}
+            self.state = {'State': {'Running': running, 'ExitCode': 0 if running else 1},
+                          'HostConfig': {'NetworkMode': network}}
+
+        def inspect(self, kind, rid):
+            return self.state
+
+    def test_a_stopped_target_is_named_with_its_exit_code(self):
+        from contracts import Inconclusive
+        from log_channel_fault import log_filter
+        with self.assertRaises(Inconclusive) as caught:
+            log_filter(self.Fixture(False), 'ae0', 'delete', 'archive')
+        self.assertIn('ae0 is not running (exit code 1)', str(caught.exception))
+        with self.assertRaises(Inconclusive) as caught:
+            log_filter(self.Fixture(True, network='other'), 'ae0', 'delete', 'archive')
+        self.assertIn('not in its owned private network', str(caught.exception))
+
+
 if __name__ == '__main__': unittest.main()

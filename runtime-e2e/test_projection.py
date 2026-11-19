@@ -1187,7 +1187,7 @@ class NightPlanProjectionTest(unittest.TestCase):
         plan = nightly.parse_plan(json.loads((Path(nightly.__file__).with_name('nightly-cut-external.json')).read_text()))
         entries = {(e['kind'], e['scenario']) for e in plan if e['scenario'] in projection_drills.SCENARIOS}
         self.assertEqual(entries, {(k, s) for k in ('pj', 'pj-ext') for s in projection_drills.SCENARIOS})
-        self.assertEqual(len(plan), 31)
+        self.assertEqual(len(plan), 32)
         embedded = nightly.parse_plan(json.loads((Path(nightly.__file__).with_name('nightly-cut-embedded.json')).read_text()))
         self.assertFalse([e for e in embedded if e['scenario'] in projection_drills.SCENARIOS])
 

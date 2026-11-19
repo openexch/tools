@@ -42,8 +42,11 @@ user other than the creating user is a FAIL (M2, O4). Holds are recomputed from 
                     tap could not observe (its session closed across a declared quorum loss or a recorded leader
                     election and reconnected after); a dispatch gap inside one may stay short of backfill and an
                     order whose terminal falls in one is recorded, not judged (Model.tap_closed, order_oracle.o5)}
-  tap_continuity   optional {"transitions": [CoreProbe tap session notes], "summary": {...}}; the dispatch
-                   density is computed from the rows themselves against core.pending_dispatch.head
+  tap_continuity   optional {"transitions": [CoreProbe tap session notes], "summary": {...},
+                   "release_counters": {role: {"minted_up_to", "minted_order", "superseded" (null: not exported)}}};
+                   the dispatch density is computed from the rows themselves against core.pending_dispatch.head; a
+                   gap right after a new_leader note closes when the core's superseded release mints account for
+                   every seq the backfill did not trace (superseded_account)
   story rows       request rows may carry "id", "resolves" and "resolved_by": an UNKNOWN original resolved by
                    a same-requestId re-send counts as the re-send's verdict (Model.creates/amends/cancels)
   dispatch_tap rows of kind RELEASE_ID carry a create's command id again; rows with
@@ -143,6 +146,100 @@ def resolve_requests(rows):
 
 def attempt(row):
     return integer(row['id_low']) >> 2
+
+
+RELEASE_COUNTER_METRICS = {'minted_up_to': 'core_release_minted_up_to_total',
+                           'minted_order': 'core_release_minted_order_total',
+                           'superseded': 'core_release_superseded_total',
+                           'abandoned': 'core_release_abandoned_total'}
+
+
+def superseded_account(rows, transitions, counters, head, summary=None, event_replay=None):
+    """Whether the dispatch gaps the backfill left short are release mints the core superseded, and the arithmetic.
+
+    A release mint that replaces a pending release takes the older seq out of the core's pending index (the core
+    counts it in ``core_release_superseded_total``): the forwarder's resync after a new leader never offers it, so the
+    ME never sees it and the tap, whose session lost that stretch across the leader change, never will either. Every
+    release seq the core minted is tapped, traced at the ME (a backfill row) or superseded unseen, so
+
+        superseded = minted_up_to + minted_order - (tapped releases + ME-traced untapped releases)
+
+    An abandoned backlog entry (``core_release_abandoned_total``, an order the ME answered RELEASED) also takes a
+    pending release seq out of the index unseen, so it is counted with the supersedes when the core exports it.
+
+    The gaps close exactly when every open gap starts right after a ``new_leader`` note, that number equals the
+    missed seqs the backfill did not trace, and the core's superseded (plus abandoned) count is at least that number.
+    The discriminating test is the equality; the core's counts are cumulative over the run, so the bound shows only
+    that enough seqs left the index unseen, not which seqs they were. The counters
+    are process-local: the member with the fullest count (the one that replayed the most log) is read; a member
+    restored inside the run under-counts, which can only keep a gap open. Without the superseded metric (an older
+    cut) the gaps stay open as before. None when the tap has no gap."""
+    tapped = [r for r in rows if r.get('source') != 'backfill']
+    seqs = [integer(r['seq']) for r in tapped]
+    high = max([head if type(head) is int else 0] + seqs) if seqs or type(head) is int else 0
+    gaps = seq_gaps(seqs, 1, high)
+    if not gaps:
+        return None
+    backfill = [r for r in rows if r.get('source') == 'backfill']
+    known = [integer(r['seq']) for r in backfill if r.get('seq') is not None]
+    pooled = sum(1 for r in backfill if r.get('seq') is None)
+    open_gaps = [[a, b] for a, b in gaps if (b - a + 1) - sum(1 for seq in known if a <= seq <= b)]
+    missed = sum(b - a + 1 for a, b in gaps)
+    traced = sum(1 for seq in known if any(a <= seq <= b for a, b in gaps)) + pooled
+    starts = sorted({integer(n.get('last_dispatch_seq') or 0) + 1 for n in transitions or []
+                     if n.get('event') == 'new_leader'})
+    out = {'gaps': open_gaps, 'after_new_leader': [g[0] for g in open_gaps if g[0] in starts], 'missed': missed,
+           'backfilled': traced, 'untraced': missed - traced,
+           'tapped_releases': len({integer(r['seq']) for r in tapped if r.get('kind') == RELEASE_KIND}),
+           'traced_untapped_releases': sum(1 for r in backfill if r.get('kind') == RELEASE_KIND),
+           'closes': False}
+    event_gaps = [list(g) for g in ((summary or {}).get('events') or {}).get('gaps') or []
+                  if g[0] in {integer(n.get('last_event_seq') or 0) + 1 for n in transitions or []
+                              if n.get('event') == 'new_leader'}]
+    if event_gaps:
+        replay = event_replay or {}
+        remaining = [list(g) for g in replay.get('remaining_gaps') or []
+                     if any(not (g[1] < a or g[0] > b) for a, b in event_gaps)]
+        out['events'] = {'gaps': event_gaps, 'replayed': bool(replay.get('complete')) and not remaining,
+                         'remaining': remaining}
+    if out['untraced'] <= 0:
+        out.update(closes=out['untraced'] == 0, why='the backfill traced every missed seq')
+        return out
+    stray = [g for g in open_gaps if g[0] not in starts]
+    if stray:
+        out['why'] = f'gap {stray[0]} does not start right after a new_leader note'
+        return out
+    members = {role: c for role, c in (counters or {}).items() if isinstance(c, dict)}
+    if not members:
+        out.update(metric='absent', why='no AE member exports the release mint counters')
+        return out
+    if any(c.get('superseded') is None for c in members.values()):
+        out.update(metric='absent', why='the core exports no core_release_superseded_total (an older cut): the gap '
+                                        'stays open')
+        return out
+    member = max(members, key=lambda role: (integer(members[role]['minted_up_to'])
+                                            + integer(members[role]['minted_order']), role))
+    c = members[member]
+    up_to, order, metric = integer(c['minted_up_to']), integer(c['minted_order']), integer(c['superseded'])
+    abandoned = integer(c['abandoned']) if c.get('abandoned') is not None else None
+    derived = up_to + order - (out['tapped_releases'] + out['traced_untapped_releases'])
+    bound = metric + (abandoned or 0)
+    out.update(metric='present', member=member, minted_up_to=up_to, minted_order=order, superseded_metric=metric,
+               abandoned_metric=abandoned, superseded_derived=derived,
+               arithmetic=(f'superseded = minted_up_to {up_to} + minted_order {order} - (tapped {out["tapped_releases"]}'
+                           f' + ME-traced untapped {out["traced_untapped_releases"]}) = {derived}; untraced missed '
+                           f'seqs {out["untraced"]}; core_release_superseded_total {metric}, core_release_abandoned_total '
+                           f'{"not exported" if abandoned is None else abandoned} ({member})'))
+    if derived != out['untraced']:
+        out['why'] = f'superseded derived {derived} != {out["untraced"]} untraced missed seqs'
+    elif derived > bound:
+        out['why'] = f'superseded derived {derived} is above the core\'s superseded and abandoned count {bound}'
+    else:
+        out.update(closes=True, why=(f'every missed seq is traced or a release seq that left the core\'s pending index '
+                                     f'unseen ({derived} untraced, within the run\'s {metric} supersedes and '
+                                     f'{abandoned or 0} abandoned entries; the counts show that this happened, not '
+                                     f'which seqs)'))
+    return out
 
 
 def seq_gaps(seqs, low, high):
@@ -277,8 +374,10 @@ class Model:
         A backfill row with a known seq must sit inside a gap; rows without a seq (resolved at the ME, rebuilt from its
         journal) are pooled across the gaps, so the check is: for every gap, known rows <= its size, and the pooled
         rows cover the remainder exactly. A gap inside a declared untappable window may stay short: the shortfall is
-        recorded in ``self.untapped`` and the gap counts as closed; pooled rows still may not exceed the deficit."""
-        self.untapped = []
+        recorded in ``self.untapped`` and the gap counts as closed; pooled rows still may not exceed the deficit. When the
+        sample carries the core's release counters, a shortfall the superseded release mints account for closes too
+        (``superseded_account``, recorded in ``self.superseded``)."""
+        self.untapped, self.superseded = [], None
         gaps, backfill = self.continuity['gaps'], self.continuity['backfill']
         declared = self.untappable('dispatch')
         known = [integer(r['seq']) for r in backfill if r.get('seq') is not None]
@@ -297,6 +396,13 @@ class Model:
             raise Inconclusive(f'{pooled} backfill rows without a seq but only {deficit} missing dispatch seqs')
         if deficit == pooled:
             return None
+        continuity = self.s.get('tap_continuity') or {}
+        if continuity.get('release_counters') is not None:
+            self.superseded = superseded_account(self.s['dispatch_tap'], continuity.get('transitions'),
+                                                 continuity.get('release_counters'), self.continuity['head'],
+                                                 continuity.get('summary'), continuity.get('event_replay'))
+            if self.superseded and self.superseded['closes']:
+                return None
         open_gaps = [[a, b] for a, b in gaps if (b - a + 1) - sum(1 for seq in known if a <= seq <= b)]
         if declared and all(any(lo <= a and b <= hi for lo, hi in declared) for a, b in open_gaps):
             self.untapped = [{'gaps': open_gaps, 'short': deficit - pooled,

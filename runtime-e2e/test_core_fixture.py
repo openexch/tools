@@ -27,6 +27,15 @@ def write(directory, name, data=b'x'):
     return {'path': str(path), 'sha256': hashlib.sha256(data).hexdigest(), 'source_sha': 'a' * 40}
 
 
+def kit_jar(pin=core_contracts.KIT_WATCHDOG_UNGATED_PIN):
+    """Jar bytes carrying a cluster-kit pin (the drills read the cut's kit from the core jar)."""
+    import zipfile
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, 'w') as jar:
+        jar.writestr('META-INF/maven/com.openexchange/cluster-kit/pom.properties', f'version={pin}\n')
+    return out.getvalue()
+
+
 def manifest(directory):
     nodes = {role: f'172.30.99.{10 + i}' for i, role in enumerate(sorted(core_contracts.ROLES))}
     engines = {role: [2 * i, 2 * i + 1] for i, role in enumerate(core_contracts.ENGINES)}
@@ -40,7 +49,7 @@ def manifest(directory):
         'cpu_set': list(range(12)) + [12, 13, 14, 15],
         'limits': {'shm_mb': 1024, 'memory_mb': 2048, 'disk_min_free_mb': 1,
                    'cpu_set_by_role': {**engines, 'probe': [20, 21]}, 'cpu_quota_by_role': {r: 2 for r in engines}},
-        'artifacts': {'ae': write(directory, 'ae.jar'), 'me': write(directory, 'me.jar'),
+        'artifacts': {'ae': write(directory, 'ae.jar', kit_jar()), 'me': write(directory, 'me.jar'),
                       'projector': write(directory, 'projector.jar'),
                       'forwarder': None, 'forwarder_b': None, 'bridge': None, 'bridge_b': None, 'shadow': None},
         'slot_artifacts': {'fwd0': None, 'fwd1': None, 'bridge0': None, 'bridge1': None, 'shadow0': None},
@@ -401,6 +410,9 @@ class SlotEnvTest(unittest.TestCase):
                 m['slot_artifacts'] = dict(m['slot_artifacts'], shadow0='shadow')
                 f = fixture_for(m, self.dir); f.keys = KeyRing(replica=True)
                 names |= set(f.engine_env('ae', 0)) | set(f.replica_env())
+                # the members' rejoin wait a peer-loss drill records (replica_drills.rejoin_wait_env)
+                f.member_rejoin_wait_env = {'ENGINE_REJOIN_WAIT_MS': '330000'}
+                names |= set(f.engine_env('ae', 0))
         # The gateway kinds: the four gateway slots with every artifact a slot can run, both driver modes
         from test_gateway_fixture import gateway_fixture
         for driver in ('external', 'embedded'):

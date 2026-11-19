@@ -22,7 +22,7 @@ import os
 import re
 import time
 
-from contracts import Inconclusive, Violation
+from contracts import Inconclusive, ProductDefect, Violation
 import core_contracts
 import core_drills
 from core_drills import DrillRun, _iso_ns, _line, control_verdict
@@ -73,6 +73,13 @@ SHADOW_RESTORE_PATHS = {2: 'EQUAL', 3: 'SKIP', 4: 'TAIL'}                  # cor
 RESTORE_NAMES = {0: 'NONE', 1: 'FULL', 2: 'EQUAL', 3: 'SKIP', 4: 'TAIL', 5: 'VIRTUAL_GENESIS'}
 REPLICA_RESTORE = {0: 'NONE', 1: 'LOCAL_SHADOW', 2: 'GENESIS', 3: 'PULLED_SHADOW', 4: 'REFUSED'}   # shadow_replica_restore_path
 HALT_TEXT = 'FATAL shadow restore'
+QUORUM_LOSS_SLACK_S = 30           # the drill's own reads between the steps of a quorum loss (quorum_loss_bound_s)
+STRANDED_TEXT = 'is less than recording start position'   # Aeron archive: a catch-up replay below the log's start
+CATCHUP_FAIL_TEXT = 'failed to join catchup log'          # Aeron Election: the follower's catch-up replay never joined
+STRANDED_DEFECT = 'stranded-below-log-start'               # ProductDefect tag: a member that can never log-catch-up
+LOUD_STRAND_DEFECT = 'loud-strand-inside-retention-floor'  # ProductDefect tag: a loud strand the floor should have held
+GATED_WATCHDOG_DEFECT = 'rejoin-watchdog-on-gated-kit'      # ProductDefect tag: the survivor exited on a gating kit
+WATCHDOG_TEXT = 'rejoin watchdog'                          # the kit's RejoinWatchdog exit line
 PULL_TEXT = '(3) pull:'
 MISSED_TEXT = 're-bootstrap missed'
 RESTART_TEXT = 'CRITICAL replica restart (exit 3)'      # CoreShadowReplicaMain's line for a decided re-bootstrap
@@ -475,10 +482,124 @@ def line_pull_skip_unchanged(w):
                      f'shadow_pull_source_skipped_leader_total {x.get("skipped_leader")}')
 
 
+def line_survivor_outlasts_quorum_loss(w):
+    """The lone survivor of a peer-loss quorum loss still ran when the drill restored the quorum. On the kit-default
+    control it fails with the watchdog's line (``rejoin watchdog``): the expected outcome that control pins."""
+    x = w.get('peerloss') or {}
+    state = x.get('survivor_state') or {}
+    if not state:
+        return _line(False, f'no survivor state recorded for {x.get("survivor")}', inconclusive=True)
+    if state.get('running'):
+        return _line(True, f'survivor {x.get("survivor")} running (rejoin wait {x.get("rejoin_wait_ms")} ms)')
+    return _line(False, f'survivor {x.get("survivor")} exited {state.get("exit_code")} during the quorum loss '
+                        f'(rejoin wait {x.get("rejoin_wait_ms")} ms): '
+                        f'{(state.get("watchdog") or state.get("fatal") or "no FATAL line")[:240]}')
+
+
 def line_filters_removed(w):
     rules = w.get('filters') or []
     return _line(all(r.get('removed') for r in rules),
                  f'{len(rules)} netfilter rules, removed: {[r.get("removed") for r in rules]}')
+
+
+def quorum_loss_bound_s(s, unblocked):
+    """The longest stretch the peer-loss-loud drills keep one member alone (its election open without a leader), from
+    the drill settings: the target's start waits out the AE restart minimum after its kill, then the target's halt (or,
+    unblocked, its /ready) gets LOUD_EXIT_BOUND_S; the loud variant then restarts the second member, whose /ready gets
+    OBSERVE_FACTOR x MEMBER_RESTART_READY_BOUND_S, and only that restores the quorum. QUORUM_LOSS_SLACK_S covers the
+    drill's own reads between the steps."""
+    bound = core_fixture.AE_RESTART_MIN_AFTER_KILL_S + s['LOUD_EXIT_BOUND_S'] + QUORUM_LOSS_SLACK_S
+    if not unblocked:
+        bound += s['OBSERVE_FACTOR'] * s['MEMBER_RESTART_READY_BOUND_S']
+    return bound
+
+
+def rejoin_wait_env(step, variant, env=None, watchdog_gated=False):
+    """The members' ENGINE_REJOIN_WAIT_MS for a replica drill step: only the peer-loss steps
+    (core_contracts.REJOIN_WAIT_DRILLS) raise it, a variant with ``rejoin_wait: 'kit'`` (the kit-default control)
+    keeps the kit default, and so does every step on a kit that gates its watchdog during a genuine quorum loss
+    (``watchdog_gated``: the override is not needed there). ``{}`` keeps the default."""
+    if (step not in core_contracts.REJOIN_WAIT_DRILLS or (variant or {}).get('rejoin_wait') == 'kit'
+            or watchdog_gated):
+        return {}
+    return {'ENGINE_REJOIN_WAIT_MS': str(core_contracts.member_rejoin_wait_ms(env))}
+
+
+def retention_settings(env):
+    """The kit's retention floor settings of a member, from its environment, else the kit defaults:
+    {floor: apply|report, member_wait_bytes, member_wait_ms}. A value the kit would refuse at boot (not a whole number,
+    outside the kit's range, an unknown floor mode) is refused here too."""
+    env = env or {}
+    floor = env.get(core_contracts.RETENTION_FLOOR_SETTING) or core_contracts.RETENTION_FLOOR_DEFAULT
+    if str(floor).strip() not in core_contracts.RETENTION_FLOOR_MODES:
+        raise Violation(f'{core_contracts.RETENTION_FLOOR_SETTING} must be apply or report, got {floor!r}')
+    out = {'floor': str(floor).strip()}
+    for key, name, default, (low, high) in (
+            ('member_wait_bytes', core_contracts.RETENTION_MEMBER_WAIT_BYTES_SETTING,
+             core_contracts.RETENTION_MEMBER_WAIT_BYTES_DEFAULT, core_contracts.RETENTION_MEMBER_WAIT_BYTES_RANGE),
+            ('member_wait_ms', core_contracts.RETENTION_MEMBER_WAIT_MS_SETTING,
+             core_contracts.RETENTION_MEMBER_WAIT_MS_DEFAULT, core_contracts.RETENTION_MEMBER_WAIT_MS_RANGE)):
+        raw = env.get(name)
+        if raw is None or raw == '':
+            out[key] = default
+        elif re.fullmatch(r'[0-9]+', str(raw)) and low <= int(raw) <= high:
+            out[key] = int(raw)
+        else:
+            raise Violation(f'{name} must be a whole number in {low}..{high}, got {raw!r}')
+    return out
+
+
+def retention_floor(position, leader_snapshot, down_ms, max_lag_bytes, max_lag_ms):
+    """The harness's own reading of the kit's bound for a stranded member, recorded next to the kit's verdict: it was
+    more than ``max_lag_bytes`` (RETENTION_MEMBER_WAIT_BYTES) behind the leader's snapshot (``leader_snapshot -
+    position``), or down longer than ``max_lag_ms`` (RETENTION_MEMBER_WAIT_MS). An unknown lag counts as within (only
+    the outage can then exceed it). The snapshot is read when the strand is observed, not when the leader purged, so it
+    can only overstate the lag."""
+    lag = leader_snapshot - position if isinstance(position, int) and isinstance(leader_snapshot, int) else None
+    by_bytes = lag is not None and lag > max_lag_bytes
+    by_time = down_ms is not None and down_ms > max_lag_ms
+    parts = [f'lag {"unknown" if lag is None else f"{lag} B"} {">" if by_bytes else "<="} {max_lag_bytes} B',
+             f'down {down_ms} ms {">" if by_time else "<="} {max_lag_ms} ms']
+    return {'exceeded': by_bytes or by_time, 'lag_bytes': lag, 'down_ms': down_ms, 'max_lag_bytes': max_lag_bytes,
+            'max_lag_ms': max_lag_ms, 'leader_snapshot': leader_snapshot, 'arithmetic': '; '.join(parts)}
+
+
+def _ns_iso(ns):
+    """Epoch ns -> RFC 3339 with ns (UTC), the form ``docker logs --since`` takes; the inverse of core_drills._iso_ns."""
+    from datetime import datetime, timezone
+    head = datetime.fromtimestamp(ns // 10**9, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
+    return f'{head}.{ns % 10**9:09d}Z'
+
+
+def kit_of(manifest):
+    """The cut's cluster-kit, read from the pin its core jar carries: {pin, watchdog_gated}. Inconclusive when the jar
+    carries no readable pin (the drill cannot tell which watchdog behaviour to expect)."""
+    import release_cut
+    path = ((manifest.get('artifacts') or {}).get('ae') or {}).get('path')
+    pin = release_cut.kit_pin_of(path) if path else None
+    if pin is None:
+        raise Inconclusive(f'the core jar {path} carries no cluster-kit pin ({release_cut.KIT_POM}): the drill cannot '
+                           f'tell whether the kit gates its rejoin watchdog')
+    return {'pin': pin, 'watchdog_gated': core_contracts.kit_watchdog_gated(pin)}
+
+
+def control_expect(control, kit):
+    """What a replica control expects of its lines on the cut's kit. The kit-default rejoin-wait control pins the
+    watchdog exit on a kit that trips it during a genuine quorum loss; on a kit that gates the watchdog the survivor
+    outlasts the quorum loss on the kit default, so the same line must hold. Every other control keeps its table entry."""
+    expect = core_drills.REPLICA_CONTROL_EXPECT[control]
+    if control == 'peerloss-loud-unblocked-kitwait' and (kit or {}).get('watchdog_gated'):
+        return {'fail': {}, 'hold': ['survivor_outlasts_quorum_loss']}
+    return expect
+
+
+def check_rejoin_wait(wait_ms, bound_s):
+    """The lone survivor must outlast the drill's quorum loss: its rejoin watchdog wait above the bound, or the drill
+    refuses to start (it would lose the member it observes and report that loss as something else)."""
+    if wait_ms <= bound_s * 1000:
+        raise Violation(f'the members\' rejoin wait ENGINE_REJOIN_WAIT_MS {wait_ms} ms does not exceed this drill\'s '
+                        f'quorum-loss bound {bound_s} s: the lone survivor would exit 1 in the middle of the drill; '
+                        f'raise {core_contracts.REJOIN_WAIT_SETTING} or lower the drill bounds')
 
 
 def untappable_windows(transitions, summary, quorum_loss=None, elections=None):
@@ -540,14 +661,26 @@ def untapped_record(order):
             'dispatch_short': sum(int(d.get('short') or 0) for d in u.get('dispatch_short') or [])}
 
 
+def superseded_record(order):
+    """The superseded-release arithmetic the order oracle judged a dispatch gap on (oracle_model.superseded_account),
+    for the drill verdict; None when the tap had no gap left short of its backfill or the sample carried no counters."""
+    account = (order or {}).get('tap_superseded')
+    if not account:
+        return None
+    return {k: account.get(k) for k in ('closes', 'why', 'gaps', 'after_new_leader', 'missed', 'backfilled', 'untraced',
+                                        'metric', 'member', 'superseded_metric', 'abandoned_metric', 'arithmetic',
+                                        'events') if k in account}
+
+
 LINES = {name[5:]: fn for name, fn in list(globals().items()) if name.startswith('line_')}
 core_drills.LINES.update(LINES)
 
 
-def replica_control_verdict(money, order, lines, control):
+def replica_control_verdict(money, order, lines, control, expect=None):
     """A replica control PASSES when both oracles PASS, every line it names FAILS with its text, and every line it keeps
-    HOLDS. A named line that fails without its text failed for another reason: the control is FAIL."""
-    expect = core_drills.REPLICA_CONTROL_EXPECT[control]
+    HOLDS. A named line that fails without its text failed for another reason: the control is FAIL. ``expect``: the
+    control's expectation on the cut's kit (control_expect), else its table entry."""
+    expect = expect or core_drills.REPLICA_CONTROL_EXPECT[control]
     base = control_verdict(money, order, lines, list(expect['fail']))
     if base['status'] != 'PASS':
         return base
@@ -575,22 +708,42 @@ class ReplicaDrillRun(DrillRun):
         self.control = self.variant.get('control')
         kind = fixture.m.get('manifest_kind')
         if self.control:
-            want = self.variant.get('kind')
-            if kind != want:
-                raise Inconclusive(f'control {self.control} runs on kind {want}, the manifest is {kind}')
+            # a control runs on its own kind, or (``kinds``) on one of its kinds: the peer-loss controls in both modes
+            want = self.variant.get('kinds') or [self.variant.get('kind')]
+            if kind not in want:
+                raise Inconclusive(f'control {self.control} runs on kind {" or ".join(want)}, the manifest is {kind}')
         elif kind not in self.spec['kinds']:
             raise Inconclusive(f'drill {name} runs on kinds {self.spec["kinds"]}, the manifest is {kind}')
         if kind in core_contracts.REPLICA_KINDS and fixture.m['slot_artifacts'].get('shadow0') != 'shadow':
             raise Inconclusive('the replica drills need shadow0 on the shadow artifact')
         spec = dict(self.spec)
         spec['story'] = story_for(spec['story'], self.s)
+        self.replica = kind in core_contracts.REPLICA_KINDS
+        # the peer-loss steps follow the cut's kit: its watchdog decides the rejoin-wait override and the kit-default
+        # control's expected outcome
+        self.kit = kit_of(fixture.m) if self.replica and spec['replica'] in core_contracts.REJOIN_WAIT_DRILLS else None
+        self.expect = control_expect(self.control, self.kit) if self.control else None
         if self.control:
-            expect = core_drills.REPLICA_CONTROL_EXPECT[self.control]
-            spec['lines'] = list(expect['fail']) + list(expect['hold'])
+            spec['lines'] = list(self.expect['fail']) + list(self.expect['hold'])
         spec['tap_extra_s'] = self.tap_extra_s(kind)
         self.spec = spec
-        self.rw = {}
-        self.replica = kind in core_contracts.REPLICA_KINDS
+        # the peer-loss steps alone run the members on a rejoin wait above their quorum loss (exact value, recorded),
+        # and only on a kit whose watchdog trips during a genuine quorum loss
+        gated = bool((self.kit or {}).get('watchdog_gated'))
+        fixture.member_rejoin_wait_env = rejoin_wait_env(self.spec['replica'], self.variant,
+                                                         watchdog_gated=gated) if self.replica else {}
+        self.rw = {'member_rejoin_wait_env': dict(fixture.member_rejoin_wait_env)}
+        if self.kit is not None:
+            self.rw['kit'] = dict(self.kit)
+            if fixture.member_rejoin_wait_env:
+                why = (f'applied: ENGINE_REJOIN_WAIT_MS {fixture.member_rejoin_wait_env["ENGINE_REJOIN_WAIT_MS"]} ms '
+                       f'(kit {self.kit["pin"]} trips its watchdog during a quorum loss)')
+            elif gated:
+                why = (f'not applied: kit {self.kit["pin"]} gates its watchdog during a genuine quorum loss, the members '
+                       f'run the kit default')
+            else:
+                why = 'not applied: the kit-default control runs the members on the kit default'
+            self.rw['rejoin_wait_override'] = why
         self.term_bytes = core_contracts.aeron_value(core_fixture.ENGINE_COMMON['TRANSPORT_LOG_TERM_LENGTH'])[1]
         self.sampler = None
 
@@ -791,13 +944,17 @@ class ReplicaDrillRun(DrillRun):
                 out = super().decide(money, order, lines, rows, sample, after)
             finally:
                 self.variant = saved
-            out.update(replica_control_verdict(money, order, lines, self.control))
+            out.update(replica_control_verdict(money, order, lines, self.control, getattr(self, 'expect', None)))
+            out['control_expect'] = getattr(self, 'expect', None)
             out['variant'] = saved
         out['replica_settings'] = dict(self.s)
         out['manifest_kind'] = self.f.m.get('manifest_kind')
         recorded = untapped_record(order)
         if recorded:
             out['untappable'] = recorded
+        superseded = superseded_record(order)
+        if superseded:
+            out['superseded'] = superseded
         return out
 
     def write_evidence(self, sample, money, order, lines, rows, w, story, tap_summary, result):
@@ -815,7 +972,36 @@ class ReplicaDrillRun(DrillRun):
         restarts = []
         for role in self.members():
             row = self.kill_role(role)
-            witness, ready_after = self.restart_role(row)
+            try:
+                witness, ready_after = self.restart_role(row)
+            except Inconclusive as error:
+                # A member that came back below the leader's log start cannot log-catch-up (the leader's archive
+                # refuses the replay below the start). A kit with a catch-up watchdog exits it loudly; before reading
+                # a running member as the silent strand, the drill gives that exit LOUD_EXIT_BOUND_S.
+                loud = self.loud_strand(role)
+                stranded = None
+                if loud is None:
+                    stranded = self.stranded(role)
+                    if stranded is None:
+                        raise
+                    loud, stranded['loud_exit_wait'] = self.strand_after_wait(role)
+                if loud is not None:
+                    self.judge_loud_strand(role, row, loud, error)
+                if not stranded['loud_exit_wait'].startswith('still running'):
+                    # it exited, but without the kit's loud line: neither the silent strand nor the loud one
+                    self.rw['stranded'] = dict(stranded, error=str(error))
+                    raise
+                # The silent strand: the member's election retries forever and never exits. A product defect, named
+                # with both lines, instead of the readiness deadline
+                self.rw['stranded'] = dict(stranded, error=str(error))
+                raise ProductDefect(STRANDED_DEFECT, (
+                    f'{role} restarted at a log position below the leader {stranded["leader"]}\'s log start and can '
+                    f'never catch up: while {role} was down the leader purged its log to its newest snapshot past a '
+                    f'segment boundary above {role}\'s position; the leader refuses every catch-up replay below its '
+                    f'log start and {role} retries its election without exiting (not ready, no loud exit within '
+                    f'{self.s["LOUD_EXIT_BOUND_S"]} s). '
+                    f'{role}: {stranded["member_line"][:160]}; {stranded["leader"]}: {stranded["leader_line"][:240]}')
+                ) from error
             restarts.append({'member': role, 'restore_path': gauge(self.try_read(lambda r=role: self.mm(r)),
                                                                    'core_restore_path'),
                              'ready_after_start_s': ready_after, 'waited_after_kill_s': witness.get('waited_after_kill_s'),
@@ -875,6 +1061,8 @@ class ReplicaDrillRun(DrillRun):
         counter does not move. The companion's survivor is the other follower (its pulled copies are what the target
         restores from; it is alone and cannot lead, which is what makes it a source) and the leader is killed instead."""
         unblocked = self.variant.get('unblocked', False)
+        kit_wait = self.variant.get('rejoin_wait') == 'kit'
+        gated = bool((getattr(self, 'kit', None) or {}).get('watchdog_gated'))
         # the unblocked companion's survivor must hold shadow copies to serve: a follower that pulled, never the leader
         # (a leader neither pulls nor produces, so it has nothing to list); the leader is killed with the replica and the
         # target. The loud variant keeps the leader as the survivor and blocks its archive port.
@@ -886,12 +1074,31 @@ class ReplicaDrillRun(DrillRun):
         x = {'leader': leader, 'target': target, 'other': other, 'survivor': survivor, 'unblocked': unblocked,
              'log_start_segment': listing['log_start_segment'], 'listing_before': listing,
              'replica_archive': 'unreachable: shadow0 is killed (a stopped container has no namespace to filter in)'}
+        x['rejoin_wait_ms'] = int(self.f.engine_env('ae', int(survivor[2:])).get(
+            'ENGINE_REJOIN_WAIT_MS', core_contracts.KIT_REJOIN_WAIT_DEFAULT_MS))
+        x['quorum_loss_bound_s'] = quorum_loss_bound_s(self.s, unblocked)
+        x['watchdog_gated'] = gated
         self.rw['peerloss'] = x
+        if kit_wait and gated:
+            # a kit that gates its watchdog during a genuine quorum loss: on the kit default the survivor outlasts it,
+            # and the control runs the same quorum loss as its companion (the line survivor_outlasts_quorum_loss holds)
+            x['expected'] = (f'the survivor outlasts the quorum loss on the kit default wait {x["rejoin_wait_ms"]} ms: '
+                             f'kit {self.kit["pin"]} gates its watchdog while no quorum is reachable')
+        elif kit_wait:
+            # the kit-default control: the survivor is expected to exit 1 on the rejoin watchdog before the target is
+            # ready; the drill then restarts it as a supervisor would and the line survivor_outlasts_quorum_loss
+            # records the exit (its expected FAIL)
+            x['expected'] = (f'the survivor exits 1 on the rejoin watchdog about {x["rejoin_wait_ms"]} ms into the '
+                             f'quorum loss, before the target is ready')
+            return self.peerloss_kit_wait(x, leader, target, second, survivor)
+        if not gated:
+            check_rejoin_wait(x['rejoin_wait_ms'], x['quorum_loss_bound_s'])
         filters = self.rw.setdefault('filters', [])
         x['pulls_before'] = gauge(self.try_read(lambda: self.mm(target)), 'shadow_pull_total')
         x['survivor_pulls_before'] = gauge(self.try_read(lambda: self.mm(survivor)), 'shadow_pull_total')
         quorum_lost_ms = time.time_ns() // 1_000_000
         rows = {r: self.kill_role(r) for r in ('shadow0', second, target)}
+        primary = None
         try:
             if not unblocked:
                 filters.append({'target': leader, 'port_kind': 'archive',
@@ -907,19 +1114,231 @@ class ReplicaDrillRun(DrillRun):
                     x['restore_path'] = int(x['restore_path'])
             else:
                 self.watch_loud_start(target, x)
+        except BaseException as error:
+            primary = error
+            x['primary_error'] = f'{type(error).__name__}: {error}'
+            raise
         finally:
+            # the survivor is the member the drill observes alone: a survivor that exited during the quorum loss is
+            # named as such (the error it replaces is chained and kept in the witness), never reported as a filter or
+            # readiness failure of another role
+            x['survivor_state'] = self.survivor_state(survivor)
+            if not x['survivor_state']['running']:
+                raise self.survivor_exit(survivor, x, gated) from primary
             for rule in filters:
                 if not rule['removed']:
                     rule['delete'] = log_channel_fault.log_filter(self.f, rule['target'], 'delete', 'archive')
                     rule['counters_after'] = log_channel_fault.log_filter(self.f, rule['target'], 'counters', 'archive')
                     rule['removed'] = rule_removed(rule['counters_after'], self.f.archive_endpoint(rule['target']))
-        self.restart_role(rows[second])
+        try:
+            self.restart_role(rows[second])
+        except Inconclusive as error:
+            # a survivor that exits while the second member restarts would read as the second's readiness failure
+            x['survivor_state'] = self.survivor_state(survivor)
+            if x['survivor_state']['running']:
+                raise
+            raise self.survivor_exit(survivor, x, gated) from error
         self.rw['quorum_loss'] = {'from_ms': quorum_lost_ms, 'to_ms': time.time_ns() // 1_000_000,
                                   'killed': ['shadow0', second, target], 'survivor': survivor}
         # the replica first: it always holds an ALIGNED shadow, so the halted target's second start has a source
         self.restart_role(rows['shadow0'], ready_timeout=self.s['OBSERVE_FACTOR'] * self.s['REPLICA_RESTART_READY_BOUND_S'])
         if not unblocked:
             self.restart_role(rows[target], ready_timeout=self.s['LOUD_EXIT_BOUND_S'])
+
+    def survivor_exit(self, survivor, x, gated=False):
+        """The error for a survivor that exited during the quorum loss: its exit code and its watchdog or FATAL line. On
+        a kit that gates its rejoin watchdog during a genuine quorum loss a watchdog exit is that kit's regression: a
+        product defect (it fails the kit-default control too, whose line survivor_outlasts_quorum_loss must hold)."""
+        state = x['survivor_state']
+        if gated and state.get('watchdog'):
+            return ProductDefect(GATED_WATCHDOG_DEFECT, (
+                f'the survivor {survivor} exited {state["exit_code"]} on the rejoin watchdog during a genuine quorum '
+                f'loss, but kit {(self.kit or {}).get("pin")} gates the watchdog while no quorum is reachable: '
+                f'{state["watchdog"][:240]}'))
+        return Inconclusive(f'the survivor {survivor} exited {state["exit_code"]} during the quorum loss: '
+                            f'{state.get("watchdog") or state.get("fatal") or "no FATAL line in its log"}')
+
+    def peerloss_kit_wait(self, x, leader, target, second, survivor):
+        """The unblocked peer loss on the kit-default rejoin wait: kill the replica, the leader and the target, wipe the
+        target's shadows and start it (it restores from the survivor's copies, which takes longer than the wait), then
+        wait for the survivor's watchdog exit (1). As a supervisor would, restart the survivor, the second member and the
+        replica, and see the target ready (restarting it if its restore halted)."""
+        wait_s = x['rejoin_wait_ms'] / 1000
+        bound = wait_s + self.s['LOUD_EXIT_BOUND_S'] + QUORUM_LOSS_SLACK_S
+        x['survivor_fault_row'] = self.f.open_fault(survivor, 0, bound, reason='expected exit: the kit rejoin watchdog')
+        quorum_lost_ms = time.time_ns() // 1_000_000
+        rows = {r: self.kill_role(r) for r in ('shadow0', second, target)}
+        x['wipe'] = {k: v for k, v in self.f.wipe_shadows(target).items() if k != 'at_ns'}
+        start = self.f.restart(target, wait_ready=False)
+        x['target_started_at'] = start['started_at']
+        try:
+            x['survivor_exit'] = self.f.wait_exit(survivor, 1, wait_s + QUORUM_LOSS_SLACK_S)
+        except Inconclusive as error:
+            x['survivor_exit_error'] = str(error)
+        x['survivor_state'] = self.survivor_state(survivor)
+        if x['survivor_state']['running']:
+            # the expected outcome did not occur: the control's line holds, and the verdict says FAIL
+            self.f.close_fault(survivor)
+        else:
+            self.f.restart(survivor, wait_ready=False)
+        self.restart_role(rows[second])
+        self.rw['quorum_loss'] = {'from_ms': quorum_lost_ms, 'to_ms': time.time_ns() // 1_000_000,
+                                  'killed': ['shadow0', second, target], 'survivor': survivor,
+                                  'survivor_exited': not x['survivor_state']['running']}
+        self.restart_role(rows['shadow0'], ready_timeout=self.s['OBSERVE_FACTOR'] * self.s['REPLICA_RESTART_READY_BOUND_S'])
+        cid = self.f.registry['containers'][target]
+        if self.f.inspect('container', cid)['State']['Running']:
+            ready, waited = self.until(lambda: self.f.ready_body(target)[0] == 200 or None, self.s['LOUD_EXIT_BOUND_S'], 1.0)
+            if not ready:
+                raise Inconclusive(f'{target} not ready {self.s["LOUD_EXIT_BOUND_S"]} s after the quorum came back')
+            self.restarted.add(target)
+            self.ledger.heal(rows[target], 'restart', {'started_at': start['started_at'], 'ready_waited_s': waited})
+            x['target_restarts'] = 1
+        else:
+            x['target_halt'] = self.survivor_state(target)
+            self.restart_role(rows[target], ready_timeout=self.s['LOUD_EXIT_BOUND_S'])
+            x['target_restarts'] = 2
+        scrape = self.try_read(lambda: self.mm(target))
+        x.update(ready=True, restore_path=gauge(scrape, 'core_restore_path'))
+        if x['restore_path'] is not None:
+            x['restore_path'] = int(x['restore_path'])
+        if not x['survivor_state']['running']:
+            def survivor_ready():
+                return self.f.ready_body(survivor)[0] == 200 or None
+            ready, _ = self.until(survivor_ready, self.s['OBSERVE_FACTOR'] * self.s['MEMBER_RESTART_READY_BOUND_S'], 1.0)
+            if not ready:
+                raise Inconclusive(f'the survivor {survivor} restarted after its watchdog exit but never became ready')
+            self.restarted.add(survivor)
+            self.f.close_fault(survivor)
+
+    def logs_of(self, role, since=None):
+        """A container's log text (stdout and stderr), from ``since`` (an RFC 3339 time) when given."""
+        cid = self.f.registry['containers'][role]
+        argv = ['docker', 'logs'] + (['--since', since] if since else []) + [cid]
+        logs = self.f.command(argv, check=False)
+        return (logs.stdout or '') + '\n' + (logs.stderr or '')
+
+    def survivor_state(self, role):
+        """Whether ``role`` still runs; when it exited, its exit code, its last FATAL or CRITICAL log line and its rejoin
+        watchdog line (if any)."""
+        cid = self.f.registry['containers'][role]
+        state = self.f.inspect('container', cid)['State']
+        out = {'running': bool(state['Running']), 'exit_code': None if state['Running'] else state['ExitCode']}
+        if not out['running']:
+            lines = [l.strip() for l in self.logs_of(role).splitlines() if 'FATAL' in l or 'CRITICAL' in l]
+            out['fatal'] = lines[-1] if lines else None
+            out['watchdog'] = next((l for l in lines if WATCHDOG_TEXT in l), None)
+        return out
+
+    def stranded(self, member):
+        """Evidence that ``member`` restarted below the leader's log start, tied to this restart: since the member's
+        last docker start, the member's own log has a failed catch-up and the leader's log refuses a replay below its
+        recording start. None when either is missing (or there is no leader, or the member is not running)."""
+        leader = self.leader()
+        if leader is None or leader == member:
+            return None
+        cid = self.f.registry['containers'][member]
+        state = self.f.inspect('container', cid)['State']
+        if not state['Running']:
+            return None
+        since = state['StartedAt']
+        member_line = next((l.strip() for l in self.logs_of(member, since).splitlines() if CATCHUP_FAIL_TEXT in l), None)
+        leader_line = next((l.strip() for l in self.logs_of(leader, since).splitlines() if STRANDED_TEXT in l), None)
+        if member_line is None or leader_line is None:
+            return None
+        found = re.search(r'requested replay start position=(\d+) is less than recording start position=(\d+)',
+                          leader_line)
+        return {'member': member, 'leader': leader, 'since': since, 'member_line': member_line,
+                'leader_line': leader_line, 'requested_position': int(found.group(1)) if found else None,
+                'leader_log_start': int(found.group(2)) if found else None}
+
+    def loud_strand(self, member):
+        """The kit's loud strand exit of ``member`` (its catch-up watchdog's CRITICAL line or FATAL reason,
+        core_contracts.loud_strand_of), from its log since its last docker start: {member, exit_code, since, line,
+        position, log_start, leader_member}. None while it runs or without the line."""
+        cid = self.f.registry['containers'][member]
+        state = self.f.inspect('container', cid)['State']
+        if state['Running']:
+            return None
+        for line in self.logs_of(member, state['StartedAt']).splitlines():
+            found = core_contracts.loud_strand_of(line)
+            if found:
+                return dict(found, member=member, exit_code=state['ExitCode'], since=state['StartedAt'],
+                            line=line.strip())
+        return None
+
+    def strand_after_wait(self, member):
+        """A running member with the silent strand's evidence: wait up to LOUD_EXIT_BOUND_S for the kit's catch-up
+        watchdog to exit it (it exits after ENGINE_CATCHUP_REFUSALS failed catch-ups or ENGINE_CATCHUP_REFUSAL_WAIT_MS of
+        them, then the fatal grace), then read its loud lines: (loud or None, what the wait saw)."""
+        cid = self.f.registry['containers'][member]
+        bound = self.s['LOUD_EXIT_BOUND_S']
+        stopped, waited = self.until(lambda: not self.f.inspect('container', cid)['State']['Running'] or None, bound, 1.0)
+        if not stopped:
+            return None, f'still running {waited} s after the readiness bound (LOUD_EXIT_BOUND_S {bound} s)'
+        loud = self.loud_strand(member)
+        return loud, f'exited {waited} s after the readiness bound' + ('' if loud else ' without the kit\'s loud line')
+
+    def judge_loud_strand(self, role, row, loud, error):
+        """The kit exited ``role`` loudly below the leader's log start: the expected loud failure (INCONCLUSIVE: the
+        member is gone and its cycle cannot finish) when the kit wrote it off or applies no floor, a product defect
+        when it did not. The harness's own bound arithmetic is recorded; when it says the bound passed but no member
+        logged the write-off, the drill cannot tell which is right and is INCONCLUSIVE."""
+        floor = self.strand_floor(role, row, loud)
+        self.rw['loud_strand'] = dict(loud, floor=floor, error=str(error))
+        line = loud['line'][:240]
+        if floor['exceeded']:
+            raise Inconclusive(
+                f'{role} exited FATAL stranded below the leader\'s log start after the kit gave it up ({floor["why"]}):'
+                f' the expected loud failure, so the drill cannot judge the rest of its cycle; {line}') from error
+        if floor['bound_passed']:
+            raise Inconclusive(
+                f'{role} exited FATAL stranded below the leader\'s log start; by the harness\'s arithmetic the bound '
+                f'passed ({floor["arithmetic"]}) but no member logged a STRANDED line for it: the drill cannot tell '
+                f'whether the floor held; {line}') from error
+        raise ProductDefect(LOUD_STRAND_DEFECT, (
+            f'{role} exited FATAL stranded below the leader\'s log start, but the kit did not write it off '
+            f'({floor["why"]}; {floor["arithmetic"]}): the leader should have held its log for {role} and {role} '
+            f'should have rejoined; {line}')) from error
+
+    def strand_floor(self, member, row, loud):
+        """Whether the kit gave ``member`` up, from the other members since the kill: a member's CRITICAL STRANDED line
+        naming it (the leader wrote it off), a CRITICAL saying a member's unknown floor passed its bound, or a member
+        that only reports its floor (RETENTION_FLOOR=report). The settings are the other members' (the leader's pruner
+        enforces the floor). The harness's own arithmetic (retention_floor) is recorded as ``bound_passed``."""
+        member_id = int(member[2:])
+        killed = row.get('opened_ns')
+        since = _ns_iso(killed) if killed else None
+        others = sorted(r for r in self.f.registry['containers'] if re.fullmatch(r'ae\d+', r) and r != member)
+        settings_of = {r: retention_settings(self.f.engine_env('ae', int(r[2:]))) for r in others}
+        out = {'settings': settings_of, 'exceeded': False, 'by': None, 'since': since}
+        reporting = [r for r, v in settings_of.items() if v['floor'] == 'report']
+        for role in others:
+            lines = self.logs_of(role, since).splitlines()
+            hit = next((l.strip() for l in lines if core_contracts.written_off(l, member_id)), None)
+            if hit:
+                out.update(exceeded=True, by='written off', written_off_by=role, line=hit[:300],
+                           why=f'{role} wrote member {member_id} off: {hit[:200]}')
+                break
+            hit = next((l.strip() for l in lines if core_contracts.FLOOR_GIVEN_UP_TEXT in l and 'has passed' in l), None)
+            if hit:
+                out.update(exceeded=True, by='floor unknown', written_off_by=role, line=hit[:300],
+                           why=f'{role} could not work out its floor and passed the bound: {hit[:200]}')
+                break
+        if not out['exceeded'] and reporting:
+            out.update(exceeded=True, by='report', why=f'{", ".join(reporting)} only report the floor '
+                                                      f'({core_contracts.RETENTION_FLOOR_SETTING}=report)')
+        if not out['exceeded']:
+            out['why'] = f'no member logged a STRANDED line for member {member_id} since its kill'
+        leader = self.leader()
+        snapshot = gauge(self.try_read(lambda: self.mm(leader)), 'core_snapshot_last_log_position') if leader else None
+        down_ms = (_iso_ns(loud['since']) - killed) // 1_000_000 if killed and loud.get('since') else None
+        bound = settings_of.get(leader) or retention_settings({})
+        arithmetic = retention_floor(loud.get('position'), int(snapshot) if snapshot is not None else None, down_ms,
+                                     bound['member_wait_bytes'], bound['member_wait_ms'])
+        out.update({k: arithmetic[k] for k in ('lag_bytes', 'down_ms', 'leader_snapshot', 'arithmetic')},
+                   bound_passed=arithmetic['exceeded'], leader=leader)
+        return out
 
     def watch_loud_start(self, target, x):
         """Start the target without waiting for /ready, watch /ready and the restore gauge until it exits, then read its
