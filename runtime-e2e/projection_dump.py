@@ -4,8 +4,11 @@ STDOUT`` per table, hashed with SHA-256 (never a CRC), and a ``SHA256SUMS`` file
 
 Two projections of one journal are equal when every table's hash is equal. The column lists are fixed here, in this
 order, and name only columns that are a function of the journal bytes: a wall-clock column (the money projection's
-``ingested_at``, the projection state's ``beat_at``, ``lease_until`` and ``updated_at``) is never dumped. A table that
-does not exist is reported as absent, never as empty.
+``ingested_at``, the projection state's ``beat_at``, ``lease_until`` and ``updated_at``) is never dumped. A column a table
+has beyond its fixed list (and not one of those known wall-clock columns) is dumped too, after the fixed ones in name
+order and recorded as ``extra_columns``: a projection that grew a column never compares equal by leaving it out. Such a
+table's fixed columns alone are hashed too (``sha256_fixed``), so a comparison can tell the extra columns from the rest.
+A table that does not exist is reported as absent, never as empty.
 
 Usage: projection_dump.py --psql <psql binary> --host H --port P --user U --database D --out DIR [--set history|money|all]
 Writes ``DIR/<table>.copy`` and ``DIR/SHA256SUMS``; prints {"tables": {table: {"sha256", "rows", "bytes"}}} as JSON.
@@ -39,12 +42,28 @@ MONEY_TABLES = {
                           ['journal_seq', 'leg_no']),
 }
 SETS = {'history': HISTORY_TABLES, 'money': MONEY_TABLES, 'all': {**HISTORY_TABLES, **MONEY_TABLES}}
+# The wall-clock columns a dump never takes (the list above names none of them)
+WALL_CLOCK_COLUMNS = {'ingested_at'}
 
 
-def copy_sql(table, tables=None):
-    """The one COPY statement of ``table``: its fixed columns, ordered by its primary key."""
+def copy_sql(table, tables=None, extra=()):
+    """The one COPY statement of ``table``: its fixed columns (then ``extra``), ordered by its primary key."""
     columns, key = (tables or SETS['all'])[table]
-    return f'COPY (SELECT {", ".join(columns)} FROM {table} ORDER BY {", ".join(key)}) TO STDOUT'
+    return f'COPY (SELECT {", ".join(list(columns) + list(extra))} FROM {table} ORDER BY {", ".join(key)}) TO STDOUT'
+
+
+def columns_sql(table):
+    return ("SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' "
+            f"AND table_name = '{table}' ORDER BY column_name")
+
+
+def extra_columns(listing, table, tables=None):
+    """The columns of ``listing`` (the output of columns_sql, one name per line) beyond the table's fixed list."""
+    columns, _ = (tables or SETS['all'])[table]
+    names = [n.strip() for n in (listing.decode() if isinstance(listing, bytes) else str(listing)).splitlines() if n.strip()]
+    if any(not n.replace('_', '').isalnum() for n in names):
+        raise ValueError(f'{table}: unexpected column name in {names}')
+    return sorted(set(names) - set(columns) - WALL_CLOCK_COLUMNS)
 
 
 def exists_sql(table):
@@ -70,16 +89,25 @@ def dump(run, out_dir, tables):
         if not present:
             results[table] = {'absent': True}
             continue
-        data = run(copy_sql(table, tables))
+        extra = extra_columns(run(columns_sql(table)), table, tables)
+        data = run(copy_sql(table, tables, extra))
         (out_dir / f'{table}.copy').write_bytes(data)
         results[table] = {'sha256': digest(data), 'rows': data.count(b'\n'), 'bytes': len(data)}
+        if extra:
+            # the fixed columns alone hashed as well, so a comparison can tell the extra columns from the rest
+            results[table]['extra_columns'] = extra
+            results[table]['sha256_fixed'] = digest(run(copy_sql(table, tables)))
     (out_dir / 'SHA256SUMS').write_text(sums_text(results))
     return results
 
 
-def equal(a, b):
-    """The tables whose hashes differ between two dumps (absent on one side counts as a difference)."""
-    return sorted(t for t in set(a) | set(b) if (a.get(t) or {}).get('sha256') != (b.get(t) or {}).get('sha256')
+def equal(a, b, fixed=False):
+    """The tables whose hashes differ between two dumps (absent on one side counts as a difference). ``fixed``: compare
+    the fixed columns alone (``sha256_fixed`` where a table had extra columns, else its one hash)."""
+    def h(d, t):
+        r = d.get(t) or {}
+        return r.get('sha256_fixed', r.get('sha256')) if fixed else r.get('sha256')
+    return sorted(t for t in set(a) | set(b) if h(a, t) != h(b, t)
                   or (a.get(t) or {}).get('absent') or (b.get(t) or {}).get('absent'))
 
 

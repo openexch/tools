@@ -40,16 +40,21 @@ build needs stops it with a message naming the variable when it is unset. A ``Co
   MK_PROBE_MANIFEST     the ``probe-manifest.json`` written by ``build_core_probes.py``
   MK_NETFILTER_HELPER   the netfilter helper directory (``iptables-legacy`` and its extensions)
   MK_GATEWAY_NC         oe-gateway of the cut's gateway commit built with GW_NC_FRESH_KEY (the gateway kinds' gateway_nc)
-  MK_GATEWAY_NC_NO_CANCEL_REOFFER_RULE, MK_GATEWAY_NC_NO_ASSET_CHECK   the same commit built with that control define (the
-                        gateway_nc of the kinds whose ``nc_define`` names it)
+  MK_GATEWAY_NC_NO_CANCEL_REOFFER_RULE, MK_GATEWAY_NC_NO_ASSET_CHECK, MK_GATEWAY_NC_NO_STALE_LABEL   the same commit
+                        built with that control define (the gateway_nc of the kinds whose ``nc_define`` names it)
+  MK_PROJECTOR_NC_<NAME>  oe-projector of the cut's gateway commit built with -DOE_PROJECTOR_CONTROL=PROJ_NC_<NAME> (the
+                        history_projector_nc of the kinds whose ``projector_define`` names it): PIN_RECORDING,
+                        NO_STOP_REPLAY, WALLCLOCK_COLUMN, DROP_ONE, BEAT_ALWAYS; the path of the install tree's bin/oe-projector
 
 The gateway kinds (``core_contracts.GATEWAY_KINDS``: gw, gw-ext, gw-slow(-ext), gw-freshkey(-ext), gw-dry-stream(-ext),
 gw-dry-stream-ceiling16m, gw-dry-gateway(-ext), gw-dry-gateway-freshkey) are derived from an rc2-cut/3 cut: the four
 gateway roles at .40-.43, oe-gateway and oe-stream from the cut, the session stub from the cut's cluster-tools test build
 (MK_CUT_NC_DIR), gateway_nc from the MK_GATEWAY_NC* setting of the kind's control define and the HTTP shim from this harness.
 
-The projection kinds (pj-dry, pj-dry-ext, pj-dry-beatalways; gateway kinds with ``projectors``) add the projection roles
-pj0 and pj1 at .44-.45 and the projection stand-in (projector_stub.py) from this harness. The stand-in reads the order-event
+The projection kinds (gateway kinds with ``projectors``) add the projection roles pj0 and pj1 at .44-.45. The projector
+kinds (pj, pj-ext and their controls pj-nc-*) stage oe-projector from the cut (an rc2-cut/4 cut carries it) and, in a
+control kind, the control build named by MK_PROJECTOR_NC_<NAME>. The dry-run kinds (pj-dry, pj-dry-ext,
+pj-dry-beatalways) stage the projection stand-in (projector_stub.py) from this harness. The stand-in reads the order-event
 ring with ``CoreProbe order-events fields=full``: on a cut whose probe predates that, the kind takes the probe of
 MK_PROBE_MANIFEST compiled from this tree, and only with --harness-drift (recorded).
 """
@@ -147,6 +152,10 @@ class Config:
                                            "oe-gateway of the cut's gateway commit built with GW_NC_NO_CANCEL_REOFFER_RULE")
     gateway_nc_no_asset: Path = _setting('MK_GATEWAY_NC_NO_ASSET_CHECK',
                                          "oe-gateway of the cut's gateway commit built with GW_NC_NO_ASSET_CHECK")
+    gateway_nc_no_stale: Path = _setting('MK_GATEWAY_NC_NO_STALE_LABEL',
+                                         "oe-gateway of the cut's gateway commit built with GW_NC_NO_STALE_LABEL")
+    # define -> the control build's oe-projector (MK_PROJECTOR_NC_<NAME>; read when a kind stages it)
+    projector_nc: dict = field(default_factory=dict)
     shm_mb: dict = field(default_factory=dict)                 # per-role overrides of SHM_MB (settings)
     harness_drift: str = None                                  # A named waiver (rig kinds only), recorded
     # The CoreProbe.java a projection kind's probe must be compiled from (this tree's; a test points it elsewhere)
@@ -326,7 +335,15 @@ SHIM_MEMORY_MB = 2048
 # The control define of a gateway_nc build -> (the Config field holding its binary, its setting name)
 GATEWAY_NC_BUILDS = {'GW_NC_FRESH_KEY': ('gateway_nc', 'MK_GATEWAY_NC'),
                      'GW_NC_NO_CANCEL_REOFFER_RULE': ('gateway_nc_no_reoffer', 'MK_GATEWAY_NC_NO_CANCEL_REOFFER_RULE'),
-                     'GW_NC_NO_ASSET_CHECK': ('gateway_nc_no_asset', 'MK_GATEWAY_NC_NO_ASSET_CHECK')}
+                     'GW_NC_NO_ASSET_CHECK': ('gateway_nc_no_asset', 'MK_GATEWAY_NC_NO_ASSET_CHECK'),
+                     'GW_NC_NO_STALE_LABEL': ('gateway_nc_no_stale', 'MK_GATEWAY_NC_NO_STALE_LABEL')}
+
+
+def projector_nc_setting(define):
+    """The setting naming the control build of oe-projector with ``define`` (PROJ_NC_X -> MK_PROJECTOR_NC_X)."""
+    if define not in core_contracts.PROJECTION_NC_DEFINES:
+        raise Violation('unknown projector control define ' + str(define))
+    return 'MK_PROJECTOR_NC_' + define[len('PROJ_NC_'):]
 # The projection slots' addresses (after the gateway roles') and container sizes: settings with defaults. The stand-in
 # runs one CoreProbe JVM per poll, hence its memory.
 PROJECTION_NODE_BASE = 44
@@ -527,7 +544,7 @@ def add_gateway_slots(m, kind, cut, cfg, cut_libs, harness_commit):
     if spec['core_jvm']:
         m['core_jvm_properties'] = dict(spec['core_jvm'])
     if spec.get('projectors'):
-        add_projection_slots(m, kind, cfg, harness_commit)
+        add_projection_slots(m, kind, cut, cfg, cut_libs, harness_commit)
     m['profile_note'] += (f'; gateway slots {driver} ({", ".join(f"{k}={v}" for k, v in sorted(spec["slots"].items()))})'
                           + (f'; core {", ".join(f"{k}={v}" for k, v in sorted(spec["core_jvm"].items()))}' if spec['core_jvm'] else ''))
 
@@ -550,13 +567,32 @@ def projection_probe(cfg, cut_probe):
     return {k: probe[k] for k in keys}
 
 
-def add_projection_slots(m, kind, cfg, harness_commit):
-    """The projection kind's two roles, port, artifacts, slot plan and limits (core_contracts.GATEWAY_KINDS 'projectors')."""
+def add_projection_slots(m, kind, cut, cfg, cut_libs, harness_commit):
+    """The projection kind's two roles, port, artifacts, slot plan and limits (core_contracts.GATEWAY_KINDS 'projectors').
+    oe-projector comes from the cut on the kind's driver mode (an external one stages the cut's driver files); a control
+    build from its MK_PROJECTOR_NC_<NAME> setting, checked by release_cut against the cut's gateway commit."""
     spec = core_contracts.GATEWAY_KINDS[kind]
     used = set(spec['projectors'].values()) - {None}
     art = {name: None for name in core_contracts.PROJECTION_BINARIES}
+    driver = spec['driver']
+    libs = (lambda: json.loads(json.dumps(cut_libs))) if driver == 'external' else (lambda: None)
     if 'history_projector' in used:
-        raise Violation(f'{kind}: the history projector binary is not in a cut yet')
+        if not release_cut.layout(cut.get('schema')).get('projector_binary') or 'oe-projector' not in cut['artifacts']:
+            raise Violation(f'{kind} stages oe-projector: the cut must carry it ({release_cut.SCHEMA}; has {cut.get("schema")})')
+        a = cut['artifacts']['oe-projector']
+        art['history_projector'] = {k: a[k] for k in ('path', 'sha256', 'source_sha')}
+        art['history_projector'].update(driver=driver, target='oe-projector')
+    if 'history_projector_nc' in used:
+        define = spec['projector_define']
+        setting = projector_nc_setting(define)
+        given = cfg.projector_nc.get(define)
+        path = _need(Path(given) if given else env_path(setting, f'oe-projector built with {define}'),
+                     f'history_projector_nc ({setting})')
+        art['history_projector_nc'] = {'path': str(path), 'sha256': sha(path), 'source_sha': cut['repos']['gateway'],
+                                       'driver': driver, 'target': 'oe-projector', 'defines': [define]}
+    for name in ('history_projector', 'history_projector_nc'):
+        if art[name] is not None and driver == 'external':
+            art[name]['libs'] = libs()
     if 'projector_stub' in used:
         path = Path(__file__).resolve().with_name('projector_stub.py')
         art['projector_stub'] = {'path': str(path), 'sha256': sha(path), 'source_sha': harness_commit, 'driver': 'embedded',
@@ -574,7 +610,8 @@ def add_projection_slots(m, kind, cfg, harness_commit):
         limits['memory_mb_by_role'][role] = cfg.memory_mb.get(role, PROJECTION_LIMITS['memory_mb'])
         limits['shm_mb_by_role'][role] = cfg.shm_mb.get(role, PROJECTION_LIMITS['shm_mb'])
     m['profile_note'] += '; projection slots ' + ', '.join(f'{k}={v}' for k, v in sorted(spec['projectors'].items())) + (
-        f' (stand-in mode {spec["stub_mode"]})' if 'projector_stub' in used else '')
+        f' (stand-in mode {spec["stub_mode"]})' if 'projector_stub' in used else '') + (
+        f' ({spec["projector_define"]})' if 'history_projector_nc' in used else '')
 
 
 def _sizes(pairs):

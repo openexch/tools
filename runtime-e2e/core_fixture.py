@@ -138,6 +138,38 @@ def t1_market_rows(source):
     return {'tick': tick, 'min': low, 'max': high, 'lot': lot}
 
 
+def projector_health_view(body, members, nodes):
+    """oe-projector's /health (gateway README "History projector": ``projector.role``, ``.cursor``, ``.halt``, ``.follow``
+    with its source index into the configured archives, endpoint, archive id, recording and counts) as the flat keys the
+    projection drills read from a slot (the stand-in's names), the body itself under ``raw``. ``members`` are the core
+    members the slot lists as its sources, in that order."""
+    pj = body.get('projector') if isinstance(body.get('projector'), dict) else {}
+    follow = pj.get('follow') if isinstance(pj.get('follow'), dict) else {}
+    counts = follow.get('counts') if isinstance(follow.get('counts'), dict) else {}
+    cursor = pj.get('cursor') if isinstance(pj.get('cursor'), dict) else {}
+    halt = pj.get('halt') if isinstance(pj.get('halt'), dict) else {}
+    index = follow.get('source')
+    member = members[index] if isinstance(index, int) and 0 <= index < len(members) else None
+    endpoint = follow.get('endpoint')
+    if endpoint and member is None:
+        host = str(endpoint).rsplit(':', 1)[0]
+        member = next((m for m in members if nodes.get(m) == host), None)
+    return {'role': pj.get('role'), 'source': {'member': member, 'index': index, 'endpoint': endpoint},
+            'archive_id': follow.get('archiveId'), 'source_switches': counts.get('switches'),
+            'recordings_walked': {'recording_id': follow.get('recordingId'), 'chain_index': follow.get('chainIndex'),
+                                  'phase': follow.get('phase')},
+            'applied_seq': cursor.get('appliedSeq'), 'head_seq': follow.get('headSeq'), 'halt': halt.get('reason'),
+            'halt_detail': halt.get('detail'), 'beats': follow.get('beats'), 'lag_ms': follow.get('lagMs'),
+            'lag_events': follow.get('lagEvents'), 'replays_open': follow.get('replaysOpen'),
+            'session_open': follow.get('sessionOpen'), 'behind': counts.get('behind'),
+            'leader_avoided': counts.get('leaderAvoided'), 'replays_started': counts.get('replaysStarted'),
+            'replay_stops': counts.get('replayStops'), 'stop_requests_answered': counts.get('stopRequestsAnswered'),
+            'records_applied': counts.get('recordsApplied'), 'mtu_refusals': counts.get('mtuRefusals'),
+            'sources_state': follow.get('sources'), 'epoch': cursor.get('epoch'), 'probe_unanswered': None, 'polls': None,
+            'last_pg_error': (pj.get('pg') or {}).get('lastError') if isinstance(pj.get('pg'), dict) else None,
+            'build': body.get('build'), 'version': body.get('version'), 'binary': True, 'raw': body}
+
+
 def role_kind(name):
     """forwarder | bridge | engine | projector, or None for a role the fixture never stops politely."""
     if name in ENGINES:
@@ -424,8 +456,22 @@ class CoreFixture(Fixture):
         self.registry['gateway_database'] = {'name': 'r01_gateway', 'migration': 'applied by oe-gateway', 'history': None}
         self.save()
 
-    def gateway_pg_url(self):
-        return f'postgresql://runtime_fixture@{self.gateway}:{self.pg_port}/r01_gateway'
+    # The database a gateway slot reads history from, when a drill names another than the gateways' own before the
+    # slot's next start (the byte-equal drill's D: gw0 on the second projection database)
+    gateway_history_database = None
+
+    def projector_binary(self):
+        """True when the projection slots run the projector binary (a kind of core_contracts.PROJECTOR_BINARY_KINDS)."""
+        return self.projection_slots and self.m.get('manifest_kind') in core_contracts.PROJECTOR_BINARY_KINDS
+
+    def gateway_pg_url(self, slot=None):
+        """The gateways' database URL. Where the projector binary writes it, the gateways log in as the reader role, a
+        member of the schema's reader group (SELECT on the four read relations and nothing else)."""
+        database = (self.gateway_history_database or {}).get(slot, 'r01_gateway')
+        if database not in self.FIXTURE_DATABASES - {'postgres', 'r01_money'}:
+            raise Violation('a gateway reads the gateways\' or a projection database: ' + str(database))
+        user = core_contracts.HISTORY_READER_LOGIN if self.projector_binary() else 'runtime_fixture'
+        return f'postgresql://{user}@{self.gateway}:{self.pg_port}/{database}'
 
     def create_projection_databases(self):
         """The projection databases: pj0 writes the gateways' database (created above, empty of history); pj1 a second,
@@ -433,6 +479,14 @@ class CoreFixture(Fixture):
         binary will)."""
         self.psql('postgres', 'CREATE DATABASE r01_history_b')
         self.registry['projection_databases'] = dict(core_contracts.PROJECTION_DATABASES)
+        if self.projector_binary():
+            # The reader group the projection schema grants to (created here, before any projector applies the schema,
+            # which then finds it), and the gateways' login role in it; the projector's own role (the fixture's owner)
+            # owns every relation
+            group, login = core_contracts.HISTORY_READER_GROUP, core_contracts.HISTORY_READER_LOGIN
+            self.psql('postgres', f'CREATE ROLE {group} NOLOGIN')
+            self.psql('postgres', f'CREATE ROLE {login} LOGIN IN ROLE {group}')
+            self.registry['history_reader'] = {'login': login, 'member_of': group}
         self.save()
 
     def recreate_projection_database(self, database):
@@ -565,6 +619,9 @@ class CoreFixture(Fixture):
         else:
             env['CORE_NODE_PORT'] = str(self.m['ports']['ae_metrics'])
             env['CORE_AUTH_KEYS'] = self.keys.table('ae')
+            if self.projector_binary():
+                # the member's replay gauge counts the history projector's replays (its reader budget reads it)
+                env['CORE_ARCHIVE_REPLAY_PROBE_STREAM'] = core_contracts.HISTORY_PROJECTOR_JOURNAL['HISTORY_PROJECTOR_REPLAY_STREAM']
             env.update(self.member_shadow_env(index))
         if self.engine_driver() == 'external':
             # TC:84-91 / ATC:37-42 external mode attaches to the wrapper's aeronmd at AERON_DIR (TC:155, ATC:70)
@@ -1566,9 +1623,16 @@ class CoreFixture(Fixture):
             env[f'{prefix}_DRIVER_DIR'] = '/dev/shm'
         if prefix == 'GATEWAY':
             env.update(GATEWAY_HTTP_BIND=f'{nodes[slot]}:{ports["gateway_http"]}',
-                       GATEWAY_ADMIN_BIND=f'{nodes[slot]}:{ports["gateway_admin"]}', GATEWAY_PG_URL=self.gateway_pg_url(),
+                       GATEWAY_ADMIN_BIND=f'{nodes[slot]}:{ports["gateway_admin"]}', GATEWAY_PG_URL=self.gateway_pg_url(slot),
                        GATEWAY_ALLOW_TREASURY_LANE='1', GATEWAY_TREASURY_CREDENTIAL=self.keys.credential(slot + '-treasury', 'ae'),
                        GATEWAY_FAUCET_MAX_AMOUNT=','.join(f'{a}:{v}' for a, v in sorted(self.GATEWAY_FAUCET_CAPS.items())))
+            # a drill's gateway history settings (history-freshness: the stale bound and its probe cadence), recorded
+            # by the drill; only those two names, through the same guard as every other name
+            overrides = {k: str(v) for k, v in ((getattr(self, 'gateway_env_overrides', None) or {}).get(slot) or {}).items()}
+            for key in overrides:
+                if key not in ('GATEWAY_HISTORY_STALE_MS', 'GATEWAY_HISTORY_PROBE_MS'):
+                    raise Violation(f'{slot}: a drill may set only the gateway history stale bound and probe cadence; refusing {key}')
+            env.update(overrides)
         else:
             # The engine status feed polls each node's own endpoint over the network (never a shared disk)
             env.update(STREAM_WS_BIND=f'{nodes[slot]}:{ports["stream_ws"]}', STREAM_ADMIN_BIND=f'{nodes[slot]}:{ports["stream_admin"]}',
@@ -1791,14 +1855,97 @@ class CoreFixture(Fixture):
     def projection_database(self, slot):
         return (self.projection_targets or {}).get(slot, core_contracts.PROJECTION_DATABASES[slot])
 
+    # The core members a projection slot lists as its sources, in that order (default: all three), when a drill names
+    # them before the slot's next start (the byte-equal drill reads B and C from members other than A's)
+    projection_sources = None
+    PROJECTOR_KEY_FILE = '/data/cluster-key'
+    PROJECTOR_RESPONSE_PORT = 20490
+
+    def projection_members(self, slot):
+        members = list((self.projection_sources or {}).get(slot) or [f'ae{i}' for i in range(3)])
+        if not members or any(m not in ENGINES or not m.startswith('ae') for m in members) or len(set(members)) != len(members):
+            raise Violation(f'{slot}: projection sources are distinct core members, got {members}')
+        return members
+
+    def history_projector_env(self, slot):
+        """oe-projector's environment (gateway README "History projector"): the required settings only. Its sources are
+        the listed members' archives with their node endpoints (role and replay budget), its cluster session the core
+        members on its own GATEWAY key (a key file in its /data), its database the slot's projection database. Leases,
+        probes, back-offs and timeouts stay at the binary's defaults."""
+        nodes, ports = self.m['nodes'], self.m['ports']
+        artifact = self.m['artifacts'][self.slot_artifact(slot)]
+        members = self.projection_members(slot)
+        params = self.GATEWAY_CHANNEL_PARAMS
+        env = {'HISTORY_PROJECTOR_DRIVER_MODE': artifact['driver'],
+               'HISTORY_PROJECTOR_INSTANCE_ID': str(self.keys.keys[(slot, 'ae')][0]),
+               'HISTORY_PROJECTOR_ADMIN_BIND': f'{nodes[slot]}:{ports["projector_admin"]}',
+               'HISTORY_PROJECTOR_JOURNAL_ARCHIVES': ','.join(self.archive_endpoint(m) for m in members),
+               'HISTORY_PROJECTOR_JOURNAL_NODE_ENDPOINTS': ','.join(f'{nodes[m]}:{ports["ae_metrics"]}' for m in members),
+               'HISTORY_PROJECTOR_LOCAL_HOST': nodes[slot],
+               'HISTORY_PROJECTOR_CLUSTER_MEMBERS': ','.join(f'{i}={nodes[f"ae{i}"]}:{ports["ae_base"] + i * ports["stride"] + 2}'
+                                                             for i in range(3)),
+               'HISTORY_PROJECTOR_CLUSTER_KEY_FILE': self.PROJECTOR_KEY_FILE,
+               'HISTORY_PROJECTOR_CORE_INGRESS_CHANNEL': 'aeron:udp?' + params,
+               'HISTORY_PROJECTOR_CORE_RESPONSE_CHANNEL': f'aeron:udp?endpoint={nodes[slot]}:{self.PROJECTOR_RESPONSE_PORT}|{params}',
+               'HISTORY_PROJECTOR_PG_URL': self.projection_pg_url(self.projection_database(slot)),
+               **core_contracts.HISTORY_PROJECTOR_JOURNAL}
+        # a drill's own projector settings for one slot (recorded by the drill; never a lease, probe or timeout)
+        env.update({k: str(v) for k, v in ((getattr(self, 'projector_env_overrides', None) or {}).get(slot) or {}).items()})
+        if artifact['driver'] == 'external':
+            env['AERON_DIR'] = '/dev/shm/aeron-' + slot
+        else:
+            env['HISTORY_PROJECTOR_DRIVER_DIR'] = '/dev/shm'
+        return env
+
+    def projector_slot_command(self, slot):
+        """oe-projector exec'd as the container's pid 1: directly (embedded), or behind the staged aeronmd in the same
+        container (external, the C++ slots' wrapper), so a kill of the slot is a kill of its driver too."""
+        name = self.slot_artifact(slot)
+        binary = f'/artifacts/{name}/bin'
+        if self.m['artifacts'][name]['driver'] != 'external':
+            return ['sh', '-c', f'exec {binary}']
+        d = '/dev/shm/aeron-' + slot
+        # a drill may give the slot's staged aeronmd its client liveness pair (projection_aeronmd_env): through the
+        # timeout guard at the exact exempt values only, and recorded in the fixture's registry
+        extra = dict(getattr(self, 'projection_aeronmd_env', None) or {})
+        driver_env = dict(DRIVER_ENV, **extra)
+        core_contracts.assert_production_timeouts(
+            driver_env, core_contracts.PROCESS_ENV | set(core_contracts.PROJECTION_DRIVER_LIVENESS_EXEMPT),
+            core_contracts.PROJECTION_DRIVER_LIVENESS_EXEMPT)
+        if extra:
+            self.registry.setdefault('projection_aeronmd_env', {})[slot] = extra
+            self.save()
+        env = ' '.join(f'{k}={v}' for k, v in sorted(driver_env.items()))
+        alive = '"$(cat /data/aeronmd.pid)"'
+        return ['sh', '-c', f'rm -rf {d}; mkdir -p {d}; AERON_DIR={d} {env} LD_LIBRARY_PATH=/artifacts/{name} /artifacts/{name}/aeronmd & '
+                            f'echo $! > /data/aeronmd.pid; i=0; '
+                            f'while {{ [ ! -f {d}/cnc.dat ] || ! kill -0 {alive} 2>/dev/null; }} && [ $i -lt {DRIVER_WAIT_TENTHS} ]; '
+                            f'do sleep 0.1; i=$((i+1)); done; '
+                            f'[ -f {d}/cnc.dat ] && kill -0 {alive} 2>/dev/null || {{ echo "aeronmd did not come up in 30 s" >&2; exit 1; }}; '
+                            f'exec {binary}']
+
+    def prepare_projection_state(self, slot):
+        """The projector slot's /data before its first start: its cluster key file (keyId:GATEWAY:secret, a secret:
+        redacted from every retained log; the file stays in the slot's own state dir, which no other role mounts)."""
+        state = self.root / 'state' / slot
+        state.mkdir(parents=True, exist_ok=True)
+        path = state / 'cluster-key'
+        path.write_text(self.keys.credential(slot, 'ae') + '\n')
+        path.chmod(0o600)
+        self.secret_values = self.keys.secrets()
+        self.registry.setdefault('prepared_state', {})[slot] = {'cluster_key': True}
+        self.save()
+
     def projection_slot_env(self, slot):
         """The stand-in's environment: its listener, its database, its own GATEWAY key, the members' metrics endpoints
         (read over the network to name the leader it follows). The stand-in's settings stay at its defaults unless the
-        fixture's PROJECTION_STUB_SETTINGS names one."""
+        fixture's PROJECTION_STUB_SETTINGS names one. The projector binary's: history_projector_env."""
         nodes, ports = self.m['nodes'], self.m['ports']
         name = self.slot_artifact(slot)
+        if name in ('history_projector', 'history_projector_nc'):
+            return self.history_projector_env(slot)
         if name != 'projector_stub':
-            raise Inconclusive(f'{slot}: the projector binary ({name}) is not runnable by this harness yet')
+            raise Inconclusive(f'{slot}: no projection artifact {name}')
         artifact = self.m['artifacts'][name]
         env = {'STUB_ADMIN_BIND': f'{nodes[slot]}:{ports["projector_admin"]}',
                'STUB_PG_URL': self.projection_pg_url(self.projection_database(slot)), 'STUB_INSTANCE': slot,
@@ -1816,24 +1963,78 @@ class CoreFixture(Fixture):
             if name is None:
                 self.slots[slot] = {'state': 'SKIPPED_ABSENT', 'reason': 'this manifest stages nothing in ' + slot}
                 continue
-            self.spawn(slot, ['python3', '-I', f'/artifacts/{name}/bin'], self.projection_slot_env(slot))
+            if name == 'projector_stub':
+                self.spawn(slot, ['python3', '-I', f'/artifacts/{name}/bin'], self.projection_slot_env(slot))
+            else:
+                if slot not in (self.registry.get('prepared_state') or {}):
+                    self.prepare_projection_state(slot)
+                self.spawn(slot, self.projector_slot_command(slot), self.projection_slot_env(slot))
             port, path = self.ready_target(slot)
             self.wait_http(slot, port, path, timeout=60)
             artifact = self.m['artifacts'][name]
             self.slots[slot] = {'state': 'STARTED', 'artifact': name, 'sha256': artifact['sha256'],
                                 'source_sha': artifact['source_sha'], 'driver': artifact['driver'], 'target': artifact['target'],
                                 'mode': artifact.get('mode'), 'database': self.projection_database(slot), 'readiness': path}
+            if artifact.get('defines'):
+                self.slots[slot]['defines'] = list(artifact['defines'])
+            if name != 'projector_stub':
+                self.slots[slot]['sources'] = self.projection_members(slot)
+                self.slots[slot]['build'] = (self.projection_health(slot) or {}).get('build')
         self.registry['slots'] = self.slots
         self.save()
         return {s: self.slots.get(s) for s in (slots or sorted(core_contracts.PROJECTION_SLOTS))}
 
     def projection_health(self, slot):
-        """The slot's own /health as JSON, or {'error': ...} when it does not answer."""
+        """The slot's own /health as JSON, or {'error': ...} when it does not answer. The projector binary's /health is
+        read into the stand-in's flat keys (projector_health_view), its own body kept under ``raw``."""
         response = self.http(slot, self.m['ports']['projector_admin'], '/health')
         try:
-            return json.loads(response.get('body') or 'null') if response.get('status') == 200 else {'error': response}
+            body = json.loads(response.get('body') or 'null') if response.get('status') == 200 else None
         except ValueError:
+            body = None
+        if not isinstance(body, dict):
             return {'error': response}
+        if self.slot_artifact(slot) in ('history_projector', 'history_projector_nc'):
+            return projector_health_view(body, self.projection_members(slot), self.m['nodes'])
+        return body
+
+    def respawn_slot(self, name):
+        """Start a stopped gateway or projection slot again in a NEW container from the same artifact, on the environment
+        the fixture computes now (a drill changed the slot's database or sources before): the old container's log is kept
+        as ``logs/<name>.gen<n>.log``, its state dir stays in place (keys and api-keys file), a gateway slot on a sidecar
+        driver rejoins that same driver. Returns the witness; the fault row closes on the slot's readiness."""
+        if name not in core_contracts.PROJECTION_SLOTS and name not in core_contracts.GATEWAY_SLOTS:
+            raise Violation('respawn_slot starts a gateway or projection slot: ' + name)
+        cid = self.registry['containers'].get(name)
+        if cid is None or self.inspect('container', cid)['State']['Running']:
+            raise Violation(f'respawn_slot needs {name} started once and now stopped')
+        gen = 1
+        while (self.root / 'logs' / f'{name}.gen{gen}.log').exists():
+            gen += 1
+        logs = self.command(['docker', 'logs', '--timestamps', cid], check=False)
+        (self.root / 'logs' / f'{name}.gen{gen}.log').write_text(redact(logs.stdout + logs.stderr, self.secret_values))
+        self.command(['docker', 'rm', cid])
+        del self.registry['containers'][name]
+        self.save()
+        if name in core_contracts.PROJECTION_SLOTS:
+            env = self.projection_slot_env(name)
+            command = (self.projector_slot_command(name) if self.slot_artifact(name) != 'projector_stub'
+                       else ['python3', '-I', f'/artifacts/{self.slot_artifact(name)}/bin'])
+            self.spawn(name, command, env)
+        else:
+            join = self.registry['containers'].get(name + self.DRIVER_SIDECAR) if self.driver_sidecar(name) else None
+            env = self.gateway_slot_env(name)
+            self.spawn(name, self.gateway_slot_command(name), env, join=join)
+        port, path = self.ready_target(name)
+        self.wait_role_ready(name, port, path, timeout=90)
+        self.close_fault(name)
+        witness = {'kind': 'respawn', 'target': name, 'generation': gen, 'container_id': self.registry['containers'][name]}
+        if name in core_contracts.PROJECTION_SLOTS:
+            witness.update(database=self.projection_database(name), sources=(self.projection_members(name)
+                                                                            if self.slot_artifact(name) != 'projector_stub' else None))
+        else:
+            witness['pg_url'] = env.get('GATEWAY_PG_URL', '').rsplit('@', 1)[-1]
+        return self.record_fault(witness)
 
     def replay_count(self, member, streams):
         """The replay-count probe of one core member (replay_count.py inside the member's container): its driver's network
