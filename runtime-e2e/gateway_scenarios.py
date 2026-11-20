@@ -919,7 +919,7 @@ class SlowConsumer(GatewayDrill):
             self.sleep(s['SAMPLE_S'])
             row = self.sample(watched)
             samples.append(row)
-            if first['resumable_closed'] is not None and (row['resumable_closed'] or 0) > first['resumable_closed']:
+            if session_closes(first, row)['total']:
                 closed_at = row['at_ns']
                 break
         if closed_at is not None:
@@ -944,8 +944,8 @@ class SlowConsumer(GatewayDrill):
         story_exit = self.wait_file(story['exit'], s['SLOW_STORY_S'] + 180)
         samples.append(self.sample(watched))
         lines = {}
-        last = samples[-1]['resumable_closed']
-        delta = None if first['resumable_closed'] is None or last is None else last - first['resumable_closed']
+        closes = session_closes(first, samples[-1])
+        delta = closes['total']
         self.record['throttle'] = {'started_ns': throttled_ns, 'closed_ns': closed_at, 'lifted_ns': lifted_ns,
                                    'close_s': None if closed_at is None else round((closed_at - throttled_ns) / 1e9, 3),
                                    'ceiling_bytes': (f.m.get('core_jvm_properties') or {}).get('core.egress.max.capacity.bytes',
@@ -954,7 +954,10 @@ class SlowConsumer(GatewayDrill):
                                    'rule_counters': counted.splitlines()[:6],
                                    'peak_pending_bytes': max((r.get('egress_pending_bytes') or 0) for r in samples)}
         lines['slow_session_closed'] = line(closed_at is not None and delta == 1,
-                                            {'counter': RESUMABLE_CLOSED, 'delta': delta, 'close_s': self.record['throttle']['close_s'],
+                                            {'counters': [RESUMABLE_CLOSED, DISCARD_CLOSED], 'delta': delta,
+                                             'resumable_closed_delta': closes['resumable_closed'],
+                                             'discard_closed_delta': closes['discard_closed'], 'path': closes['path'],
+                                             'close_s': self.record['throttle']['close_s'],
                                              'bound_s': s['SLOW_CLOSE_BOUND_S']}, 'slow session not closed within bound')
         lines['closed_session_is_st0'] = st0_close_line(samples, first, closed_at, lifted_ns, clean)
         commits = [r['commit'] for r in samples if r['commit'] is not None]
@@ -995,6 +998,26 @@ class SlowConsumer(GatewayDrill):
                 return int(text) if text.lstrip('-').isdigit() else text
             self.sleep(1)
         return None
+
+
+CLOSE_PATHS = {'resumable_closed': 'ceiling (resumable session closed at the egress ceiling)',
+               'discard_closed': 'not connected (egress offer failed after a delivery: discard close)'}
+
+
+def session_closes(first, row):
+    """The core's session closes between two samples, on either path: the egress ceiling (``resumable_closed``) or a
+    failed offer after a delivery (``discard_closed``, the NOT_CONNECTED path). Each delta is None when the counter is
+    unreadable in either sample; ``total`` sums the readable ones (None when neither is), ``path`` names those that
+    moved."""
+    out, total = {}, None
+    for key in CLOSE_PATHS:
+        a, b = first.get(key), row.get(key)
+        out[key] = None if a is None or b is None else b - a
+        if out[key] is not None:
+            total = (total or 0) + out[key]
+    out['total'] = total
+    out['path'] = [CLOSE_PATHS[k] for k in CLOSE_PATHS if out[k]] or None
+    return out
 
 
 def st0_saw_close(samples, first, closed_at):

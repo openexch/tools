@@ -488,8 +488,50 @@ def baseline_back(baseline, after, readers=(), shm_slack=None):
     now_shm = sum(((after.get(m) or {}).get('shm_bytes') or 0) for m in baseline)
     out['shm'] = {'baseline': base_shm, 'now': now_shm, 'slack': shm_slack,
                   'members': {m: [(baseline[m] or {}).get('shm_bytes'), (after.get(m) or {}).get('shm_bytes')] for m in baseline}}
+    out['shm']['growth'] = {m: ((after.get(m) or {}).get('shm_bytes') or 0) - ((baseline[m] or {}).get('shm_bytes') or 0)
+                            for m in baseline}
     out['shm_back'] = shm_slack is None or now_shm <= base_shm + shm_slack
     out['back'] = out['count_back'] and out['shm_back']
+    return out
+
+
+def _mb(n):
+    return f'{n / (1024 * 1024):+.1f}'
+
+
+def shm_text(after):
+    """The failure text of a /dev/shm baseline line: each member's growth over its baseline (largest first) and the
+    members' total against the slack, which is what the line judges. A probe error names itself."""
+    shm = after.get('shm')
+    if not shm:
+        return 'core member /dev/shm not probed: ' + ', '.join(str(o) for o in after.get('over') or ['no sample'])
+    growth = shm.get('growth') or {m: (v[1] or 0) - (v[0] or 0) for m, v in (shm.get('members') or {}).items()}
+    members = ', '.join(f'{m} {_mb(g)} MB' for m, g in sorted(growth.items(), key=lambda kv: (-kv[1], kv[0])))
+    slack = shm.get('slack')
+    return (f'core member /dev/shm above baseline: {members}; members together {_mb(shm["now"] - shm["baseline"])} MB'
+            f' > slack {(slack or 0) / (1024 * 1024):.1f} MB')
+
+
+def shm_sources(baseline, probe, limit=20):
+    """What lies behind a /dev/shm after-sample, per member: the top-level /dev/shm entries [baseline, now], the
+    largest files now (when the probe lists them) and the driver's network publications that were not in the
+    baseline (by driver dir and registration id)."""
+    out = {}
+    for m, now in (probe or {}).items():
+        now, base = now or {}, (baseline or {}).get(m) or {}
+        if 'error' in now:
+            out[m] = {'error': now['error']}
+            continue
+        dirs = sorted(set(base.get('shm_dirs') or {}) | set(now.get('shm_dirs') or {}))
+        known = {(d.get('dir'), p.get('registration')) for d in base.get('drivers') or [] for p in d.get('publications') or []}
+        new = [{'dir': d.get('dir'), 'stream': p.get('stream'), 'session': p.get('session'),
+                'registration': p.get('registration'), 'channel': p.get('channel')}
+               for d in now.get('drivers') or [] for p in d.get('publications') or []
+               if (d.get('dir'), p.get('registration')) not in known]
+        out[m] = {'shm_dirs': {d: [(base.get('shm_dirs') or {}).get(d), (now.get('shm_dirs') or {}).get(d)] for d in dirs},
+                  'shm_files': (now.get('shm_files') or [])[:limit],
+                  'publications': sum(len(d.get('publications') or []) for d in now.get('drivers') or []),
+                  'publications_new': new[:limit], 'publications_new_count': len(new)}
     return out
 
 
@@ -1039,7 +1081,11 @@ class MeRestartFollow(ProjectionDrill):
         for name, after in (('writer_kill', after_d), ('money_projector_kill', after_f)):
             detail = {k: after.get(k) for k in ('back', 'waited_ms', 'over', 'readers')}
             lines['replay_baseline_after_' + name] = line(after['count_back'], detail, ORPHAN_TEXT)
-            lines['shm_baseline_after_' + name] = line(after['shm_back'], dict(detail, shm=after.get('shm')), ORPHAN_TEXT)
+            # its own text: /dev/shm growth is not an orphan replay. While the replay line fails, the shm line is its
+            # consequence (an orphan's log buffers grow /dev/shm) and is listed, not judged
+            lines['shm_baseline_after_' + name] = consequence(
+                line(after['shm_back'], dict(detail, shm=after.get('shm'), sources=shm_sources(baseline, after.get('probe'))),
+                     shm_text(after)), 'replay_baseline_after_' + name)
         if hung is not None:
             lines['orphan_stopped_after_hung_writer'] = self.hung_line(hung['fault'])
         lines['no_unexpected_exit'] = self.exits_line(('pj0', 'pj1', 'projector') + CORE_MEMBERS)

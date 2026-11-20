@@ -253,6 +253,51 @@ class PromotionLineTest(unittest.TestCase):
             w(snapshots={'positions': rd.snapshot_positions({-1, 4096}), 'aligned_delta': 0}))))
 
 
+    def test_the_pre_drill_snapshot_is_below_the_aligned_baseline(self):
+        # night 20261119T150409Z entry 12: the leader's pre-drill snapshot 415136 had its ALIGNED before aligned0, so the
+        # line demanded one ALIGNED too many; only the positions above the baseline snapshot are this drill's
+        raw = {415136, 3119168, 12978656, None, -1}
+        self.assertEqual(rd.snapshot_positions(raw, above=415136), [3119168, 12978656])
+        self.assertEqual(rd.snapshot_positions(raw, above=None), [415136, 3119168, 12978656])
+        self.assertEqual(rd.snapshot_positions(raw, above=-1), [415136, 3119168, 12978656])
+        line = rd.line_aligned_per_snapshot(w(snapshots={'positions': rd.snapshot_positions(raw, above=415136),
+                                                         'baseline_position': 415136, 'aligned_delta': 1.0}))
+        self.assertTrue(holds(line))
+        self.assertIn('2 member snapshot positions above the baseline snapshot 415136, replica ALIGNED +1.0', line['detail'])
+        # the -1 slack stays for the last snapshot only: two snapshots above the baseline with no ALIGNED still fail
+        self.assertFalse(holds(rd.line_aligned_per_snapshot(
+            w(snapshots={'positions': [3119168, 12978656], 'baseline_position': 415136, 'aligned_delta': 0}))))
+        # no snapshot above the baseline is no snapshot this drill saw
+        self.assertTrue(rd.line_aligned_per_snapshot(
+            w(snapshots={'positions': rd.snapshot_positions({415136}, above=415136)}))['inconclusive'])
+
+    def test_the_promotion_drill_reads_the_baseline_snapshot_before_aligned0(self):
+        from types import SimpleNamespace
+        order, snaps = [], iter([415136, 415136, 3119168])
+
+        def snapshot_position():
+            order.append('snapshot')
+            return next(snaps)
+
+        def aligned_counts():
+            order.append('aligned')
+            return {'aligned': 5 if order.count('aligned') == 1 else 6, 'match': 0, 'mismatch': 0}
+        run = SimpleNamespace(s=dict(S, PROMOTION_ATTEMPTS=1), rw={}, rm_setting=lambda name: 13000,
+                              aligned_counts=aligned_counts, snapshot_position=snapshot_position,
+                              need=lambda probe, bound, text: ('ae1', {}), supplier=None, leader=lambda: 'ae0',
+                              leader_log_position=lambda: 100, kill_role=lambda role: {'target': role},
+                              wait_leader=lambda kind, old: (None, 5.0), try_read=lambda read: {}, rm=lambda: {},
+                              restart_role=lambda row: ({'waited_after_kill_s': 1}, 1), lag_rows=lambda: [],
+                              sleep=lambda s: None)
+        rd.ReplicaDrillRun.replica_leaderloss_promotion(run)
+        self.assertEqual(order[:2], ['snapshot', 'aligned'])
+        snapshots = run.rw['snapshots']
+        self.assertEqual(snapshots['baseline_position'], 415136)
+        self.assertEqual(snapshots['positions'], [3119168])
+        self.assertEqual(snapshots['seen_positions'], [415136, 3119168])
+        self.assertEqual(snapshots['aligned_delta'], 1)
+
+
 class LagAndCatalogLineTest(unittest.TestCase):
     def test_lag_inside_the_term_and_its_vacuity(self):
         lag = {'samples_with_lag': 600, 'max_lag_bytes': 180000.0, 'term_bytes': 1048576, 'achieved_hz': 9.8,
@@ -590,6 +635,15 @@ class DrillFrameTest(unittest.TestCase):
                                      variant={'kind': 'shadow-cooldown30', 'control': 'supplierloss-cooldown30'})
             self.assertEqual(run.spec['lines'], ['supplier_loss_recovery'])
             self.assertGreater(run.spec['tap_extra_s'], 0)
+
+    def test_the_promotion_tap_scales_with_the_attempts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run = rd.ReplicaDrillRun(self.fixture(temp, 'shadow-query'), 'leaderloss-promotion', Path(temp) / 'out')
+            self.assertEqual(run.s['PROMOTION_ATTEMPTS'], 6)
+            six = run.tap_extra_s('shadow-query')
+            run.s = dict(run.s, PROMOTION_ATTEMPTS=3)
+            self.assertAlmostEqual(six, 2 * run.tap_extra_s('shadow-query'))
+            self.assertEqual(run.spec['tap_extra_s'], six)
 
     def test_every_drill_has_its_step_and_a_tap_long_enough(self):
         with tempfile.TemporaryDirectory() as temp:
