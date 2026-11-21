@@ -833,6 +833,18 @@ class ProjectionDrill(GatewayDrill):
             return None
         return hist if isinstance(hist, dict) else None
 
+    def lagging_read(self, user, order):
+        """GET of one order through gw0, bracketed by gw0's history reads by cause: the gateway answers every unavailable
+        cause with one body, so a LAGGING answer is told apart only by its counter (``lagging_counted``: that group rose
+        by at least one across this read; ``causes_delta``: every group that moved)."""
+        before = self.history_causes()
+        answer = self.history(user, f'/api/v2/orders/{order}')
+        after = self.history_causes()
+        delta = {k: after.get(k, 0) - before.get(k, 0) for k in set(before) | set(after) if after.get(k, 0) != before.get(k, 0)}
+        answer['causes_delta'] = delta
+        answer['lagging_counted'] = delta.get('lagging', 0) >= 1 if after else None
+        return answer
+
     def history_causes(self):
         """gw0's history reads (its /metrics) by cause group, {} when unreadable (history_reads_by_group)."""
         return history_reads_by_group(self.f.http('gw0', self.f.m['ports']['gateway_admin'], '/metrics').get('body') or '')
@@ -1540,12 +1552,12 @@ class HistoryFreshness(ProjectionDrill):
                 # the closed order once the heartbeat is past stale, and gw0's /health until it shows stale (its history
                 # block refreshes at the gateway's own probe cadence), all inside the freeze
                 if closed is None and order:
-                    closed = self.history(user, f'/api/v2/orders/{order}')
+                    closed = self.lagging_read(user, order)
                 if not health_stale(health):
                     health = self.f.http('gw0', self.f.m['ports']['gateway_admin'], '/health')
             self.sleep(p['SAMPLE_MS'] / 1000)
         if closed is None and order:
-            closed = self.history(user, f'/api/v2/orders/{order}')
+            closed = self.lagging_read(user, order)
         if health is None:
             health = self.f.http('gw0', self.f.m['ports']['gateway_admin'], '/health')
         stale_at = next((t for t, age in beat_ages if age is not None and age > p['HISTORY_STALE_MS']), None)
@@ -1566,7 +1578,11 @@ class HistoryFreshness(ProjectionDrill):
                                                   'heartbeat kept fresh while the projection was frozen',
                                                   inconclusive=stale_at is None and p['FREEZE_S'] * 1000 <= p['HISTORY_STALE_MS'])
         lagging = (closed or {}).get('status')
-        out['b_closed_order_lagging_not_404'] = line(lagging == 503, {'status': lagging, 'body': (closed or {}).get('body', '')[:200]},
+        lag_counted = (closed or {}).get('lagging_counted')
+        out['b_closed_order_lagging_not_404'] = line(lagging == 503 and bool(lag_counted),
+                                                     {'status': lagging, 'lagging_counted': lag_counted,
+                                                      'causes_delta': (closed or {}).get('causes_delta'),
+                                                      'body': (closed or {}).get('body', '')[:200]},
                                                      'closed order answered 404 while the projection lagged' if lagging == 404
                                                      else 'closed order not answered LAGGING', inconclusive=not order)
         stale = [(self.as_of(r) or {}).get('stale') for r in reads]

@@ -769,6 +769,27 @@ class DrillLogicTest(unittest.TestCase):
                          {'heartbeat': 4, 'pg': 3, 'ok': 9, 'not_found': 1, 'busy': 3})
         self.assertEqual(projection_drills.history_reads_by_group(''), {})
 
+    def test_a_lagging_answer_is_told_apart_by_its_counter(self):
+        class Fake:
+            def __init__(self, counts):
+                self.counts = list(counts)
+
+            def history_causes(self):
+                return self.counts.pop(0)
+
+            def history(self, user, path):
+                return {'status': 503, 'body': '{}'}
+        read = projection_drills.ProjectionDrill.lagging_read
+        lagged = read(Fake([{'stale': 2}, {'stale': 2, 'lagging': 1}]), 1, '7')
+        self.assertTrue(lagged['lagging_counted'])
+        self.assertEqual(lagged['causes_delta'], {'lagging': 1})
+        # the same 503 body from another cause (here a stale heartbeat) is not LAGGING
+        stale = read(Fake([{'stale': 2}, {'stale': 3}]), 1, '7')
+        self.assertFalse(stale['lagging_counted'])
+        self.assertEqual(stale['causes_delta'], {'stale': 1})
+        # metrics unreadable after the read: not judged
+        self.assertIsNone(read(Fake([{}, {}]), 1, '7')['lagging_counted'])
+
     def test_the_stale_label(self):
         self.assertIs(projection_drills.fresh_label({'stale': False, 'ageMs': 1}), False)
         self.assertIs(projection_drills.fresh_label({'stale': True}), True)
