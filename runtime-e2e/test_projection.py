@@ -96,7 +96,8 @@ class ProjectionContractTest(unittest.TestCase):
                          {'pj-dry', 'pj-dry-ext', 'pj-dry-beatalways'})
         self.assertEqual(core_contracts.PROJECTOR_BINARY_KINDS,
                          {'pj', 'pj-ext', 'pj-nc-pinrecording', 'pj-nc-nostopreplay-ext', 'pj-nc-wallclock', 'pj-nc-dropone',
-                          'pj-nc-beatalways', 'pj-nc-nostale'})
+                          'pj-nc-beatalways', 'pj-nc-nostale', 'pj-nc-pinrecording-ext', 'pj-nc-wallclock-ext',
+                          'pj-nc-dropone-ext', 'pj-nc-beatalways-ext', 'pj-nc-nostale-ext'})
         for kind in core_contracts.PROJECTION_KINDS:
             spec = core_contracts.GATEWAY_KINDS[kind]
             self.assertIn(kind, core_contracts.CUT_KINDS)
@@ -112,7 +113,17 @@ class ProjectionContractTest(unittest.TestCase):
         # every control of the binary drills has its kind, and the compared projections run the control build
         controls = {k: v['projection_control'] for k, v in core_contracts.GATEWAY_KINDS.items()
                     if k in core_contracts.PROJECTOR_BINARY_KINDS and v.get('projection_control')}
-        self.assertEqual(sorted(controls.values()), sorted(projection_drills.SCENARIOS * 2))
+        self.assertEqual(sorted(controls.values()), sorted(list(projection_drills.SCENARIOS * 2) + [
+            core_contracts.GATEWAY_KINDS[b]['projection_control'] for b in core_contracts.PROJECTION_CONTROL_EXT_TWINS.values()]))
+        # each external leg is its embedded control on the external driver, nothing else changed
+        for twin, base in core_contracts.PROJECTION_CONTROL_EXT_TWINS.items():
+            spec, embedded = core_contracts.GATEWAY_KINDS[twin], core_contracts.GATEWAY_KINDS[base]
+            self.assertEqual((embedded['driver'], spec['driver']), ('embedded', 'external'))
+            self.assertEqual(dict(spec, driver='embedded'), embedded)
+            self.assertEqual(projection_drills.control_of(dict(projection_manifest(self.dir), manifest_kind=twin),
+                                                          spec['projection_control']),
+                             projection_drills.control_of(dict(projection_manifest(self.dir), manifest_kind=base),
+                                                          embedded['projection_control']))
         for kind in ('pj-nc-wallclock', 'pj-nc-dropone', 'pj-nc-nostopreplay-ext'):
             self.assertEqual(set(core_contracts.GATEWAY_KINDS[kind]['projectors'].values()), {'history_projector_nc'})
 

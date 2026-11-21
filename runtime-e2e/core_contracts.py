@@ -525,6 +525,7 @@ GATEWAY_KINDS.update({
 #                               PROJ_NC_DROP_SEQ (default 2) and never writes it
 #   pj-nc-beatalways            history-freshness: pj0 beats at every fence whatever the head
 #   pj-nc-nostale               history-freshness: gw0 runs oe-gateway built with GW_NC_NO_STALE_LABEL
+#   <control>-ext               the same control on the external driver, for each control above but the no-stop one
 _PJ_BIN = {'pj0': 'history_projector', 'pj1': 'history_projector'}
 _PJ_NC = {'pj0': 'history_projector_nc', 'pj1': 'history_projector_nc'}
 GATEWAY_KINDS.update({
@@ -548,6 +549,12 @@ GATEWAY_KINDS.update({
                       'nc_define': 'GW_NC_NO_STALE_LABEL', 'projectors': dict(_PJ_BIN),
                       'projection_control': 'history-freshness', 'control_text': 'stale label missing'},
 })
+# The external legs of the embedded controls: the same control on the external driver (engines, slots and projectors);
+# the no-stop control has no embedded leg (a stopped copy keeps no subscription on the embedded driver)
+PROJECTION_CONTROL_EXT_TWINS = {k + '-ext': k for k in ('pj-nc-pinrecording', 'pj-nc-wallclock', 'pj-nc-dropone',
+                                                       'pj-nc-beatalways', 'pj-nc-nostale')}
+GATEWAY_KINDS.update({twin: dict(GATEWAY_KINDS[base], driver='external')
+                      for twin, base in PROJECTION_CONTROL_EXT_TWINS.items()})
 PROJECTION_KINDS = {k for k, v in GATEWAY_KINDS.items() if v.get('projectors')}
 # The kinds whose projection slots run the projector binary (product or control build), not the stand-in
 PROJECTOR_BINARY_KINDS = {k for k in PROJECTION_KINDS
