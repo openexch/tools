@@ -54,13 +54,8 @@ func passiveChecks(ctx context.Context, cfg *Config, client *oms.Client, feedCli
 			}
 			registry.Set("gateway_ready", err == nil, detail, true)
 
-			stale := ""
-			for _, m := range cfg.Markets {
-				if age := time.Since(feedClient.View(m.ID).LastMsgAt); age > 30*time.Second {
-					stale += m.Symbol + " "
-				}
-			}
-			registry.Set("market_data_fresh", stale == "", strings.TrimSpace(stale), true)
+			ok, detail := marketDataFreshState(cfg.Markets, feedClient.View, time.Now())
+			registry.Set("market_data_fresh", ok, detail, true)
 
 			// The takers guarantee steady fills; silence means the trade
 			// path (core -> gateway -> user stream) stopped working end-to-end.
@@ -78,14 +73,8 @@ func passiveChecks(ctx context.Context, cfg *Config, client *oms.Client, feedCli
 			if time.Since(startedAt) < 2*time.Minute {
 				registry.Set("book_depth", true, "warming up", true)
 			} else {
-				thin := ""
-				for _, m := range cfg.Markets {
-					v := feedClient.View(m.ID)
-					if len(v.Bids) < 18 || len(v.Asks) < 18 {
-						thin += fmt.Sprintf("%s(%d/%d) ", m.Symbol, len(v.Bids), len(v.Asks))
-					}
-				}
-				registry.Set("book_depth", thin == "", strings.TrimSpace(thin), true)
+				ok, detail := bookDepthState(cfg.Markets, feedClient.View, time.Now())
+				registry.Set("book_depth", ok, detail, true)
 			}
 		}
 	}
@@ -104,7 +93,7 @@ type HealthOpts struct {
 	Addr            string // health server listen address ("" = disabled)
 	CORSOrigin      string // demo UI origin asserted by the CORS canary
 	PublicURL       string // public gateway edge to probe ("" = local only)
-	EdgeWSURL       string // public market-data WS (the edge relay path) ("" = check disabled)
+	EdgeWSURL       string // public market-data WS; "" registers edge_feed_fresh as a failing critical check
 	BridgeHealthURL string // settlement bridge health endpoint ("" = check disabled)
 }
 
@@ -178,14 +167,12 @@ func (t *edgeLagTracker) LagMs() float64 {
 	return t.ewmaMs
 }
 
-// edgeFeedCheck proves the path real viewers use: the public market WS
-// (market.openexch.io/ws → the market-relay Worker → Durable Object). The
-// local feed staying fresh while this one stalls is exactly the half-open
-// publisher failure seen live on 2026-07-07: the gateway was healthy but
-// the edge served a frozen feed. Critical: a stale edge IS a demo outage,
-// so it pages through admin_demo_healthy / DemoUnhealthy.
+// edgeFeedCheck proves the path real viewers use: the public market-data
+// WebSocket (on the box: Cloudflare, the reverse proxy, the market-data
+// service). The local feed staying fresh while this one stalls is exactly a
+// half-open publisher or a broken public hop: the service is healthy but the
+// viewers see a frozen feed. Critical: a stale edge is a demo outage.
 func edgeFeedCheck(ctx context.Context, edgeFeed *feed.Client, market MarketSpec, lag *edgeLagTracker, registry *health.Registry) {
-	const staleAfter = 60 * time.Second
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	startedAt := time.Now()
@@ -198,12 +185,8 @@ func edgeFeedCheck(ctx context.Context, edgeFeed *feed.Client, market MarketSpec
 				registry.Set("edge_feed_fresh", true, "warming up", true)
 				continue
 			}
-			age := time.Since(edgeFeed.View(market.ID).LastMsgAt)
-			detail := fmt.Sprintf("%s last frame %s ago", market.Symbol, age.Truncate(time.Second))
-			if ms := lag.LagMs(); ms >= 0 {
-				detail += fmt.Sprintf(", relay lag ~%.0fms", ms)
-			}
-			registry.Set("edge_feed_fresh", age <= staleAfter, detail, true)
+			ok, detail := edgeFeedState(market, edgeFeed.View, lag.LagMs(), time.Now())
+			registry.Set("edge_feed_fresh", ok, detail, true)
 		}
 	}
 }
@@ -535,7 +518,7 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 
 		go passiveChecks(ctx, cfg, client, feedClient, stats, registry)
 
-		// Watch the PUBLIC viewer path (edge relay) with its own feed client,
+		// Watch the PUBLIC viewer path with its own feed client,
 		// subscribed to the first market only: one edge connection suffices
 		// to prove publisher->DO->viewer freshness.
 		var edgeFeed *feed.Client
@@ -549,7 +532,7 @@ func run(ctx context.Context, cfg *Config, client *oms.Client, source, binanceUR
 			// No edge URL => the freshness check never runs. Register it as a
 			// failing critical check rather than leaving it unregistered, so a
 			// misconfigured deploy reads unhealthy instead of silently green.
-			registry.Set("edge_feed_fresh", false, "SIM_EDGE_WS_URL not configured", true)
+			registerEdgeFeedUnset(registry)
 		}
 
 		// Watch the settlement bridge: a halt stops all money settlement and

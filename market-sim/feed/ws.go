@@ -11,8 +11,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Client maintains one WS connection per market (the gateway tracks a single
-// subscribed market per channel) and the observed book for each.
+// Client maintains one WS connection per market (a connection holds one
+// subscribed market; a subscribe replaces it) and the observed book for each.
 type Client struct {
 	wsURL   string
 	markets []int // marketIds
@@ -68,38 +68,6 @@ func (c *Client) View(marketID int) BookView {
 	return b.View()
 }
 
-// gateway wire shapes (JSON numbers; see GatewayOrderBook.buildJson,
-// GatewayStateManager.buildBookDeltaJson, TradeRingBuffer).
-type wsMessage struct {
-	Type        string     `json:"type"`
-	MarketID    int        `json:"marketId"`
-	BidVersion  int64      `json:"bidVersion"`
-	AskVersion  int64      `json:"askVersion"`
-	BookVersion int64      `json:"bookVersion"` // v4 monotonic chain id
-	Bids        []wsLevel  `json:"bids"`
-	Asks        []wsLevel  `json:"asks"`
-	Changes     []wsChange `json:"changes"`
-	Trades      []wsTrade  `json:"trades"`
-}
-
-type wsLevel struct {
-	Price    float64 `json:"price"`
-	Quantity float64 `json:"quantity"`
-}
-
-type wsChange struct {
-	Price      float64 `json:"price"`
-	Quantity   float64 `json:"quantity"`
-	Side       string  `json:"side"`       // BID | ASK
-	UpdateType string  `json:"updateType"` // NEW_LEVEL | UPDATE_LEVEL | DELETE_LEVEL
-}
-
-type wsTrade struct {
-	Price     float64 `json:"price"`
-	Quantity  float64 `json:"quantity"`
-	Timestamp int64   `json:"timestamp"`
-}
-
 func (c *Client) marketLoop(ctx context.Context, marketID int) {
 	b := c.books[marketID]
 	for {
@@ -130,6 +98,16 @@ func (c *Client) session(ctx context.Context, marketID int, b *book) error {
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close()
+	// Stop must not wait out a read deadline: closing the connection ends it.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-done:
+		}
+	}()
 
 	sub, _ := json.Marshal(map[string]any{"action": "subscribe", "marketId": marketID})
 	if err := conn.WriteMessage(websocket.TextMessage, sub); err != nil {
@@ -148,48 +126,39 @@ func (c *Client) session(ctx context.Context, marketID int, b *book) error {
 		if err != nil {
 			return fmt.Errorf("read: %w", err)
 		}
-		var msg wsMessage
-		if err := json.Unmarshal(data, &msg); err != nil {
+		f, err := Decode(data)
+		if err != nil {
+			b.setProblem(err.Error())
+			return err
+		}
+		if f.MarketID != 0 && f.MarketID != int64(marketID) {
 			continue
 		}
-		if msg.MarketID != 0 && msg.MarketID != marketID {
-			continue
-		}
-		switch msg.Type {
+		switch f.Type {
 		case "BOOK_SNAPSHOT":
-			bids := make([]Level, 0, len(msg.Bids))
-			for _, l := range msg.Bids {
-				bids = append(bids, Level(l))
-			}
-			asks := make([]Level, 0, len(msg.Asks))
-			for _, l := range msg.Asks {
-				asks = append(asks, Level(l))
-			}
-			b.replace(bids, asks, msg.BidVersion, msg.AskVersion)
+			b.replace(f.Bids, f.Asks, 0, 0, f.BookVersion, f.Stale)
 		case "BOOK_DELTA":
-			if c.OnFrameVersion != nil && msg.BookVersion > 0 {
-				c.OnFrameVersion(marketID, msg.BookVersion)
+			if c.OnFrameVersion != nil && f.BookVersion > 0 {
+				c.OnFrameVersion(marketID, f.BookVersion)
 			}
-			ok := true
-			for _, ch := range msg.Changes {
-				if !b.applyDelta(ch.Side, ch.UpdateType, ch.Price, ch.Quantity, msg.BidVersion, msg.AskVersion) {
-					ok = false
-					break
-				}
-			}
-			if !ok {
-				// Conflation seam: ask for a fresh snapshot.
+			if !b.applyDelta(f.Changes, f.BidVersion, f.AskVersion, f.BookVersion, f.FromVersion) {
+				// Chain break or conflation seam: ask for a fresh snapshot.
 				refresh, _ := json.Marshal(map[string]any{"action": "refresh", "marketId": marketID})
 				if err := conn.WriteMessage(websocket.TextMessage, refresh); err != nil {
 					return fmt.Errorf("refresh: %w", err)
 				}
 			}
 		case "TRADES_BATCH":
-			if n := len(msg.Trades); n > 0 {
-				b.recordTrade(msg.Trades[n-1].Price)
+			if n := len(f.Trades); n > 0 {
+				b.recordTrade(f.Trades[n-1].Price)
 			}
+		case "ERROR":
+			// An error frame is not a sign of a live feed.
+			b.setProblem(fmt.Sprintf("%s: %s", f.Code, f.Message))
 		default:
-			b.touch() // ticker stats, confirmations, candles: liveness only
+			if f.Known {
+				b.touch() // ticker stats, confirmations, candles, pong: liveness only
+			}
 		}
 	}
 }
