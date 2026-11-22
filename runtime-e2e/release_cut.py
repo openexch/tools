@@ -778,6 +778,11 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
             for lib, lentry in ((entry or {}).get('libs') or {}).items():
                 staged(f'{what}.libs.{lib}', lentry, lib)
             continue
+        if key == 'marketdata':
+            _marketdata_artifact(f, what, entry, cut, cls, staged)
+            for lib, lentry in ((entry or {}).get('libs') or {}).items():
+                staged(f'{what}.libs.{lib}', lentry, lib)
+            continue
         if key.endswith('_b') and cls == 'product':
             f.add('K3', f'{what}: a second build ({key}) in a product kind')
         target = entry.get('target') if isinstance(entry, dict) else None
@@ -872,6 +877,27 @@ def drifted_probe(m, cut, cls, key, source=CORE_PROBE_SOURCE):
         return None
     return (f'{key}: compiled from this harness tree\'s CoreProbe.java ({here[:12]}), not the cut\'s probe '
             f'(harness_drift: {waiver["reason"]})')
+
+
+def _marketdata_artifact(f, what, entry, cut, cls, staged):
+    """The market-data slot's oe-marketdata: the cut's own artifact when the cut lists it; until a cut layout does, in a
+    rig kind only, a product build of the cut's gateway commit (it carries the cut's gateway sha, its stamp, and sits in a
+    build tree configured with no control define). A product kind stages the cut's bytes only."""
+    if 'oe-marketdata' in (cut.get('artifacts') or {}):
+        staged(what, entry, 'oe-marketdata')
+        return
+    if cls == 'product':
+        f.add('K4', f'{what}: oe-marketdata is not an artifact of cut {cut.get("cut_id")} (a product kind stages the cut\'s bytes only)')
+        return
+    if not _rehash(f, what, entry):
+        return
+    want = (cut.get('repos') or {}).get('gateway')
+    if not want or entry.get('source_sha') != want or want.encode() not in Path(entry['path']).read_bytes():
+        f.add('K4', f'{what}: oe-marketdata is not a build of the cut\'s gateway {want}')
+    flags = (build_tree_setting(entry['path'], 'CMAKE_CXX_FLAGS') or '').split()
+    control = build_tree_setting(entry['path'], 'OE_PROJECTOR_CONTROL')
+    if any(flag.startswith('-D') for flag in flags) or control:
+        f.add('K3', f'{what}: oe-marketdata from a build tree with a control define ({" ".join(flags)} {control or ""})'.rstrip())
 
 
 def _gateway_test_artifact(f, what, key, entry, m, cut, cls):

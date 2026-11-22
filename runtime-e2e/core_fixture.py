@@ -57,7 +57,7 @@ LIFE2_CORE_ORDER = [step for step in GENESIS_ORDER if step[0] != 'me_genesis']
 # stop(): the polite-stop bound per role (docker stop -t). Forwarder: exit 0, contract <= 1 s (RUN:465-472);
 # bridge: exit 0 within 10 s (RUN:1768-1770); engines: 15 s then kill is the escalation bound only; on jars with the
 # polite-stop fix the code and time are judged by the drills' engine_polite_stop line (143 within ENGINE_SHUTDOWN_TIMEOUT_S + slack).
-STOP_BOUND_S = {'forwarder': 3, 'bridge': 10, 'engine': 15, 'projector': 10, 'replica': 15, 'projection': 10}
+STOP_BOUND_S = {'forwarder': 3, 'bridge': 10, 'engine': 15, 'projector': 10, 'replica': 15, 'projection': 10, 'marketdata': 10}
 FORWARDER_STOP_CONTRACT_S = 1.0
 SESSION_WINDOW_S = 10.0          # the core's session timeout a killed forwarder's session outlives it by
 READY_AFTER_KILL_S = 5.0         # The ready_after_kill bound, a setting (measured 1.12 s in DR-A05)
@@ -182,6 +182,8 @@ def role_kind(name):
         return 'replica'
     if name in core_contracts.PROJECTION_ROLES:
         return 'projection'
+    if name in core_contracts.MARKETDATA_ROLES:
+        return 'marketdata'
     return 'projector' if name == 'projector' else None
 
 
@@ -304,6 +306,7 @@ class CoreFixture(Fixture):
     clock = staticmethod(time.time)
     gateway_slots = False            # a manifest without the gateway roles (set in __init__)
     projection_slots = False         # a manifest without the projection roles (set in __init__)
+    marketdata_slots = False         # a manifest without the market-data role (set in __init__)
     sleep = staticmethod(time.sleep)
 
     def __init__(self, manifest_path, attach=False, keyring=None, drill=False):
@@ -324,8 +327,9 @@ class CoreFixture(Fixture):
         # The REPLICA key only when this manifest runs the replica (an older core refuses a table naming the class)
         self.gateway_slots = core_contracts.gateway_manifest(self.m)
         self.projection_slots = core_contracts.projection_manifest(self.m)
+        self.marketdata_slots = core_contracts.marketdata_manifest(self.m)
         self.keys = keyring or KeyRing(replica=self.m['slot_artifacts'].get('shadow0') == 'shadow', gateway=self.gateway_slots,
-                                       projection=self.projection_slots)
+                                       projection=self.projection_slots, marketdata=self.marketdata_slots)
         self.secret_values = self.keys.secrets()
         self.slots = {}
         if attach:
@@ -392,7 +396,8 @@ class CoreFixture(Fixture):
             artifact = self.m['artifacts'][role]
             self._stage(artifact['path'], dest / (role + '.jar'), artifact['sha256'], 'artifact changed while staging: ' + role, 0o644)
         for role in (core_contracts.OPTIONAL_BINARIES + (core_contracts.GATEWAY_BINARIES if self.gateway_slots else [])
-                     + (core_contracts.PROJECTION_BINARIES if self.projection_slots else [])):
+                     + (core_contracts.PROJECTION_BINARIES if self.projection_slots else [])
+                     + (core_contracts.MARKETDATA_BINARIES if self.marketdata_slots else [])):
             artifact = self.m['artifacts'][role]
             if artifact is None:
                 continue
@@ -438,8 +443,10 @@ class CoreFixture(Fixture):
             self.create_gateway_database()
         if self.projection_slots:
             self.create_projection_databases()
+        if self.marketdata_slots:
+            self.create_marketdata_database()
 
-    FIXTURE_DATABASES = {'postgres', 'r01_money', 'r01_gateway', 'r01_history_b'}
+    FIXTURE_DATABASES = {'postgres', 'r01_money', 'r01_gateway', 'r01_history_b', core_contracts.MARKETDATA_DATABASE}
 
     def psql(self, database, sql):
         """The core fixture's databases only: the money projector's and the gateway's users store."""
@@ -488,6 +495,47 @@ class CoreFixture(Fixture):
             self.psql('postgres', f'CREATE ROLE {login} LOGIN IN ROLE {group}')
             self.registry['history_reader'] = {'login': login, 'member_of': group}
         self.save()
+
+    MARKETDATA_PASSWORD_FILE = '/data/pg-password'
+
+    def create_marketdata_database(self):
+        """The market history database and its writer login role (fixed names, core_contracts), empty: oe-marketdata applies
+        its own schema and owns every relation. The role's password is a run secret (redacted) in md0's own state dir;
+        the fixture's pg_hba trusts the fixture network, so the password is carried, not checked."""
+        db, role = core_contracts.MARKETDATA_DATABASE, core_contracts.MARKETDATA_WRITER
+        password = uuid.uuid4().hex + uuid.uuid4().hex
+        self.psql('postgres', f"CREATE ROLE {role} LOGIN PASSWORD '{password}'")
+        self.psql('postgres', f'CREATE DATABASE {db} OWNER {role}')
+        state = self.root / 'state' / 'md0'
+        state.mkdir(parents=True, exist_ok=True)
+        path = state / 'pg-password'
+        path.write_text(password + '\n')
+        path.chmod(0o600)
+        self.marketdata_secrets = {password}
+        self.secret_values = self.keys.secrets() | self.marketdata_secrets
+        self.registry['marketdata_database'] = {'name': db, 'writer': role, 'schema': 'applied by oe-marketdata'}
+        self.registry.setdefault('prepared_state', {})['md0'] = {'pg_password_file': True}
+        self.save()
+
+    # The order history databases (row "history database lost"): the gateways' database, which pj0 writes and the gateways
+    # read, and pj1's. Taking one down refuses every new connection to it and ends every open one, the same failure a
+    # stopped database server shows its clients; the money database and the market history database stay up.
+    ORDER_HISTORY_DATABASES = ('r01_gateway', 'r01_history_b')
+
+    def history_databases_down(self, down):
+        """Take the order history databases down (``down`` True) or bring them back; returns the witness (recorded)."""
+        names = ', '.join(f"'{d}'" for d in self.ORDER_HISTORY_DATABASES)
+        for database in self.ORDER_HISTORY_DATABASES:
+            self.psql('postgres', f'ALTER DATABASE {database} ALLOW_CONNECTIONS {"false" if down else "true"}')
+        ended = 0
+        if down:
+            ended = int(self.psql('postgres', f'SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity '
+                                              f'WHERE datname IN ({names})') or 0)
+        state = self.psql('postgres', f"SELECT string_agg(datname || '=' || datallowconn, ',' ORDER BY datname) "
+                                      f'FROM pg_database WHERE datname IN ({names})')
+        return self.record_fault({'kind': 'history_databases_down' if down else 'history_databases_up',
+                                  'databases': list(self.ORDER_HISTORY_DATABASES), 'backends_ended': ended,
+                                  'allow_connections': state, 'at_ns': time.time_ns()})
 
     def recreate_projection_database(self, database):
         """Drop and create one projection database, empty (a projection from genesis into an empty database). The
@@ -1027,6 +1075,9 @@ class CoreFixture(Fixture):
                 if self.projection_slots and not getattr(self, 'projection_deferred', False):
                     self.start_projection_slots()
                     boot['phases']['projection_slots_ns'] = time.time_ns()
+                if self.marketdata_slots and not getattr(self, 'marketdata_deferred', False):
+                    self.start_marketdata_slots()
+                    boot['phases']['marketdata_slots_ns'] = time.time_ns()
         boot['phases']['complete_ns'] = time.time_ns()
         self.registry['slots'] = self.slots; self.registry['boot'] = boot
         self.registry['startup_complete'] = True; self.save()
@@ -1512,6 +1563,10 @@ class CoreFixture(Fixture):
         if role in core_contracts.PROJECTION_SLOTS and self.slot_artifact(role):
             # /health, not /ready: a standby copy is never ready, and a writer is ready only after its first probe
             return self.m['ports']['projector_admin'], '/health'
+        if role in core_contracts.MARKETDATA_SLOTS and self.slot_artifact(role):
+            # /ready/session (the ME session): /ready also needs a book snapshot of every expected market, which a market
+            # with no order yet may never get
+            return self.m['ports']['md_admin'], '/ready/session'
         raise Violation('no readiness target for ' + role)
 
     def start_slot(self, slot):
@@ -1583,6 +1638,17 @@ class CoreFixture(Fixture):
     GATEWAY_FUZZ_UNKNOWN_ASSET = 999
     GATEWAY_FAUCET_CAPS = {0: '1', GATEWAY_FUZZ_UNKNOWN_ASSET: '1'}
 
+    def faucet_caps(self):
+        """The gateways' faucet caps: GATEWAY_FAUCET_CAPS, or the caps a drill names before the gateways start (a drill that
+        funds its users through the treasury lane), recorded in the registry."""
+        caps = getattr(self, 'gateway_faucet_caps', None)
+        if not caps:
+            return dict(self.GATEWAY_FAUCET_CAPS)
+        if self.registry.get('gateway_faucet_caps') != {str(k): v for k, v in caps.items()}:
+            self.registry['gateway_faucet_caps'] = {str(k): v for k, v in caps.items()}
+            self.save()
+        return dict(caps)
+
     def core_behavior_step(self):
         """A gateway kind runs the core at its kind's behaviour version (default 4: a create's requestId lookup runs before
         the gate, so a stored acceptance is answered again under a closed gate). The genesis ladder ends at 3; the step to 4
@@ -1632,7 +1698,7 @@ class CoreFixture(Fixture):
             env.update(GATEWAY_HTTP_BIND=f'{nodes[slot]}:{ports["gateway_http"]}',
                        GATEWAY_ADMIN_BIND=f'{nodes[slot]}:{ports["gateway_admin"]}', GATEWAY_PG_URL=self.gateway_pg_url(slot),
                        GATEWAY_ALLOW_TREASURY_LANE='1', GATEWAY_TREASURY_CREDENTIAL=self.keys.credential(slot + '-treasury', 'ae'),
-                       GATEWAY_FAUCET_MAX_AMOUNT=','.join(f'{a}:{v}' for a, v in sorted(self.GATEWAY_FAUCET_CAPS.items())))
+                       GATEWAY_FAUCET_MAX_AMOUNT=','.join(f'{a}:{v}' for a, v in sorted(self.faucet_caps().items())))
             # a drill's gateway history settings (history-freshness: the stale bound and its probe cadence), recorded
             # by the drill; only those two names, through the same guard as every other name
             overrides = {k: str(v) for k, v in ((getattr(self, 'gateway_env_overrides', None) or {}).get(slot) or {}).items()}
@@ -1797,7 +1863,7 @@ class CoreFixture(Fixture):
         path = state / 'api-keys'
         path.write_text(text)
         path.chmod(0o600)
-        self.secret_values = self.keys.secrets()
+        self.secret_values = self.keys.secrets() | getattr(self, 'marketdata_secrets', set())
         self.registry.setdefault('prepared_state', {})[slot] = {'api_key_users': users}
         self.save()
 
@@ -1939,7 +2005,7 @@ class CoreFixture(Fixture):
         path = state / 'cluster-key'
         path.write_text(self.keys.credential(slot, 'ae') + '\n')
         path.chmod(0o600)
-        self.secret_values = self.keys.secrets()
+        self.secret_values = self.keys.secrets() | getattr(self, 'marketdata_secrets', set())
         self.registry.setdefault('prepared_state', {})[slot] = {'cluster_key': True}
         self.save()
 
@@ -2004,6 +2070,84 @@ class CoreFixture(Fixture):
         if self.slot_artifact(slot) in ('history_projector', 'history_projector_nc'):
             return projector_health_view(body, self.projection_members(slot), self.m['nodes'])
         return body
+
+    # ---------------------------------------------------------------- the market-data slot
+
+    MARKETDATA_EGRESS_PORT = 20500
+
+    def marketdata_env(self, slot):
+        """oe-marketdata's environment (gateway marketdata/MarketDataSettings.h): the required settings only. Its ME
+        session on its own GATEWAY key of the ME table, the ME journal's archives as the bridge reads them, the market
+        history database under its writer role; every bound, size and timeout stays at the binary's default."""
+        nodes, ports = self.m['nodes'], self.m['ports']
+        artifact = self.m['artifacts'][self.slot_artifact(slot)]
+        me = self.m['credentials']['me']
+        env = {'MD_DRIVER_MODE': artifact['driver'], 'MD_INSTANCE_ID': str(self.keys.keys[(slot, 'me')][0]),
+               'MD_ME_CLUSTER_ADDRESSES': ','.join(nodes[f'me{i}'] for i in range(3)),
+               'MD_ME_PORT_BASE': str(ports['me_base']), 'CLUSTER_PORT_STRIDE': str(ports['stride']),
+               'MD_ME_EGRESS_ENDPOINT': f'{nodes[slot]}:{self.MARKETDATA_EGRESS_PORT}',
+               me['credential_env']: self.keys.credential(slot, 'me'),
+               'MD_ME_JOURNAL_ARCHIVES': ','.join(f'{nodes[f"me{i}"]}:{ports["me_base"] + i * ports["stride"] + 10}'
+                                                  for i in range(3)),
+               'MD_LOCAL_HOST': nodes[slot], 'MD_PUBLIC_BIND': f'{nodes[slot]}:{ports["md_public"]}',
+               'MD_ADMIN_BIND': f'{nodes[slot]}:{ports["md_admin"]}',
+               'MD_PG_URL': f'postgresql://{self.gateway}:{self.pg_port}/{core_contracts.MARKETDATA_DATABASE}',
+               'MD_PG_USER': core_contracts.MARKETDATA_WRITER, 'MD_PG_PASSWORD_FILE': self.MARKETDATA_PASSWORD_FILE,
+               'MD_CORS_ORIGINS': 'none', 'MD_EXPECTED_MARKETS': core_contracts.MARKETDATA_EXPECTED_MARKETS,
+               **core_contracts.MARKETDATA_JOURNAL}
+        if artifact['driver'] == 'external':
+            env['AERON_DIR'] = '/dev/shm/aeron-' + slot
+        else:
+            env['MD_DRIVER_DIR'] = '/dev/shm'
+        return env
+
+    def marketdata_command(self, slot):
+        """oe-marketdata as the container's pid 1: directly (embedded), or behind the staged aeronmd in the same container
+        (external, the projector slots' wrapper)."""
+        name = self.slot_artifact(slot)
+        binary = f'/artifacts/{name}/bin'
+        if self.m['artifacts'][name]['driver'] != 'external':
+            return ['sh', '-c', f'exec {binary}']
+        d = '/dev/shm/aeron-' + slot
+        env = ' '.join(f'{k}={v}' for k, v in sorted(DRIVER_ENV.items()))
+        alive = '"$(cat /data/aeronmd.pid)"'
+        return ['sh', '-c', f'rm -rf {d}; mkdir -p {d}; AERON_DIR={d} {env} LD_LIBRARY_PATH=/artifacts/{name} /artifacts/{name}/aeronmd & '
+                            f'echo $! > /data/aeronmd.pid; i=0; '
+                            f'while {{ [ ! -f {d}/cnc.dat ] || ! kill -0 {alive} 2>/dev/null; }} && [ $i -lt {DRIVER_WAIT_TENTHS} ]; '
+                            f'do sleep 0.1; i=$((i+1)); done; '
+                            f'[ -f {d}/cnc.dat ] && kill -0 {alive} 2>/dev/null || {{ echo "aeronmd did not come up in 30 s" >&2; exit 1; }}; '
+                            f'exec {binary}']
+
+    MARKETDATA_READY_BOUND_S = 90
+
+    def start_marketdata_slots(self, slots=None):
+        """Start the market-data slot after the gateway and projection slots (its ME session needs the ME's config; a
+        declared slot whose artifact is null is SKIPPED_ABSENT). Waits for /ready/session, the ME session."""
+        for slot in slots or sorted(core_contracts.MARKETDATA_SLOTS):
+            name = self.slot_artifact(slot)
+            if name is None:
+                self.slots[slot] = {'state': 'SKIPPED_ABSENT', 'reason': 'this manifest stages nothing in ' + slot}
+                continue
+            self.spawn(slot, self.marketdata_command(slot), self.marketdata_env(slot))
+            port, path = self.ready_target(slot)
+            self.wait_http(slot, port, path, timeout=self.MARKETDATA_READY_BOUND_S)
+            artifact = self.m['artifacts'][name]
+            health = self.marketdata_health(slot)
+            self.slots[slot] = {'state': 'STARTED', 'artifact': name, 'sha256': artifact['sha256'],
+                                'source_sha': artifact['source_sha'], 'driver': artifact['driver'], 'target': artifact['target'],
+                                'readiness': path, 'build': (health or {}).get('build')}
+        self.registry['slots'] = self.slots
+        self.save()
+        return {s: self.slots.get(s) for s in (slots or sorted(core_contracts.MARKETDATA_SLOTS))}
+
+    def marketdata_health(self, slot='md0'):
+        """md0's own /health as JSON, or None when it does not answer."""
+        response = self.http(slot, self.m['ports']['md_admin'], '/health')
+        try:
+            body = json.loads(response.get('body') or 'null')
+        except ValueError:
+            return None
+        return body if isinstance(body, dict) else None
 
     def respawn_slot(self, name):
         """Start a stopped gateway or projection slot again in a NEW container from the same artifact, on the environment
@@ -2080,7 +2224,8 @@ class CoreFixture(Fixture):
         return witness
 
     def _fault_target(self, name):
-        if (name not in set(ENGINES) | set(SLOTS) | core_contracts.GATEWAY_ROLES | core_contracts.PROJECTION_ROLES | {'projector'}
+        if (name not in set(ENGINES) | set(SLOTS) | core_contracts.GATEWAY_ROLES | core_contracts.PROJECTION_ROLES
+                | core_contracts.MARKETDATA_ROLES | {'projector'}
                 or name not in self.registry['containers']):
             raise Violation('unsupported or unstarted fault target: ' + name)
         return self.registry['containers'][name]

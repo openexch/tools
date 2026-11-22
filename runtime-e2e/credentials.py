@@ -5,14 +5,14 @@ Every run mints fresh 32-byte secrets. Both tables use the v1 key spec of the cl
 authenticator: ``keyId:CLASS:secretHex::users=*`` entries joined by ``;``. The users
 field is mandatory and ``users=*`` is the only any-user form (a key with no users field fails the load);
 every fixture principal is any-user. Clients receive one ``keyId:CLASS:secretHex`` credential (unchanged).
-The ME table holds classes FORWARDER and ADMIN. The replica's REPLICA key (SessionClass.REPLICA, 7 since money-schema
+The ME table holds classes FORWARDER and ADMIN, and GATEWAY for the market-data slot. The replica's REPLICA key (SessionClass.REPLICA, 7 since money-schema
 v7) is minted only for a manifest that runs the replica, so a table never names a class an older core cannot load. Evidence carries key ids and classes
 only; ``secrets()`` is what the fixture redacts from every retained log.
 """
 import secrets
 
 AE_CLASSES = {'GATEWAY', 'FORWARDER', 'BRIDGE', 'ADMIN', 'TOOL', 'TREASURY', 'REPLICA'}
-ME_CLASSES = {'FORWARDER', 'ADMIN'}
+ME_CLASSES = {'FORWARDER', 'ADMIN', 'GATEWAY'}
 
 # (principal, cluster, class, keyId). keyIds are fixed per principal so evidence is comparable across
 # runs; only the secrets change. shadow0 (the replica) gets its key only when the manifest runs it (REPLICA_PRINCIPAL).
@@ -36,13 +36,16 @@ GATEWAY_PRINCIPALS = [('gw0', 'ae', 'GATEWAY', 51), ('gw1', 'ae', 'GATEWAY', 52)
 # The projection slots (minted only for a manifest that runs them): one GATEWAY key each, the class of the projector's
 # head probe (an any-user order-event query), as a stream's key is
 PROJECTION_PRINCIPALS = [('pj0', 'ae', 'GATEWAY', 57), ('pj1', 'ae', 'GATEWAY', 58)]
+# The market-data slot (minted only for a manifest that runs it): one GATEWAY key on the ME, the class the ME admits for
+# market data (egress only, no ingress but the keepalive)
+MARKETDATA_PRINCIPALS = [('md0', 'me', 'GATEWAY', 131)]
 # A user API key of the gateway's api-key auth mode (GATEWAY_API_KEYS_FILE, one ``key:userId`` per line): 32 random
 # bytes as 64 hex characters (the gateway's floor is 16 characters)
 API_KEY_BYTES = 32
 
 
 class KeyRing:
-    def __init__(self, secret_source=None, replica=False, gateway=False, projection=False):
+    def __init__(self, secret_source=None, replica=False, gateway=False, projection=False, marketdata=False):
         source = secret_source or (lambda: secrets.token_bytes(32))
         self.source = source
         self.keys = {}
@@ -51,7 +54,8 @@ class KeyRing:
         self.reserved = {} if replica else dict(RESERVED)
         for principal, cluster, cls, key_id in (PRINCIPALS + ([REPLICA_PRINCIPAL] if replica else [])
                                                 + (GATEWAY_PRINCIPALS if gateway else [])
-                                                + (PROJECTION_PRINCIPALS if projection else [])):
+                                                + (PROJECTION_PRINCIPALS if projection else [])
+                                                + (MARKETDATA_PRINCIPALS if marketdata else [])):
             if cls not in (AE_CLASSES if cluster == 'ae' else ME_CLASSES):
                 raise ValueError(f'{principal}: class {cls} not valid on {cluster}')
             secret = source()

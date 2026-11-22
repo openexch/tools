@@ -80,6 +80,26 @@ HISTORY_READER_LOGIN = 'runtime_history_reader'
 STUB_MODES = {'follow', 'beat-always'}
 # The projection databases (the fixture's PostgreSQL): pj0 writes the gateways' database, pj1 a second one
 PROJECTION_DATABASES = {'pj0': 'r01_gateway', 'pj1': 'r01_history_b'}
+# The public market-data slot: oe-marketdata of the cut's gateway commit in md0, its own container and address, one
+# GATEWAY-class session on the ME and the ME journal's archives as its trade path, writing the market history database
+# under its own login role. A manifest declares md0 or not, and only next to the gateway roles. A declared slot may be
+# null (not started). Until a cut layout lists oe-marketdata, the slot stages the product build of the cut's gateway
+# commit that MK_MARKETDATA names (release_cut checks its stamp against the cut's gateway sha).
+MARKETDATA_SLOTS = {'md0': 'marketdata'}
+MARKETDATA_ROLES = set(MARKETDATA_SLOTS)
+MARKETDATA_BINARIES = ['marketdata']
+MARKETDATA_SLOT_ARTIFACTS = {'md0': {'marketdata'}}
+MARKETDATA_TARGETS = {'marketdata': 'oe-marketdata'}
+MARKETDATA_PORTS = {'md_public': 8110, 'md_admin': 8111}
+# The market history database and its writer role (fixed names that cannot meet a legacy one); the service applies its
+# own schema (sql/market_history_v1.sql) and owns every relation
+MARKETDATA_DATABASE = 'oe_marketdata'
+MARKETDATA_WRITER = 'oe_marketdata_writer'
+# The ME journal as the bridge reads it (stream, control stream, the archive's MTU), on the service's own replay stream;
+# the markets the fixture's genesis creates. Settings of the fixture, not limits of the binary.
+MARKETDATA_JOURNAL = {'MD_JOURNAL_CONTROL_STREAM': '4010', 'MD_JOURNAL_STREAM': '4001', 'MD_JOURNAL_CHANNEL': 'aeron:ipc',
+                      'MD_REPLAY_STREAM': '4014', 'MD_JOURNAL_MTU': '1408'}
+MARKETDATA_EXPECTED_MARKETS = '1,2,3,4,5'
 # JVM system properties a manifest may set on the core members (core_jvm_properties): the per-session egress ceiling of
 # the slow-consumer drill. A setting of the core (SessionEgressQueue), never a timeout.
 CORE_JVM_PROPERTIES = {'core.egress.max.capacity.bytes'}
@@ -106,22 +126,33 @@ def projection_manifest(manifest):
     return bool(present)
 
 
+def marketdata_manifest(manifest):
+    """True when ``manifest`` declares the market-data role md0, False when not. It needs the gateway roles."""
+    present = MARKETDATA_ROLES & set((manifest or {}).get('nodes') or {})
+    if present and not gateway_manifest(manifest):
+        raise Violation('the market-data role needs the gateway roles')
+    return bool(present)
+
+
 def roles_of(manifest):
-    """The roles a manifest must declare: ROLES, plus the gateway roles on a gateway manifest and the projection roles on
-    a projection manifest."""
+    """The roles a manifest must declare: ROLES, plus the gateway roles on a gateway manifest, the projection roles on
+    a projection manifest and md0 on a market-data manifest."""
     return (ROLES | (GATEWAY_ROLES if gateway_manifest(manifest) else set())
-            | (PROJECTION_ROLES if projection_manifest(manifest) else set()))
+            | (PROJECTION_ROLES if projection_manifest(manifest) else set())
+            | (MARKETDATA_ROLES if marketdata_manifest(manifest) else set()))
 
 
 def slots_of(manifest):
     return {**SLOTS, **(GATEWAY_SLOTS if gateway_manifest(manifest) else {}),
-            **(PROJECTION_SLOTS if projection_manifest(manifest) else {})}
+            **(PROJECTION_SLOTS if projection_manifest(manifest) else {}),
+            **(MARKETDATA_SLOTS if marketdata_manifest(manifest) else {})}
 
 
 def ports_of(manifest):
     """The port profile a manifest must carry."""
     return {**PORT_PROFILE, **(GATEWAY_PORTS if gateway_manifest(manifest) else {}),
-            **(PROJECTION_PORTS if projection_manifest(manifest) else {})}
+            **(PROJECTION_PORTS if projection_manifest(manifest) else {}),
+            **(MARKETDATA_PORTS if marketdata_manifest(manifest) else {})}
 
 
 # The replica's port slot (CLUSTER_REPLICA_SLOT): its ports are ae_base + slot x stride + offset, like a member's
@@ -231,7 +262,13 @@ PROCESS_ENV = {
     # one setting a drill may set (projection-byte-equal-replay C: the rebuild's batch size, recorded with the run)
     'HISTORY_PROJECTOR_BATCH_EVENTS',
     # the core members' replay gauge (core README): the replay stream core_archive_replays_active counts
-    'CORE_ARCHIVE_REPLAY_PROBE_STREAM'}
+    'CORE_ARCHIVE_REPLAY_PROBE_STREAM',
+    # oe-marketdata (gateway marketdata/MarketDataSettings.h; strict, exit 78): only the required settings, the rest on
+    # its defaults (stale bounds, timeouts and sizes are never set)
+    'MD_DRIVER_MODE', 'MD_DRIVER_DIR', 'MD_INSTANCE_ID', 'MD_ME_CLUSTER_ADDRESSES', 'MD_ME_PORT_BASE',
+    'MD_ME_EGRESS_ENDPOINT', 'MD_ME_JOURNAL_ARCHIVES', 'MD_JOURNAL_CONTROL_STREAM', 'MD_JOURNAL_STREAM',
+    'MD_JOURNAL_CHANNEL', 'MD_REPLAY_STREAM', 'MD_JOURNAL_MTU', 'MD_LOCAL_HOST', 'MD_PUBLIC_BIND', 'MD_ADMIN_BIND',
+    'MD_PG_URL', 'MD_PG_USER', 'MD_PG_PASSWORD_FILE', 'MD_CORS_ORIGINS', 'MD_EXPECTED_MARKETS'}
 # Only `execute` on the probe container may carry these (the pinned T1 drivers). The values are
 # session secrets except T1_ME_MARKETS and T1_LOCAL_HOST. T1_BRIDGE_KEY, T1_TAP_KEY and T1_ME_FORWARDER_KEY are
 # never set: the via-bridge genesis needs no bridge key and the capture/resend verbs are not run from the probe.
@@ -555,6 +592,27 @@ PROJECTION_CONTROL_EXT_TWINS = {k + '-ext': k for k in ('pj-nc-pinrecording', 'p
                                                        'pj-nc-beatalways', 'pj-nc-nostale')}
 GATEWAY_KINDS.update({twin: dict(GATEWAY_KINDS[base], driver='external')
                       for twin, base in PROJECTION_CONTROL_EXT_TWINS.items()})
+# The critical-path kinds: the projector binary kind plus the market-data slot md0 (oe-marketdata of the cut's gateway
+# commit on the kind's driver mode). ``slot_plan`` names the forwarder and bridge plan (default A: the cut's builds).
+#   cps, cps-ext                the critical-path smoke, the gate brake and the history loss, both engine driver modes
+#   cps-nofwd, cps-nofwd-ext    both forwarder slots empty: nothing reaches the ME (the smoke's non-vacuity control)
+#   cps-nc-dropone              the smoke on oe-projector built with PROJ_NC_DROP_ONE in pj0 and pj1 (the history line's
+#                               control, ``smoke_control`` names the scenario and ``control_text`` its text; one mode,
+#                               as the other drills' controls)
+_MD = {'md0': 'marketdata'}
+GATEWAY_KINDS.update({
+    'cps': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_BIN), 'marketdata': dict(_MD)},
+    'cps-ext': {'driver': 'external', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_BIN),
+                'marketdata': dict(_MD)},
+    'cps-nofwd': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_BIN),
+                  'marketdata': dict(_MD), 'slot_plan': 'NOFWD'},
+    'cps-nofwd-ext': {'driver': 'external', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_BIN),
+                      'marketdata': dict(_MD), 'slot_plan': 'NOFWD'},
+    'cps-nc-dropone': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_NC),
+                       'projector_define': 'PROJ_NC_DROP_ONE', 'marketdata': dict(_MD),
+                       'smoke_control': 'critical-path-smoke-core', 'control_text': 'history differs from the core: missing event'},
+})
+MARKETDATA_KINDS = {k for k, v in GATEWAY_KINDS.items() if v.get('marketdata')}
 PROJECTION_KINDS = {k for k, v in GATEWAY_KINDS.items() if v.get('projectors')}
 # The kinds whose projection slots run the projector binary (product or control build), not the stand-in
 PROJECTOR_BINARY_KINDS = {k for k in PROJECTION_KINDS
@@ -905,6 +963,35 @@ def validate_projection_artifacts(manifest):
             _lib(lib, name + ' library ' + lib_name)
 
 
+MARKETDATA_ARTIFACT_KEYS = {'path', 'sha256', 'source_sha', 'driver', 'target', 'libs'}
+
+
+def validate_marketdata_artifacts(manifest):
+    """The market-data binary of a market-data manifest: declared (null when absent), pinned like a slot binary, its
+    target oe-marketdata; an external one stages the driver files."""
+    artifacts = manifest['artifacts']
+    for name in MARKETDATA_BINARIES:
+        if name not in artifacts:
+            raise Violation('a market-data manifest declares its artifact explicitly (null when absent): ' + name)
+        entry = artifacts[name]
+        if entry is None:
+            continue
+        if not isinstance(entry, dict) or set(entry) - MARKETDATA_ARTIFACT_KEYS:
+            raise Violation(f'{name}: artifact keys are ' + ', '.join(sorted(MARKETDATA_ARTIFACT_KEYS)))
+        _source(entry, name); _file(entry, name)
+        if entry.get('target') != MARKETDATA_TARGETS[name]:
+            raise Violation(f'{name}: target must be {MARKETDATA_TARGETS[name]}, got {entry.get("target")!r}')
+        if entry.get('driver') not in DRIVER_MODES:
+            raise Violation(name + ': driver must be embedded or external')
+        libs = entry.get('libs') or {}
+        if entry['driver'] == 'external' and set(libs) != {'aeronmd', 'libaeron_driver.so', 'libaeron.so'}:
+            raise Violation(f'{name}: an external slot stages aeronmd, libaeron_driver.so and libaeron.so')
+        for lib_name, lib in libs.items():
+            if '/' in lib_name:
+                raise Violation(name + ': library names are flat file names')
+            _lib(lib, name + ' library ' + lib_name)
+
+
 def validate_gateway_artifacts(manifest):
     """The gateway binaries of a gateway manifest: each declared (null when absent), pinned like a slot binary (path,
     sha256, 40-hex source commit, driver mode, the libraries an external one stages), its target fixed by its key. A
@@ -1026,8 +1113,9 @@ def validate_core_manifest(manifest, manifest_path, cpu_count=None, profiles=jou
         validate_cpus(manifest, cpu_count)
         integer(manifest['seed'])
         artifacts = manifest['artifacts']
+        marketdata = marketdata_manifest(manifest)
         unknown = (set(artifacts) - set(REQUIRED_JARS) - set(OPTIONAL_BINARIES) - (set(GATEWAY_BINARIES) if gateway else set())
-                   - (set(PROJECTION_BINARIES) if projection else set()))
+                   - (set(PROJECTION_BINARIES) if projection else set()) - (set(MARKETDATA_BINARIES) if marketdata else set()))
         if unknown:
             raise Violation('unknown artifacts: ' + ', '.join(sorted(unknown)))
         for role in REQUIRED_JARS:
@@ -1053,13 +1141,17 @@ def validate_core_manifest(manifest, manifest_path, cpu_count=None, profiles=jou
             validate_gateway_artifacts(manifest)
         if projection:
             validate_projection_artifacts(manifest)
+        if marketdata:
+            validate_marketdata_artifacts(manifest)
         slots = manifest['slot_artifacts']
         if set(slots) != set(slots_of(manifest)):
             raise Violation('slot_artifacts must name every slot role: ' + ', '.join(sorted(slots_of(manifest))))
         for slot, name in slots.items():
-            if name is not None and name not in {**SLOT_ARTIFACTS, **GATEWAY_SLOT_ARTIFACTS, **PROJECTION_SLOT_ARTIFACTS}[slot]:
+            if name is not None and name not in {**SLOT_ARTIFACTS, **GATEWAY_SLOT_ARTIFACTS, **PROJECTION_SLOT_ARTIFACTS,
+                                                 **MARKETDATA_SLOT_ARTIFACTS}[slot]:
                 raise Violation(f'slot {slot} cannot run artifact {name}')
-            if name is not None and (slot in GATEWAY_SLOTS or slot in PROJECTION_SLOTS) and artifacts.get(name) is None:
+            if name is not None and (slot in GATEWAY_SLOTS or slot in PROJECTION_SLOTS or slot in MARKETDATA_SLOTS) \
+                    and artifacts.get(name) is None:
                 raise Violation(f'slot {slot} runs {name}, but artifacts.{name} is null')
         validate_core_jvm_properties(manifest)
         validate_replica_slot(manifest)

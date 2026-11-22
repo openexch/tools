@@ -13,6 +13,8 @@ fixture network, never through a disk. Three parts:
   the key's (user, quantity); the control text of a second order is exactly ``second order for one Idempotency-Key``.
 * ``stream``: a minimal RFC 6455 client (text frames, ping/pong, close) that authenticates with a first frame,
   subscribes and writes every frame it receives, with its receive time, to a JSON line file.
+* ``calls``: a scripted REST workload in order, each keyed call retried with its key until decided; the request log.
+* ``mdfeed``: the public market-data client (oe-marketdata /ws, no credential): one market's frames to a JSON line file.
 
 Sizes, rates and bounds are arguments with defaults, never limits.
 """
@@ -753,6 +755,83 @@ def settle(rows, targets, keys, out, bound_s=60, backoff_s=0.5, sender=None, clo
     return client.log
 
 
+# A keyed call is sent again with the same key and body while its answer says nothing was decided: no answer, 502, 503
+# and 504 (RETRY_STATUSES), and 429 (a rate bucket was empty). ``retry`` False sends the call once (a read, or a call
+# whose first answer is the evidence: an amend under a closed gate).
+CALL_RETRY_STATUSES = RETRY_STATUSES | {429}
+
+
+def calls(plan, keys, out, clock=time.monotonic, sleep=time.sleep, sender=request):
+    """The REST client of a scripted workload: every call ({user, method, path, body, key, tag, retry}) in order to
+    ``plan['target']`` with the user's API key and, when it names one, its Idempotency-Key. A keyed call is retried with
+    the same key and body until answered (CALL_RETRY_STATUSES) or ``plan['bound_s']`` passes. Every attempt is recorded;
+    the result is one row per call with its last answer and its attempts, in call order: the client's request log."""
+    rows = []
+    bound_s, backoff_s = plan.get('bound_s', 60), plan.get('backoff_s', 0.5)
+    for call in plan['calls']:
+        headers = {'X-API-Key': keys[str(call['user'])]}
+        if call.get('key'):
+            headers['Idempotency-Key'] = call['key']
+        attempts, deadline = [], clock() + bound_s
+        while True:
+            sent = time.time_ns()
+            status, reply, error = sender(call['method'], plan['target'], call['path'], headers, call.get('body'),
+                                          plan.get('attempt_s', 30))
+            attempts.append({'status': status, 'reply': reply, 'error': error, 'sent_ns': sent, 'recv_ns': time.time_ns()})
+            retry = call.get('retry', bool(call.get('key')))
+            if not retry or status not in CALL_RETRY_STATUSES or clock() >= deadline:
+                break
+            sleep(backoff_s if status != 429 else max(backoff_s, 1.1))
+        last = attempts[-1]
+        rows.append({**{k: call.get(k) for k in ('user', 'method', 'path', 'body', 'key', 'tag')},
+                     'status': last['status'], 'reply': last['reply'], 'sent_ns': attempts[0]['sent_ns'],
+                     'recv_ns': last['recv_ns'], 'attempts': attempts})
+    if out is not None:
+        Path(out).write_text(json.dumps(rows) + '\n')
+    return rows
+
+
+def mdfeed(plan, out, stop_file=None, seconds=1800):
+    """The public market-data client: one connection to ``plan['target']`` (path /ws, no credential), subscribed to
+    ``plan['market']``; every frame written to ``out`` (JSON lines, with its receive time) until the stop file or
+    ``seconds``. A closed connection is opened and subscribed again (recorded as a ``close`` and a ``connect`` line)."""
+    host, _, port = plan['target'].rpartition(':')
+    deadline = time.monotonic() + seconds
+    stop = stop_file or plan.get('stop_file')
+    with open(out, 'a', buffering=1) as f:
+        while time.monotonic() < deadline and not (stop and os.path.exists(stop)):
+            try:
+                client = WsClient(host, int(port), path='/ws')
+                client.sock.settimeout(0.5)
+                client.send({'action': 'subscribe', 'marketId': int(plan['market'])})
+                f.write(json.dumps({'recv_ns': time.time_ns(), 'connect': plan['target']}) + '\n')
+            except (OSError, ConnectionError) as error:
+                f.write(json.dumps({'recv_ns': time.time_ns(), 'error': f'{type(error).__name__}: {error}'}) + '\n')
+                time.sleep(1.0)
+                continue
+            while time.monotonic() < deadline and not (stop and os.path.exists(stop)):
+                try:
+                    frame = client.recv()
+                except socket.timeout:
+                    continue
+                except (OSError, ValueError) as error:
+                    frame = ('close', f'{type(error).__name__}')
+                row = {'recv_ns': time.time_ns()}
+                if isinstance(frame, tuple):
+                    row['close'] = frame[1]
+                    f.write(json.dumps(row) + '\n')
+                    break
+                try:
+                    row['frame'] = json.loads(frame)
+                except ValueError:
+                    row['text'] = frame
+                f.write(json.dumps(row) + '\n')
+            try:
+                client.sock.close()
+            except OSError:
+                pass
+
+
 def place(rows, target, keys, out):
     """Every row ({key, user, body, tag}) sent once to ``target``; each answer recorded."""
     client = Client(keys)
@@ -895,16 +974,24 @@ def main(argv=None):
     s.add_argument('--target', required=True); s.add_argument('--token-file', required=True)
     s.add_argument('--channels', default='orders,fills,balances'); s.add_argument('--out', required=True)
     s.add_argument('--stop-file'); s.add_argument('--seconds', type=float, default=60)
-    for verb in ('pairs', 'tick', 'cancels', 'fuzz', 'resend', 'streams', 'settle', 'place'):
+    m = sub.add_parser('mdfeed')
+    m.add_argument('--plan', required=True); m.add_argument('--out', required=True)
+    for verb in ('pairs', 'tick', 'cancels', 'fuzz', 'resend', 'streams', 'settle', 'place', 'calls'):
         v = sub.add_parser(verb)
         v.add_argument('--plan', required=True, help='JSON plan file')
         v.add_argument('--keys', required=True)
         v.add_argument('--out', required=True)
     args = parser.parse_args(argv)
-    if args.verb in ('pairs', 'tick', 'cancels', 'fuzz', 'resend', 'streams', 'settle', 'place'):
+    if args.verb == 'mdfeed':
+        plan = json.loads(Path(args.plan).read_text())
+        mdfeed(plan, args.out, plan.get('stop_file'), plan.get('seconds', 1800))
+        return 0
+    if args.verb in ('pairs', 'tick', 'cancels', 'fuzz', 'resend', 'streams', 'settle', 'place', 'calls'):
         plan = json.loads(Path(args.plan).read_text())
         keys = json.loads(Path(args.keys).read_text())
-        if args.verb == 'settle':
+        if args.verb == 'calls':
+            calls(plan, keys, args.out)
+        elif args.verb == 'settle':
             settle(plan['rows'], plan['targets'], keys, args.out, plan['bound_s'], plan.get('backoff_s', 0.5))
         elif args.verb == 'place':
             place(plan['rows'], plan['target'], keys, args.out)

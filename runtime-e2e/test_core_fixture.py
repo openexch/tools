@@ -439,6 +439,10 @@ class SlotEnvTest(unittest.TestCase):
             for slot in core_contracts.PROJECTION_SLOTS:
                 names |= set(p.projection_slot_env(slot))
             names |= set(p.engine_env('ae', 0))
+        # The market-data slot, both driver modes
+        from test_smoke_core import marketdata_fixture
+        for driver in ('external', 'embedded'):
+            names |= set(marketdata_fixture(self.dir, driver).marketdata_env('md0'))
         f = self.fx()
         self.assertEqual(names, f.allowed_env())
         # every set value passes the guard
