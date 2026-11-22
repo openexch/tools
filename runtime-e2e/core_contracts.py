@@ -71,10 +71,22 @@ PROJECTION_PORTS = {'projector_admin': 8095}
 HISTORY_PROJECTOR_JOURNAL = {'HISTORY_PROJECTOR_JOURNAL_CONTROL_STREAM': '10', 'HISTORY_PROJECTOR_JOURNAL_STREAM': '4102',
                              'HISTORY_PROJECTOR_JOURNAL_CHANNEL': 'aeron:ipc', 'HISTORY_PROJECTOR_JOURNAL_MTU': '1408',
                              'HISTORY_PROJECTOR_REPLAY_STREAM': '4302'}
-# The login role the gateways read a projection database through on a kind that runs the projector binary: a member of
-# the schema's reader group role (sql/history_projection_v1.sql), SELECT on the four read relations and nothing else
+# The fixture's PostgreSQL roles: the console's role plan (cloud-console services/historydb.go) on the fixture's database
+# names. One login role per process kind, none of them the bootstrap superuser (initdb's, which only the harness itself
+# uses: its reads, its drills' faults and the database steps below). A retention role that may only delete (DELETE and
+# TRUNCATE through each writer's default privileges, set before that writer first starts, and SELECT on the two money
+# tables its age delete reads) and that no process logs in as here. oe-stream logs in nowhere on the fixture (api-key
+# auth only); its role is made as the console makes it.
+FIXTURE_SUPERUSER = 'runtime_fixture'
+MONEY_PROJECTOR_LOGIN = 'core'
+GATEWAY_LOGIN = 'oe_gateway'
+STREAM_LOGIN = 'oe_stream'
+HISTORY_PROJECTOR_LOGIN = 'oe_projector'
+RETENTION_ROLE = 'history_retention'
+# The login role the gateways read a projection database through on a kind that runs the projector binary: the gateway's
+# own login, a member of the schema's reader group role (sql/history_projection_v1.sql), SELECT on the four read relations
 HISTORY_READER_GROUP = 'oe_history_reader'
-HISTORY_READER_LOGIN = 'runtime_history_reader'
+HISTORY_READER_LOGIN = GATEWAY_LOGIN
 # The stand-in's modes: ``follow`` beats only at the core's head; ``beat-always`` beats whatever the head (the freshness
 # drill's control: stale history then reads fresh)
 STUB_MODES = {'follow', 'beat-always'}
@@ -95,6 +107,45 @@ MARKETDATA_PORTS = {'md_public': 8110, 'md_admin': 8111}
 # own schema (sql/market_history_v1.sql) and owns every relation
 MARKETDATA_DATABASE = 'oe_marketdata'
 MARKETDATA_WRITER = 'oe_marketdata_writer'
+# The login roles and the process kind of each (the retention role is the console's, never a fixture process)
+LOGIN_ROLES = {MONEY_PROJECTOR_LOGIN: 'money projector', GATEWAY_LOGIN: 'oe-gateway', STREAM_LOGIN: 'oe-stream',
+               HISTORY_PROJECTOR_LOGIN: 'oe-projector', MARKETDATA_WRITER: 'oe-marketdata', RETENTION_ROLE: 'console retention'}
+# The database step of each fixture database (the console's historyDatabases on the fixture's names): its owner at
+# creation, the roles granted CONNECT, the writers (USAGE and CREATE on schema public, and the retention role's default
+# privileges when ``retention``), the readers (USAGE), each writer's default SELECT grantees, and the relations the
+# retention role reads. CREATE on schema public is revoked from PUBLIC. r01_history_b (a second projection, drills only)
+# has no retention role.
+DATABASE_ROLE_PLAN = {
+    'r01_money': {'owner': MONEY_PROJECTOR_LOGIN, 'connect': [MONEY_PROJECTOR_LOGIN, RETENTION_ROLE],
+                  'writers': [MONEY_PROJECTOR_LOGIN], 'readers': [], 'default_select': {}, 'retention': True,
+                  'retention_select': ['money_journal', 'money_journal_leg']},
+    'r01_gateway': {'owner': GATEWAY_LOGIN, 'connect': [GATEWAY_LOGIN, STREAM_LOGIN, HISTORY_PROJECTOR_LOGIN, RETENTION_ROLE],
+                    'writers': [GATEWAY_LOGIN, HISTORY_PROJECTOR_LOGIN], 'readers': [STREAM_LOGIN, HISTORY_READER_GROUP],
+                    'default_select': {GATEWAY_LOGIN: [STREAM_LOGIN]}, 'retention': True, 'retention_select': []},
+    'r01_history_b': {'owner': HISTORY_PROJECTOR_LOGIN, 'connect': [GATEWAY_LOGIN, HISTORY_PROJECTOR_LOGIN],
+                      'writers': [HISTORY_PROJECTOR_LOGIN], 'readers': [HISTORY_READER_GROUP], 'default_select': {},
+                      'retention': False, 'retention_select': []},
+    MARKETDATA_DATABASE: {'owner': MARKETDATA_WRITER, 'connect': [MARKETDATA_WRITER, RETENTION_ROLE],
+                          'writers': [MARKETDATA_WRITER], 'readers': [], 'default_select': {}, 'retention': True,
+                          'retention_select': []},
+}
+# The ownership table (one writer per relation): per database, each table and view with the role that writes it, the
+# view readers, and whether the retention role belongs there. Gateway's users store is not on the fixture (api-key auth).
+_PROJECTION_TABLES = ('oe_orders', 'oe_fills', 'oe_order_events', 'oe_projection_state', 'oe_projection_source_memo',
+                      'oe_projection_replay', 'oe_projection_schema')
+_PROJECTION_VIEWS = ('gateway_order_history_v1', 'gateway_fills_v1', 'gateway_order_trail_v1', 'gateway_history_heartbeat_v1')
+TABLE_OWNERS = {
+    'r01_money': {'tables': {t: MONEY_PROJECTOR_LOGIN for t in ('money_journal', 'money_journal_leg')}, 'views': {},
+                  'view_readers': [], 'retention': True},
+    'r01_gateway': {'tables': {t: HISTORY_PROJECTOR_LOGIN for t in _PROJECTION_TABLES},
+                    'views': {v: HISTORY_PROJECTOR_LOGIN for v in _PROJECTION_VIEWS},
+                    'view_readers': [HISTORY_READER_GROUP], 'retention': True},
+    'r01_history_b': {'tables': {t: HISTORY_PROJECTOR_LOGIN for t in _PROJECTION_TABLES},
+                      'views': {v: HISTORY_PROJECTOR_LOGIN for v in _PROJECTION_VIEWS},
+                      'view_readers': [HISTORY_READER_GROUP], 'retention': False},
+    MARKETDATA_DATABASE: {'tables': {t: MARKETDATA_WRITER for t in ('md_trades', 'md_candles', 'md_state')}, 'views': {},
+                          'view_readers': [], 'retention': True},
+}
 # The ME journal as the bridge reads it (stream, control stream, the archive's MTU), on the service's own replay stream;
 # the markets the fixture's genesis creates. Settings of the fixture, not limits of the binary.
 MARKETDATA_JOURNAL = {'MD_JOURNAL_CONTROL_STREAM': '4010', 'MD_JOURNAL_STREAM': '4001', 'MD_JOURNAL_CHANNEL': 'aeron:ipc',
