@@ -86,10 +86,12 @@ def main():
         hold_s = hold_seconds()
         import gateway_drills
         import projection_drills
+        import red_proofs
         import smoke_core
         gateway = gateway_drills.is_scenario(args.scenario)
         projection = projection_drills.is_scenario(args.scenario)
         critical = smoke_core.is_scenario(args.scenario)
+        red = red_proofs.is_scenario(args.scenario)
         if core_topology != (args.scenario.startswith('core-') or gateway or projection or critical):
             raise Inconclusive('core-*, gateway and projection scenarios need a schema v2 core manifest and only they accept one')
         if args.scenario.startswith('core-boots-'):
@@ -126,6 +128,14 @@ def main():
             fixture = CoreFixture(args.manifest, drill=True)
             result['state_root'] = str(fixture.root)
             result.update(smoke_core.scenario(fixture, args.scenario, args.output))
+        elif red:
+            # The red proofs (history-fed oracles cannot PASS; one writer per table): refused before any container when the
+            # kind cannot run them
+            red_proofs.check_scenario(manifest, args.scenario)
+            from core_fixture import CoreFixture
+            fixture = CoreFixture(args.manifest, drill=True)
+            result['state_root'] = str(fixture.root)
+            result.update(red_proofs.scenario(fixture, args.scenario, args.output))
         elif args.scenario.startswith(('core-drill-', 'core-control-', 'core-red-')):
             # The core-topology drills, the controls and the two REDs; drill=True refuses a non-enforced ME
             from core_fixture import CoreFixture

@@ -136,7 +136,7 @@ Measurement (`gateway_measure.py`; data on the product binaries, never a pass li
 
 ## Projection slots
 
-A gateway manifest may also declare `pj0` and `pj1`, both or neither. pj0 writes the gateways' history database (`r01_gateway`); pj1 writes `r01_history_b`. A slot runs `history_projector` (oe-projector of the cut), in a control kind `history_projector_nc` (oe-projector of the cut's gateway commit configured with `-DOE_PROJECTOR_CONTROL=<PROJ_NC_...>`, the install tree holding oe-projector alone; its build tree's `OE_PROJECTOR_CONTROL` must equal its one declared define; the drop build also reads `PROJ_NC_DROP_SEQ`, default 2, which the fixture leaves at its default), or, in a dry-run kind, `projector_stub` (`projector_stub.py`, never published). The projector runs on the kind's driver mode (external: the staged aeronmd in the slot's own container) with its required `HISTORY_PROJECTOR_*` settings only: the listed core members' archives and node endpoints, the order journal (stream 4102, control stream 10, IPC MTU 1408, replay stream 4302), its GATEWAY key in `/data/cluster-key`, its database; everything else stays at the binary's defaults, except where a drill sets a setting and records it (the byte-equal drill's C: `HISTORY_PROJECTOR_BATCH_EVENTS`). In the follow drill the projection slots' staged aeronmd keeps a stopped client for `PJ_DRIVER_CLIENT_LIVENESS_S` (`AERON_CLIENT_LIVENESS_TIMEOUT` 60s, `AERON_PUBLICATION_UNBLOCK_TIMEOUT` 75s: the only values `core_contracts.PROJECTION_DRIVER_LIVENESS_EXEMPT` admits past the production timeout guard), recorded in the slot registry and the drill record. The core members then set `CORE_ARCHIVE_REPLAY_PROBE_STREAM` to that replay stream. The fixture creates the reader group `oe_history_reader` and the login role `runtime_history_reader` in it, and the gateways read history through that role. Its /health is read into the drills' keys (`core_fixture.projector_health_view`). The stand-in reads the core's order-event ring with `CoreProbe order-events fields=full` on its own GATEWAY key, holds a database lease, applies batches fenced by the lease, compares duplicates byte for byte, and beats only when a fresh head probe is at or below what it has applied. Its settings are `STUB_*` with defaults.
+A gateway manifest may also declare `pj0` and `pj1`, both or neither. pj0 writes the gateways' history database (`r01_gateway`); pj1 writes `r01_history_b`. A slot runs `history_projector` (oe-projector of the cut), in a control kind `history_projector_nc` (oe-projector of the cut's gateway commit configured with `-DOE_PROJECTOR_CONTROL=<PROJ_NC_...>`, the install tree holding oe-projector alone; its build tree's `OE_PROJECTOR_CONTROL` must equal its one declared define; the drop build also reads `PROJ_NC_DROP_SEQ`, default 2, which the fixture leaves at its default), or, in a dry-run kind, `projector_stub` (`projector_stub.py`, never published). The projector runs on the kind's driver mode (external: the staged aeronmd in the slot's own container) with its required `HISTORY_PROJECTOR_*` settings only: the listed core members' archives and node endpoints, the order journal (stream 4102, control stream 10, IPC MTU 1408, replay stream 4302), its GATEWAY key in `/data/cluster-key`, its database; everything else stays at the binary's defaults, except where a drill sets a setting and records it (the byte-equal drill's C: `HISTORY_PROJECTOR_BATCH_EVENTS`). In the follow drill the projection slots' staged aeronmd keeps a stopped client for `PJ_DRIVER_CLIENT_LIVENESS_S` (`AERON_CLIENT_LIVENESS_TIMEOUT` 60s, `AERON_PUBLICATION_UNBLOCK_TIMEOUT` 75s: the only values `core_contracts.PROJECTION_DRIVER_LIVENESS_EXEMPT` admits past the production timeout guard), recorded in the slot registry and the drill record. The core members then set `CORE_ARCHIVE_REPLAY_PROBE_STREAM` to that replay stream. The fixture creates the reader group `oe_history_reader` and makes the gateways' own login role `oe_gateway` a member of it; on the projector binary kinds the projector logs in as `oe_projector` and the gateways read history as `oe_gateway` (the database roles below). Its /health is read into the drills' keys (`core_fixture.projector_health_view`). The stand-in reads the core's order-event ring with `CoreProbe order-events fields=full` on its own GATEWAY key, holds a database lease, applies batches fenced by the lease, compares duplicates byte for byte, and beats only when a fresh head probe is at or below what it has applied. Its settings are `STUB_*` with defaults.
 
 Kinds (`mk_manifests.py <kind> <tag> --cut <cut>`): `pj` and `pj-ext` (the drills on the projector binary, embedded and external), their controls `pj-nc-pinrecording` and `pj-nc-nostopreplay-ext` (`projector-me-restart-follow`; the no-stop build runs on the external driver, where a hung copy's subscription outlives the takeover), `pj-nc-wallclock` and `pj-nc-dropone` (`projection-byte-equal-replay`; the control build runs in every compared projection), `pj-nc-beatalways` and `pj-nc-nostale` (`history-freshness`; the latter runs gw0 as `gateway_nc` with `GW_NC_NO_STALE_LABEL`), and the external leg of each control but the no-stop one (`pj-nc-pinrecording-ext`, `pj-nc-wallclock-ext`, `pj-nc-dropone-ext`, `pj-nc-beatalways-ext`, `pj-nc-nostale-ext`: the same control on the external driver); the projector control builds are named by `MK_PROJECTOR_NC_<NAME>` (`PIN_RECORDING`, `NO_STOP_REPLAY`, `WALLCLOCK_COLUMN`, `DROP_ONE`, `BEAT_ALWAYS`). The dry-run kinds `pj-dry`, `pj-dry-ext` and the control `pj-dry-beatalways` (the freshness line must fail with `stale history served as fresh`) run the stand-in. On a cut whose probe predates `fields=full`, pass `--harness-drift REASON` and set `MK_PROBE_MANIFEST` to a probe built from this tree.
 
@@ -174,6 +174,50 @@ Hold point (dry runs): `RUNNER_HOLD_AFTER_S=<seconds>` keeps the fixture up afte
 writes `<output>/hold.ready` (run id, state root, containers, network, PostgreSQL address) and closes the fixture when
 `<output>/hold.release` appears or the seconds pass; recorded under `hold` in `result.json`, never changing the
 decision. A nightly refuses the setting.
+
+## Database roles
+
+The fixture's PostgreSQL follows the console's role plan (cloud-console `services/historydb.go`) on its own database names
+(`core_contracts.LOGIN_ROLES`, `DATABASE_ROLE_PLAN`): one login role per process kind, none of them the bootstrap
+superuser `runtime_fixture`, which only the harness itself uses. The money projector logs in as `core` (it also applies
+its packaged migrations, so it owns the money tables), oe-projector as `oe_projector`, oe-gateway as `oe_gateway` (a
+member of `oe_history_reader`), oe-marketdata as `oe_marketdata_writer`; `oe_stream` is made but logs in nowhere on the
+fixture (api-key auth). The retention role `history_retention` holds DELETE and TRUNCATE through each writer's default
+privileges, set in each database before its writers start (none in `r01_history_b`), and SELECT on the two money tables
+its age delete reads. Each database is owned by its writer, CREATE on schema public is revoked from PUBLIC and granted to
+the writers. On a rig kind whose projection slots run the stand-in, the stand-in and the gateways still use the
+superuser.
+
+## Red proofs
+
+Oracles that read history cannot PASS, and one writer per table (`red_proofs.py`, `pg_control.py`, `table_owners.py`,
+`refusals.py`; the module docstrings have the details).
+
+- `core-control-pgorders` (kinds `cps`, `cps-ext`: pj0 frozen before the last batch; `pj-nc-dropone`, `pj-nc-dropone-ext`:
+  every projector never writes journalSeq 2, which the workload makes the last record of the first order): the order
+  oracle on a sample whose `core.live_orders` and `core_events` come from `oe_orders` and `oe_order_events` through an
+  explicit field map must not PASS (`oracle passed from PG orders`), and must fail on O4, O5 or O6, while the product
+  oracles PASS and the run shows the divergence. A field the map does not give is `pg sample incomplete: <field>`.
+- `core-control-stale-money-history` (`cps`, `cps-ext`): the money projector frozen before the last batch, which lands a
+  deposit, a withdrawal and a fill after the freeze; the money oracle on the stale money history must not PASS
+  (`money oracle passed on a stale money history`) and names M13, M14 or the barrier.
+- `core-table-owners` (`cps`, `cps-ext`): the grants and login roles of every fixture database after every writer
+  created its relations: one INSERT or UPDATE role per relation as `core_contracts.TABLE_OWNERS` names it, the retention
+  role with exactly DELETE and TRUNCATE where the table gives it a place (at most those on a view) and nothing elsewhere,
+  SELECT on a view only for its reader group, no unnamed DELETE role, no process kind on a superuser login (from each
+  container's settings and the server's sessions).
+- The second-writer row: `refusals.py` (a cut with `oms-app`, a manifest with the role `oms`, the console's retired
+  setting `OMS_PROJECT_DIR`, a planted `oms` catalog service; each switched off in a test copy prints its
+  `... accepted: ...` text). The first two run in the unit suite; the console's run with
+  `python3 refusals.py --console <cloud-console tree>` (or `CONSOLE_TREE=<tree>` for the unit test).
+- The source scan (unit suite): no module on the core oracle path reads an order relation or imports `pg_control`.
+
+`RED_CONTROL=<name>` runs the controls (`red_proofs.CONTROLS`): `pg-no-freeze` (INCONCLUSIVE `control vacuous: PG
+equals the core`), `money-no-freeze` (`control vacuous: money history at the head`), `money-creates-only` (`control
+vacuous: no money movement after the freeze`), `owners-gateway-insert` (`second writer on oe_orders: oe_gateway`),
+`owners-retention-insert` (`retention role can insert: md_trades`), `owners-late-default-privileges` (`retention role
+has no grant: <relation>`), `owners-third-delete-role` (`unnamed delete role on money_journal: planted_cleaner`). Sizes
+and bounds are settings (`red_proofs.SETTINGS`).
 
 ## Nightly
 

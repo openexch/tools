@@ -1280,8 +1280,8 @@ class ResetProjectionTest(LifecycleBase):
         calls = []
         dump = f.root / 'lives' / 'life-1' / 'money_journal.pg.jsonl'
 
-        def psql(db, sql):
-            calls.append((db, sql))
+        def psql(db, sql, role=None):
+            calls.append((db, sql, role))
             if sql.startswith('DROP DATABASE'):
                 self.assertTrue(dump.exists() and dump.read_text().count('\n') == 3, 'dump written before the drop')
             if 'information_schema.tables' in sql:
@@ -1293,11 +1293,17 @@ class ResetProjectionTest(LifecycleBase):
             return ''
         f.psql = psql
         w = f.reset_projection()
-        sqls = [s for _, s in calls]
+        sqls = [s for _, s, _ in calls]
         drop = next(i for i, s in enumerate(sqls) if s.startswith('DROP DATABASE r01_money'))
         self.assertLess(max(i for i, s in enumerate(sqls) if ' t' in s and 'json_agg' in s), drop)
-        self.assertEqual(sqls[drop + 1], 'CREATE DATABASE r01_money')
-        self.assertIn('CREATE TABLE money_journal', sqls[-1])               # packaged migrations re-applied
+        self.assertEqual(sqls[drop + 1], 'CREATE DATABASE r01_money OWNER core')
+        # the role plan's grants and default privileges, then the packaged migrations re-applied as the money projector's
+        # login role (it owns the money tables), then the retention role's SELECT on the two tables its age delete reads
+        defaults = next(i for i, s in enumerate(sqls) if s.startswith('ALTER DEFAULT PRIVILEGES FOR ROLE core'))
+        migration = next(i for i, c in enumerate(calls) if 'CREATE TABLE money_journal' in c[1])
+        self.assertLess(defaults, migration)
+        self.assertEqual(calls[migration][2], 'core')
+        self.assertIn('GRANT SELECT ON public.money_journal TO history_retention', sqls[-2])
         self.assertEqual((w['kind'], w['life'], w['tables']), ('reset_projection', 1, {'money_journal': 2, 'money_journal_leg': 1}))
         self.assertEqual(json.loads(dump.read_text().splitlines()[0]), {'table': 'money_journal', 'row': {'journal_seq': 1}})
         self.assertEqual(f.registry['projection_dumps']['1'],                    # the wipe precondition's record

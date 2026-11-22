@@ -338,7 +338,15 @@ class GatewayFixtureWiringTest(unittest.TestCase):
         f.command = lambda argv, **kw: calls.append(argv) or types.SimpleNamespace(stdout='')
         f.pg = Path('/pg')
         f.create_gateway_database()
-        self.assertIn('CREATE DATABASE r01_gateway', calls[-1])
+        sql = [c[-1] for c in calls]
+        self.assertEqual(sql[0], 'CREATE DATABASE r01_gateway OWNER oe_gateway')
+        # the console's grants on the database, its writers' default privileges for the retention role, and for oe-stream
+        # SELECT on what oe-gateway creates
+        self.assertIn('REVOKE CREATE ON SCHEMA public FROM PUBLIC', sql)
+        self.assertIn('GRANT USAGE, CREATE ON SCHEMA public TO oe_gateway, oe_projector', sql)
+        self.assertIn('ALTER DEFAULT PRIVILEGES FOR ROLE oe_projector GRANT DELETE, TRUNCATE ON TABLES TO history_retention', sql)
+        self.assertIn('ALTER DEFAULT PRIVILEGES FOR ROLE oe_gateway GRANT SELECT ON TABLES TO oe_stream', sql)
+        self.assertTrue(all(c[6] == 'runtime_fixture' for c in calls))
         with self.assertRaisesRegex(Violation, 'unknown fixture database'):
             f.psql('r01_oms', 'select 1')
 

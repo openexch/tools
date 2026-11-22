@@ -438,6 +438,7 @@ class CoreFixture(Fixture):
         self.command([self.pg / 'pg_ctl', '-D', data, '-l', self.root / 'logs/postgres.log', '-w', 'start'])
         self.registry['pg_started'] = True
         self.registry['pg_pid'] = int((data / 'postmaster.pid').read_text().splitlines()[0]); self.save()
+        self.create_roles()
         self.create_money_database()
         if self.gateway_slots:
             self.create_gateway_database()
@@ -448,19 +449,86 @@ class CoreFixture(Fixture):
 
     FIXTURE_DATABASES = {'postgres', 'r01_money', 'r01_gateway', 'r01_history_b', core_contracts.MARKETDATA_DATABASE}
 
-    def psql(self, database, sql):
-        """The core fixture's databases only: the money projector's and the gateway's users store."""
+    def psql(self, database, sql, role=None):
+        """The core fixture's databases only. The harness connects as the bootstrap superuser; ``role`` (one of the role
+        plan's login roles) runs a step as that role instead (a writer creating its relations, so it owns them)."""
         if database not in self.FIXTURE_DATABASES:
             raise Violation('unknown fixture database')
-        return self.command([self.pg / 'psql', '-h', self.gateway, '-p', self.pg_port, '-U', 'runtime_fixture',
+        user = role or core_contracts.FIXTURE_SUPERUSER
+        if role is not None and role not in core_contracts.LOGIN_ROLES:
+            raise Violation('psql as a role outside the role plan: ' + str(role))
+        return self.command([self.pg / 'psql', '-h', self.gateway, '-p', self.pg_port, '-U', user,
                              '-d', database, '-v', 'ON_ERROR_STOP=1', '-tA', '-c', sql]).stdout.strip()
+
+    # Databases whose default privileges a drill sets only after the slots started (the ownership row's control: a
+    # relation created before the default privileges were set), else empty
+    deferred_default_privileges = frozenset()
+
+    def create_roles(self):
+        """The role plan's roles (core_contracts.LOGIN_ROLES and the reader group), each a login role with no superuser,
+        createdb, createrole, replication or bypassrls right; idempotent."""
+        sql = [f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{core_contracts.HISTORY_READER_GROUP}') "
+               f"THEN CREATE ROLE {core_contracts.HISTORY_READER_GROUP} NOLOGIN; END IF; END $$"]
+        for role in sorted(core_contracts.LOGIN_ROLES):
+            sql.append(f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{role}') THEN CREATE ROLE {role} "
+                       f"LOGIN; END IF; END $$")
+            sql.append(f'ALTER ROLE {role} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS')
+        sql.append(f'GRANT {core_contracts.HISTORY_READER_GROUP} TO {core_contracts.GATEWAY_LOGIN}')
+        for statement in sql:
+            self.psql('postgres', statement)
+        self.registry['db_roles'] = {'superuser': core_contracts.FIXTURE_SUPERUSER, 'logins': dict(core_contracts.LOGIN_ROLES),
+                                     'reader_group': core_contracts.HISTORY_READER_GROUP,
+                                     'reader_members': [core_contracts.GATEWAY_LOGIN]}
+        self.save()
+
+    def create_database(self, database):
+        """CREATE DATABASE with the role plan's owner, then its grants (grant_database)."""
+        plan = core_contracts.DATABASE_ROLE_PLAN[database]
+        self.psql('postgres', f'CREATE DATABASE {database} OWNER {plan["owner"]}')
+        self.grant_database(database, defaults=database not in self.deferred_default_privileges)
+
+    def grant_database(self, database, defaults=True):
+        """The console's grants on one database: CONNECT, no CREATE on schema public for PUBLIC, USAGE and CREATE for the
+        writers, USAGE for the readers and the retention role, and (``defaults``) each writer's default privileges:
+        DELETE and TRUNCATE to the retention role, SELECT to the writer's default readers. Default privileges act only on
+        relations created later, so this runs before any writer starts."""
+        plan = core_contracts.DATABASE_ROLE_PLAN[database]
+        retention = core_contracts.RETENTION_ROLE
+        usage = list(plan['readers']) + ([retention] if plan['retention'] else [])
+        sql = [f'GRANT CONNECT ON DATABASE {database} TO {", ".join(plan["connect"])}',
+               'REVOKE CREATE ON SCHEMA public FROM PUBLIC',
+               f'GRANT USAGE, CREATE ON SCHEMA public TO {", ".join(plan["writers"])}']
+        if usage:
+            sql.append(f'GRANT USAGE ON SCHEMA public TO {", ".join(usage)}')
+        for statement in sql:
+            self.psql(database, statement)
+        if defaults:
+            self.set_default_privileges(database)
+
+    def set_default_privileges(self, database):
+        plan = core_contracts.DATABASE_ROLE_PLAN[database]
+        for writer in plan['writers']:
+            if plan['retention']:
+                self.psql(database, f'ALTER DEFAULT PRIVILEGES FOR ROLE {writer} GRANT DELETE, TRUNCATE ON TABLES TO '
+                                    f'{core_contracts.RETENTION_ROLE}')
+            readers = plan['default_select'].get(writer)
+            if readers:
+                self.psql(database, f'ALTER DEFAULT PRIVILEGES FOR ROLE {writer} GRANT SELECT ON TABLES TO {", ".join(readers)}')
+        self.registry.setdefault('default_privileges', {})[database] = time.time_ns(); self.save()
+
+    def grant_retention_select(self, database):
+        """SELECT for the retention role on the relations its age delete reads, once each exists."""
+        for relation in core_contracts.DATABASE_ROLE_PLAN[database]['retention_select']:
+            self.psql(database, f"DO $$ BEGIN IF to_regclass('public.{relation}') IS NOT NULL THEN EXECUTE "
+                                f"'GRANT SELECT ON public.{relation} TO {core_contracts.RETENTION_ROLE}'; END IF; END $$")
 
     def create_gateway_database(self):
         """The gateway's users store, empty: oe-gateway applies its own migration (db/migration, under an advisory lock,
         its sha256 recorded) and oe-stream only verifies it. History relations are not seeded: no drill of this
         harness reads history (the history read contract is the projection's, a later slice)."""
-        self.psql('postgres', 'CREATE DATABASE r01_gateway')
-        self.registry['gateway_database'] = {'name': 'r01_gateway', 'migration': 'applied by oe-gateway', 'history': None}
+        self.create_database('r01_gateway')
+        self.registry['gateway_database'] = {'name': 'r01_gateway', 'migration': 'applied by oe-gateway', 'history': None,
+                                             'owner': core_contracts.DATABASE_ROLE_PLAN['r01_gateway']['owner']}
         self.save()
 
     # The database a gateway slot reads history from, when a drill names another than the gateways' own before the
@@ -472,28 +540,26 @@ class CoreFixture(Fixture):
         return self.projection_slots and self.m.get('manifest_kind') in core_contracts.PROJECTOR_BINARY_KINDS
 
     def gateway_pg_url(self, slot=None):
-        """The gateways' database URL. Where the projector binary writes it, the gateways log in as the reader role, a
-        member of the schema's reader group (SELECT on the four read relations and nothing else)."""
+        """The gateways' database URL. Where the projector binary writes it, the gateways log in as their own login role,
+        a member of the schema's reader group (SELECT on the four read relations, nothing else of the projection); where a
+        stand-in writes it (rig kinds), as the bootstrap superuser the stand-in writes as."""
         database = (self.gateway_history_database or {}).get(slot, 'r01_gateway')
         if database not in self.FIXTURE_DATABASES - {'postgres', 'r01_money'}:
             raise Violation('a gateway reads the gateways\' or a projection database: ' + str(database))
-        user = core_contracts.HISTORY_READER_LOGIN if self.projector_binary() else 'runtime_fixture'
+        user = core_contracts.GATEWAY_LOGIN if self.projector_binary() else core_contracts.FIXTURE_SUPERUSER
         return f'postgresql://{user}@{self.gateway}:{self.pg_port}/{database}'
 
     def create_projection_databases(self):
         """The projection databases: pj0 writes the gateways' database (created above, empty of history); pj1 a second,
         empty one. The projection creates its own schema in each (the stand-in under an advisory lock, as the projector
         binary will)."""
-        self.psql('postgres', 'CREATE DATABASE r01_history_b')
+        self.create_database('r01_history_b')
         self.registry['projection_databases'] = dict(core_contracts.PROJECTION_DATABASES)
         if self.projector_binary():
-            # The reader group the projection schema grants to (created here, before any projector applies the schema,
-            # which then finds it), and the gateways' login role in it; the projector's own role (the fixture's owner)
-            # owns every relation
-            group, login = core_contracts.HISTORY_READER_GROUP, core_contracts.HISTORY_READER_LOGIN
-            self.psql('postgres', f'CREATE ROLE {group} NOLOGIN')
-            self.psql('postgres', f'CREATE ROLE {login} LOGIN IN ROLE {group}')
-            self.registry['history_reader'] = {'login': login, 'member_of': group}
+            # The reader group the projection schema grants to (create_roles, before any projector applies the schema,
+            # which then finds it) and the gateways' login role in it; the projector's login role owns every relation
+            self.registry['history_reader'] = {'login': core_contracts.GATEWAY_LOGIN,
+                                               'member_of': core_contracts.HISTORY_READER_GROUP}
         self.save()
 
     MARKETDATA_PASSWORD_FILE = '/data/pg-password'
@@ -504,8 +570,8 @@ class CoreFixture(Fixture):
         the fixture's pg_hba trusts the fixture network, so the password is carried, not checked."""
         db, role = core_contracts.MARKETDATA_DATABASE, core_contracts.MARKETDATA_WRITER
         password = uuid.uuid4().hex + uuid.uuid4().hex
-        self.psql('postgres', f"CREATE ROLE {role} LOGIN PASSWORD '{password}'")
-        self.psql('postgres', f'CREATE DATABASE {db} OWNER {role}')
+        self.psql('postgres', f"ALTER ROLE {role} PASSWORD '{password}'")
+        self.create_database(db)
         state = self.root / 'state' / 'md0'
         state.mkdir(parents=True, exist_ok=True)
         path = state / 'pg-password'
@@ -544,22 +610,28 @@ class CoreFixture(Fixture):
         if database not in set(core_contracts.PROJECTION_DATABASES.values()) - {'r01_gateway'}:
             raise Violation('only a second projection database is recreated: ' + str(database))
         self.psql('postgres', f'DROP DATABASE {database} WITH (FORCE)')
-        self.psql('postgres', f'CREATE DATABASE {database}')
+        self.create_database(database)
         return self.record_fault({'kind': 'recreate_projection_database', 'database': database})
 
     def projection_pg_url(self, database):
+        """A projection's database URL: the projector binary logs in as its own login role; a stand-in (rig kinds) as
+        the bootstrap superuser."""
         if database not in set(core_contracts.PROJECTION_DATABASES.values()):
             raise Violation('unknown projection database ' + str(database))
-        return f'postgresql://runtime_fixture@{self.gateway}:{self.pg_port}/{database}'
+        user = core_contracts.HISTORY_PROJECTOR_LOGIN if self.projector_binary() else core_contracts.FIXTURE_SUPERUSER
+        return f'postgresql://{user}@{self.gateway}:{self.pg_port}/{database}'
 
     def create_money_database(self):
-        """The run's money database and the projector jar's packaged migrations (start_database, and reset_projection)."""
-        self.psql('postgres', 'CREATE DATABASE r01_money')
+        """The run's money database and the projector jar's packaged migrations (start_database, and reset_projection),
+        applied as the money projector's login role, so it owns the money tables; the retention role's SELECT on the two
+        tables its age delete reads follows."""
+        self.create_database('r01_money')
         with zipfile.ZipFile(self.m['artifacts']['projector']['path']) as jar:
             schemas = sorted(n for n in jar.namelist() if n.startswith('db/migration/V') and n.endswith('.sql'))
             if not schemas: raise Inconclusive('missing packaged projector schema')
             for name in schemas:
-                self.psql('r01_money', jar.read(name).decode())
+                self.psql('r01_money', jar.read(name).decode(), role=core_contracts.MONEY_PROJECTOR_LOGIN)
+        self.grant_retention_select('r01_money')
 
     # ---------------------------------------------------------------- processes
 
@@ -810,7 +882,7 @@ class CoreFixture(Fixture):
 
     def projector_env(self):
         return {'PROJECTOR_POSTGRES_URL': f'jdbc:postgresql://{self.gateway}:{self.pg_port}/r01_money',
-                'PROJECTOR_POSTGRES_USER': 'runtime_fixture', 'PROJECTOR_POSTGRES_PASSWORD': 'synthetic-fixture-only',
+                'PROJECTOR_POSTGRES_USER': core_contracts.MONEY_PROJECTOR_LOGIN, 'PROJECTOR_POSTGRES_PASSWORD': 'synthetic-fixture-only',
                 'PROJECTOR_CORE_JOURNAL_ARCHIVES': ','.join(self.m['nodes'][f'ae{i}'] + ':' + str(19301 + 100 * i) for i in range(3)),
                 'PROJECTOR_LOCAL_HOST': self.m['nodes']['projector'], 'PROJECTOR_METRICS_PORT': str(self.m['ports']['projector_http']),
                 **self.projector_driver_env()}
