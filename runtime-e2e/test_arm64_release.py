@@ -169,7 +169,8 @@ class SiblingAssembleTest(unittest.TestCase):
         code, text = run_main(arm64_sibling.main, ['expect', str(out), '--cut', str(self.cut), '--out', str(exp)])
         self.assertEqual(code, 0, text)
         lines = [line.split() for line in exp.read_text().splitlines() if not line.startswith('#')]
-        self.assertEqual([x[0] for x in lines], ['oe-gateway', 'oe-stream', 'oe-projector', 'market-sim', 'obs-sampler'])
+        self.assertEqual([x[0] for x in lines], ['oe-gateway', 'oe-stream', 'oe-projector', 'oe-marketdata', 'market-sim',
+                                                     'obs-sampler'])
         self.assertEqual(lines[0], ['oe-gateway', sibling['artifacts']['oe-gateway']['sha256'], SHAS['gateway']])
 
     def test_a_prefix_of_another_gateway_commit_is_refused(self):

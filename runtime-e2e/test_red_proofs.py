@@ -292,16 +292,20 @@ def green_listing():
     dbs = {}
     for db, spec in core_contracts.TABLE_OWNERS.items():
         rels = []
+        history = spec.get('retention_tables')
         for name, writer in spec['tables'].items():
             eff = {writer: list(ALL)}
-            if spec['retention']:
+            if spec['retention'] and (history is None or name in history):
                 eff[ret] = ['DELETE', 'TRUNCATE'] + (['SELECT'] if db == 'r01_money' else [])
             rels.append(relation(name, 'r', writer, eff))
         for name, writer in spec['views'].items():
-            eff = {writer: list(ALL), 'oe_history_reader': ['SELECT'], 'oe_gateway': ['SELECT']}
-            if spec['retention']:
+            readers = spec['view_readers'][name]
+            eff = {writer: list(ALL), **{r: ['SELECT'] for r in readers}}
+            if 'oe_history_reader' in readers:
+                eff['oe_gateway'] = ['SELECT']
+            if spec['retention'] and history is None:
                 eff[ret] = ['DELETE', 'TRUNCATE']
-            rels.append(relation(name, 'v', writer, eff, [f'{writer}=arwdDxt/{writer}', f'oe_history_reader=r/{writer}']))
+            rels.append(relation(name, 'v', writer, eff, [f'{writer}=arwdDxt/{writer}'] + [f'{r}=r/{writer}' for r in readers]))
         dbs[db] = {'relations': rels, 'default_acl': []}
     roles = [{'name': 'runtime_fixture', 'login': True, 'super': True}] + [
         {'name': r, 'login': True, 'super': False} for r in core_contracts.LOGIN_ROLES]
@@ -329,6 +333,27 @@ class TableOwnersTest(unittest.TestCase):
         lines, info = table_owners.judge(green_listing(), DECLARED, NODES)
         self.assertEqual(failing(lines), [])
         self.assertEqual(info['superusers'], ['runtime_fixture'])
+
+    def test_view_readers_are_per_view(self):
+        listing = green_listing()
+        rels = {r['name']: r for r in listing['databases']['r01_money']['relations']}
+        # the gateway's history reader on the money lookup view, and oe_money_reader on it, are both unnamed there
+        for grantee in ('oe_history_reader', 'oe_money_reader'):
+            view = dict(rels['money_journal_leg_asset'], acl=['core=arwdDxt/core', f'{grantee}=r/core'])
+            planted = copy.deepcopy(listing)
+            planted['databases']['r01_money']['relations'] = [view if r['name'] == view['name'] else r
+                                                              for r in planted['databases']['r01_money']['relations']]
+            lines, _ = table_owners.judge(planted, DECLARED, NODES)
+            self.assertEqual(failing(lines), [f'view readable by an unnamed role: money_journal_leg_asset: {grantee}'])
+        self.assertIn('oe_money_reader=r/core', rels['gateway_balance_movements_v1']['acl'])
+
+    def test_the_retention_role_keeps_the_money_history_tables_only(self):
+        listing = green_listing()
+        for r in listing['databases']['r01_money']['relations']:
+            if r['name'] == 'money_market_asset':
+                r['effective']['history_retention'] = ['DELETE', 'TRUNCATE']
+        lines, _ = table_owners.judge(listing, DECLARED, NODES)
+        self.assertEqual(failing(lines), ['retention role has a grant outside its tables: money_market_asset'])
 
     def test_red_two_writer_kinds_on_the_superuser_login(self):
         # today's fixture: the money projector and oe-projector both log in as the initdb superuser

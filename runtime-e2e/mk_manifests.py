@@ -43,7 +43,12 @@ build needs stops it with a message naming the variable when it is unset. A ``Co
   MK_GATEWAY_NC_NO_CANCEL_REOFFER_RULE, MK_GATEWAY_NC_NO_ASSET_CHECK, MK_GATEWAY_NC_NO_STALE_LABEL   the same commit
                         built with that control define (the gateway_nc of the kinds whose ``nc_define`` names it)
   MK_MARKETDATA         oe-marketdata of the cut's gateway commit (a product build), staged in md0 by the critical-path
-                        kinds while the cut does not list it
+                        kinds while the cut does not list it (a cut of layout rc2-cut/5 does)
+  MK_MARKETDATA_<NAME>  oe-marketdata of the cut's gateway commit built with test defines (CMAKE_CXX_FLAGS -D<define>
+                        each, nothing else): the marketdata_nc of the market-data drill kinds, <NAME> their defines
+                        without the MD_ prefix joined by '_' (marketdata_nc_setting): TC_COMMIT_PAUSE,
+                        TC_COMMIT_PAUSE_NC_COMMIT_SPLIT, NC_NO_EPOCH_CHECK, NC_EMPTY_SERIES, NC_REST_FROM_MEMORY,
+                        NC_NO_LIVE_EMIT_CURSOR, NC_NO_STALL_CHECK
   MK_PROJECTOR_NC_<NAME>  oe-projector of the cut's gateway commit built with -DOE_PROJECTOR_CONTROL=PROJ_NC_<NAME> (the
                         history_projector_nc of the kinds whose ``projector_define`` names it): PIN_RECORDING,
                         NO_STOP_REPLAY, WALLCLOCK_COLUMN, DROP_ONE, BEAT_ALWAYS; the path of the install tree's bin/oe-projector
@@ -162,6 +167,8 @@ class Config:
                                                  'does not list it')
     # define -> the control build's oe-projector (MK_PROJECTOR_NC_<NAME>; read when a kind stages it)
     projector_nc: dict = field(default_factory=dict)
+    # setting name -> a test build of oe-marketdata (MK_MARKETDATA_<NAME>; read when a kind stages it)
+    marketdata_nc: dict = field(default_factory=dict)
     shm_mb: dict = field(default_factory=dict)                 # per-role overrides of SHM_MB (settings)
     harness_drift: str = None                                  # A named waiver (rig kinds only), recorded
     # The CoreProbe.java a projection kind's probe must be compiled from (this tree's; a test points it elsewhere)
@@ -344,6 +351,13 @@ GATEWAY_NC_BUILDS = {'GW_NC_FRESH_KEY': ('gateway_nc', 'MK_GATEWAY_NC'),
                      'GW_NC_NO_CANCEL_REOFFER_RULE': ('gateway_nc_no_reoffer', 'MK_GATEWAY_NC_NO_CANCEL_REOFFER_RULE'),
                      'GW_NC_NO_ASSET_CHECK': ('gateway_nc_no_asset', 'MK_GATEWAY_NC_NO_ASSET_CHECK'),
                      'GW_NC_NO_STALE_LABEL': ('gateway_nc_no_stale', 'MK_GATEWAY_NC_NO_STALE_LABEL')}
+
+
+def marketdata_nc_setting(defines):
+    """The setting naming the test build of oe-marketdata with ``defines`` (MD_TC_X, MD_NC_Y -> MK_MARKETDATA_TC_X_NC_Y)."""
+    if not defines or not set(defines) <= core_contracts.MARKETDATA_NC_DEFINES:
+        raise Violation('unknown oe-marketdata test defines ' + str(defines))
+    return 'MK_MARKETDATA_' + '_'.join(d[len('MD_'):] for d in defines)
 
 
 def projector_nc_setting(define):
@@ -644,9 +658,18 @@ def add_marketdata_slot(m, kind, cut, cfg, cut_libs):
             path = _need(cfg.marketdata, 'marketdata (MK_MARKETDATA)')
             entry = {'path': str(path), 'sha256': sha(path), 'source_sha': cut['repos']['gateway']}
         entry.update(driver=driver, target='oe-marketdata')
-        if driver == 'external':
-            entry['libs'] = json.loads(json.dumps(cut_libs))
         art['marketdata'] = entry
+    if 'marketdata_nc' in used:
+        defines = list(spec['marketdata_defines'])
+        setting = marketdata_nc_setting(defines)
+        given = cfg.marketdata_nc.get(setting)
+        path = _need(Path(given) if given else env_path(setting, f'oe-marketdata built with {"+".join(defines)}'),
+                     f'marketdata_nc ({setting})')
+        art['marketdata_nc'] = {'path': str(path), 'sha256': sha(path), 'source_sha': cut['repos']['gateway'],
+                                'driver': driver, 'target': 'oe-marketdata', 'defines': defines}
+    for entry in art.values():
+        if entry is not None and driver == 'external':
+            entry['libs'] = json.loads(json.dumps(cut_libs))
     m['artifacts'].update(art)
     octet = m['network']['subnet'].split('.')[2]
     m['nodes'].update({role: f'172.30.{octet}.{MARKETDATA_NODE_BASE + j}'

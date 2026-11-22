@@ -55,8 +55,9 @@ import zipfile
 
 from machine_paths import env_path
 
-SCHEMA = 'rc2-cut/4'                      # what a new cut manifest declares
-# The cut manifest layouts the checker reads. rc2-cut/4 adds the gateway's history projector (oe-projector) and requires
+SCHEMA = 'rc2-cut/5'                      # what a new cut manifest declares
+# The cut manifest layouts the checker reads. rc2-cut/5 adds the public market-data service (oe-marketdata, gateway repo), the
+# genesis tool (ct-genesis, cluster-tools) and the market simulator (market-sim, tools, a pure-Go build); rc2-cut/4 adds the gateway's history projector (oe-projector) and requires
 # ``substrate.aeron_patches`` (the cluster-tools lock's Aeron patch files); rc2-cut/3 adds the gateway repo and its two
 # binaries (oe-gateway, oe-stream) to rc2-cut/2; rc2-cut/2 names the core repo ``core`` and its jars ``core-*``;
 # rc2-cut/1 (cuts written before the rename) names them ``assets`` / ``assets-*``. Every older layout stays readable as
@@ -71,6 +72,9 @@ LAYOUTS = {
     'rc2-cut/4': {'repo': 'core', 'cluster': 'core-cluster.jar', 'projector': 'core-projector.jar',
                   'retired': {'core-bridge', 'oms-app', 'match-gateway'}, 'gateway': True, 'projector_binary': True,
                   'aeron_patches': True},
+    'rc2-cut/5': {'repo': 'core', 'cluster': 'core-cluster.jar', 'projector': 'core-projector.jar',
+                  'retired': {'core-bridge', 'oms-app', 'match-gateway'}, 'gateway': True, 'projector_binary': True,
+                  'aeron_patches': True, 'marketdata': True, 'genesis_tool': True, 'simulator': True},
 }
 SCHEMAS = tuple(LAYOUTS)
 RULES = tuple(f'K{n}' for n in range(1, 12))
@@ -105,6 +109,12 @@ GATEWAY_PRODUCT = {
 }
 # The gateway repo's history projector (rc2-cut/4): C++, stamped like the other two
 GATEWAY_PROJECTOR = {'oe-projector': {'repo': 'gateway', 'lang': 'cpp', 'stamped': True, 'schemas': ('money',)}}
+# rc2-cut/5: the public market-data service (C++, stamped with the gateway commit, carrying the money schema sha256 the
+# gateway lock pins, as the other gateway binaries do), the genesis tool (C++, stamped with the cluster-tools commit; it
+# compiles no schema identity in) and the market simulator (Go: two byte-equal builds, the tools commit linked in)
+MARKETDATA_PRODUCT = {'oe-marketdata': {'repo': 'gateway', 'lang': 'cpp', 'stamped': True, 'schemas': ('money',)}}
+GENESIS_TOOL = {'ct-genesis': {'repo': 'cluster-tools', 'lang': 'cpp', 'stamped': True, 'schemas': ()}}
+SIMULATOR = {'market-sim': {'repo': 'tools', 'lang': 'go', 'stamped': True, 'schemas': ()}}
 GATEWAY_SHIM = 'runtime-e2e/gateway_shim.py'
 PROJECTOR_STUB = 'runtime-e2e/projector_stub.py'
 CORE_PROBE_SOURCE = Path(__file__).resolve().parent / 'java' / 'CoreProbe.java'
@@ -166,6 +176,12 @@ def product(schema=SCHEMA):
         out.update(GATEWAY_PRODUCT)
     if lay.get('projector_binary'):
         out.update(GATEWAY_PROJECTOR)
+    if lay.get('marketdata'):
+        out.update(MARKETDATA_PRODUCT)
+    if lay.get('genesis_tool'):
+        out.update(GENESIS_TOOL)
+    if lay.get('simulator'):
+        out.update(SIMULATOR)
     return out
 
 
@@ -184,6 +200,8 @@ def fixture_names(schema=SCHEMA):
         names.update(gateway='oe-gateway', stream='oe-stream')
     if lay.get('projector_binary'):
         names.update(history_projector='oe-projector')
+    if lay.get('marketdata'):
+        names.update(marketdata='oe-marketdata')
     return names
 
 
@@ -325,8 +343,8 @@ def _derived_k4(f, name, entry, spec, repos, record, aeron_version, cls):
             f.add('K4', f'{name}: derivation attested (a builder-set label only) is refused in a product kind')
         return
     if derivation == 'rebuild-equal':
-        if spec['lang'] != 'java':
-            f.add('K4', f'{name}: rebuild-equal is the Java jars\' derivation; a C++ binary is binary-build-info')
+        if spec['lang'] == 'cpp':
+            f.add('K4', f'{name}: rebuild-equal is the Java jars\' and the Go tools\' derivation; a C++ binary is binary-build-info')
         if len(shas) < 2 or len(set(shas)) != 1:
             f.add('K4', f'{name}: no two byte-equal builds of {source} in the build record (rebuild-equal not shown)')
         elif shas[0] != entry.get('sha256'):
@@ -340,9 +358,15 @@ def _derived_k4(f, name, entry, spec, repos, record, aeron_version, cls):
             if len(paths) < 2 or len(roots) < 2 or art in paths:
                 f.add('K4', f'{name}: rebuild-equal needs two distinct builds (distinct paths in distinct build roots, neither the '
                             f'artifact): {sorted(paths)}')
+        path = Path(str(entry.get('path', '')))
+        if spec['lang'] == 'go' and path.is_file() and not (source and source.encode() in path.read_bytes()):
+            f.add('K4', f'{name}: the binary does not carry its source sha {source} (main.sourceSha not linked)')
         return
     if spec['lang'] == 'java':
         f.add('K4', f'{name}: binary-build-info is the C++ derivation; a jar is derived by rebuild-equal')
+        return
+    if spec['lang'] == 'go':
+        f.add('K4', f'{name}: binary-build-info is the C++ derivation; a Go tool is derived by rebuild-equal')
         return
     if entry.get('sha256') not in shas:
         f.add('K4', f'{name}: the build record holds no build of {source} with sha256 {entry.get("sha256")}')
@@ -773,7 +797,8 @@ def check_fixture(m, cut, cls, rules=RULES, old_pins=None):
         if entry is None:
             continue
         what = 'artifacts.' + key
-        if key in core_contracts.GATEWAY_TEST_ARTIFACTS | core_contracts.PROJECTION_TEST_ARTIFACTS:
+        if key in (core_contracts.GATEWAY_TEST_ARTIFACTS | core_contracts.PROJECTION_TEST_ARTIFACTS
+                   | core_contracts.MARKETDATA_TEST_ARTIFACTS):
             _gateway_test_artifact(f, what, key, entry, m, cut, cls)
             for lib, lentry in ((entry or {}).get('libs') or {}).items():
                 staged(f'{what}.libs.{lib}', lentry, lib)
@@ -930,6 +955,16 @@ def _gateway_test_artifact(f, what, key, entry, m, cut, cls):
         named = '+'.join(entry.get('defines') or [])
         if not named or control != named:
             f.add('K4', f'{what}: history_projector_nc build tree OE_PROJECTOR_CONTROL {control!r} is not the defines {named!r}')
+    elif key == 'marketdata_nc':
+        # a test build of oe-marketdata: the cut's gateway sha (its stamp), in a build tree whose CMAKE_CXX_FLAGS are
+        # exactly the test defines the entry names
+        want = repos.get('gateway')
+        if not want or entry.get('source_sha') != want or want.encode() not in Path(entry['path']).read_bytes():
+            f.add('K4', f'{what}: marketdata_nc is not a build of the cut\'s gateway {want}')
+        flags = (build_tree_setting(entry['path'], 'CMAKE_CXX_FLAGS') or '').split()
+        named = sorted('-D' + d for d in entry.get('defines') or [])
+        if not named or sorted(flags) != named:
+            f.add('K4', f'{what}: marketdata_nc build tree CMAKE_CXX_FLAGS {flags} is not the defines {named}')
     elif key == 'session_stub':
         want = repos.get('cluster-tools')
         configured = build_tree_setting(entry['path'], 'CT_BUILD_SOURCE_SHA')
@@ -968,8 +1003,8 @@ SIBLING_ORIGINS = {
 AERON_DRIVER_FILES = ('aeronmd', 'libaeron_driver.so', 'libaeron.so')
 # The tools Go binaries of the sibling (not cut artifacts): name -> the package directory in tools.
 GO_TOOLS = {'market-sim': 'market-sim', 'obs-sampler': 'obs-sampler'}
-# arm64 binaries a publish job ships that a cut of an older layout does not list yet: accepted with their repo's rule,
-# not required (a layout that lists them makes them required through the cut's own artifacts)
+# arm64 binaries a publish job ships that a cut of an older layout does not list: accepted with their repo's rule, not
+# required (rc2-cut/5 lists oe-marketdata and ct-genesis, which makes them required through the cut's own artifacts)
 SIBLING_PUBLISHED = {'oe-marketdata': 'gateway', 'ct-genesis': 'cluster-tools', 'switch-behavior': 'cluster-tools'}
 SIBLING_DERIVE = 'arm64 set does not derive from the cut: {}'
 SIBLING_GO_REPRO = 'go build is not reproducible: {}'

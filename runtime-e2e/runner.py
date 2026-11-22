@@ -96,6 +96,7 @@ def main():
             shutil.copytree(Path(__file__).parent / 'java', sources / 'java')
         hold_s = hold_seconds()
         import gateway_drills
+        import md_drills
         import observation_drill
         import projection_drills
         import red_proofs
@@ -103,6 +104,7 @@ def main():
         gateway = gateway_drills.is_scenario(args.scenario)
         projection = projection_drills.is_scenario(args.scenario)
         critical = smoke_core.is_scenario(args.scenario)
+        market = md_drills.is_scenario(args.scenario)
         red = red_proofs.is_scenario(args.scenario)
         observed = observation_drill.is_scenario(args.scenario)
         if core_topology != (args.scenario.startswith('core-') or gateway or projection or critical):
@@ -141,6 +143,13 @@ def main():
             fixture = CoreFixture(args.manifest, drill=True)
             result['state_root'] = str(fixture.root)
             result.update(smoke_core.scenario(fixture, args.scenario, args.output))
+        elif market:
+            # The market-data drills: refused before any container when the kind cannot run them
+            md_drills.check_scenario(manifest, args.scenario)
+            from core_fixture import CoreFixture
+            fixture = CoreFixture(args.manifest, drill=True)
+            result['state_root'] = str(fixture.root)
+            result.update(md_drills.scenario(fixture, args.scenario, args.output))
         elif observed:
             # The short observation drill: refused before any container when the kind cannot run it
             observation_drill.check_scenario(manifest, args.scenario)

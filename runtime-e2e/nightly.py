@@ -145,6 +145,9 @@ def scenario_known(scenario):
     import smoke_core
     if smoke_core.is_scenario(scenario):                 # the critical-path drills (smoke_core.SCENARIOS)
         return True
+    import md_drills
+    if md_drills.is_scenario(scenario):                  # the market-data drills (md_drills.SCENARIOS)
+        return True
     import red_proofs
     if red_proofs.is_scenario(scenario):                 # the red proofs (red_proofs.SCENARIOS)
         return True

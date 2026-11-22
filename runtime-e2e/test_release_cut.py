@@ -83,6 +83,21 @@ class World:
                 p = self.put('artifacts/' + name, data)
                 self.build(name, 'gateway', SHAS['gateway'], data, 1)
                 art[name] = self.entry(p, SHAS['gateway'], 'binary-build-info')
+        # rc2-cut/5: the market-data service, the genesis tool (C++, stamped, carrying their schema identities) and the
+        # simulator (Go, two byte-equal builds carrying the tools commit)
+        for flag, name, repo in (('marketdata', 'oe-marketdata', 'gateway'), ('genesis_tool', 'ct-genesis', 'cluster-tools')):
+            if lay.get(flag):
+                spec = release_cut.product(schema)[name]
+                data = (b'ELF ' + name.encode() + b' ' + SHAS[repo].encode() + b' '
+                        + b' '.join(SCHEMAS[s].encode() for s in spec['schemas']))
+                p = self.put('artifacts/' + name, data)
+                self.build(name, repo, SHAS[repo], data, 1)
+                art[name] = self.entry(p, SHAS[repo], 'binary-build-info')
+        if lay.get('simulator'):
+            data = b'ELF go market-sim ' + SHAS['tools'].encode()
+            p = self.put('artifacts/market-sim', data)
+            self.build('market-sim', 'tools', SHAS['tools'], data, 2)
+            art['market-sim'] = self.entry(p, SHAS['tools'], 'rebuild-equal')
         for name in ('aeronmd', 'libaeron_driver.so', 'libaeron.so'):
             data = b'ELF ' + name.encode() + b' aeron 1.53.1'
             p = self.put('artifacts/' + name, data)
@@ -225,12 +240,66 @@ class CutLayoutTest(CheckerBase):
         patch = mock.patch.object(release_cut, 'git_blob', w.blob); patch.start(); self.addCleanup(patch.stop)
         return w
 
-    def test_a_new_cut_is_rc2_cut_4_with_repo_key_core(self):
-        self.assertEqual(release_cut.SCHEMA, 'rc2-cut/4')
-        self.assertEqual(self.w.m['schema'], 'rc2-cut/4')
+    def test_a_new_cut_is_rc2_cut_5_with_repo_key_core(self):
+        self.assertEqual(release_cut.SCHEMA, 'rc2-cut/5')
+        self.assertEqual(self.w.m['schema'], 'rc2-cut/5')
         self.assertIn('core', self.w.m['repos']); self.assertNotIn('assets', self.w.m['repos'])
         self.assertLessEqual({CLUSTER, PROJECTOR}, set(self.w.m['artifacts']))
         self.assertEqual(self.check(self.w.m).items, [])
+
+    def test_layout_5_lists_the_market_data_service_the_genesis_tool_and_the_simulator(self):
+        products = release_cut.product('rc2-cut/5')
+        self.assertEqual({k: (v['repo'], v['lang']) for k, v in products.items()
+                          if k in ('oe-marketdata', 'ct-genesis', 'market-sim')},
+                         {'oe-marketdata': ('gateway', 'cpp'), 'ct-genesis': ('cluster-tools', 'cpp'), 'market-sim': ('tools', 'go')})
+        self.assertNotIn('oe-marketdata', release_cut.product('rc2-cut/4'))
+        self.assertEqual(release_cut.fixture_names('rc2-cut/5')['marketdata'], 'oe-marketdata')
+        self.assertNotIn('marketdata', release_cut.fixture_names('rc2-cut/4'))
+        self.assertEqual(release_cut.LAYOUTS['rc2-cut/5']['retired'], {'core-bridge', 'oms-app', 'match-gateway'})
+        self.assertLessEqual({'oe-marketdata', 'ct-genesis', 'market-sim'}, set(self.w.m['artifacts']))
+        self.assertEqual(self.check(self.w.m).items, [])
+
+    def test_a_layout_5_cut_without_the_three_is_refused(self):
+        m = copy.deepcopy(self.w.m)
+        for name in ('oe-marketdata', 'ct-genesis', 'market-sim'):
+            del m['artifacts'][name]
+        self.assertIn(('K9', 'artifacts: missing ct-genesis, market-sim, oe-marketdata'), self.check(m).items)
+
+    def test_a_layout_4_cut_is_still_accepted(self):
+        w = World(Path(self.temp.name) / 'four', 'rc2-cut/4')
+        patch = mock.patch.object(release_cut, 'git_blob', w.blob); patch.start(); self.addCleanup(patch.stop)
+        self.assertNotIn('oe-marketdata', w.m['artifacts'])
+        self.assertEqual(release_cut.check(w.m, old_pins=w.pins).items, [])
+
+    def test_the_simulator_is_two_byte_equal_builds_carrying_the_tools_commit(self):
+        m = copy.deepcopy(self.w.m); m['artifacts']['market-sim']['derivation'] = 'binary-build-info'
+        self.assertIn(('K4', 'market-sim: binary-build-info is the C++ derivation; a Go tool is derived by rebuild-equal'),
+                      self.refused(m, {'K4'}).items)
+        data = b'ELF go market-sim unknown'
+        p = self.w.put('artifacts/market-sim', data)
+        self.w.record['market-sim'] = []
+        self.w.build('market-sim', 'tools', SHAS['tools'], data, 2, tag='-unstamped')
+        m = copy.deepcopy(self.w.m); m['artifacts']['market-sim'] = World.entry(p, SHAS['tools'], 'rebuild-equal')
+        self.w.refresh_record(m)
+        self.assertIn(('K4', f'market-sim: the binary does not carry its source sha {SHAS["tools"]} (main.sourceSha not linked)'),
+                      self.refused(m, {'K4'}).items)
+        self.w.record['market-sim'][1]['sha256'] = '0' * 64
+        self.w.put(self.w.record['market-sim'][1]['path'], b'other')
+        self.w.record['market-sim'][1]['sha256'] = h(b'other')
+        self.w.refresh_record(m)
+        self.assertIn(('K4', f'market-sim: no two byte-equal builds of {SHAS["tools"]} in the build record (rebuild-equal not shown)'),
+                      self.check(m).items)
+
+    def test_the_market_data_service_carries_its_schema_identities(self):
+        data = b'ELF oe-marketdata ' + SHAS['gateway'].encode() + b' ' + SCHEMAS['order'].encode()      # not the money schema
+        p = self.w.put('artifacts/oe-marketdata', data)
+        self.w.record['oe-marketdata'] = []
+        self.w.build('oe-marketdata', 'gateway', SHAS['gateway'], data, 1, tag='-nojournal')
+        m = copy.deepcopy(self.w.m); m['artifacts']['oe-marketdata'] = World.entry(p, SHAS['gateway'], 'binary-build-info')
+        self.w.refresh_record(m)
+        found = self.refused(m, {'K2'})
+        self.assertIn(('K2', f'oe-marketdata: the build identity does not carry schemas.money {SCHEMAS["money"]}'),
+                      found.items)
 
     def test_an_old_cut_is_still_accepted(self):
         w = self.old_world()
@@ -255,9 +324,10 @@ class CutLayoutTest(CheckerBase):
         self.assertIn('K9', self.check(m).by_rule())
 
     def test_an_unknown_schema_is_refused(self):
-        m = copy.deepcopy(self.w.m); m['schema'] = 'rc2-cut/5'
+        m = copy.deepcopy(self.w.m); m['schema'] = 'rc2-cut/6'
         found = release_cut.check_cut(m, old_pins=self.w.pins)
-        self.assertIn(('K9', "schema must be one of rc2-cut/1, rc2-cut/2, rc2-cut/3, rc2-cut/4, got 'rc2-cut/5'"), found.items)
+        self.assertIn(('K9', "schema must be one of rc2-cut/1, rc2-cut/2, rc2-cut/3, rc2-cut/4, rc2-cut/5, got 'rc2-cut/6'"),
+                      found.items)
 
     def test_core_bridge_is_retired_in_a_new_cut_and_assets_bridge_stays_retired(self):
         for name in ('core-bridge', 'assets-bridge'):
@@ -657,7 +727,7 @@ class Arm64SiblingTest(CheckerBase):
     def test_the_sibling_derives_from_the_cut(self):
         self.assertEqual(sorted(self.s['artifacts']), sorted(
             ['ct-forwarder', 'ct-bridge', 'aeronmd', 'libaeron_driver.so', 'libaeron.so', 'oe-gateway', 'oe-stream',
-             'oe-projector', 'market-sim', 'obs-sampler']))
+             'oe-projector', 'oe-marketdata', 'ct-genesis', 'market-sim', 'obs-sampler']))
         self.assertEqual(self.sib(self.s).items, [])
 
     def test_planted_sibling_entry_with_another_source_sha(self):

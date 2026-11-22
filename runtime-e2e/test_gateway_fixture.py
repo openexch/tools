@@ -757,7 +757,7 @@ class GatewayKindBuilderTest(unittest.TestCase):
         old = test_release_cut.World(self.root / 'old-cut', 'rc2-cut/2')
         old.pins.update(self.world.pins)
         path = self.root / 'rc2-cut-2.json'; path.write_text(json.dumps(old.m))
-        with self.assertRaisesRegex(Violation, 'the cut must be rc2-cut/4'):
+        with self.assertRaisesRegex(Violation, 'the cut must be ' + release_cut.SCHEMA):
             test_mk_manifests.mk_manifests.build_from_cut('gw', 'r1', path, self.cfg, old_pins=old.pins)
 
 

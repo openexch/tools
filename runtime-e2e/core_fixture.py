@@ -467,8 +467,8 @@ class CoreFixture(Fixture):
     def create_roles(self):
         """The role plan's roles (core_contracts.LOGIN_ROLES and the reader group), each a login role with no superuser,
         createdb, createrole, replication or bypassrls right; idempotent."""
-        sql = [f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{core_contracts.HISTORY_READER_GROUP}') "
-               f"THEN CREATE ROLE {core_contracts.HISTORY_READER_GROUP} NOLOGIN; END IF; END $$"]
+        sql = [f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{group}') THEN CREATE ROLE {group} NOLOGIN; "
+               f"END IF; END $$" for group in (core_contracts.HISTORY_READER_GROUP, core_contracts.MONEY_READER_GROUP)]
         for role in sorted(core_contracts.LOGIN_ROLES):
             sql.append(f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{role}') THEN CREATE ROLE {role} "
                        f"LOGIN; END IF; END $$")
@@ -478,6 +478,7 @@ class CoreFixture(Fixture):
             self.psql('postgres', statement)
         self.registry['db_roles'] = {'superuser': core_contracts.FIXTURE_SUPERUSER, 'logins': dict(core_contracts.LOGIN_ROLES),
                                      'reader_group': core_contracts.HISTORY_READER_GROUP,
+                                     'money_reader_group': core_contracts.MONEY_READER_GROUP,
                                      'reader_members': [core_contracts.GATEWAY_LOGIN]}
         self.save()
 
@@ -603,6 +604,20 @@ class CoreFixture(Fixture):
                                   'databases': list(self.ORDER_HISTORY_DATABASES), 'backends_ended': ended,
                                   'allow_connections': state, 'at_ns': time.time_ns()})
 
+    def marketdata_database_down(self, down):
+        """Take the market history database down (``down`` True: every new connection refused and every open one ended,
+        what a stopped database server shows its clients) or bring it back; returns the witness (recorded). The money
+        database and the order history databases stay up."""
+        db = core_contracts.MARKETDATA_DATABASE
+        self.psql('postgres', f'ALTER DATABASE {db} ALLOW_CONNECTIONS {"false" if down else "true"}')
+        ended = 0
+        if down:
+            ended = int(self.psql('postgres', f"SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
+                                              f"WHERE datname = '{db}'") or 0)
+        state = self.psql('postgres', f"SELECT datallowconn FROM pg_database WHERE datname = '{db}'")
+        return self.record_fault({'kind': 'marketdata_database_down' if down else 'marketdata_database_up', 'database': db,
+                                  'backends_ended': ended, 'allow_connections': state, 'at_ns': time.time_ns()})
+
     def recreate_projection_database(self, database):
         """Drop and create one projection database, empty (a projection from genesis into an empty database). The
         projection that writes it is stopped first by the drill; the gateways' database is never recreated (it holds the
@@ -631,6 +646,16 @@ class CoreFixture(Fixture):
             if not schemas: raise Inconclusive('missing packaged projector schema')
             for name in schemas:
                 self.psql('r01_money', jar.read(name).decode(), role=core_contracts.MONEY_PROJECTOR_LOGIN)
+        # As the console after each money migration run: the writer's default privileges gave the retention role DELETE and
+        # TRUNCATE on every new relation; it keeps privileges on the money history tables only (a lookup table or a view
+        # is not history)
+        keep = core_contracts.TABLE_OWNERS['r01_money']['retention_tables']
+        self.psql('r01_money', "DO $$ DECLARE r record; BEGIN FOR r IN SELECT c.relname FROM pg_class c JOIN pg_namespace n "
+                               "ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm') "
+                               "AND pg_get_userbyid(c.relowner) = current_user AND c.relname <> ALL (ARRAY["
+                               + ', '.join(f"'{t}'" for t in keep) + "]) LOOP EXECUTE format('REVOKE ALL ON public.%I FROM "
+                               f"%I', r.relname, '{core_contracts.RETENTION_ROLE}'); END LOOP; END $$",
+                  role=core_contracts.MONEY_PROJECTOR_LOGIN)
         self.grant_retention_select('r01_money')
 
     # ---------------------------------------------------------------- processes
@@ -2147,11 +2172,23 @@ class CoreFixture(Fixture):
 
     MARKETDATA_EGRESS_PORT = 20500
 
+    # A market-data drill may order the ME journal archives (member indexes, failover order: the first is followed first)
+    # and give the commit-pause test build its two settings; both recorded by the drill
+    marketdata_archive_order = None
+    marketdata_env_overrides = None
+
     def marketdata_env(self, slot):
         """oe-marketdata's environment (gateway marketdata/MarketDataSettings.h): the required settings only. Its ME
-        session on its own GATEWAY key of the ME table, the ME journal's archives as the bridge reads them, the market
-        history database under its writer role; every bound, size and timeout stays at the binary's default."""
+        session on its own GATEWAY key of the ME table, the ME journal's archives as the bridge reads them (in member order,
+        or in the order a drill set), the market history database under its writer role; every bound, size and timeout
+        stays at the binary's default. A drill's overrides are the commit-pause test build's settings only."""
         nodes, ports = self.m['nodes'], self.m['ports']
+        order = list(self.marketdata_archive_order or range(3))
+        if sorted(order) != [0, 1, 2]:
+            raise Violation(f'marketdata_archive_order names each ME member once: {order}')
+        overrides = dict(self.marketdata_env_overrides or {})
+        if set(overrides) - core_contracts.MARKETDATA_TEST_ENV:
+            raise Violation('a drill overrides only ' + ', '.join(sorted(core_contracts.MARKETDATA_TEST_ENV)))
         artifact = self.m['artifacts'][self.slot_artifact(slot)]
         me = self.m['credentials']['me']
         env = {'MD_DRIVER_MODE': artifact['driver'], 'MD_INSTANCE_ID': str(self.keys.keys[(slot, 'me')][0]),
@@ -2160,7 +2197,7 @@ class CoreFixture(Fixture):
                'MD_ME_EGRESS_ENDPOINT': f'{nodes[slot]}:{self.MARKETDATA_EGRESS_PORT}',
                me['credential_env']: self.keys.credential(slot, 'me'),
                'MD_ME_JOURNAL_ARCHIVES': ','.join(f'{nodes[f"me{i}"]}:{ports["me_base"] + i * ports["stride"] + 10}'
-                                                  for i in range(3)),
+                                                  for i in order),
                'MD_LOCAL_HOST': nodes[slot], 'MD_PUBLIC_BIND': f'{nodes[slot]}:{ports["md_public"]}',
                'MD_ADMIN_BIND': f'{nodes[slot]}:{ports["md_admin"]}',
                'MD_PG_URL': f'postgresql://{self.gateway}:{self.pg_port}/{core_contracts.MARKETDATA_DATABASE}',
@@ -2171,6 +2208,7 @@ class CoreFixture(Fixture):
             env['AERON_DIR'] = '/dev/shm/aeron-' + slot
         else:
             env['MD_DRIVER_DIR'] = '/dev/shm'
+        env.update({k: str(v) for k, v in overrides.items()})
         return env
 
     def marketdata_command(self, slot):

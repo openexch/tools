@@ -442,7 +442,11 @@ class SlotEnvTest(unittest.TestCase):
         # The market-data slot, both driver modes
         from test_smoke_core import marketdata_fixture
         for driver in ('external', 'embedded'):
-            names |= set(marketdata_fixture(self.dir, driver).marketdata_env('md0'))
+            md = marketdata_fixture(self.dir, driver)
+            names |= set(md.marketdata_env('md0'))
+            # the commit-pause test build's two settings (core-md-exactly-once)
+            md.marketdata_env_overrides = {'MDTC_COMMIT_PAUSE_MS': 4000, 'MDTC_COMMIT_PAUSE_SKIP': 0}
+            names |= set(md.marketdata_env('md0'))
         f = self.fx()
         self.assertEqual(names, f.allowed_env())
         # every set value passes the guard

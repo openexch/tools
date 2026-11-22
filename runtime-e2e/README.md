@@ -116,7 +116,7 @@ The replica kinds fill the `shadow0` role with the core jar as `CORE_ROLE=replic
 
 A core manifest may declare four more roles: `gw0`, `gw1` (oe-gateway) and `st0`, `st1` (oe-stream). It declares all four or none. Each runs in its own container on its own GATEWAY key and its own cluster session, and reaches the core only over the network.
 
-- Cuts are `rc2-cut/4`: `rc2-cut/3` added `repos.gateway` and the product artifacts `oe-gateway` and `oe-stream`; `rc2-cut/4` adds `oe-projector` and requires `substrate.aeron_patches` (each Aeron patch file of the cluster-tools lock: `lock_path`, `path`, `sha256`; `release_cut.py` re-hashes every file and refuses a set other than the lock's at `repos.cluster-tools`). Older cuts stay readable as written. Every gateway binary is built from the pinned gateway commit and pinned by sha256. A slot runs the cut's binary or a test-only alternative: `gateway_nc` (oe-gateway built with one `GW_NC_*` define; its build tree's `CMAKE_CXX_FLAGS` must equal the declared define), `gateway_stub` (`gateway_shim.py`, an HTTP shim over CoreProbe, never published) or `session_stub` (`ct_session_stub`, steered through `/data/stub.cmd`). The control builds are named by `MK_GATEWAY_NC`, `MK_GATEWAY_NC_NO_CANCEL_REOFFER_RULE`, `MK_GATEWAY_NC_NO_ASSET_CHECK` and `MK_GATEWAY_NC_NO_STALE_LABEL`.
+- Cuts are `rc2-cut/5`: `rc2-cut/5` adds three product artifacts, `oe-marketdata` (gateway repo, C++, stamped, carrying the money schema sha256 like the other gateway binaries), `ct-genesis` (cluster-tools, C++, stamped) and `market-sim` (tools, Go: derivation `rebuild-equal`, two byte-equal builds in the build record, the tools commit linked in as `main.sourceSha`); `match-gateway`, `oms-app` and `core-bridge` stay retired. `rc2-cut/3` added `repos.gateway` and the product artifacts `oe-gateway` and `oe-stream`; `rc2-cut/4` adds `oe-projector` and requires `substrate.aeron_patches` (each Aeron patch file of the cluster-tools lock: `lock_path`, `path`, `sha256`; `release_cut.py` re-hashes every file and refuses a set other than the lock's at `repos.cluster-tools`). Older cuts stay readable as written. Every gateway binary is built from the pinned gateway commit and pinned by sha256. A slot runs the cut's binary or a test-only alternative: `gateway_nc` (oe-gateway built with one `GW_NC_*` define; its build tree's `CMAKE_CXX_FLAGS` must equal the declared define), `gateway_stub` (`gateway_shim.py`, an HTTP shim over CoreProbe, never published) or `session_stub` (`ct_session_stub`, steered through `/data/stub.cmd`). The control builds are named by `MK_GATEWAY_NC`, `MK_GATEWAY_NC_NO_CANCEL_REOFFER_RULE`, `MK_GATEWAY_NC_NO_ASSET_CHECK` and `MK_GATEWAY_NC_NO_STALE_LABEL`.
 - Users authenticate with per-run API keys, written to each slot's own `/data/api-keys` and redacted from every retained file. The gateway's users store is the PostgreSQL database `r01_gateway`. The treasury lane is on in every gateway kind: a TREASURY key per gateway in the members' `CORE_AUTH_KEYS`, plus `GATEWAY_ALLOW_TREASURY_LANE`, `GATEWAY_TREASURY_CREDENTIAL` and `GATEWAY_FAUCET_MAX_AMOUNT`.
 - External driver mode: the slot's aeronmd runs as pid 1 of a sidecar container `<slot>-driver`, the way production runs it as its own service. The sidecar holds the slot's address and a shareable IPC namespace; oe-gateway or oe-stream joins those two namespaces only. A kill, a SIGSTOP or a restart of the binary leaves the driver running, and the restarted binary must attach to the same driver (otherwise the run is INCONCLUSIVE). The session stub keeps its in-container driver. A sidecar gets the slot's memory and CPU settings too, so an external slot's footprint is about twice an embedded one.
 - Before the gateway slots start, the fixture moves the core to behaviour 4 (`core_behavior_step`); a kind's `behavior` can keep it at 3. Product slots answer on a fixed response port (`GATEWAY_RESPONSE_PORT`, 20480).
@@ -155,10 +155,14 @@ Kinds (`mk_manifests.py <kind> <tag> --cut <cut>`): the projector binary kind pl
 (`oe-marketdata` of the cut's gateway commit in its own container, one GATEWAY-class session on the ME, the ME journal's
 archives as its trade path, the market history database `oe_marketdata` under its writer role `oe_marketdata_writer`).
 `cps` and `cps-ext` (engines, user-facing slots and projectors embedded or external), `cps-nofwd` and `cps-nofwd-ext`
-(both forwarder slots empty), `cps-nc-dropone` (oe-projector built with `PROJ_NC_DROP_ONE` in pj0 and pj1). Until a cut
-lists `oe-marketdata`, the slot stages the product build of the cut's gateway commit named by `MK_MARKETDATA`; the
-checker accepts it in a rig kind only when it carries the cut's gateway sha and sits in a build tree with no control
-define.
+(both forwarder slots empty), `cps-nc-dropone` (oe-projector built with `PROJ_NC_DROP_ONE` in pj0 and pj1). An
+`rc2-cut/5` cut lists `oe-marketdata` and the slot stages it. On an older cut the slot stages the product build of the cut's
+gateway commit named by `MK_MARKETDATA`; the checker accepts it in a rig kind only when it carries the cut's gateway sha
+and sits in a build tree with no control define. The market-data drill kinds stage `marketdata_nc` instead, a test build
+of the cut's gateway commit whose build tree's `CMAKE_CXX_FLAGS` are exactly its test defines (`MK_MARKETDATA_<NAME>`,
+`mk_manifests.marketdata_nc_setting`): `cps-mdtc` and `cps-mdtc-ext` (the commit-pause seam `MD_TC_COMMIT_PAUSE`), and one
+control kind per rule switched off, `cps-mdnc-split`, `cps-mdnc-epoch`, `cps-mdnc-emptyseries`, `cps-mdnc-restmemory`,
+`cps-mdnc-liveemit`, `cps-mdnc-nostall` (`core_contracts.GATEWAY_KINDS`, `md_drill` and `control_text`).
 
 Scenarios: `critical-path-smoke-core` (funding on the treasury lane, crossing pairs, a partial fill, amend, cancel,
 cancel-all, a create refused for funds, a replayed create, an accepted and a refused withdrawal, all through gw0; both
@@ -169,6 +173,19 @@ forwarders it ends INCONCLUSIVE `control vacuous: orders matched`), `core-gate-b
 OPEN twice), `core-history-loss` (the order history databases down and back twice). Sizes and bounds are settings
 (`smoke_core.SETTINGS`). `CPS_CONTROL=<name>` runs the harness's own controls (`smoke_core.CONTROLS`): one rule switched
 off or one input planted, recorded; a control run passes only when a judged line fails with exactly its text.
+
+Market-data drills (`md_drills.py`; the module docstring has the details), each ending with the barrier, both core
+oracles PASS, fills > 0, `md_trades` equal to the ME journal's trade set by trade id and `md_candles` equal to a
+recomputation from it: `core-md-exactly-once` (md0 killed inside a paused commit after the batch reached a subscribed
+client, twice; `cps-mdtc`, `cps-mdtc-ext`), `core-md-failover` (the ME leader killed twice, the first time the member md0's
+journal follower reads; the book goes stale and heals, the follower stalls and fails over, no tradeId twice on one
+connection), `core-md-history-loss` (the market history database down and back twice, then across an md0 start),
+`core-md-epoch` (a market history of another genesis parks the writer; the reset; a clean start), `core-md-driverkill`
+(external: md0's aeronmd killed, exit 70, restart, recovery; embedded: the embedded driver's directory unlinked, md0 keeps serving) and
+`core-md-frozen` (md0 stopped with SIGSTOP past its egress stale time, twice: matching, dispatch and settlement go on and
+the ME egress age stays under the drill bound). Sizes and bounds are settings (`md_drills.SETTINGS`);
+`MD_CONTROL=<name>` runs the harness controls (`md_drills.CONTROLS`: a fault step skipped or shortened, INCONCLUSIVE with
+its text), and each `cps-mdnc-*` kind is the control of the one drill it names.
 
 Hold point (dry runs): `RUNNER_HOLD_AFTER_S=<seconds>` keeps the fixture up after the scenario has decided. The runner
 writes `<output>/hold.ready` (run id, state root, containers, network, PostgreSQL address) and closes the fixture when
@@ -251,7 +268,7 @@ Paths are settings, never machine defaults. A night reads them from the environm
 |---|---|---|
 | `NIGHTLY_LOCK`, `NIGHTLY_CUT`, `NIGHTLY_CT_REPO` | `nightly.py` | heavy-job lock file, release cut manifest, cluster-tools checkout (falls back to `CUT_CT_REPO`) |
 | `CUT_TOOLS_REPO`, `CUT_CT_REPO`, `CUT_OLD_PINS` | `release_cut.py` | tools and cluster-tools checkouts, previous pin set |
-| `MK_RUNS`, `MK_BIN_A`, `MK_BUILD_B`, `MK_NC_DIR`, `MK_CUT_NC_DIR`, `MK_DRIVER_PROPERTIES`, `MK_AE_JAR`, `MK_ME_JAR`, `MK_PROJECTOR_JAR`, `MK_PROBE_MANIFEST`, `MK_NETFILTER_HELPER`, `MK_GATEWAY_NC`, `MK_GATEWAY_NC_NO_CANCEL_REOFFER_RULE`, `MK_GATEWAY_NC_NO_ASSET_CHECK`, `MK_MARKETDATA` | `mk_manifests.py` | run directory, C++ binaries and build trees, negative-control builds, external driver properties, engine and probe artifacts |
+| `MK_RUNS`, `MK_BIN_A`, `MK_BUILD_B`, `MK_NC_DIR`, `MK_CUT_NC_DIR`, `MK_DRIVER_PROPERTIES`, `MK_AE_JAR`, `MK_ME_JAR`, `MK_PROJECTOR_JAR`, `MK_PROBE_MANIFEST`, `MK_NETFILTER_HELPER`, `MK_GATEWAY_NC`, `MK_GATEWAY_NC_NO_CANCEL_REOFFER_RULE`, `MK_GATEWAY_NC_NO_ASSET_CHECK`, `MK_MARKETDATA`, `MK_MARKETDATA_<NAME>` | `mk_manifests.py` | run directory, C++ binaries and build trees, negative-control builds, external driver properties, engine and probe artifacts |
 | `CORE_PROBE_CORE_JAR` | `test_story.py` | the core jar the story tests compile and run against (unset: they skip) |
 | `LEGACY_TEMPLATE`, `LEGACY_JARS` | `legacy_tag.py` | v0.5.0-beta manifest template and jars |
 | `XVER_LEGACY_RUNS`, `XVER_SEEDS`, `XVER_CUT` | `xver.py` | cross-version run inputs |

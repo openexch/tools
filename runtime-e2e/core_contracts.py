@@ -86,6 +86,9 @@ RETENTION_ROLE = 'history_retention'
 # The login role the gateways read a projection database through on a kind that runs the projector binary: the gateway's
 # own login, a member of the schema's reader group role (sql/history_projection_v1.sql), SELECT on the four read relations
 HISTORY_READER_GROUP = 'oe_history_reader'
+# The money database's read group of the balance movements view (core-projector V002 grants SELECT on the view to it and
+# creates it only when the migrating role may create roles; like the console, the fixture creates it first, NOLOGIN)
+MONEY_READER_GROUP = 'oe_money_reader'
 HISTORY_READER_LOGIN = GATEWAY_LOGIN
 # The stand-in's modes: ``follow`` beats only at the core's head; ``beat-always`` beats whatever the head (the freshness
 # drill's control: stale history then reads fresh)
@@ -95,13 +98,29 @@ PROJECTION_DATABASES = {'pj0': 'r01_gateway', 'pj1': 'r01_history_b'}
 # The public market-data slot: oe-marketdata of the cut's gateway commit in md0, its own container and address, one
 # GATEWAY-class session on the ME and the ME journal's archives as its trade path, writing the market history database
 # under its own login role. A manifest declares md0 or not, and only next to the gateway roles. A declared slot may be
-# null (not started). Until a cut layout lists oe-marketdata, the slot stages the product build of the cut's gateway
-# commit that MK_MARKETDATA names (release_cut checks its stamp against the cut's gateway sha).
+# null (not started). A cut of layout rc2-cut/5 lists oe-marketdata and the slot stages it; on an older cut the slot
+# stages the product build of the cut's gateway commit that MK_MARKETDATA names (release_cut checks its stamp against the
+# cut's gateway sha). ``marketdata_nc`` is a test build of the same commit (rig kinds only): oe-marketdata compiled with
+# the test defines its ``defines`` list (a test seam such as the commit pause, or one rule switched off), and nothing else.
 MARKETDATA_SLOTS = {'md0': 'marketdata'}
 MARKETDATA_ROLES = set(MARKETDATA_SLOTS)
-MARKETDATA_BINARIES = ['marketdata']
-MARKETDATA_SLOT_ARTIFACTS = {'md0': {'marketdata'}}
-MARKETDATA_TARGETS = {'marketdata': 'oe-marketdata'}
+MARKETDATA_BINARIES = ['marketdata', 'marketdata_nc']
+MARKETDATA_SLOT_ARTIFACTS = {'md0': {'marketdata', 'marketdata_nc'}}
+MARKETDATA_TARGETS = {'marketdata': 'oe-marketdata', 'marketdata_nc': 'oe-marketdata'}
+MARKETDATA_TEST_ARTIFACTS = {'marketdata_nc'}
+# The test defines a marketdata_nc build may carry (gateway marketdata/*.cpp; never in a published binary):
+#   MD_TC_COMMIT_PAUSE          each commit waits MDTC_COMMIT_PAUSE_MS before its COMMIT (the seam the writer is killed in)
+#   MD_NC_COMMIT_SPLIT          with the pause: the cursor commits in a transaction of its own, before the rows
+#   MD_NC_NO_EPOCH_CHECK        a record of another genesis taken like any other
+#   MD_NC_EMPTY_SERIES          empty tape and candle series sent while the market history was down at the start
+#   MD_NC_REST_FROM_MEMORY      GET /api/candles answers a failed history read with 200 and the candles in hand
+#   MD_NC_NO_LIVE_EMIT_CURSOR   a trade read again is handed to the live path again
+#   MD_NC_NO_STALL_CHECK        the journal follower never judges its source stalled (it never fails over)
+MARKETDATA_NC_DEFINES = {'MD_TC_COMMIT_PAUSE', 'MD_NC_COMMIT_SPLIT', 'MD_NC_NO_EPOCH_CHECK', 'MD_NC_EMPTY_SERIES',
+                         'MD_NC_REST_FROM_MEMORY', 'MD_NC_NO_LIVE_EMIT_CURSOR', 'MD_NC_NO_STALL_CHECK'}
+# The commit-pause test build's two settings (read only by a build with MD_TC_COMMIT_PAUSE): the pause and the commits of
+# the process that go through before the first pause
+MARKETDATA_TEST_ENV = {'MDTC_COMMIT_PAUSE_MS', 'MDTC_COMMIT_PAUSE_SKIP'}
 MARKETDATA_PORTS = {'md_public': 8110, 'md_admin': 8111}
 # The market history database and its writer role (fixed names that cannot meet a legacy one); the service applies its
 # own schema (sql/market_history_v1.sql) and owns every relation
@@ -130,21 +149,26 @@ DATABASE_ROLE_PLAN = {
                           'retention_select': []},
 }
 # The ownership table (one writer per relation): per database, each table and view with the role that writes it, the
-# view readers, and whether the retention role belongs there. Gateway's users store is not on the fixture (api-key auth).
+# readers of each view (``view_readers``: view -> roles), whether the retention role belongs there and, when only some of
+# its tables are history (``retention_tables``), which: every other relation of that database gives the retention role
+# nothing. Gateway's users store is not on the fixture (api-key auth). The money database carries the core projector's
+# V002 too: the market asset lookup table and two views, the balance movements view readable by oe_money_reader only.
 _PROJECTION_TABLES = ('oe_orders', 'oe_fills', 'oe_order_events', 'oe_projection_state', 'oe_projection_source_memo',
                       'oe_projection_replay', 'oe_projection_schema')
 _PROJECTION_VIEWS = ('gateway_order_history_v1', 'gateway_fills_v1', 'gateway_order_trail_v1', 'gateway_history_heartbeat_v1')
 TABLE_OWNERS = {
-    'r01_money': {'tables': {t: MONEY_PROJECTOR_LOGIN for t in ('money_journal', 'money_journal_leg')}, 'views': {},
-                  'view_readers': [], 'retention': True},
+    'r01_money': {'tables': {t: MONEY_PROJECTOR_LOGIN for t in ('money_journal', 'money_journal_leg', 'money_market_asset')},
+                  'views': {v: MONEY_PROJECTOR_LOGIN for v in ('money_journal_leg_asset', 'gateway_balance_movements_v1')},
+                  'view_readers': {'money_journal_leg_asset': [], 'gateway_balance_movements_v1': [MONEY_READER_GROUP]},
+                  'retention': True, 'retention_tables': ['money_journal', 'money_journal_leg']},
     'r01_gateway': {'tables': {t: HISTORY_PROJECTOR_LOGIN for t in _PROJECTION_TABLES},
                     'views': {v: HISTORY_PROJECTOR_LOGIN for v in _PROJECTION_VIEWS},
-                    'view_readers': [HISTORY_READER_GROUP], 'retention': True},
+                    'view_readers': {v: [HISTORY_READER_GROUP] for v in _PROJECTION_VIEWS}, 'retention': True},
     'r01_history_b': {'tables': {t: HISTORY_PROJECTOR_LOGIN for t in _PROJECTION_TABLES},
                       'views': {v: HISTORY_PROJECTOR_LOGIN for v in _PROJECTION_VIEWS},
-                      'view_readers': [HISTORY_READER_GROUP], 'retention': False},
+                      'view_readers': {v: [HISTORY_READER_GROUP] for v in _PROJECTION_VIEWS}, 'retention': False},
     MARKETDATA_DATABASE: {'tables': {t: MARKETDATA_WRITER for t in ('md_trades', 'md_candles', 'md_state')}, 'views': {},
-                          'view_readers': [], 'retention': True},
+                          'view_readers': {}, 'retention': True},
 }
 # The ME journal as the bridge reads it (stream, control stream, the archive's MTU), on the service's own replay stream;
 # the markets the fixture's genesis creates. Settings of the fixture, not limits of the binary.
@@ -319,7 +343,9 @@ PROCESS_ENV = {
     'MD_DRIVER_MODE', 'MD_DRIVER_DIR', 'MD_INSTANCE_ID', 'MD_ME_CLUSTER_ADDRESSES', 'MD_ME_PORT_BASE',
     'MD_ME_EGRESS_ENDPOINT', 'MD_ME_JOURNAL_ARCHIVES', 'MD_JOURNAL_CONTROL_STREAM', 'MD_JOURNAL_STREAM',
     'MD_JOURNAL_CHANNEL', 'MD_REPLAY_STREAM', 'MD_JOURNAL_MTU', 'MD_LOCAL_HOST', 'MD_PUBLIC_BIND', 'MD_ADMIN_BIND',
-    'MD_PG_URL', 'MD_PG_USER', 'MD_PG_PASSWORD_FILE', 'MD_CORS_ORIGINS', 'MD_EXPECTED_MARKETS'}
+    'MD_PG_URL', 'MD_PG_USER', 'MD_PG_PASSWORD_FILE', 'MD_CORS_ORIGINS', 'MD_EXPECTED_MARKETS',
+    # the commit-pause test build of oe-marketdata (marketdata_nc with MD_TC_COMMIT_PAUSE; a drill sets them, recorded)
+    'MDTC_COMMIT_PAUSE_MS', 'MDTC_COMMIT_PAUSE_SKIP'}
 # Only `execute` on the probe container may carry these (the pinned T1 drivers). The values are
 # session secrets except T1_ME_MARKETS and T1_LOCAL_HOST. T1_BRIDGE_KEY, T1_TAP_KEY and T1_ME_FORWARDER_KEY are
 # never set: the via-bridge genesis needs no bridge key and the capture/resend verbs are not run from the probe.
@@ -663,7 +689,47 @@ GATEWAY_KINDS.update({
                        'projector_define': 'PROJ_NC_DROP_ONE', 'marketdata': dict(_MD),
                        'smoke_control': 'critical-path-smoke-core', 'control_text': 'history differs from the core: missing event'},
 })
+# The market-data drill kinds (md_drills): the critical-path kind with md0 on a marketdata_nc build of the cut's gateway
+# commit, ``marketdata_defines`` its test defines and ``md_drill`` the one drill the kind runs; a control kind also names
+# ``control_text``, the text the drill's line must fail with.
+#   cps-mdtc, cps-mdtc-ext      core-md-exactly-once: the commit-pause seam (the writer is killed inside a commit)
+#   cps-mdnc-split              core-md-exactly-once: the seam plus the cursor committed apart from the rows
+#   cps-mdnc-epoch              core-md-epoch: the epoch check off
+#   cps-mdnc-emptyseries        core-md-history-loss: empty series sent while the history was down at the start
+#   cps-mdnc-restmemory         core-md-history-loss: /api/candles answered from memory during the outage
+#   cps-mdnc-liveemit           core-md-failover: the live-emit cursor off
+#   cps-mdnc-nostall            core-md-failover: stall detection off
+# Each control runs in one mode, as the other drills' controls.
+_MDNC = {'md0': 'marketdata_nc'}
+GATEWAY_KINDS.update({
+    'cps-mdtc': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_BIN),
+                 'marketdata': dict(_MDNC), 'marketdata_defines': ['MD_TC_COMMIT_PAUSE'], 'md_drill': 'core-md-exactly-once'},
+    'cps-mdtc-ext': {'driver': 'external', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_BIN),
+                     'marketdata': dict(_MDNC), 'marketdata_defines': ['MD_TC_COMMIT_PAUSE'],
+                     'md_drill': 'core-md-exactly-once'},
+    'cps-mdnc-split': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_BIN),
+                       'marketdata': dict(_MDNC), 'marketdata_defines': ['MD_TC_COMMIT_PAUSE', 'MD_NC_COMMIT_SPLIT'],
+                       'md_drill': 'core-md-exactly-once', 'control_text': 'missing trade <id>|duplicate trade <id>'},
+    'cps-mdnc-epoch': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_BIN),
+                       'marketdata': dict(_MDNC), 'marketdata_defines': ['MD_NC_NO_EPOCH_CHECK'], 'md_drill': 'core-md-epoch',
+                       'control_text': 'trades of two genesis epochs in one history'},
+    'cps-mdnc-emptyseries': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_BIN),
+                             'marketdata': dict(_MDNC), 'marketdata_defines': ['MD_NC_EMPTY_SERIES'],
+                             'md_drill': 'core-md-history-loss', 'control_text': 'empty series sent without the history'},
+    'cps-mdnc-restmemory': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_BIN),
+                            'marketdata': dict(_MDNC), 'marketdata_defines': ['MD_NC_REST_FROM_MEMORY'],
+                            'md_drill': 'core-md-history-loss', 'control_text': 'REST candles answered without the history'},
+    'cps-mdnc-liveemit': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_BIN),
+                          'marketdata': dict(_MDNC), 'marketdata_defines': ['MD_NC_NO_LIVE_EMIT_CURSOR'],
+                          'md_drill': 'core-md-failover', 'control_text': 'trade <id> sent twice to one connection'},
+    'cps-mdnc-nostall': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'projectors': dict(_PJ_BIN),
+                         'marketdata': dict(_MDNC), 'marketdata_defines': ['MD_NC_NO_STALL_CHECK'],
+                         'md_drill': 'core-md-failover', 'control_text': 'followed a stopped recording'},
+})
 MARKETDATA_KINDS = {k for k, v in GATEWAY_KINDS.items() if v.get('marketdata')}
+# The kinds whose md0 runs the product oe-marketdata (the smoke, the gate brake, the history loss and the product legs of
+# the market-data drills)
+MARKETDATA_PRODUCT_KINDS = {k for k in MARKETDATA_KINDS if set(GATEWAY_KINDS[k]['marketdata'].values()) <= {'marketdata'}}
 PROJECTION_KINDS = {k for k, v in GATEWAY_KINDS.items() if v.get('projectors')}
 # The kinds whose projection slots run the projector binary (product or control build), not the stand-in
 PROJECTOR_BINARY_KINDS = {k for k in PROJECTION_KINDS
@@ -1014,7 +1080,7 @@ def validate_projection_artifacts(manifest):
             _lib(lib, name + ' library ' + lib_name)
 
 
-MARKETDATA_ARTIFACT_KEYS = {'path', 'sha256', 'source_sha', 'driver', 'target', 'libs'}
+MARKETDATA_ARTIFACT_KEYS = {'path', 'sha256', 'source_sha', 'driver', 'target', 'libs', 'defines'}
 
 
 def validate_marketdata_artifacts(manifest):
@@ -1034,6 +1100,12 @@ def validate_marketdata_artifacts(manifest):
             raise Violation(f'{name}: target must be {MARKETDATA_TARGETS[name]}, got {entry.get("target")!r}')
         if entry.get('driver') not in DRIVER_MODES:
             raise Violation(name + ': driver must be embedded or external')
+        defines = entry.get('defines')
+        if name in MARKETDATA_TEST_ARTIFACTS:
+            if not isinstance(defines, list) or not defines or not set(defines) <= MARKETDATA_NC_DEFINES:
+                raise Violation(f'{name}: defines is a non-empty list of ' + ', '.join(sorted(MARKETDATA_NC_DEFINES)))
+        elif defines is not None:
+            raise Violation(f'{name}: the product build carries no defines')
         libs = entry.get('libs') or {}
         if entry['driver'] == 'external' and set(libs) != {'aeronmd', 'libaeron_driver.so', 'libaeron.so'}:
             raise Violation(f'{name}: an external slot stages aeronmd, libaeron_driver.so and libaeron.so')

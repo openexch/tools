@@ -34,6 +34,7 @@ def marketdata_manifest(directory, driver='external', kind='cps'):
     if driver == 'external':
         entry['libs'] = copy.deepcopy(m['artifacts']['forwarder']['libs'])
     m['artifacts']['marketdata'] = entry
+    m['artifacts']['marketdata_nc'] = None
     m['slot_artifacts']['md0'] = 'marketdata'
     if kind:
         m['manifest_kind'] = kind
@@ -98,12 +99,16 @@ class MarketDataContractTest(unittest.TestCase):
 
     def test_the_kinds(self):
         import mk_manifests
-        self.assertEqual(core_contracts.MARKETDATA_KINDS, {'cps', 'cps-ext', 'cps-nofwd', 'cps-nofwd-ext', 'cps-nc-dropone'})
+        self.assertEqual(core_contracts.MARKETDATA_PRODUCT_KINDS, {'cps', 'cps-ext', 'cps-nofwd', 'cps-nofwd-ext', 'cps-nc-dropone'})
+        self.assertEqual(core_contracts.MARKETDATA_KINDS - core_contracts.MARKETDATA_PRODUCT_KINDS,
+                         {'cps-mdtc', 'cps-mdtc-ext', 'cps-mdnc-split', 'cps-mdnc-epoch', 'cps-mdnc-emptyseries',
+                          'cps-mdnc-restmemory', 'cps-mdnc-liveemit', 'cps-mdnc-nostall'})
         for kind in core_contracts.MARKETDATA_KINDS:
             spec = core_contracts.GATEWAY_KINDS[kind]
             self.assertIn(kind, core_contracts.CUT_KINDS)
             self.assertIn(kind, core_contracts.PROJECTOR_BINARY_KINDS)
-            self.assertEqual(spec['marketdata'], {'md0': 'marketdata'})
+            self.assertEqual(spec['marketdata'], {'md0': 'marketdata' if kind in core_contracts.MARKETDATA_PRODUCT_KINDS
+                                                  else 'marketdata_nc'})
             self.assertEqual(mk_manifests.CUT_KINDS[kind][3], 'NOFWD' if 'nofwd' in kind else 'A')
             self.assertEqual(spec['driver'], 'external' if kind.endswith('-ext') else 'embedded')
         self.assertEqual(mk_manifests.SLOTS['NOFWD'], {'fwd0': None, 'fwd1': None, 'bridge0': 'bridge', 'bridge1': 'bridge'})
@@ -163,7 +168,8 @@ class MarketDataFixtureTest(unittest.TestCase):
 
 
 class MarketDataCutTest(unittest.TestCase):
-    """The checker on the market-data artifact: the cut's gateway commit, a product build tree, rig kinds only."""
+    """The checker on the market-data artifact: the cut's own oe-marketdata on a cut of layout rc2-cut/5; on an older cut, a
+    product build of the cut's gateway commit in a rig kind only."""
 
     def setUp(self):
         import test_mk_manifests
@@ -171,30 +177,56 @@ class MarketDataCutTest(unittest.TestCase):
         self.builder.setUp()
         self.addCleanup(self.builder.tearDown)
 
-    def check(self, m):
+    def check(self, m, world=None, cls='rig'):
         import release_cut
-        return [rule + ' ' + text for rule, text in
-                release_cut.check(m, self.builder.world.m, 'rig', old_pins=self.builder.world.pins).items]
+        world = world or self.builder.world
+        return [rule + ' ' + text for rule, text in release_cut.check(m, world.m, cls, old_pins=world.pins).items]
 
-    def test_a_build_of_the_cut_s_gateway_commit_is_accepted_and_others_refused(self):
+    def test_a_cut_of_layout_5_stages_its_own_oe_marketdata(self):
+        import hashlib
+        cut = self.builder.world.m
+        self.assertIn('oe-marketdata', cut['artifacts'])
         for kind in sorted(core_contracts.MARKETDATA_KINDS):
             _, m = self.builder.built(kind)
-            self.assertEqual(m['artifacts']['marketdata']['source_sha'], self.builder.world.m['repos']['gateway'])
+            if (m['slot_artifacts'] or {}).get('md0') != 'marketdata':
+                continue
+            self.assertEqual(m['artifacts']['marketdata']['sha256'], cut['artifacts']['oe-marketdata']['sha256'], kind)
             self.assertEqual(m['nodes']['md0'][-3:], '.46')
             self.assertEqual(self.check(m), [], kind)
-            fwd = (m['slot_artifacts']['fwd0'], m['slot_artifacts']['fwd1'])
-            self.assertEqual(fwd, (None, None) if 'nofwd' in kind else ('forwarder', 'forwarder'))
         _, m = self.builder.built('cps')
-        root = self.builder.root
-        other = root / 'other/bin/oe-marketdata'; other.parent.mkdir(parents=True); other.write_bytes(b'ELF oe-marketdata of another commit')
-        import hashlib
+        other = self.builder.root / 'other/bin/oe-marketdata'
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b'ELF oe-marketdata ' + cut['repos']['gateway'].encode() + b' rebuilt')
         bad = copy.deepcopy(m)
         bad['artifacts']['marketdata'].update(path=str(other), sha256=hashlib.sha256(other.read_bytes()).hexdigest())
-        self.assertTrue(any('is not a build of the cut\'s gateway' in t for t in self.check(bad)))
-        (root / 'gw/CMakeCache.txt').write_text('CMAKE_CXX_FLAGS:STRING=-DMD_NC_COMMIT_SPLIT\n')
-        self.assertTrue(any(t.startswith('K3') and 'control define' in t for t in self.check(m)))
+        self.assertTrue(any(t.startswith('K4') and 'is not an artifact of cut' in t for t in self.check(bad)), self.check(bad))
+
+    def test_an_older_cut_takes_a_build_of_the_cut_s_gateway_commit_in_a_rig_kind_only(self):
+        import hashlib
         import release_cut
-        refused = release_cut.check(m, self.builder.world.m, 'product', old_pins=self.builder.world.pins).items
+        import test_release_cut
+        world = test_release_cut.World(self.builder.root / 'cut4', 'rc2-cut/4')
+        world.pins.update(self.builder.world.pins)
+        path = self.builder.root / 'rc2-cut-4-manifest.json'
+        path.write_text(json.dumps(world.m))
+        self.assertNotIn('oe-marketdata', world.m['artifacts'])
+        for kind in sorted(core_contracts.MARKETDATA_KINDS):
+            _, m = self.builder.built(kind, cut=path, world=world)
+            if (m['slot_artifacts'] or {}).get('md0') != 'marketdata':
+                continue
+            self.assertEqual(m['artifacts']['marketdata']['source_sha'], world.m['repos']['gateway'])
+            self.assertEqual(self.check(m, world), [], kind)
+            fwd = (m['slot_artifacts']['fwd0'], m['slot_artifacts']['fwd1'])
+            self.assertEqual(fwd, (None, None) if 'nofwd' in kind else ('forwarder', 'forwarder'))
+        _, m = self.builder.built('cps', cut=path, world=world)
+        root = self.builder.root
+        other = root / 'other/bin/oe-marketdata'; other.parent.mkdir(parents=True); other.write_bytes(b'ELF oe-marketdata of another commit')
+        bad = copy.deepcopy(m)
+        bad['artifacts']['marketdata'].update(path=str(other), sha256=hashlib.sha256(other.read_bytes()).hexdigest())
+        self.assertTrue(any('is not a build of the cut\'s gateway' in t for t in self.check(bad, world)))
+        (root / 'gw/CMakeCache.txt').write_text('CMAKE_CXX_FLAGS:STRING=-DMD_NC_COMMIT_SPLIT\n')
+        self.assertTrue(any(t.startswith('K3') and 'control define' in t for t in self.check(m, world)))
+        refused = release_cut.check(m, world.m, 'product', old_pins=world.pins).items
         self.assertTrue(any('not an artifact of cut' in text for _, text in refused))
 
 
