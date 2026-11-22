@@ -200,7 +200,8 @@ def judge(listing, declared, nodes, plan=None, retention=None, reader_group=None
             lines['delete:' + key] = _line(not deleters, {'roles': deleters},
                                            f'unnamed delete role on {name}: {deleters[0]}' if deleters else None)
             held = effective.get(retention, set())
-            if not spec['retention']:
+            history = spec.get('retention_tables')
+            if not spec['retention'] or (history is not None and name not in history):
                 ok, text = not held, f'retention role has a grant outside its tables: {name}'
             elif held & {'INSERT', 'UPDATE'}:
                 ok, text = False, f'retention role can insert: {name}'
@@ -214,7 +215,7 @@ def judge(listing, declared, nodes, plan=None, retention=None, reader_group=None
             lines['retention:' + key] = _line(ok, {'held': sorted(held), 'table_names_it': spec['retention']}, text)
             if view:
                 readers = sorted(g for g in acl_grantees(rel.get('acl'), 'r') if g not in {rel['owner']}
-                                 | set(spec.get('view_readers') or []))
+                                 | set((spec.get('view_readers') or {}).get(name) or []))
                 lines['readers:' + key] = _line(not readers, {'readers': readers},
                                                 f'view readable by an unnamed role: {name}: {readers[0]}' if readers else None)
     for db in sorted(set(listing['databases']) - set(plan)):

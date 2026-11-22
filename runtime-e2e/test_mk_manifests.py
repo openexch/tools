@@ -168,6 +168,17 @@ class CutManifestBuilderTest(unittest.TestCase):
         # oe-marketdata of the cut's gateway commit (a product build tree: no control define), for the critical-path kinds
         nc['marketdata'] = put('gw/bin/oe-marketdata', b'ELF oe-marketdata ' + self.world.m['repos']['gateway'].encode())
         put('gw/CMakeCache.txt', b'CMAKE_CXX_FLAGS:STRING=\n')
+        # one test build tree of oe-marketdata per define set of the market-data drill kinds (CMAKE_CXX_FLAGS = the defines)
+        nc['marketdata_nc'] = {}
+        for spec in core_contracts.GATEWAY_KINDS.values():
+            defines = spec.get('marketdata_defines')
+            if not defines:
+                continue
+            setting = mk_manifests.marketdata_nc_setting(defines)
+            d = 'md-' + setting.lower()
+            nc['marketdata_nc'][setting] = put(d + '/bin/oe-marketdata', b'ELF oe-marketdata ' + '+'.join(defines).encode()
+                                               + b' ' + self.world.m['repos']['gateway'].encode())
+            put(d + '/CMakeCache.txt', ('CMAKE_CXX_FLAGS:STRING=' + ' '.join('-D' + x for x in defines) + '\n').encode())
         shim = (Path(mk_manifests.__file__).resolve().with_name('gateway_shim.py')).read_bytes()
         stub = (Path(mk_manifests.__file__).resolve().with_name('projector_stub.py')).read_bytes()
         blob = self.world.blob
@@ -187,8 +198,11 @@ class CutManifestBuilderTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def built(self, kind, cut=None):
-        path, m = mk_manifests.build_from_cut(kind, 'r1', cut or self.cut_path, self.cfg, old_pins=self.world.pins)
+    def built(self, kind, cut=None, world=None):
+        world = world or self.world
+        if world is not self.world:
+            patch = mock.patch.object(mk_manifests.release_cut, 'git_blob', world.blob); patch.start(); self.addCleanup(patch.stop)
+        path, m = mk_manifests.build_from_cut(kind, 'r1', cut or self.cut_path, self.cfg, old_pins=world.pins)
         core_contracts.validate_core_manifest(json.loads(path.read_text()), path, cpu_count=24, require_me_enforced=True)
         return path, m
 
