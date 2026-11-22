@@ -105,6 +105,8 @@ def _number(env, key, default):
 
 def settings_from_env(env=None):
     env = os.environ if env is None else env
+    if env.get('RUNNER_HOLD_AFTER_S'):
+        raise Violation('RUNNER_HOLD_AFTER_S is the dry runs\' hold point: a nightly never holds a fixture up')
     after = env.get('NIGHTLY_AFTER_INTERRUPT', 'run')
     if after not in ('run', 'skip'):
         raise Violation(f'NIGHTLY_AFTER_INTERRUPT is run or skip, got {after!r}')
@@ -139,6 +141,9 @@ def scenario_known(scenario):
     if m:
         return 1 <= int(m.group(1)) <= 20           # runner.py's bound
     if scenario == 'core-control-edk-cnctimeout':        # run_cnc_timeout, outside the CONTROLS table
+        return True
+    import smoke_core
+    if smoke_core.is_scenario(scenario):                 # the critical-path drills (smoke_core.SCENARIOS)
         return True
     if scenario.startswith(('core-xver-', 'core-act-', 'core-rollback-')):    # Xver.scenario
         import xver

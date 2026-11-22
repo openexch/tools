@@ -146,6 +146,35 @@ Scenarios (`projection_drills.py`): `projector-me-restart-follow`, `projection-b
 
 Tools: `projection_dump.py` (canonical COPY dump plus SHA256SUMS; no wall-clock column is dumped, and a column a table has beyond its fixed list is dumped after them and recorded as `extra_columns`, with a second hash of the fixed columns alone, `sha256_fixed`) and `replay_count.py` (run inside a core member: open replays = sender-position counters on the replay streams, plus `/dev/shm` bytes, its top-level entries and its largest files). Every bound is a setting in `projection_drills.SETTINGS`, overridden by an environment variable of the same name.
 
+## Critical path
+
+The whole user path of the core topology through the product binaries, judged from the core (`smoke_core.py`; the
+module docstring has the details).
+
+Kinds (`mk_manifests.py <kind> <tag> --cut <cut>`): the projector binary kind plus the market-data slot `md0`
+(`oe-marketdata` of the cut's gateway commit in its own container, one GATEWAY-class session on the ME, the ME journal's
+archives as its trade path, the market history database `oe_marketdata` under its writer role `oe_marketdata_writer`).
+`cps` and `cps-ext` (engines, user-facing slots and projectors embedded or external), `cps-nofwd` and `cps-nofwd-ext`
+(both forwarder slots empty), `cps-nc-dropone` (oe-projector built with `PROJ_NC_DROP_ONE` in pj0 and pj1). Until a cut
+lists `oe-marketdata`, the slot stages the product build of the cut's gateway commit named by `MK_MARKETDATA`; the
+checker accepts it in a rig kind only when it carries the cut's gateway sha and sits in a build tree with no control
+define.
+
+Scenarios: `critical-path-smoke-core` (funding on the treasury lane, crossing pairs, a partial fill, amend, cancel,
+cancel-all, a create refused for funds, a replayed create, an accepted and a refused withdrawal, all through gw0; both
+core oracles, fills, the workload, the REST client's request log against the core's decided set, the order history and
+the streams against the core, the public tape and `md_trades` against the ME journal, the book's resting level),
+`core-control-smoke-nomatch` (the same on `cps-nofwd`: must not PASS and the order oracle names O7 or O10; on a kind with
+forwarders it ends INCONCLUSIVE `control vacuous: orders matched`), `core-gate-brake` (the global gate SUSPENDED and
+OPEN twice), `core-history-loss` (the order history databases down and back twice). Sizes and bounds are settings
+(`smoke_core.SETTINGS`). `CPS_CONTROL=<name>` runs the harness's own controls (`smoke_core.CONTROLS`): one rule switched
+off or one input planted, recorded; a control run passes only when a judged line fails with exactly its text.
+
+Hold point (dry runs): `RUNNER_HOLD_AFTER_S=<seconds>` keeps the fixture up after the scenario has decided. The runner
+writes `<output>/hold.ready` (run id, state root, containers, network, PostgreSQL address) and closes the fixture when
+`<output>/hold.release` appears or the seconds pass; recorded under `hold` in `result.json`, never changing the
+decision. A nightly refuses the setting.
+
 ## Nightly
 
 `nightly.py --plan nightly-cut.json --evidence-root DIR --harness-commit SHA --tools-repo DIR --ct-repo DIR` runs a fixed plan of `{kind, scenario}` entries from a `git archive` of the pinned tools commit (a modified or extra file refuses the night). It takes a heavy-job lock without waiting (a held lock or foreign load ends the night `SKIPPED_BUSY`, exit 75), records stale earlier nights as `INTERRUPTED`, enforces `NIGHTLY_BOUND_S` (default 5 h) and writes `SHA256SUMS` last. Nothing is pushed or published.
@@ -156,7 +185,7 @@ Paths are settings, never machine defaults. A night reads them from the environm
 |---|---|---|
 | `NIGHTLY_LOCK`, `NIGHTLY_CUT`, `NIGHTLY_CT_REPO` | `nightly.py` | heavy-job lock file, release cut manifest, cluster-tools checkout (falls back to `CUT_CT_REPO`) |
 | `CUT_TOOLS_REPO`, `CUT_CT_REPO`, `CUT_OLD_PINS` | `release_cut.py` | tools and cluster-tools checkouts, previous pin set |
-| `MK_RUNS`, `MK_BIN_A`, `MK_BUILD_B`, `MK_NC_DIR`, `MK_CUT_NC_DIR`, `MK_DRIVER_PROPERTIES`, `MK_AE_JAR`, `MK_ME_JAR`, `MK_PROJECTOR_JAR`, `MK_PROBE_MANIFEST`, `MK_NETFILTER_HELPER`, `MK_GATEWAY_NC`, `MK_GATEWAY_NC_NO_CANCEL_REOFFER_RULE`, `MK_GATEWAY_NC_NO_ASSET_CHECK` | `mk_manifests.py` | run directory, C++ binaries and build trees, negative-control builds, external driver properties, engine and probe artifacts |
+| `MK_RUNS`, `MK_BIN_A`, `MK_BUILD_B`, `MK_NC_DIR`, `MK_CUT_NC_DIR`, `MK_DRIVER_PROPERTIES`, `MK_AE_JAR`, `MK_ME_JAR`, `MK_PROJECTOR_JAR`, `MK_PROBE_MANIFEST`, `MK_NETFILTER_HELPER`, `MK_GATEWAY_NC`, `MK_GATEWAY_NC_NO_CANCEL_REOFFER_RULE`, `MK_GATEWAY_NC_NO_ASSET_CHECK`, `MK_MARKETDATA` | `mk_manifests.py` | run directory, C++ binaries and build trees, negative-control builds, external driver properties, engine and probe artifacts |
 | `CORE_PROBE_CORE_JAR` | `test_story.py` | the core jar the story tests compile and run against (unset: they skip) |
 | `LEGACY_TEMPLATE`, `LEGACY_JARS` | `legacy_tag.py` | v0.5.0-beta manifest template and jars |
 | `XVER_LEGACY_RUNS`, `XVER_SEEDS`, `XVER_CUT` | `xver.py` | cross-version run inputs |

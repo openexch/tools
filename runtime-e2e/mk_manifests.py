@@ -42,6 +42,8 @@ build needs stops it with a message naming the variable when it is unset. A ``Co
   MK_GATEWAY_NC         oe-gateway of the cut's gateway commit built with GW_NC_FRESH_KEY (the gateway kinds' gateway_nc)
   MK_GATEWAY_NC_NO_CANCEL_REOFFER_RULE, MK_GATEWAY_NC_NO_ASSET_CHECK, MK_GATEWAY_NC_NO_STALE_LABEL   the same commit
                         built with that control define (the gateway_nc of the kinds whose ``nc_define`` names it)
+  MK_MARKETDATA         oe-marketdata of the cut's gateway commit (a product build), staged in md0 by the critical-path
+                        kinds while the cut does not list it
   MK_PROJECTOR_NC_<NAME>  oe-projector of the cut's gateway commit built with -DOE_PROJECTOR_CONTROL=PROJ_NC_<NAME> (the
                         history_projector_nc of the kinds whose ``projector_define`` names it): PIN_RECORDING,
                         NO_STOP_REPLAY, WALLCLOCK_COLUMN, DROP_ONE, BEAT_ALWAYS; the path of the install tree's bin/oe-projector
@@ -112,7 +114,9 @@ SLOTS = {'A': {'fwd0': 'forwarder', 'fwd1': 'forwarder', 'bridge0': 'bridge', 'b
          'N1': {'fwd0': 'forwarder', 'fwd1': None, 'bridge0': 'bridge', 'bridge1': 'bridge'},
          'A03': {'fwd0': 'forwarder_b', 'fwd1': 'forwarder_b', 'bridge0': 'bridge', 'bridge1': 'bridge'},
          'REDA03': {'fwd0': 'forwarder_b', 'fwd1': 'forwarder_b', 'bridge0': 'bridge', 'bridge1': 'bridge'},
-         'REDA04': {'fwd0': 'forwarder', 'fwd1': 'forwarder', 'bridge0': 'bridge_b', 'bridge1': 'bridge_b'}}
+         'REDA04': {'fwd0': 'forwarder', 'fwd1': 'forwarder', 'bridge0': 'bridge_b', 'bridge1': 'bridge_b'},
+         # both forwarder slots empty: no order reaches the ME (cps-nofwd)
+         'NOFWD': {'fwd0': None, 'fwd1': None, 'bridge0': 'bridge', 'bridge1': 'bridge'}}
 
 
 def _jars():
@@ -154,6 +158,8 @@ class Config:
                                          "oe-gateway of the cut's gateway commit built with GW_NC_NO_ASSET_CHECK")
     gateway_nc_no_stale: Path = _setting('MK_GATEWAY_NC_NO_STALE_LABEL',
                                          "oe-gateway of the cut's gateway commit built with GW_NC_NO_STALE_LABEL")
+    marketdata: Path = _setting('MK_MARKETDATA', "oe-marketdata of the cut's gateway commit (product build), while the cut "
+                                                 'does not list it')
     # define -> the control build's oe-projector (MK_PROJECTOR_NC_<NAME>; read when a kind stages it)
     projector_nc: dict = field(default_factory=dict)
     shm_mb: dict = field(default_factory=dict)                 # per-role overrides of SHM_MB (settings)
@@ -325,7 +331,8 @@ CUT_KINDS = {
     'full': ('external', 'embedded', 'CUT', 'A', {}),
     # The gateway kinds: forwarders and bridges on the cut, external as in the dev profile; engines, projector and the
     # gateway slots on the kind's driver mode (core_contracts.GATEWAY_KINDS)
-    **{kind: ('external', spec['driver'], 'CUT', 'A', {}) for kind, spec in core_contracts.GATEWAY_KINDS.items()},
+    **{kind: ('external', spec['driver'], 'CUT', spec.get('slot_plan', 'A'), {})
+       for kind, spec in core_contracts.GATEWAY_KINDS.items()},
 }
 # The gateway roles' addresses (after every other role's, so a gateway kind keeps the other roles' addresses) and their
 # container sizes: settings with defaults, never acceptance limits. The shim runs CoreProbe JVMs, hence its memory.
@@ -545,6 +552,8 @@ def add_gateway_slots(m, kind, cut, cfg, cut_libs, harness_commit):
         m['core_jvm_properties'] = dict(spec['core_jvm'])
     if spec.get('projectors'):
         add_projection_slots(m, kind, cut, cfg, cut_libs, harness_commit)
+    if spec.get('marketdata'):
+        add_marketdata_slot(m, kind, cut, cfg, cut_libs)
     m['profile_note'] += (f'; gateway slots {driver} ({", ".join(f"{k}={v}" for k, v in sorted(spec["slots"].items()))})'
                           + (f'; core {", ".join(f"{k}={v}" for k, v in sorted(spec["core_jvm"].items()))}' if spec['core_jvm'] else ''))
 
@@ -614,11 +623,51 @@ def add_projection_slots(m, kind, cut, cfg, cut_libs, harness_commit):
         f' ({spec["projector_define"]})' if 'history_projector_nc' in used else '')
 
 
+# The market-data slot's address (after the projection roles') and its container sizes: settings with defaults
+MARKETDATA_NODE_BASE = 46
+MARKETDATA_LIMITS = {'cpu_set': [6, 7, 8, 9], 'cpu_quota': 1.0, 'memory_mb': 1024, 'shm_mb': 512}
+
+
+def add_marketdata_slot(m, kind, cut, cfg, cut_libs):
+    """The market-data role md0, its ports, artifact, slot plan and limits (core_contracts.GATEWAY_KINDS 'marketdata').
+    oe-marketdata comes from the cut when the cut lists it; until a cut layout does, from MK_MARKETDATA, a product build of
+    the cut's gateway commit (release_cut checks its stamp against repos.gateway)."""
+    spec = core_contracts.GATEWAY_KINDS[kind]
+    driver = spec['driver']
+    used = set(spec['marketdata'].values()) - {None}
+    art = {name: None for name in core_contracts.MARKETDATA_BINARIES}
+    if 'marketdata' in used:
+        listed = (cut.get('artifacts') or {}).get('oe-marketdata')
+        if listed:
+            entry = {k: listed[k] for k in ('path', 'sha256', 'source_sha')}
+        else:
+            path = _need(cfg.marketdata, 'marketdata (MK_MARKETDATA)')
+            entry = {'path': str(path), 'sha256': sha(path), 'source_sha': cut['repos']['gateway']}
+        entry.update(driver=driver, target='oe-marketdata')
+        if driver == 'external':
+            entry['libs'] = json.loads(json.dumps(cut_libs))
+        art['marketdata'] = entry
+    m['artifacts'].update(art)
+    octet = m['network']['subnet'].split('.')[2]
+    m['nodes'].update({role: f'172.30.{octet}.{MARKETDATA_NODE_BASE + j}'
+                       for j, role in enumerate(sorted(core_contracts.MARKETDATA_ROLES))})
+    m['ports'].update(core_contracts.MARKETDATA_PORTS)
+    m['slot_artifacts'].update(spec['marketdata'])
+    limits = m['limits']
+    for role in core_contracts.MARKETDATA_ROLES:
+        limits['cpu_set_by_role'][role] = list(MARKETDATA_LIMITS['cpu_set'])
+        limits['cpu_quota_by_role'][role] = MARKETDATA_LIMITS['cpu_quota']
+        limits['memory_mb_by_role'][role] = cfg.memory_mb.get(role, MARKETDATA_LIMITS['memory_mb'])
+        limits['shm_mb_by_role'][role] = cfg.shm_mb.get(role, MARKETDATA_LIMITS['shm_mb'])
+    m['profile_note'] += '; market-data slot ' + ', '.join(f'{k}={v}' for k, v in sorted(spec['marketdata'].items()))
+
+
 def _sizes(pairs):
     sizes = {}
     for pair in pairs or []:
         role, _, value = pair.partition('=')
-        if role not in core_contracts.ROLES | core_contracts.GATEWAY_ROLES | core_contracts.PROJECTION_ROLES or not value.isdigit():
+        if role not in (core_contracts.ROLES | core_contracts.GATEWAY_ROLES | core_contracts.PROJECTION_ROLES
+                        | core_contracts.MARKETDATA_ROLES) or not value.isdigit():
             raise SystemExit('a size override is ROLE=MB, got ' + pair)
         sizes[role] = int(value)
     return sizes

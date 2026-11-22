@@ -165,6 +165,9 @@ class CutManifestBuilderTest(unittest.TestCase):
             nc['projector_nc'][define] = put(d + '/inst/bin/oe-projector', b'ELF oe-projector nc ' + define.encode() + b' '
                                              + self.world.m['repos']['gateway'].encode())
             put(d + '/CMakeCache.txt', f'OE_PROJECTOR_CONTROL:STRING={define}\n'.encode())
+        # oe-marketdata of the cut's gateway commit (a product build tree: no control define), for the critical-path kinds
+        nc['marketdata'] = put('gw/bin/oe-marketdata', b'ELF oe-marketdata ' + self.world.m['repos']['gateway'].encode())
+        put('gw/CMakeCache.txt', b'CMAKE_CXX_FLAGS:STRING=\n')
         shim = (Path(mk_manifests.__file__).resolve().with_name('gateway_shim.py')).read_bytes()
         stub = (Path(mk_manifests.__file__).resolve().with_name('projector_stub.py')).read_bytes()
         blob = self.world.blob

@@ -1,8 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Artifact-only scenario runner. Unknown, incomplete and skipped evidence exits nonzero."""
+"""Artifact-only scenario runner. Unknown, incomplete and skipped evidence exits nonzero.
+
+Hold point (dry runs only): with ``RUNNER_HOLD_AFTER_S`` set (a positive integer of seconds), a run that started a fixture
+keeps it up after the scenario has decided and before the fixture is closed. The runner writes ``<output>/hold.ready``
+(JSON: run id, state root, the containers, the fixture network and its PostgreSQL address) and waits until
+``<output>/hold.release`` exists or the setting's seconds pass, then closes the fixture as always. The hold is recorded in
+result.json under ``hold`` and never changes the decision. A nightly refuses the setting.
+"""
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import signal
 import shutil
@@ -13,6 +21,34 @@ import traceback
 from contracts import Inconclusive, Violation, check_result, validate_manifest
 from fixture import Fixture
 from scenarios import critical_path_smoke
+
+
+HOLD_SETTING = 'RUNNER_HOLD_AFTER_S'
+
+
+def hold_seconds(environ=os.environ):
+    """The hold point's bound in seconds, or None when the setting is unset."""
+    value = environ.get(HOLD_SETTING)
+    if value is None or value == '':
+        return None
+    if not value.isdigit() or int(value) < 1:
+        raise Violation(f'{HOLD_SETTING} must be a positive integer of seconds, got {value!r}')
+    return int(value)
+
+
+def hold_point(fixture, output, status, bound_s, clock=time.monotonic, sleep=time.sleep):
+    """Keep the fixture up after the decision: write hold.ready, wait for hold.release or the bound; the record."""
+    ready, release = Path(output) / 'hold.ready', Path(output) / 'hold.release'
+    info = {'run_id': fixture.run_id, 'state_root': str(fixture.root), 'status': status, 'bound_s': bound_s,
+            'containers': dict(fixture.registry.get('containers') or {}), 'network': fixture.m['network']['subnet'],
+            'postgres': {'host': getattr(fixture, 'gateway', None), 'port': fixture.m.get('postgres_port')},
+            'release_file': str(release), 'written_ns': time.time_ns()}
+    ready.write_text(json.dumps(info, indent=1) + '\n')
+    started = clock()
+    while not release.exists() and clock() - started < bound_s:
+        sleep(1)
+    return {'held_s': round(clock() - started, 1), 'released_by': 'file' if release.exists() else 'bound',
+            'bound_s': bound_s, 'ready_file': str(ready)}
 
 
 def main():
@@ -47,11 +83,14 @@ def main():
                 shutil.copyfile(source, sources / source.name)
         if (Path(__file__).parent / 'java').is_dir():
             shutil.copytree(Path(__file__).parent / 'java', sources / 'java')
+        hold_s = hold_seconds()
         import gateway_drills
         import projection_drills
+        import smoke_core
         gateway = gateway_drills.is_scenario(args.scenario)
         projection = projection_drills.is_scenario(args.scenario)
-        if core_topology != (args.scenario.startswith('core-') or gateway or projection):
+        critical = smoke_core.is_scenario(args.scenario)
+        if core_topology != (args.scenario.startswith('core-') or gateway or projection or critical):
             raise Inconclusive('core-*, gateway and projection scenarios need a schema v2 core manifest and only they accept one')
         if args.scenario.startswith('core-boots-'):
             from core_scenarios import consecutive_boots
@@ -80,6 +119,13 @@ def main():
             fixture = CoreFixture(args.manifest, drill=True)
             result['state_root'] = str(fixture.root)
             result.update(projection_drills.scenario(fixture, args.scenario, args.output))
+        elif critical:
+            # The critical-path drills on the user-facing binaries: refused before any container when the kind cannot run them
+            smoke_core.check_scenario(manifest, args.scenario)
+            from core_fixture import CoreFixture
+            fixture = CoreFixture(args.manifest, drill=True)
+            result['state_root'] = str(fixture.root)
+            result.update(smoke_core.scenario(fixture, args.scenario, args.output))
         elif args.scenario.startswith(('core-drill-', 'core-control-', 'core-red-')):
             # The core-topology drills, the controls and the two REDs; drill=True refuses a non-enforced ME
             from core_fixture import CoreFixture
@@ -152,6 +198,11 @@ def main():
     except Exception as error:
         result.update(status='INCONCLUSIVE', error=str(error), traceback=traceback.format_exc())
     finally:
+        if fixture and locals().get('hold_s'):
+            try:
+                result['hold'] = hold_point(fixture, args.output, result['status'], hold_s)
+            except Exception as error:
+                result['hold'] = {'error': str(error)[:300]}
         if fixture:
             fault_name = {'false-ready': 'false-ready.json', 'false-ready-ae': 'false-ready-ae.json',
                           'log-channel-me': 'log-channel-me.json', 'log-channel-ae': 'log-channel-ae.json',

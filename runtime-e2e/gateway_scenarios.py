@@ -217,7 +217,7 @@ class GatewayDrill:
         self.mark('booted')
         shutil.copyfile(Path(__file__).with_name('gateway_probe.py'), self.probe_dir / 'gateway_probe.py')
         (self.probe_dir / 'gw-keys.json').write_text(json.dumps({str(u): k for u, k in f.keys.api_keys(sorted(users)).items()}))
-        f.secret_values = f.keys.secrets()
+        f.secret_values = f.keys.secrets() | getattr(f, 'marketdata_secrets', set())
         self.record['slots'] = {k: f.slots.get(k) for k in sorted(core_contracts.GATEWAY_SLOTS)}
         self.record['status'] = self.status('gw1')
         self.record['core_behavior'] = f.registry.get('core_behavior')
@@ -380,9 +380,10 @@ class GatewayDrill:
 
     # ---------------------------------------------------------------- the money oracle over the gateway's answers
 
-    def money(self, creates, cancels, gate_sequence):
-        """The core's money oracle (core_oracle) over a two-observation barrier, with the creates and cancels rebuilt from
-        what the gateways answered. Returns (money verdict, order verdict); the sample is kept."""
+    def money(self, creates, cancels, gate_sequence, amends=(), funding=()):
+        """The core's money oracle (core_oracle) over a two-observation barrier, with the creates, cancels and amends
+        rebuilt from what the gateways answered, and the funding the drill sent through the treasury lane (``funding``,
+        after the genesis rows). Returns (money verdict, order verdict); the sample is kept."""
         f = self.f
         f.stop_tap()
         deadline = self.clock() + 60
@@ -418,8 +419,9 @@ class GatewayDrill:
             first = second
         sample = {'version': 'core-sample-v2', 'markets': {str(m): {'base': m, 'quote': 0} for m in range(1, 6)},
                   'risk': f.registry['risk'], 'genesis': f.registry['genesis_snapshot'], 'counters': second['counters'],
-                  'funding': [{k: v for k, v in r.items() if k != 'reply'} for r in f.registry['funding']],
-                  'creates': [{k: v for k, v in c.items() if k != 'key'} for c in creates], 'amends': [], 'cancels': cancels,
+                  'funding': [{k: v for k, v in r.items() if k != 'reply'} for r in list(f.registry['funding']) + list(funding)],
+                  'creates': [{k: v for k, v in c.items() if k != 'key'} for c in creates], 'amends': list(amends),
+                  'cancels': cancels,
                   'core_events': tap['order_event'], 'admission': tap['admission'], 'dispatch_tap': second['dispatch_tap'],
                   **{k: second[k] for k in ['core', 'me_journal', 'me_journal_seq', 'me_open_legs', 'money_journal',
                                             'money_journal_legs']},

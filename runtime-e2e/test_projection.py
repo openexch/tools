@@ -97,7 +97,7 @@ class ProjectionContractTest(unittest.TestCase):
         self.assertEqual(core_contracts.PROJECTOR_BINARY_KINDS,
                          {'pj', 'pj-ext', 'pj-nc-pinrecording', 'pj-nc-nostopreplay-ext', 'pj-nc-wallclock', 'pj-nc-dropone',
                           'pj-nc-beatalways', 'pj-nc-nostale', 'pj-nc-pinrecording-ext', 'pj-nc-wallclock-ext',
-                          'pj-nc-dropone-ext', 'pj-nc-beatalways-ext', 'pj-nc-nostale-ext'})
+                          'pj-nc-dropone-ext', 'pj-nc-beatalways-ext', 'pj-nc-nostale-ext'} | core_contracts.MARKETDATA_KINDS)
         for kind in core_contracts.PROJECTION_KINDS:
             spec = core_contracts.GATEWAY_KINDS[kind]
             self.assertIn(kind, core_contracts.CUT_KINDS)
