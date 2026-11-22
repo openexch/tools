@@ -3,6 +3,7 @@
 """Release cut checker: every artifact of a cut is bound to a single source SHA. A harness tool, not the release gate itself.
 
 usage: release_cut.py check <manifest> [--cut <cut manifest>] [--class product|rig|rig-xver|nightly] [--old-pins <file>]
+       release_cut.py check <arm64 sibling manifest> --cut <cut manifest>                               (rule K11)
        release_cut.py record-builds <out.json> <name>=<repo>:<source_sha>:<path>[,<path>...] ...
        release_cut.py audit <state root | listing.json> --manifest <m> [--cut <cut>] [--swap SLOT=A,B]
        release_cut.py precheck <state root>... [--pg-rows <rows.json>] [--aeron-dir <dir>]                (runbook step 1)
@@ -31,6 +32,9 @@ refuses, 0 when none does. The rules:
   K8  a substrate block whose Aeron versions differ
   K9  an unknown key, a missing required key, a short sha (a per-member artifact key is unknown by design)
   K10 two engine jars built against different cluster-kit pins, or a pin other than the substrate's
+  K11 (an arm64 sibling manifest, schema ``arm64-sibling/1``, checked against its cut) an artifact whose declared source sha,
+      or the source sha the binary carries, is not the commit the cut names for its repo; a C++ artifact of the cut or a Go
+      tool missing from the set; a Go tool whose two builds differ; a sibling that names another cut
 
 ``rules`` is the test seam: a RED manifest is refused with the rule's text, and passes with that rule switched off.
 
@@ -69,7 +73,7 @@ LAYOUTS = {
                   'aeron_patches': True},
 }
 SCHEMAS = tuple(LAYOUTS)
-RULES = tuple(f'K{n}' for n in range(1, 11))
+RULES = tuple(f'K{n}' for n in range(1, 12))
 CLASSES = ('product', 'rig', 'rig-xver', 'nightly')
 RIG_CLASSES = ('rig', 'rig-xver', 'nightly')
 OTHER_REPOS = ('match', 'cluster-kit', 'cluster-tools', 'tools')
@@ -920,7 +924,128 @@ def _gateway_test_artifact(f, what, key, entry, m, cut, cls):
                 f.add('K4', text)
 
 
-def check(manifest, cut=None, cls=None, rules=RULES, old_pins=None):
+# The arm64 sibling of a cut. The cut's C++ binaries are x86 builds of the dev box and the demo box is aarch64, so the box
+# runs arm64 builds of the same commits: the files of the gateway and cluster-tools publish jobs (their CI manifests give
+# the sha256) and the tools Go binaries, cross-built twice from the cut's tools commit (arm64_sibling.py go-build). An arm64
+# file cannot be byte-equal to its x86 cut artifact; it is tied to the cut by source sha instead. K11 accepts the sibling
+# only when every artifact's declared source sha AND the source sha the binary itself carries are the commit the cut names
+# for its repo.
+SIBLING_SCHEMA = 'arm64-sibling/1'
+SIBLING_KEYS = {'schema', 'cut_id', 'cut_sha256', 'arch', 'artifacts'}
+SIBLING_COMMON = {'repo', 'path', 'sha256', 'source_sha', 'origin'}
+# per origin: the keys an entry of that origin carries besides SIBLING_COMMON
+SIBLING_ORIGINS = {
+    'ci-publish': {'published', 'reported_sha'},             # a publish job's file, under <repo>/<source sha>/ in S3
+    'go-cross-build': {'builds', 'go_version', 'reported_sha'},  # a Go tool built twice on the dev box, byte-equal
+}
+# The Aeron driver files carry no source sha of their own; like K4 they are held to the substrate's C++ Aeron version
+AERON_DRIVER_FILES = ('aeronmd', 'libaeron_driver.so', 'libaeron.so')
+# The tools Go binaries of the sibling (not cut artifacts): name -> the package directory in tools. The observation
+# sampler is added here, with its directory, once it exists; the sibling then requires it like the simulator.
+GO_TOOLS = {'market-sim': 'market-sim'}
+# arm64 binaries a publish job ships that a cut of an older layout does not list yet: accepted with their repo's rule,
+# not required (a layout that lists them makes them required through the cut's own artifacts)
+SIBLING_PUBLISHED = {'oe-marketdata': 'gateway', 'ct-genesis': 'cluster-tools', 'switch-behavior': 'cluster-tools'}
+SIBLING_DERIVE = 'arm64 set does not derive from the cut: {}'
+SIBLING_GO_REPRO = 'go build is not reproducible: {}'
+
+
+def sibling_repo(name, cut):
+    """The repo an arm64 sibling artifact comes from, or None for a name the sibling does not know."""
+    spec = product((cut or {}).get('schema')).get(name)
+    if spec is not None and spec['lang'] == 'cpp':
+        return spec['repo']
+    if name in GO_TOOLS:
+        return 'tools'
+    return SIBLING_PUBLISHED.get(name)
+
+
+def sibling_required(cut):
+    """The names the sibling of ``cut`` must list: every C++ artifact the cut names, and every Go tool."""
+    products = product((cut or {}).get('schema'))
+    cpp = {n for n in ((cut or {}).get('artifacts') or {}) if products.get(n, {}).get('lang') == 'cpp'}
+    return cpp | set(GO_TOOLS)
+
+
+def check_sibling(m, cut, rules=RULES, cut_sha256=None):
+    """K11 (and K1/K9 on its entries): an arm64 sibling manifest against the cut it names. Empty Findings = accepted."""
+    f = Findings(rules)
+    if not isinstance(m, dict):
+        f.add('K9', 'sibling manifest is not an object')
+        return f
+    if not isinstance(cut, dict) or cut.get('schema') not in SCHEMAS:
+        f.add('K9', 'an arm64 sibling manifest is checked against its cut: --cut <rc2-cut-manifest.json>')
+        return f
+    _unknown(f, 'sibling', m, SIBLING_KEYS)
+    if m.get('arch') != 'arm64':
+        f.add('K9', f'sibling.arch must be arm64, got {m.get("arch")!r}')
+    if not (isinstance(m.get('cut_sha256'), str) and HEX64.fullmatch(m['cut_sha256'])):
+        f.add('K9', f'sibling.cut_sha256: not a 64-hex sha256 ({m.get("cut_sha256")!r})')
+    if m.get('cut_id') != cut.get('cut_id'):
+        f.add('K11', f'arm64 set names another cut: {m.get("cut_id")} (the cut is {cut.get("cut_id")})')
+    elif cut_sha256 is not None and m.get('cut_sha256') != cut_sha256:
+        f.add('K11', f'arm64 set names another cut manifest: cut_sha256 {m.get("cut_sha256")} (the cut file is {cut_sha256})')
+    repos = cut.get('repos') if isinstance(cut.get('repos'), dict) else {}
+    aeron = str(((cut.get('substrate') or {}).get('aeron') or {}).get('cpp') or '')
+    artifacts = m.get('artifacts') if isinstance(m.get('artifacts'), dict) else {}
+    if not isinstance(m.get('artifacts'), dict):
+        f.add('K9', 'sibling.artifacts must be an object')
+    for name in sorted(sibling_required(cut) - set(artifacts)):
+        f.add('K11', f'arm64 set misses an artifact: {name}')
+    for name, entry in sorted(artifacts.items()):
+        what = 'sibling.' + name
+        want_repo = sibling_repo(name, cut)
+        if want_repo is None:
+            f.add('K9', f'{what}: not a C++ artifact of the cut, a published arm64 binary or a Go tool')
+            continue
+        if not isinstance(entry, dict):
+            f.add('K9', f'{what}: must be an object')
+            continue
+        origin = entry.get('origin')
+        if origin not in SIBLING_ORIGINS:
+            f.add('K9', f'{what}.origin must be one of ' + ', '.join(sorted(SIBLING_ORIGINS)) + f', got {origin!r}')
+            continue
+        if (origin == 'go-cross-build') != (name in GO_TOOLS):
+            f.add('K9', f'{what}: origin {origin} is the ' + ('Go tools\' origin only' if origin == 'go-cross-build'
+                                                             else 'origin of a published binary; a Go tool is go-cross-build'))
+        driver_file = name in AERON_DRIVER_FILES
+        allowed = SIBLING_COMMON | SIBLING_ORIGINS[origin]
+        _unknown(f, what, entry, allowed, allowed - ({'reported_sha'} if driver_file else set()))
+        if driver_file and 'reported_sha' in entry:
+            f.add('K9', f'{what}.reported_sha: an Aeron driver file carries the Aeron version, not a source sha')
+        _shas(f, what, entry)
+        _rehash(f, what, entry)
+        want = repos.get(want_repo)
+        derived = isinstance(want, str) and bool(HEX40.fullmatch(want))
+        derived = derived and entry.get('repo') == want_repo and entry.get('source_sha') == want
+        path = Path(str(entry.get('path', '')))
+        blob = path.read_bytes() if path.is_absolute() and path.is_file() and not path.is_symlink() else b''
+        if driver_file:
+            # the substrate's C++ Aeron version, as K4 holds the x86 driver files to it
+            derived = derived and bool(aeron) and aeron.encode() in blob
+        else:
+            # the commit the binary itself reports: declared, and carried in its bytes (the arch-independent read of what
+            # `<binary> --version` prints; the publish job and the box self-check run it on arm64)
+            reported = entry.get('reported_sha')
+            derived = derived and reported == want and want.encode() in blob
+        if origin == 'ci-publish':
+            derived = derived and entry.get('published') == f'{want_repo}/{want}/'
+        if not derived:
+            f.add('K11', SIBLING_DERIVE.format(name))
+        if origin == 'go-cross-build':
+            builds = entry.get('builds')
+            ok = (isinstance(builds, list) and len(builds) >= 2 and all(isinstance(b, str) and HEX64.fullmatch(b) for b in builds)
+                  and len(set(builds)) == 1 and builds[0] == entry.get('sha256'))
+            if not ok:
+                f.add('K11', SIBLING_GO_REPRO.format(name))
+            if not (isinstance(entry.get('go_version'), str) and entry['go_version'].startswith('go')):
+                f.add('K9', f'{what}.go_version: the toolchain of the two builds (`go env GOVERSION`), got {entry.get("go_version")!r}')
+    return f
+
+
+def check(manifest, cut=None, cls=None, rules=RULES, old_pins=None, cut_sha256=None):
+    if isinstance(manifest, dict) and manifest.get('schema') == SIBLING_SCHEMA:
+        return check_sibling(manifest, cut, rules, cut_sha256)
     if isinstance(manifest, dict) and manifest.get('schema') in SCHEMAS:
         return check_cut(manifest, rules, cls, old_pins)
     if cut is None:
@@ -1870,8 +1995,9 @@ def main(argv=None):
         return 0 if out['status'] == 'observed' else 1
     manifest = json.loads(args.manifest.read_text())
     cut = json.loads(args.cut.read_text()) if args.cut else None
+    cut_sha256 = sha256_file(args.cut) if args.cut else None
     pins = load_old_pins(args.old_pins) if args.old_pins else None
-    findings = check(manifest, cut, args.cls, old_pins=pins)
+    findings = check(manifest, cut, args.cls, old_pins=pins, cut_sha256=cut_sha256)
     for rule, text in findings.items:
         print(f'{rule} {text}')
     if findings.items:
