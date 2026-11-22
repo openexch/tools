@@ -5,9 +5,9 @@ Read-only money invariant checker. `money_check.py` reconciles the ledger agains
 It reads the ledger from either store behind one interface:
 
 - `--store redis` (default): Redis `db0` directly (`bal:{userId}` hashes), the v0.5 stack.
-- `--store core`: runs `CoreDump` from the release cut's `tools.core-dump` jar (core-bridge.jar at the cut's core commit) and reads its JSON snapshot.
+- `--store core`: the core expected side, no OMS (section below).
 
-The expected-hold side always comes from the v0.5 OMS open-orders API, so the tool needs a running v0.5 OMS.
+With `--store redis` the expected-hold side comes from the v0.5 OMS open-orders API, so that store needs a running v0.5 OMS.
 
 Python 3, standard library only. It speaks RESP over a socket with a small built-in client and uses the `redis` package instead if it is importable.
 
@@ -38,7 +38,51 @@ Amounts are 8-decimal fixed-point `int64` throughout.
 
 BUY holds after a partial fill at a better price. The OMS does not expose an order's stored hold amount, so the tool computes `price x remainingQty`. When a BUY fills partly below its limit, the core's residual hold is `originalHold - sum(fillPrice x fillQty)`, which is larger than the computed value by the price improvement. That drift is always positive (over-collateralized), bounded by `sum((limitPrice - fillPrice) x filledQty)`, and zero for unfilled orders. A negative locked gap (under-collateralized) is never explained by this and is a real finding.
 
-## Usage
+## The core expected side (`--store core`)
+
+Both sides come from the core, each read by its own process started from the release cut's bytes (re-hashed against the
+cut manifest; `--artifact-root DIR` names the directory the jars were copied to, their names and digests stay the cut's):
+
+- the ledger: `CoreDump` (the cut's `tools.core-dump` jar) with a TOOL key: balances, per-order holds, the feed markers;
+- the expected holds: the core's own order snapshot for every user, read with an ADMIN key by `CoreProbe order-dump` (the
+  cut's `harness.core_probe` jar on its `core-cluster.jar`).
+
+Stability is defined by content: the tool reads dump, orders, dump, orders and judges only when both dumps and both order
+snapshots are equal. Otherwise the attempt is UNSTABLE and it reads again after `--stable-wait-ms` (default 1000,
+`MONEY_CHECK_STABLE_WAIT_MS`), up to `--stable-retries` attempts (default 5, `MONEY_CHECK_STABLE_RETRIES`). It never
+reports a mismatch from two instants.
+
+The invariants, exact for every user: conservation per asset against the core's own deposits and withdrawals (the money
+history, `--money-history-dsn`, or `--funding-file` written from it; judged only when the history is at the core's money
+journal head, read with `--core-metrics`); locked equals the sum of holds; every hold belongs to a live order (else a
+`residual hold: user <u> asset <a> <amount>`); every live order's hold equals the value recomputed from its fields (SELL
+remaining; an unfilled priced BUY price x remaining; a partly filled BUY at least price x remaining and at most its hold
+amount, since a fill below the limit keeps the price improvement held until the order ends); `--zero-hold-users` hold
+nothing; non-negativity; `core_pending_commands` and `core_release_backlog` are 0 on every member (`--core-metrics`).
+
+This compares the core with itself and with the tool's own recomputation; it is not the fixture oracle, and it is exact only
+at a quiesce point. The output says so.
+
+```bash
+python3 money_check.py --store core --cut /abs/cut-manifest.json --artifact-root /opt/oe/tools \
+    --core-addresses 10.0.0.1,10.0.0.2,10.0.0.3 --core-port-base 9300 --local-host 10.0.0.9 \
+    --driver-mode external --aeron-dir /dev/shm/aeron \
+    --tool-key-file ~/.oe/tool.key --admin-key-file ~/.oe/admin.key \
+    --money-history-dsn "host=127.0.0.1 dbname=oe_money user=obs" \
+    --core-metrics http://10.0.0.1:19700/metrics,http://10.0.0.2:19700/metrics,http://10.0.0.3:19700/metrics \
+    --zero-hold-users 900000-900999 --json
+```
+
+Required with `--store core`: `--cut`, `--core-addresses`, `--core-port-base`, `--local-host`, `--driver-mode` (`embedded`,
+or `external` with `--aeron-dir`; the two reads get `COREDUMP_DRIVER_MODE` and `CORE_PROBE_DRIVER_MODE`), the two key
+files (`keyId:CLASS:secretHex`, mode 600: a key file readable by others is refused), and exactly one funding source.
+Optional: `--core-port-stride` (100), `--core-timeout` (40 s per read), `--java` and `--jvm-opt` (default: the three
+`--add-opens` options Aeron needs on Java 21), `--psql`. The OMS and sim-log flags are refused with exit 64.
+
+Exit codes in this mode: `0` green, `2` an invariant was violated, `3` UNSTABLE through every attempt, `1` operational
+error (a missing setting, the core unreachable, `CoreDump timeout`: CoreDump's own exit 3 is mapped to 1, never to 3).
+
+## Usage (`--store redis`)
 
 ```bash
 # one sweep: Redis store, OMS at http://localhost:8080, default sim log
@@ -50,10 +94,6 @@ python3 money_check.py --json
 # continuous: one sweep every 60 s
 python3 money_check.py --loop 60
 
-# against the core: CoreDump runs from the release cut's tools.core-dump jar (sha256 checked)
-CORE_AUTH_CREDENTIAL=<ADMIN or TOOL credential> python3 money_check.py --store core \
-    --cut /abs/cut-manifest.json
-
 # unit tests
 python3 -m unittest test_money_check
 ```
@@ -62,7 +102,7 @@ Flags: `--store {redis,core}`, `--oms-url`, `--sim-log` (repeatable, globs allow
 
 Default asset map, matching the market-sim `DefaultMarkets` table: `USD=0, BTC=1, ETH=2, SOL=3, XRP=4, DOGE=5`. Override with `--asset-map` if a deployment numbers assets differently.
 
-Exit codes: `0` all green, `2` an invariant was violated, `1` operational error (store or OMS unreachable, CoreDump timeout), `64` a retired flag or value (`--ae-dump-cmd`, `--ae-timeout`, `--store ae`, `--core-dump-cmd`: use `--cut`). With `--loop` the process runs until Ctrl-C or `--max-sweeps` and exits `2` if any sweep violated.
+Exit codes: `0` all green, `2` an invariant was violated, `1` operational error (store or OMS unreachable), `64` a usage error: a retired flag or value (`--ae-dump-cmd`, `--ae-timeout`, `--store ae`, `--core-dump-cmd`: use `--cut`), a flag that has no meaning with `--store core`, or any other bad argument. With `--loop` the process runs until Ctrl-C or `--max-sweeps` and exits `2` if any sweep violated.
 
 ## Reading results on a live stack
 
@@ -70,11 +110,15 @@ A sweep is not atomic across the store and the OMS, and the simulator keeps trad
 
 Never benign: a negative locked gap, drift on the same (user, asset) that grows or persists across sweeps, a conservation gap that does not clear, or any non-negativity failure.
 
-For a clean point-in-time check, pause the simulator (`POST /control {"pause":true}` on market-sim) and run one sweep per store. `--store core` adds the `core_holds_vs_locked` check (the core's own hold entries must sum to its own `locked`) and reports `consumePosition` and `lastAppliedTradeId`.
+For a clean point-in-time check, pause the simulator (`POST /control {"pause":true}` on market-sim) and run one sweep.
 
 ## CoreDump
 
-`CoreDump` is `com.openexchange.core.bridge.CoreDump` in the `core` repo, run by money-check as `java -cp <cut jar> CoreDump` after checking the jar's sha256 against the cut. It connects an `AeronCluster` client with the credential from `CORE_AUTH_CREDENTIAL` (or `-Dcore.auth.credential`), requests balance, hold and feed-position snapshots, prints one JSON document and exits `0`, or `3` when the 30 s snapshot deadline passes:
+`CoreDump` is `com.openexchange.core.bridge.CoreDump` in the `core` repo. It needs `COREDUMP_DRIVER_MODE` (`embedded`: its
+own driver in `/dev/shm/aeron-aedump-<pid>`, deleted on exit; `external`: the aeronmd at `AERON_DIR`), the core's address
+(`BRIDGE_CORE_CLUSTER_ADDRESSES`, `BRIDGE_CORE_PORT_BASE`, `BRIDGE_LOCAL_HOST`) and a TOOL credential in
+`CORE_AUTH_CREDENTIAL`; money-check sets all of them from its flags. It prints one JSON document and exits `0`, `1` when the
+start is refused, or `3` when its 30 s snapshot deadline passes:
 
 ```json
 {

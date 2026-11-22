@@ -148,6 +148,11 @@ def scenario_known(scenario):
     import red_proofs
     if red_proofs.is_scenario(scenario):                 # the red proofs (red_proofs.SCENARIOS)
         return True
+    import observation_drill
+    if observation_drill.is_scenario(scenario):          # the short observation drill (observation_drill.SCENARIOS)
+        return True
+    if scenario == 'demo-observation-24h':               # the box observation's verdict over a sample set (no fixture)
+        return True
     if scenario.startswith(('core-xver-', 'core-act-', 'core-rollback-')):    # Xver.scenario
         import xver
         return scenario in xver.SCENARIO_NAMES

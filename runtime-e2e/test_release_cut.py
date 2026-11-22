@@ -617,11 +617,12 @@ def arm64_sibling(w, cut_sha256):
                       'published': f'{repo}/{sha}/'}
         if not driver:
             arts[name]['reported_sha'] = sha
-    data = b'\x7fELF aarch64 go market-sim ' + SHAS['tools'].encode()
-    p = w.put('arm64/market-sim', data)
-    arts['market-sim'] = {'repo': 'tools', 'path': str(p), 'sha256': h(data), 'source_sha': SHAS['tools'],
-                          'reported_sha': SHAS['tools'], 'origin': 'go-cross-build', 'builds': [h(data), h(data)],
-                          'go_version': GO_VERSION}
+    for tool in release_cut.GO_TOOLS:
+        data = b'\x7fELF aarch64 go ' + tool.encode() + b' ' + SHAS['tools'].encode()
+        p = w.put('arm64/' + tool, data)
+        arts[tool] = {'repo': 'tools', 'path': str(p), 'sha256': h(data), 'source_sha': SHAS['tools'],
+                      'reported_sha': SHAS['tools'], 'origin': 'go-cross-build', 'builds': [h(data), h(data)],
+                      'go_version': GO_VERSION}
     return {'schema': release_cut.SIBLING_SCHEMA, 'cut_id': w.m['cut_id'], 'cut_sha256': cut_sha256, 'arch': 'arm64',
             'artifacts': arts}
 
@@ -656,7 +657,7 @@ class Arm64SiblingTest(CheckerBase):
     def test_the_sibling_derives_from_the_cut(self):
         self.assertEqual(sorted(self.s['artifacts']), sorted(
             ['ct-forwarder', 'ct-bridge', 'aeronmd', 'libaeron_driver.so', 'libaeron.so', 'oe-gateway', 'oe-stream',
-             'oe-projector', 'market-sim']))
+             'oe-projector', 'market-sim', 'obs-sampler']))
         self.assertEqual(self.sib(self.s).items, [])
 
     def test_planted_sibling_entry_with_another_source_sha(self):

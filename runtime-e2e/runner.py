@@ -51,6 +51,10 @@ def hold_point(fixture, output, status, bound_s, clock=time.monotonic, sleep=tim
             'bound_s': bound_s, 'ready_file': str(ready)}
 
 
+class _Decided(Exception):
+    """A scenario that decided without a fixture or a manifest (the observation verdict over a sample set)."""
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--manifest', required=True, type=Path)
@@ -66,6 +70,13 @@ def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda number, frame: (_ for _ in ()).throw(Inconclusive('runner interrupted: ' + str(number))))
     try:
+        if args.scenario == 'demo-observation-24h':
+            # The box observation's verdict: --manifest names the sample set (its sampleset.json or its directory);
+            # without one the run ends INCONCLUSIVE "no sample set". No fixture starts.
+            import observation
+            result.update(observation.scenario(args.manifest if args.manifest.exists() else None, args.output))
+            if result['status'] == 'PASS': check_result(result)
+            raise _Decided()
         manifest = json.loads(args.manifest.read_text())
         core_topology = manifest.get('schema_version') == 2
         if core_topology:
@@ -85,6 +96,7 @@ def main():
             shutil.copytree(Path(__file__).parent / 'java', sources / 'java')
         hold_s = hold_seconds()
         import gateway_drills
+        import observation_drill
         import projection_drills
         import red_proofs
         import smoke_core
@@ -92,6 +104,7 @@ def main():
         projection = projection_drills.is_scenario(args.scenario)
         critical = smoke_core.is_scenario(args.scenario)
         red = red_proofs.is_scenario(args.scenario)
+        observed = observation_drill.is_scenario(args.scenario)
         if core_topology != (args.scenario.startswith('core-') or gateway or projection or critical):
             raise Inconclusive('core-*, gateway and projection scenarios need a schema v2 core manifest and only they accept one')
         if args.scenario.startswith('core-boots-'):
@@ -128,6 +141,13 @@ def main():
             fixture = CoreFixture(args.manifest, drill=True)
             result['state_root'] = str(fixture.root)
             result.update(smoke_core.scenario(fixture, args.scenario, args.output))
+        elif observed:
+            # The short observation drill: refused before any container when the kind cannot run it
+            observation_drill.check_scenario(manifest, args.scenario)
+            from core_fixture import CoreFixture
+            fixture = CoreFixture(args.manifest, drill=True)
+            result['state_root'] = str(fixture.root)
+            result.update(observation_drill.scenario(fixture, args.scenario, args.output))
         elif red:
             # The red proofs (history-fed oracles cannot PASS; one writer per table): refused before any container when the
             # kind cannot run them
@@ -201,6 +221,8 @@ def main():
         if result['status'] == 'PASS': check_result(result)
         elif result['status'] not in {'FAIL', 'INCONCLUSIVE'}:
             raise Inconclusive('unsupported scenario decision: ' + str(result['status']))
+    except _Decided:
+        pass
     except Violation as error:
         result.update(status='FAIL', error=str(error), traceback=traceback.format_exc())
         if getattr(error, 'defect', None):

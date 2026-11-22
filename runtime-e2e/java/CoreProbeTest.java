@@ -57,6 +57,7 @@ public final class CoreProbeTest {
         run("tap_dense_run_reports_no_gap", CoreProbeTest::tapDense);
         run("order_dump_keeps_every_page", CoreProbeTest::orderDumpPages);
         run("retired_environment_names_are_refused", CoreProbeTest::retiredEnvironment);
+        run("driver_mode_embedded_or_external_strictly", CoreProbeTest::driverMode);
         run("order_events_pages_to_the_head", CoreProbeTest::replayPagesToHead);
         run("order_events_overrun_reports_the_lost_range_and_continues", CoreProbeTest::replayOverrun);
         run("order_events_head_probe_is_one_end", CoreProbeTest::replayHeadProbe);
@@ -545,6 +546,32 @@ public final class CoreProbeTest {
                 "out", "/x")));
         refusal("for= must be", () -> CoreProbe.StoryConfig.parse(Map.of("script", "funding", "seed", "3", "users", "5",
                 "out", "/x", "for", "funding")));
+    }
+
+    private static void driverMode() {
+        final Map<String, String> env = new HashMap<>();
+        check(CoreProbe.driverChoice(env::get) == null, "unset mode is not the embedded driver");
+        env.put("CORE_PROBE_DRIVER_MODE", "Embedded");
+        check(CoreProbe.driverChoice(env::get) == null, "embedded is not the embedded driver");
+        env.put("CORE_PROBE_DRIVER_MODE", " external ");
+        env.put("AERON_DIR", " /dev/shm/aeron-x ");
+        check("/dev/shm/aeron-x".equals(CoreProbe.driverChoice(env::get)), "external does not attach to AERON_DIR");
+        final String[][] refused = {{"external", null, "CORE_PROBE_DRIVER_MODE=external needs AERON_DIR"},
+                {"external", " ", "CORE_PROBE_DRIVER_MODE=external needs AERON_DIR"},
+                {"embedded", "/dev/shm/aeron", "AERON_DIR='/dev/shm/aeron' is set but CORE_PROBE_DRIVER_MODE is embedded"},
+                {null, "/dev/shm/aeron", "AERON_DIR='/dev/shm/aeron' is set but CORE_PROBE_DRIVER_MODE is embedded"},
+                {"shared", null, "Invalid CORE_PROBE_DRIVER_MODE 'shared' (expected external|embedded)"}};
+        for (final String[] r : refused) {
+            final Map<String, String> e = new HashMap<>();
+            if (r[0] != null) e.put("CORE_PROBE_DRIVER_MODE", r[0]);
+            if (r[1] != null) e.put("AERON_DIR", r[1]);
+            try {
+                CoreProbe.driverChoice(e::get);
+                throw new AssertionError("not refused: mode " + r[0] + " dir " + r[1]);
+            } catch (final IllegalArgumentException x) {
+                check(x.getMessage().startsWith(r[2]), "refusal text: " + x.getMessage());
+            }
+        }
     }
 
     private static void retiredEnvironment() {

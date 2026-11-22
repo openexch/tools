@@ -966,9 +966,8 @@ SIBLING_ORIGINS = {
 }
 # The Aeron driver files carry no source sha of their own; like K4 they are held to the substrate's C++ Aeron version
 AERON_DRIVER_FILES = ('aeronmd', 'libaeron_driver.so', 'libaeron.so')
-# The tools Go binaries of the sibling (not cut artifacts): name -> the package directory in tools. The observation
-# sampler is added here, with its directory, once it exists; the sibling then requires it like the simulator.
-GO_TOOLS = {'market-sim': 'market-sim'}
+# The tools Go binaries of the sibling (not cut artifacts): name -> the package directory in tools.
+GO_TOOLS = {'market-sim': 'market-sim', 'obs-sampler': 'obs-sampler'}
 # arm64 binaries a publish job ships that a cut of an older layout does not list yet: accepted with their repo's rule,
 # not required (a layout that lists them makes them required through the cut's own artifacts)
 SIBLING_PUBLISHED = {'oe-marketdata': 'gateway', 'ct-genesis': 'cluster-tools', 'switch-behavior': 'cluster-tools'}

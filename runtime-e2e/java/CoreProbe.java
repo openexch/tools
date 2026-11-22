@@ -48,6 +48,8 @@ import java.util.function.UnaryOperator;
  *
  * <p>Environment (all required, no defaults): CORE_ADDRESSES (comma list, member order),
  * CORE_PORT_BASE, CLUSTER_PORT_STRIDE, CORE_LOCAL_HOST, CORE_AUTH_CREDENTIAL (keyId:CLASS:secretHex).
+ * Driver: CORE_PROBE_DRIVER_MODE embedded (its own driver; also when unset) or external (AERON_DIR, required then);
+ * see {@link #driverChoice}.
  * The names retired by the rename to core ({@link #RETIRED_ENV}) refuse the probe before it reads anything, set or
  * empty: there is no dual read and the old name is never honoured.
  * The credential's class must be one the verb allows; the core checks it again. {@code story script=funding}
@@ -111,6 +113,39 @@ public final class CoreProbe {
             }
         }
         return null;
+    }
+
+    /** The probe's driver mode setting and the external driver's directory. */
+    static final String DRIVER_MODE_ENV = "CORE_PROBE_DRIVER_MODE";
+    static final String AERON_DIR_ENV = "AERON_DIR";
+
+    /**
+     * The media driver the probe runs on: {@code null} for its own embedded driver (a per-pid directory under /dev/shm,
+     * deleted on exit), or the directory of the external aeronmd to attach to. {@code CORE_PROBE_DRIVER_MODE} is
+     * {@code embedded} or {@code external}; unset means embedded, the mode every harness manifest records for the probe
+     * ({@code driver_mode} of {@code core_probe}). External needs {@code AERON_DIR}; {@code AERON_DIR} set in embedded mode, or
+     * an unknown mode, is refused (exit 64) before any session.
+     */
+    static String driverChoice(final UnaryOperator<String> env) {
+        final String mode = env.apply(DRIVER_MODE_ENV);
+        final String dir = env.apply(AERON_DIR_ENV);
+        final boolean dirSet = dir != null && !dir.isBlank();
+        if (mode == null || mode.isBlank() || mode.trim().equalsIgnoreCase("embedded")) {
+            if (dirSet) {
+                throw new IllegalArgumentException(AERON_DIR_ENV + "='" + dir + "' is set but " + DRIVER_MODE_ENV
+                        + " is embedded (the embedded driver never uses it): set " + DRIVER_MODE_ENV + "=external or unset "
+                        + AERON_DIR_ENV);
+            }
+            return null;
+        }
+        if (!mode.trim().equalsIgnoreCase("external")) {
+            throw new IllegalArgumentException("Invalid " + DRIVER_MODE_ENV + " '" + mode + "' (expected external|embedded)");
+        }
+        if (!dirSet) {
+            throw new IllegalArgumentException(DRIVER_MODE_ENV + "=external needs " + AERON_DIR_ENV
+                    + " (the external media driver's directory)");
+        }
+        return dir.trim();
     }
 
     private static String env(final String name) {
@@ -301,7 +336,8 @@ public final class CoreProbe {
 
     private void connect(final io.aeron.security.CredentialsSupplier credentialsSupplier) {
         supplier = credentialsSupplier;
-        if (driver == null) {
+        final String externalDir = driverChoice(System::getenv);
+        if (driver == null && externalDir == null) {
             driver = MediaDriver.launch(new MediaDriver.Context()
                     .aeronDirectoryName("/dev/shm/core-probe-" + ProcessHandle.current().pid())
                     .threadingMode(ThreadingMode.SHARED).dirDeleteOnStart(true).dirDeleteOnShutdown(true)
@@ -313,7 +349,7 @@ public final class CoreProbe {
         cluster = AeronCluster.connect(new AeronCluster.Context()
                 .credentialsSupplier(supplier)
                 .messageTimeoutNs(java.util.concurrent.TimeUnit.SECONDS.toNanos(8))
-                .aeronDirectoryName(driver.aeronDirectoryName())
+                .aeronDirectoryName(externalDir != null ? externalDir : driver.aeronDirectoryName())
                 .ingressChannel("aeron:udp?term-length=4m|mtu=8192")
                 .ingressEndpoints(endpoints())
                 .egressChannel("aeron:udp?endpoint=" + env("CORE_LOCAL_HOST") + ":0|term-length=4m")

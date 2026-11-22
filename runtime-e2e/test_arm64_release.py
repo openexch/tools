@@ -62,14 +62,16 @@ class GoBuildTest(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix='go-build-test-'))
         self.addCleanup(shutil.rmtree, self.tmp)
         self.repo = self.tmp / 'tools'
-        (self.repo / 'market-sim').mkdir(parents=True)
-        (self.repo / 'market-sim' / 'main.go').write_text('package main\n')
+        for sub in release_cut.GO_TOOLS.values():
+            (self.repo / sub).mkdir(parents=True)
+            (self.repo / sub / 'main.go').write_text('package main\n')
         git(self.repo, 'init', '-q')
         git(self.repo, 'add', '.')
         git(self.repo, 'commit', '-q', '-m', 'c')
         self.sha = git(self.repo, 'rev-parse', 'HEAD')
         # the work tree differs from the commit: the build must take the commit's bytes
-        (self.repo / 'market-sim' / 'main.go').unlink()
+        for sub in release_cut.GO_TOOLS.values():
+            (self.repo / sub / 'main.go').unlink()
         self.go = self.tmp / 'go'
         self.go.write_text(FAKE_GO)
         self.go.chmod(0o755)
@@ -88,6 +90,7 @@ class GoBuildTest(unittest.TestCase):
         self.assertEqual(entry, {'repo': 'tools', 'path': str((self.out / 'market-sim').resolve()), 'sha256': h(data),
                                  'source_sha': self.sha, 'reported_sha': self.sha, 'origin': 'go-cross-build',
                                  'builds': [h(data), h(data)], 'go_version': 'go1.99.0-fake'})
+        self.assertEqual(sorted(json.loads((self.out / 'go-builds.json').read_text())), sorted(release_cut.GO_TOOLS))
 
     def test_two_builds_that_differ_are_refused(self):
         os.environ['FAKE_GO_DIFFER'] = '1'
@@ -121,11 +124,14 @@ class SiblingAssembleTest(unittest.TestCase):
             names = [n for n, e in self.w.m['artifacts'].items()
                      if release_cut.PRODUCT.get(n, {}).get('lang') == 'cpp' and release_cut.PRODUCT[n]['repo'] == repo]
             self.ci[repo] = self.publish(repo, SHAS[repo], names + (['driver.properties'] if repo == 'cluster-tools' else []))
-        data = ELF_ARM64 + b' market-sim ' + SHAS['tools'].encode()
-        p = self.w.put('go/market-sim', data)
-        self.go = self.w.put('go/go-builds.json', json.dumps({'market-sim': {
-            'repo': 'tools', 'path': str(p), 'sha256': h(data), 'source_sha': SHAS['tools'], 'reported_sha': SHAS['tools'],
-            'origin': 'go-cross-build', 'builds': [h(data), h(data)], 'go_version': 'go1.26.4'}}).encode())
+        builds = {}
+        for tool in release_cut.GO_TOOLS:
+            data = ELF_ARM64 + b' ' + tool.encode() + b' ' + SHAS['tools'].encode()
+            p = self.w.put('go/' + tool, data)
+            builds[tool] = {'repo': 'tools', 'path': str(p), 'sha256': h(data), 'source_sha': SHAS['tools'],
+                            'reported_sha': SHAS['tools'], 'origin': 'go-cross-build', 'builds': [h(data), h(data)],
+                            'go_version': 'go1.26.4'}
+        self.go = self.w.put('go/go-builds.json', json.dumps(builds).encode())
 
     def publish(self, repo, sha, names, reported=True):
         d = self.tmp / 'ci' / f'{repo}-{sha[:7]}'
@@ -163,7 +169,7 @@ class SiblingAssembleTest(unittest.TestCase):
         code, text = run_main(arm64_sibling.main, ['expect', str(out), '--cut', str(self.cut), '--out', str(exp)])
         self.assertEqual(code, 0, text)
         lines = [line.split() for line in exp.read_text().splitlines() if not line.startswith('#')]
-        self.assertEqual([x[0] for x in lines], ['oe-gateway', 'oe-stream', 'oe-projector', 'market-sim'])
+        self.assertEqual([x[0] for x in lines], ['oe-gateway', 'oe-stream', 'oe-projector', 'market-sim', 'obs-sampler'])
         self.assertEqual(lines[0], ['oe-gateway', sibling['artifacts']['oe-gateway']['sha256'], SHAS['gateway']])
 
     def test_a_prefix_of_another_gateway_commit_is_refused(self):
@@ -321,14 +327,15 @@ class BoxSelfCheckTest(unittest.TestCase):
     """box_check.sh selfcheck against stub binaries (no arm64 machine, no qemu: BOX_ELF_MACHINE=none skips the ELF step)."""
 
     KEYS = {'oe-gateway': 'GATEWAY_DRIVER_MODE', 'oe-stream': 'STREAM_DRIVER_MODE',
-            'oe-projector': 'HISTORY_PROJECTOR_DRIVER_MODE', 'oe-marketdata': 'MD_DRIVER_MODE', 'market-sim': 'SIM_STREAM_URL'}
+            'oe-projector': 'HISTORY_PROJECTOR_DRIVER_MODE', 'oe-marketdata': 'MD_DRIVER_MODE', 'market-sim': 'SIM_STREAM_URL',
+            'obs-sampler': 'OBS_SAMPLER_CONFIG'}
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix='b1-test-'))
         self.addCleanup(shutil.rmtree, self.tmp)
         self.scratch = self.tmp / 'scratch'
         self.scratch.mkdir()
-        self.source = {n: SHAS['tools'] if n == 'market-sim' else SHAS['gateway'] for n in self.KEYS}
+        self.source = {n: SHAS['tools'] if n in release_cut.GO_TOOLS else SHAS['gateway'] for n in self.KEYS}
         for name, key in self.KEYS.items():
             stub(self.scratch / name, name, self.source[name], key)
         self.write_expect()
@@ -350,7 +357,7 @@ class BoxSelfCheckTest(unittest.TestCase):
     def test_the_cut_set_passes(self):
         code, out = self.selfcheck()
         self.assertEqual(code, 0, out)
-        self.assertIn('SELFCHECK PASS (5 binaries)', out)
+        self.assertIn('SELFCHECK PASS (6 binaries)', out)
         self.assertIn(f'OK oe-gateway sha256 {h((self.scratch / "oe-gateway").read_bytes())} source {SHAS["gateway"]}; '
                       'empty environment refused with 78 naming GATEWAY_DRIVER_MODE', out)
 
