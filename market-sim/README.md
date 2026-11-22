@@ -7,6 +7,7 @@ Agent-based market simulator and synthetic health check for Open Exchange. It dr
 ```bash
 go build -o market-sim .
 go test ./...
+./market-sim -version     # market-sim source <commit>: the tools commit the binary was linked with (unknown here)
 
 # Fund the bot population (shortfall deposits only, safe to repeat; needs the gateway's treasury lane)
 ./market-sim -mode=seed -gateway-url=http://127.0.0.1:8080 -api-keys-file=/path/sim-keys -faucet-max=0:10000,1:5
@@ -18,6 +19,8 @@ go test ./...
 ./market-sim -mode=run -gateway-url=http://127.0.0.1:8080 -stream-url=ws://127.0.0.1:8081/ws/v2 \
   -api-keys-file=/path/sim-keys -faucet-max=0:10000,1:5 -keyed-stats-file=/path/keyed.json
 ```
+
+The release binary is the linux/arm64 cross-build of `runtime-e2e/arm64_sibling.py go-build`: pure Go, built twice from `git archive <commit>` and refused unless the two builds are byte-equal, with the commit linked in as `main.sourceSha`. A setting the simulator cannot run with (no `-stream-url` in run mode, a bad `-faucet-max`, missing API keys, no markets) is refused before anything is sent, with exit 78 and the key's name.
 
 Gateway side: `GATEWAY_AUTH_MODES` and `STREAM_AUTH_MODES` include `api-key`, with the same keys in `GATEWAY_API_KEYS_FILE`. Seeding needs the treasury lane (`GATEWAY_TREASURY_CREDENTIAL` and `GATEWAY_ALLOW_TREASURY_LANE=1`).
 

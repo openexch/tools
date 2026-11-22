@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The cut checker. One RED per rule K1-K10, each refused with its rule and accepted with
+"""The cut checker. One RED per rule K1-K11, each refused with its rule and accepted with
 that rule switched off (the rules seam); the K4 exemption refused in a product kind; the guarded-row REDs (rows 02, 11, 22,
 24, 26, 41, 52); a passing cut. No Docker, no real artifact: every jar and binary is a small file in a temp tree."""
 import contextlib
@@ -596,6 +596,148 @@ def core_config_payload(version, genesis_id, schema_version=7):
     app = struct.pack('<HHHH', 24, 70, 2, schema_version) + struct.pack('<qIIq', 0x7000 + version, version, version, genesis_id)
     app += struct.pack('<HH', 4, 0) + struct.pack('<HH', 4, 0)
     return struct.pack('<HHHH', 24, 1, 111, 8) + b'\0' * 24 + app
+
+
+GO_VERSION = 'go1.26.4'
+
+
+def arm64_sibling(w, cut_sha256):
+    """The arm64 sibling of the World's cut: every C++ artifact as a publish job's arm64 file carrying its repo's commit (the
+    Aeron driver files the Aeron version), and the simulator built twice from the tools commit."""
+    arts = {}
+    for name, entry in w.m['artifacts'].items():
+        spec = release_cut.PRODUCT.get(name)
+        if spec is None or spec['lang'] != 'cpp':
+            continue
+        repo, sha = spec['repo'], w.m['repos'][spec['repo']]
+        driver = name in release_cut.AERON_DRIVER_FILES
+        data = b'\x7fELF aarch64 ' + name.encode() + (b' aeron 1.53.1' if driver else b' source ' + sha.encode())
+        p = w.put('arm64/' + name, data)
+        arts[name] = {'repo': repo, 'path': str(p), 'sha256': h(data), 'source_sha': sha, 'origin': 'ci-publish',
+                      'published': f'{repo}/{sha}/'}
+        if not driver:
+            arts[name]['reported_sha'] = sha
+    data = b'\x7fELF aarch64 go market-sim ' + SHAS['tools'].encode()
+    p = w.put('arm64/market-sim', data)
+    arts['market-sim'] = {'repo': 'tools', 'path': str(p), 'sha256': h(data), 'source_sha': SHAS['tools'],
+                          'reported_sha': SHAS['tools'], 'origin': 'go-cross-build', 'builds': [h(data), h(data)],
+                          'go_version': GO_VERSION}
+    return {'schema': release_cut.SIBLING_SCHEMA, 'cut_id': w.m['cut_id'], 'cut_sha256': cut_sha256, 'arch': 'arm64',
+            'artifacts': arts}
+
+
+class Arm64SiblingTest(CheckerBase):
+    """K11: the arm64 sibling is accepted only when every artifact derives from the cut by source sha; each RED names its
+    artifact with the exact text and passes with K11 switched off."""
+
+    def setUp(self):
+        super().setUp()
+        self.cut_path = self.w.put('cut.json', json.dumps(self.w.m).encode())
+        self.cut_sha = h(self.cut_path.read_bytes())
+        self.s = arm64_sibling(self.w, self.cut_sha)
+
+    def sib(self, m, rules=release_cut.RULES):
+        return release_cut.check(m, self.w.m, rules=rules, cut_sha256=self.cut_sha)
+
+    def refused_k11(self, m, *texts):
+        found = self.sib(m)
+        self.assertEqual(sorted(found.items), sorted(('K11', t) for t in texts), found.items)
+        self.assertEqual(self.sib(m, rules=tuple(r for r in release_cut.RULES if r != 'K11')).items, [],
+                         'passes with K11 switched off')
+
+    def replant(self, name, data):
+        """Replace the arm64 file of ``name`` (its sha256 follows, so K1 stays quiet and only K11 can see it)."""
+        entry = self.s['artifacts'][name]
+        Path(entry['path']).write_bytes(data)
+        entry['sha256'] = h(data)
+        if 'builds' in entry:
+            entry['builds'] = [h(data), h(data)]
+
+    def test_the_sibling_derives_from_the_cut(self):
+        self.assertEqual(sorted(self.s['artifacts']), sorted(
+            ['ct-forwarder', 'ct-bridge', 'aeronmd', 'libaeron_driver.so', 'libaeron.so', 'oe-gateway', 'oe-stream',
+             'oe-projector', 'market-sim']))
+        self.assertEqual(self.sib(self.s).items, [])
+
+    def test_planted_sibling_entry_with_another_source_sha(self):
+        other = '9' * 40
+        self.s['artifacts']['oe-gateway']['source_sha'] = other
+        self.s['artifacts']['oe-gateway']['published'] = f'gateway/{other}/'
+        self.refused_k11(self.s, 'arm64 set does not derive from the cut: oe-gateway')
+
+    def test_planted_binary_built_from_another_commit(self):
+        # declared right, but the file carries (and so reports) another commit
+        self.replant('oe-stream', b'\x7fELF aarch64 oe-stream source ' + b'9' * 40)
+        self.refused_k11(self.s, 'arm64 set does not derive from the cut: oe-stream')
+
+    def test_planted_reported_sha_of_another_commit(self):
+        self.s['artifacts']['ct-bridge']['reported_sha'] = '9' * 40
+        self.refused_k11(self.s, 'arm64 set does not derive from the cut: ct-bridge')
+
+    def test_planted_publish_prefix_of_another_commit(self):
+        self.s['artifacts']['oe-projector']['published'] = 'gateway/' + '9' * 40 + '/'
+        self.refused_k11(self.s, 'arm64 set does not derive from the cut: oe-projector')
+
+    def test_planted_go_tool_from_another_tools_commit(self):
+        other = '9' * 40
+        self.replant('market-sim', b'\x7fELF aarch64 go market-sim ' + other.encode())
+        self.s['artifacts']['market-sim'].update(source_sha=other, reported_sha=other)
+        self.refused_k11(self.s, 'arm64 set does not derive from the cut: market-sim')
+
+    def test_planted_driver_file_of_another_aeron(self):
+        self.replant('aeronmd', b'\x7fELF aarch64 aeronmd aeron 1.49.0')
+        self.refused_k11(self.s, 'arm64 set does not derive from the cut: aeronmd')
+
+    def test_two_go_builds_that_differ(self):
+        self.s['artifacts']['market-sim']['builds'][1] = '0' * 64
+        self.refused_k11(self.s, 'go build is not reproducible: market-sim')
+
+    def test_a_missing_artifact(self):
+        del self.s['artifacts']['oe-stream']
+        self.refused_k11(self.s, 'arm64 set misses an artifact: oe-stream')
+        del self.s['artifacts']['market-sim']
+        self.refused_k11(self.s, 'arm64 set misses an artifact: oe-stream', 'arm64 set misses an artifact: market-sim')
+
+    def test_a_sibling_of_another_cut(self):
+        self.s['cut_id'] = 'rc2-cut-0'
+        self.refused_k11(self.s, 'arm64 set names another cut: rc2-cut-0 (the cut is rc2-cut-1)')
+        self.s['cut_id'] = self.w.m['cut_id']
+        self.s['cut_sha256'] = '0' * 64
+        self.refused_k11(self.s, f'arm64 set names another cut manifest: cut_sha256 {"0" * 64} (the cut file is {self.cut_sha})')
+
+    def test_an_edited_file_is_k1(self):
+        Path(self.s['artifacts']['oe-gateway']['path']).write_bytes(b'edited')
+        self.assertIn('K1', self.sib(self.s).by_rule())
+
+    def test_structure_is_k9(self):
+        self.assertEqual(release_cut.check(self.s, None).items,
+                         [('K9', 'an arm64 sibling manifest is checked against its cut: --cut <rc2-cut-manifest.json>')])
+        s = copy.deepcopy(self.s)
+        s['artifacts']['oe-unknown'] = dict(s['artifacts']['oe-gateway'])
+        s['artifacts']['oe-gateway']['origin'] = 'go-cross-build'
+        s['artifacts']['aeronmd']['reported_sha'] = SHAS['cluster-tools']
+        s['arch'] = 'amd64'
+        texts = [t for r, t in self.sib(s).items if r == 'K9']
+        self.assertIn('sibling.oe-unknown: not a C++ artifact of the cut, a published arm64 binary or a Go tool', texts)
+        self.assertIn("sibling.arch must be arm64, got 'amd64'", texts)
+        self.assertIn('sibling.aeronmd.reported_sha: an Aeron driver file carries the Aeron version, not a source sha', texts)
+        self.assertTrue(any(t.startswith('sibling.oe-gateway: origin go-cross-build') for t in texts), texts)
+
+    def test_cli(self):
+        good = self.w.put('sibling.json', json.dumps(self.s).encode())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(release_cut.main(['check', str(good), '--cut', str(self.cut_path)]), 0)
+        self.assertIn('ACCEPTED sibling.json', out.getvalue())
+        bad = copy.deepcopy(self.s)
+        bad['artifacts']['oe-gateway']['source_sha'] = '9' * 40
+        badp = self.w.put('sibling-bad.json', json.dumps(bad).encode())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(release_cut.main(['check', str(badp), '--cut', str(self.cut_path)]), 1)
+        print(out.getvalue(), end='')          # the refusal as printed (kept in the test log)
+        self.assertIn('K11 arm64 set does not derive from the cut: oe-gateway\n', out.getvalue())
+        self.assertIn('REFUSED sibling-bad.json: K11', out.getvalue())
 
 
 def write_ae_member(state_root, member, frames, snapshot=False):

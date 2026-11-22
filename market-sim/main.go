@@ -58,24 +58,29 @@ func main() {
 	edgeWS := flag.String("edge-ws-url", envOr("SIM_EDGE_WS_URL", ""), "public market-data WS to watch (the edge relay viewer path; empty = check disabled)")
 	bridgeHealth := flag.String("bridge-health-url", envOr("SIM_BRIDGE_HEALTH_URL", "http://127.0.0.1:9600/health"), "settlement bridge health endpoint; a HALTED bridge stops all money settlement and leaks holds (empty = check disabled)")
 	anchorFile := flag.String("anchor-file", envOr("SIM_ANCHOR_FILE", "anchors.json"), "reference-price persistence file (empty = disabled)")
+	version := flag.Bool("version", false, "print the tools commit this binary was built from and exit")
 	flag.Parse()
+	if *version {
+		printVersion()
+		return
+	}
 	cfg.SelectMarkets(*markets)
 
 	if len(cfg.Markets) == 0 {
-		log.Fatal("no markets selected")
+		refuseConfig("-markets", "no markets selected")
 	}
 	if !*userStream {
 		cfg.StreamURL = ""
 	} else if *mode == "run" && cfg.StreamURL == "" {
-		log.Fatal("-stream-url is required in run mode (or -user-stream=false to run on reconcile passes only)")
+		refuseConfig("SIM_STREAM_URL", "-stream-url is required in run mode (or -user-stream=false to run on reconcile passes only)")
 	}
 	var err error
 	if cfg.FaucetMax, err = parseFaucetMax(*faucetMax); err != nil {
-		log.Fatalf("-faucet-max: %v", err)
+		refuseConfig("SIM_FAUCET_MAX", "-faucet-max: %v", err)
 	}
 	creds, err := loadCredentials(*keysFile, *devAuth, cfg.Users())
 	if err != nil {
-		log.Fatal(err)
+		refuseConfig("SIM_API_KEYS_FILE", "%v", err)
 	}
 
 	client := oms.NewClient(cfg.GatewayURL, creds)
