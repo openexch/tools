@@ -39,7 +39,7 @@ expected_key() {
         oe-projector) echo HISTORY_PROJECTOR_DRIVER_MODE ;;
         oe-marketdata) echo MD_DRIVER_MODE ;;
         market-sim) echo SIM_STREAM_URL ;;
-        # the observation sampler gets its line here when it exists
+        obs-sampler) echo OBS_SAMPLER_CONFIG ;;
         *) return 1 ;;
     esac
 }

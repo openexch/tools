@@ -219,6 +219,28 @@ vacuous: no money movement after the freeze`), `owners-gateway-insert` (`second 
 has no grant: <relation>`), `owners-third-delete-role` (`unnamed delete role on money_journal: planted_cleaner`). Sizes
 and bounds are settings (`red_proofs.SETTINGS`).
 
+## Observation
+
+The observation of a running stack: `obs-sampler` (Go, one per host, `../obs-sampler/`) writes the sample files, and
+`observation.py` judges a merged sample set offline, verdict lines V1 to V12 (the module docstring lists them, their
+settings and their exact failure texts). Missing evidence is INCONCLUSIVE; a live pid whose work counter cannot be read
+while its input moved is `alive and unreachable: <service>`, never a gap.
+
+- `demo-observation-24h`: `runner.py --manifest <sample set>/sampleset.json --scenario demo-observation-24h --output <dir>`
+  judges a sample set copied off a box (no fixture starts); with no sample set it ends INCONCLUSIVE `no sample set`.
+  The window and every bound are settings of the set (`settings` in `sampleset.json`, defaults `observation.SETTINGS`),
+  so a short dry run is the same command on a short set.
+- `core-observation-drill` (`cps`, `cps-ext`; `observation_drill.py`): the fixture twin. A clean run of
+  `OBS_DRILL_WINDOW_S` must PASS; `OBS_DRILL_FAULT` plants one fault, and the verdict must name exactly its line and its
+  service: `freeze-projector` (V3 `alive and unreachable: oe-projector/<slot>`), `freeze-bridge` (V3 `alive and
+  unreachable: ct-bridge/bridge0`, plus the two control builds of the verdict over the same samples), `kill-core` (V2
+  `repeated restart: core/<slot> x3`), `grow-file` (V7 `unexplained disk growth: core/ae0 state <bytes>`).
+  `OBS_DRILL_CONTROL=skip-plant` must end INCONCLUSIVE `fault was never planted`. Inputs: `OBS_SAMPLER_BIN` (the
+  sampler built for this host) and `OBS_DRILL_CUT` (the cut manifest money-check reads its jars from); money-check
+  with the core expected side runs at Q0 and Q2 in the probe container.
+- Unit suite: `test_observation_verdict.py` (a clean set, one planted set per line and per V3 service kind, each with its
+  vacuity control `verdict line <Vn> is vacuous`) and `test_observation_drill.py`.
+
 ## Nightly
 
 `nightly.py --plan nightly-cut.json --evidence-root DIR --harness-commit SHA --tools-repo DIR --ct-repo DIR` runs a fixed plan of `{kind, scenario}` entries from a `git archive` of the pinned tools commit (a modified or extra file refuses the night). It takes a heavy-job lock without waiting (a held lock or foreign load ends the night `SKIPPED_BUSY`, exit 75), records stale earlier nights as `INTERRUPTED`, enforces `NIGHTLY_BOUND_S` (default 5 h) and writes `SHA256SUMS` last. Nothing is pushed or published.

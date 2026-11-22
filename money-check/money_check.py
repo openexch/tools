@@ -28,14 +28,17 @@ It is READ-ONLY: it never issues a write to Redis, the core, or the OMS.
       No available < 0 and no locked < 0, ever.
 
 Stores:
-  --store redis (default)  read Redis db0 directly (bal:{userId} hashes).
-  --store core             run the CoreDump CLI of the release cut (--cut MANIFEST: the jar of its tools.core-dump entry,
-                           re-hashed against the manifest) and read its JSON snapshot. There is no default jar: without
-                           --cut, or with a cut that names no CoreDump jar, the check refuses to run (exit 1).
+  --store redis (default)  read Redis db0 directly (bal:{userId} hashes); the expected side is the v0.5 OMS.
+  --store core             the core expected side (core_expected.py): the ledger from CoreDump and the expected holds
+                           from the core's own order snapshot, both run from the release cut's jars (--cut MANIFEST,
+                           re-hashed against it); funding from the money history. No OMS. The OMS and sim-log flags are
+                           refused with this store (exit 64).
 
-Exit codes:  0 = all green   2 = an invariant was violated   1 = operational error
-             64 = a retired flag or value (--ae-dump-cmd, --core-dump-cmd, --ae-timeout, --store ae): the line
-                  names the new one.
+Exit codes:  0 = all green   2 = an invariant was violated   1 = operational error (core unreachable, CoreDump timeout:
+             CoreDump's own exit 3 is mapped here, never to 3)   3 = UNSTABLE: the core's content kept moving through
+             every stable-read attempt (--store core)
+             64 = a retired flag or value (--ae-dump-cmd, --core-dump-cmd, --ae-timeout, --store ae), a flag that has no
+                  meaning with --store core, or any other usage error: the line names it.
 """
 
 import argparse
@@ -51,6 +54,9 @@ import time
 import urllib.error
 import urllib.request
 from collections import defaultdict
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import core_expected  # noqa: E402
 
 SCALE = 10 ** 8  # all amounts are 8dp fixed-point int64
 
@@ -232,65 +238,6 @@ def load_redis_store(host, port, db):
                 "position": {"consumePosition": None, "lastAppliedTradeId": None}}
     finally:
         r.close()
-
-
-CORE_DUMP_TOOL = "core-dump"
-CORE_DUMP_MAIN = "com.openexchange.core.bridge.CoreDump"
-
-
-def core_dump_command(cut_path):
-    """The CoreDump command of a release cut: ``java -cp <tools.core-dump.path> <main>``. The jar must exist and hash to the
-    manifest's sha256; anything missing is a RuntimeError naming it (there is no default jar)."""
-    if not cut_path:
-        raise RuntimeError("--store core needs --cut MANIFEST: CoreDump runs from the release cut's jar "
-                           "(tools.core-dump), never from a default path")
-    try:
-        with open(cut_path) as fh:
-            cut = json.load(fh)
-    except (OSError, ValueError) as e:
-        raise RuntimeError(f"--cut {cut_path}: not a readable cut manifest: {e}")
-    entry = (cut.get("tools") or {}).get(CORE_DUMP_TOOL) if isinstance(cut, dict) else None
-    if not isinstance(entry, dict) or not entry.get("path") or not entry.get("sha256"):
-        raise RuntimeError(f"--cut {cut_path}: the cut {cut.get('cut_id') if isinstance(cut, dict) else None} names no "
-                           f"tools.{CORE_DUMP_TOOL} jar (path and sha256)")
-    if entry.get("main") != CORE_DUMP_MAIN:
-        raise RuntimeError(f"--cut {cut_path}: tools.{CORE_DUMP_TOOL}.main is {entry.get('main')!r}, not {CORE_DUMP_MAIN}")
-    jar = entry["path"]
-    try:
-        with open(jar, "rb") as fh:
-            digest = hashlib.sha256(fh.read()).hexdigest()
-    except OSError as e:
-        raise RuntimeError(f"--cut {cut_path}: the CoreDump jar {jar} is not readable: {e}")
-    if digest != entry["sha256"]:
-        raise RuntimeError(f"--cut {cut_path}: the CoreDump jar {jar} hashes to {digest}, the cut pins {entry['sha256']}")
-    return ["java", "-cp", jar, CORE_DUMP_MAIN]
-
-
-def load_core_store(dump_cmd, timeout):
-    try:
-        proc = subprocess.run(dump_cmd, shell=isinstance(dump_cmd, str), capture_output=True,
-                             timeout=timeout, text=True)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"CoreDump timed out after {timeout}s (cmd: {dump_cmd})")
-    if proc.returncode == 3:
-        raise RuntimeError("CoreDump reported its own 30s snapshot timeout (exit 3) -- "
-                          "is the core cluster up and has a leader?")
-    if proc.returncode != 0:
-        raise RuntimeError(f"CoreDump exited {proc.returncode}: {proc.stderr.strip()[:400]}")
-    try:
-        doc = json.loads(proc.stdout)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"CoreDump stdout was not JSON: {e}; first 200 chars: {proc.stdout[:200]!r}")
-    balances = {}
-    for b in doc.get("balances", []):
-        balances[(int(b["userId"]), int(b["assetId"]))] = {
-            "available": int(b["available"]), "locked": int(b["locked"])}
-    holds = defaultdict(int)
-    for h in doc.get("holds", []):
-        holds[(int(h["userId"]), int(h["assetId"]))] += int(h["remaining"])
-    return {"balances": balances, "holds": dict(holds),
-            "position": {"consumePosition": doc.get("consumePosition"),
-                        "lastAppliedTradeId": doc.get("lastAppliedTradeId")}}
 
 
 # --------------------------------------------------------------------------- #
@@ -588,10 +535,7 @@ def run_sweep(args, asset_map):
     result = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "checks": [], "error": None}
 
     # 1. load the store
-    if args.store == "redis":
-        store = load_redis_store(args.redis_host, args.redis_port, args.redis_db)
-    else:
-        store = load_core_store(core_dump_command(args.cut), args.core_timeout)
+    store = load_redis_store(args.redis_host, args.redis_port, args.redis_db)
     balances = store["balances"]
     result["position"] = store["position"]
 
@@ -705,7 +649,7 @@ def status_line(result, sweep_no, rolling):
 # main
 # --------------------------------------------------------------------------- #
 def build_arg_parser():
-    p = argparse.ArgumentParser(description="Live-money guardrail for the Open Exchange cutover soak.")
+    p = _Parser(description="Live-money guardrail for the Open Exchange cutover soak.")
     p.add_argument("--store", choices=["redis", "core"], default="redis",
                   help="ledger source: redis (default) or core (via CoreDump)")
     p.add_argument("--oms-url", default="http://localhost:8080",
@@ -717,9 +661,37 @@ def build_arg_parser():
     p.add_argument("--redis-port", type=int, default=6379)
     p.add_argument("--redis-db", type=int, default=0)
     p.add_argument("--cut", default=None, metavar="MANIFEST",
-                  help="release cut manifest; --store core runs CoreDump from its tools.core-dump jar (required)")
+                  help="release cut manifest; --store core runs CoreDump (tools.core-dump) and the order snapshot reader "
+                       "(harness.core_probe on artifacts.core-cluster.jar) from its jars (required)")
+    p.add_argument("--artifact-root", default=None, metavar="DIR",
+                  help="core: the directory the cut's jars were copied to (file names and sha256 stay the cut's)")
     p.add_argument("--core-timeout", type=int, default=40,
-                  help="seconds to wait for CoreDump (its own timeout is 30s)")
+                  help="seconds to wait for each core read (CoreDump's own deadline is 30s)")
+    p.add_argument("--core-addresses", default=None, help="core: the members' hosts, comma list in member order")
+    p.add_argument("--core-port-base", type=int, default=None, help="core: the cluster port base")
+    p.add_argument("--core-port-stride", type=int, default=100, help="core: the port stride per member (default 100)")
+    p.add_argument("--local-host", default=None, help="core: this machine's address the core replies to")
+    p.add_argument("--driver-mode", choices=["embedded", "external"], default=None,
+                  help="core: the media driver of the two reads (required): embedded or external (with --aeron-dir)")
+    p.add_argument("--aeron-dir", default=None, help="core: the external aeronmd's directory (external mode only)")
+    p.add_argument("--tool-key-file", default=None, help="core: TOOL credential file for CoreDump (mode 600)")
+    p.add_argument("--admin-key-file", default=None, help="core: ADMIN credential file for the order snapshot (mode 600)")
+    p.add_argument("--money-history-dsn", default=None,
+                  help="core: PostgreSQL connection string of the money history database (the funding source)")
+    p.add_argument("--funding-file", default=None,
+                  help="core: per-asset deposits and withdrawals written from the money history, instead of the DSN")
+    p.add_argument("--psql", default="psql", help="core: the psql program (default psql)")
+    p.add_argument("--java", default="java", help="core: the java program the two reads run with (default java)")
+    p.add_argument("--jvm-opt", action="append", default=None,
+                  help="core: a JVM option of the two reads, repeatable; replaces the default --add-opens set")
+    p.add_argument("--core-metrics", default=None,
+                  help="core: comma list of member /metrics URLs; checks core_pending_commands and core_release_backlog")
+    p.add_argument("--zero-hold-users", default=None,
+                  help="core: users that must hold nothing at all, e.g. 900000-900999 (the simulator's own)")
+    p.add_argument("--stable-retries", type=int, default=int(os.environ.get("MONEY_CHECK_STABLE_RETRIES", 5)),
+                  help="core: stable-read attempts before UNSTABLE (default 5, MONEY_CHECK_STABLE_RETRIES)")
+    p.add_argument("--stable-wait-ms", type=int, default=int(os.environ.get("MONEY_CHECK_STABLE_WAIT_MS", 1000)),
+                  help="core: wait between attempts (default 1000, MONEY_CHECK_STABLE_WAIT_MS)")
     p.add_argument("--asset-map", default=None,
                   help='override symbol->id map, e.g. "USD=0,BTC=1,ETH=2,SOL=3,XRP=4,DOGE=5"')
     p.add_argument("--users", default=None,
@@ -732,6 +704,7 @@ def build_arg_parser():
     p.add_argument("--max-sweeps", type=int, default=None,
                   help="stop after N sweeps (for bounded soak runs)")
     p.add_argument("--json", action="store_true", help="emit one JSON object per sweep")
+    p.add_argument("--verbose", action="store_true", help="print every drift, not the first 20")
     p.add_argument("--extra-deposits", default=None,
                   help="FILE of manual deposits (ts user asset amount) to add to the sim-log ledger")
     return p
@@ -768,12 +741,133 @@ def retired_refusal(argv):
     return None
 
 
+# Flags of the OMS and sim-log expected side: refused with --store core, whose expected side and funding come from the core
+CORE_REFUSED = ("--oms-url", "--sim-log", "--extra-deposits", "--users", "--asset-map", "--loop", "--max-sweeps",
+                "--redis-host", "--redis-port", "--redis-db", "--tolerance", "--http-timeout")
+
+
+def core_refusal(argv):
+    """The refusal line for a flag that has no meaning with --store core, or None."""
+    if not any(a == "--store=core" or (a == "--store" and i + 1 < len(argv) and argv[i + 1] == "core")
+               for i, a in enumerate(argv)):
+        return None
+    for arg in argv:
+        name = arg.split("=", 1)[0]
+        if name in CORE_REFUSED:
+            return (f"money_check: refused: {name} has no meaning with --store core: the expected side and the funding "
+                    "come from the core and its money history")
+    return None
+
+
+def core_env(args, tool_key, admin_key):
+    """The environment of the two reads: the core's address in each program's own names, the driver mode, the key."""
+    stride = args.core_port_stride
+    if args.core_port_base is None:
+        raise core_expected.OperationalError("--store core needs --core-port-base")
+    for flag, value in (("--core-addresses", args.core_addresses), ("--local-host", args.local_host),
+                        ("--driver-mode", args.driver_mode)):
+        if not value:
+            raise core_expected.OperationalError(f"--store core needs {flag}")
+    if (args.driver_mode == "external") != bool(args.aeron_dir):
+        raise core_expected.OperationalError("--aeron-dir is required with --driver-mode external and refused with embedded")
+    common = {"AERON_DIR": args.aeron_dir} if args.aeron_dir else {}
+    dump = {"COREDUMP_DRIVER_MODE": args.driver_mode, "CORE_AUTH_CREDENTIAL": tool_key,
+            "BRIDGE_CORE_CLUSTER_ADDRESSES": args.core_addresses, "BRIDGE_CORE_PORT_BASE": str(args.core_port_base),
+            "BRIDGE_LOCAL_HOST": args.local_host}
+    probe = {"CORE_PROBE_DRIVER_MODE": args.driver_mode, "CORE_AUTH_CREDENTIAL": admin_key,
+             "CORE_ADDRESSES": args.core_addresses, "CORE_PORT_BASE": str(args.core_port_base),
+             "CLUSTER_PORT_STRIDE": str(stride), "CORE_LOCAL_HOST": args.local_host}
+    return {"common": common, "dump": dump, "probe": probe}
+
+
+def print_core(result):
+    print(f"[{result['ts']}] core sweep: {result['status']}")
+    print(f"   {result['statement']}")
+    for a in result.get("attempts", []):
+        if not a["stable"]:
+            print(f"   UNSTABLE attempt {a['attempt']}: the dump or the order snapshot changed between two reads")
+    if result.get("position"):
+        print(f"   core position: consume={result['position']['consumePosition']} "
+              f"lastAppliedTradeId={result['position']['lastAppliedTradeId']}; {result.get('accounts')} accounts, "
+              f"{result.get('live_orders')} live orders, {result.get('hold_entries')} holds")
+    for c in result.get("checks", []):
+        line = f"   {c['status']:<13} {c['name']}"
+        if c.get("reason"):
+            line += f"  ({c['reason']})"
+        print(line)
+        for d in c.get("drifts", [])[:50]:
+            print(f"        {json.dumps(d, sort_keys=True)}")
+    for d in result.get("residual_holds", []):
+        print(f"   {core_expected.residual_text(d)}")
+
+
+def core_main(args):
+    """--store core: one sweep with the core's own expected side. Exit 0 green, 2 violated, 3 unstable, 1 operational."""
+    try:
+        tool_key = core_expected.read_key(args.tool_key_file, "--tool-key-file")
+        admin_key = core_expected.read_key(args.admin_key_file, "--admin-key-file")
+        java = [args.java, *(core_expected.JVM_FLAGS if args.jvm_opt is None else args.jvm_opt)]
+        dump_argv, probe_argv = core_expected.cut_programs(args.cut, args.artifact_root, java)
+        env = core_env(args, tool_key, admin_key)
+        if bool(args.money_history_dsn) == bool(args.funding_file):
+            raise core_expected.OperationalError("--store core needs exactly one funding source: --money-history-dsn or "
+                                                 "--funding-file")
+        if args.money_history_dsn:
+            funding = lambda: core_expected.funding_from_history(args.money_history_dsn, args.psql)
+        else:
+            funding = lambda: core_expected.funding_from_file(args.funding_file)
+        counters = None
+        if args.core_metrics:
+            urls = [u.strip() for u in args.core_metrics.split(",") if u.strip()]
+            counters = lambda: core_expected.core_counters(urls)
+        zero = [tuple(r) for r in ranges_of(args.zero_hold_users)] if args.zero_hold_users else ()
+        reader = core_expected.CoreReader(dump_argv, probe_argv, env, args.core_timeout)
+        result, code = core_expected.sweep(reader, funding, zero, counters, args.stable_retries, args.stable_wait_ms,
+                                           log=lambda m: print(m, file=sys.stderr))
+    except core_expected.OperationalError as e:
+        print(f"money_check: operational error: {e}", file=sys.stderr)
+        if args.json:
+            print(json.dumps({"mode": "core", "status": "ERROR", "error": str(e), "statement": core_expected.STATEMENT}))
+        return 1
+    if args.json:
+        print(json.dumps(result), flush=True)
+    else:
+        print_core(result)
+    return code
+
+
+def ranges_of(spec):
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        lo, _, hi = part.partition("-")
+        out.append((int(lo), int(hi or lo)))
+    return out
+
+
+class _Parser(argparse.ArgumentParser):
+    """A usage error exits 64 (EX_USAGE), never 2: 2 means an invariant was violated."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"money_check: usage: {message}", file=sys.stderr)
+        sys.exit(64)
+
+
 def main(argv=None):
-    refusal = retired_refusal(sys.argv[1:] if argv is None else argv)
+    argv = sys.argv[1:] if argv is None else argv
+    refusal = retired_refusal(argv) or core_refusal(argv)
     if refusal is not None:
         print(refusal, file=sys.stderr)
         return 64
-    args = build_arg_parser().parse_args(argv)
+    try:
+        args = build_arg_parser().parse_args(argv)
+    except SystemExit as e:
+        return e.code
+    if args.store == "core":
+        return core_main(args)
     if args.sim_log is None:
         args.sim_log = ["~/.local/log/cluster/sim.log"]
     asset_map = parse_asset_map(args.asset_map)

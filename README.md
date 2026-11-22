@@ -26,14 +26,16 @@ The previous v0.5 stack (`oms`, `admin-gateway`, `trading-ui`) still runs the de
 |---|---|---|---|
 | [`runtime-e2e/`](runtime-e2e/README.md) | Isolated Docker acceptance harness: runs pinned, already-built artifacts, injects faults, judges money and order state with oracles | v1 core topology and the v0.5 topology | Python, Java probes |
 | [`market-sim/`](market-sim/README.md) | Agent-based market simulator and demo canary with a health endpoint | v0.5 OMS REST API | Go |
-| [`money-check/`](money-check/README.md) | Read-only money invariant checker (conservation, locked equals open holds, non-negativity) | v0.5 Redis ledger or the core via `CoreDump` | Python |
+| [`money-check/`](money-check/README.md) | Read-only money invariant checker (conservation, locked equals open holds, every hold on a live order, non-negativity) | the core (both sides from the core, no OMS) or the v0.5 Redis ledger | Python |
+| [`obs-sampler/`](obs-sampler/README.md) | Read-only observation sampler, one per host; its sample files are judged offline by `runtime-e2e/observation.py` | any host of the core topology | Go |
 | `tb-bench/` | TigerBeetle two-phase benchmark driver kept from the ledger evaluation | a TigerBeetle cluster | Java |
 
 ## Build and test
 
 ```bash
-# Go tools (market-sim needs Go 1.23+, see each go.mod)
+# Go tools (Go 1.23+, see each go.mod)
 (cd market-sim && go build -o market-sim . && go test ./...)
+(cd obs-sampler && go build -o obs-sampler . && go test ./...)
 
 # Python tools: standard library only
 python3 -m unittest discover -s runtime-e2e -p 'test_*.py'

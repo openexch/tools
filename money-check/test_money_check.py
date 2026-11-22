@@ -23,10 +23,9 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import core_expected  # noqa: E402
 from money_check import (  # noqa: E402
-    CORE_DUMP_MAIN,
     SCALE,
-    core_dump_command,
     build_arg_parser,
     check_core_internal,
     check_conservation,
@@ -425,51 +424,335 @@ class RetiredFlags(unittest.TestCase):
         self.assertEqual((args.store, args.cut, args.core_timeout), ("core", "cut.json", 5))
 
 
-class CoreDumpFromTheCut(unittest.TestCase):
-    """--store core runs CoreDump from the cut's tools.core-dump jar, re-hashed; no cut or no jar refuses to run."""
+class CoreProgramsFromTheCut(unittest.TestCase):
+    """--store core runs CoreDump (tools.core-dump) and the order snapshot reader (harness.core_probe on
+    artifacts.core-cluster.jar) from the cut's bytes, re-hashed; no cut, a missing entry or other bytes refuse to run."""
 
     def setUp(self):
         import hashlib
-        import tempfile
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = self.tmp.name
-        self.jar = os.path.join(self.dir, "core-bridge.jar")
-        with open(self.jar, "wb") as fh:
-            fh.write(b"jar bytes")
-        self.entry = {"path": self.jar, "sha256": hashlib.sha256(b"jar bytes").hexdigest(), "source_sha": "a" * 40,
-                      "derivation": "rebuild-equal", "tree_dirty": False, "kind": "tool", "main": CORE_DUMP_MAIN}
+        self.files = {}
+        for name in ("core-bridge.jar", "CoreProbe.jar", "core-cluster.jar"):
+            path = os.path.join(self.dir, name)
+            with open(path, "wb") as fh:
+                fh.write(name.encode())
+            self.files[name] = {"path": path, "sha256": hashlib.sha256(name.encode()).hexdigest()}
+        self.doc = {"cut_id": "dev-cut-1",
+                    "tools": {"core-dump": dict(self.files["core-bridge.jar"], main=core_expected.CORE_DUMP_MAIN)},
+                    "harness": {"core_probe": self.files["CoreProbe.jar"]},
+                    "artifacts": {"core-cluster.jar": self.files["core-cluster.jar"]}}
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def cut(self, tools):
+    def cut(self, doc):
         path = os.path.join(self.dir, "cut.json")
         with open(path, "w") as fh:
-            json.dump({"cut_id": "v8-cut-1", "tools": tools}, fh)
+            json.dump(doc, fh)
         return path
 
-    def test_the_command_is_the_cut_jar(self):
-        self.assertEqual(core_dump_command(self.cut({"core-dump": self.entry})), ["java", "-cp", self.jar, CORE_DUMP_MAIN])
+    def test_the_programs_are_the_cut_jars(self):
+        dump, probe = core_expected.cut_programs(self.cut(self.doc), java=("java",))
+        self.assertEqual(dump, ["java", "-cp", self.files["core-bridge.jar"]["path"], core_expected.CORE_DUMP_MAIN])
+        self.assertEqual(probe, ["java", "-cp", f'{self.files["CoreProbe.jar"]["path"]}:{self.files["core-cluster.jar"]["path"]}',
+                                 "CoreProbe", "order-dump"])
+        dump, _ = core_expected.cut_programs(self.cut(self.doc))
+        self.assertEqual(dump[:2], ["java", "--add-opens"])
 
-    def test_no_cut_no_jar_or_other_bytes_refuse(self):
-        with self.assertRaisesRegex(RuntimeError, "needs --cut MANIFEST"):
-            core_dump_command(None)
-        with self.assertRaisesRegex(RuntimeError, "names no tools.core-dump jar"):
-            core_dump_command(self.cut({}))
-        with self.assertRaisesRegex(RuntimeError, "not a readable cut manifest"):
-            core_dump_command(os.path.join(self.dir, "missing.json"))
-        with self.assertRaisesRegex(RuntimeError, "hashes to .* the cut pins"):
-            core_dump_command(self.cut({"core-dump": dict(self.entry, sha256="0" * 64)}))
-        with self.assertRaisesRegex(RuntimeError, "main is 'x'"):
-            core_dump_command(self.cut({"core-dump": dict(self.entry, main="x")}))
+    def test_an_artifact_root_keeps_the_names_and_the_digests(self):
+        other = os.path.join(self.dir, "box")
+        os.mkdir(other)
+        for name in self.files:
+            shutil.copyfile(self.files[name]["path"], os.path.join(other, name))
+        dump, _ = core_expected.cut_programs(self.cut(self.doc), other, java=("java",))
+        self.assertEqual(dump[2], os.path.join(other, "core-bridge.jar"))
+        with open(os.path.join(other, "core-bridge.jar"), "ab") as fh:
+            fh.write(b"x")
+        with self.assertRaisesRegex(core_expected.OperationalError, "hashes to .* the cut pins"):
+            core_expected.cut_programs(self.cut(self.doc), other)
 
-    def test_a_core_sweep_without_a_cut_is_an_operational_error(self):
+    def test_no_cut_no_entry_or_other_bytes_refuse(self):
+        E = core_expected.OperationalError
+        with self.assertRaisesRegex(E, "needs --cut MANIFEST"):
+            core_expected.cut_programs(None)
+        with self.assertRaisesRegex(E, "not a readable cut manifest"):
+            core_expected.cut_programs(os.path.join(self.dir, "missing.json"))
+        for key, sub, text in (("tools", "core-dump", "names no tools.core-dump jar"),
+                               ("harness", "core_probe", "names no harness.core_probe jar"),
+                               ("artifacts", "core-cluster.jar", "names no artifacts.core-cluster.jar")):
+            doc = json.loads(json.dumps(self.doc))
+            del doc[key][sub]
+            with self.assertRaisesRegex(E, text):
+                core_expected.cut_programs(self.cut(doc))
+        doc = json.loads(json.dumps(self.doc))
+        doc["tools"]["core-dump"]["main"] = "x"
+        with self.assertRaisesRegex(E, "main is 'x'"):
+            core_expected.cut_programs(self.cut(doc))
+
+    def test_key_files_must_be_private(self):
+        path = os.path.join(self.dir, "admin.key")
+        with open(path, "w") as fh:
+            fh.write("12:ADMIN:00ff\n")
+        os.chmod(path, 0o644)
+        with self.assertRaisesRegex(core_expected.OperationalError, "readable by others"):
+            core_expected.read_key(path, "--admin-key-file")
+        os.chmod(path, 0o600)
+        self.assertEqual(core_expected.read_key(path, "--admin-key-file"), "12:ADMIN:00ff")
+
+
+# --------------------------------------------------------------------------- core expected side over dump fixtures
+
+M = 10 ** 8
+
+
+def dump_doc(balances, holds, consume=10, trade=5):
+    return {"balances": [{"userId": u, "assetId": a, "available": av, "locked": lk} for u, a, av, lk in balances],
+            "holds": [{"orderId": o, "userId": u, "assetId": a, "remaining": r} for o, u, a, r in holds],
+            "consumePosition": consume, "lastAppliedTradeId": trade}
+
+
+def order(oid, user, side, price, qty, filled=0, status="NEW", typ="LIMIT", hold_amount=None):
+    hold_asset = 0 if side == "BUY" else 1
+    if hold_amount is None:
+        hold_amount = price * qty // M if side == "BUY" else qty
+    return {"order": oid, "user": user, "market": 1, "status": status, "side": side, "type": typ, "tif": "GTC",
+            "price": price, "quantity": qty, "filled": filled, "remaining": qty - filled, "stop_price": 0,
+            "hold_asset": hold_asset, "hold_amount": hold_amount, "budget": 0}
+
+
+class Proc:
+    def __init__(self, rc, out="", err=""):
+        self.returncode, self.stdout, self.stderr = rc, out, err
+
+
+class FakeCore:
+    """A scripted core behind the two programs: ``states`` is a list of (dump doc, orders) the reads walk through (one
+    state per read of each program); ``dump_rc`` overrides CoreDump's exit code."""
+
+    def __init__(self, states, dump_rc=0, timeout=False, by_read=False):
+        self.states, self.dump_rc, self.timeout, self.dumps, self.orders = states, dump_rc, timeout, 0, 0
+        self.by_read = by_read   # True: the state is a function of the read count over both programs (a moving core)
+
+    def state(self, own):
+        i = self.dumps + self.orders if self.by_read else own
+        return self.states[min(i, len(self.states) - 1)]
+
+    def run(self, argv, **kw):
+        if self.timeout:
+            import subprocess
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+        if argv[-1] == "order-dump":
+            st = self.state(self.orders)
+            self.orders += 1
+            return Proc(0, json.dumps({"verb": "order-dump", "pages": 1, "count": len(st[1]), "orders": st[1]}) + "\n")
+        st = self.state(self.dumps)
+        self.dumps += 1
+        if self.dump_rc:
+            return Proc(self.dump_rc, "", "CoreDump: snapshot incomplete after 30000ms")
+        return Proc(0, json.dumps(st[0]))
+
+
+ENV = {"common": {}, "dump": {}, "probe": {}}
+CLEAN = (dump_doc([(1, 0, 900 * M, 100 * M), (2, 1, 5 * M, 5 * M)], [(11, 1, 0, 100 * M), (12, 2, 1, 5 * M)]),
+         [order(11, 1, "BUY", 10 * M, 10 * M), order(12, 2, "SELL", 20 * M, 5 * M)])
+FUNDING = lambda: ({0: 1000 * M, 1: 10 * M}, {}, None)
+
+
+def sweep(core, **kw):
+    reader = core_expected.CoreReader(["java", "CoreDump"], ["java", "CoreProbe", "order-dump"], ENV, 5, run=core.run)
+    logs = []
+    kw.setdefault("sleep", lambda s: None)
+    result, code = core_expected.sweep(reader, kw.pop("funding", FUNDING), log=logs.append, **kw)
+    return result, code, logs
+
+
+def guard_clean_is_not_unreachable(code):
+    """The guard: an unreachable core is never clean."""
+    if code == 0:
+        raise AssertionError("unreachable core reported as clean")
+
+
+def guard_timeout_is_operational(code):
+    if code == 3:
+        raise AssertionError("CoreDump timeout reported as UNSTABLE")
+
+
+def guard_one_instant(core_consistent_each_instant, code):
+    if core_consistent_each_instant and code == 2:
+        raise AssertionError("mismatch reported across two instants")
+
+
+class CoreExpectedSide(unittest.TestCase):
+    def test_clean_state_is_green(self):
+        result, code, _ = sweep(FakeCore([CLEAN]))
+        self.assertEqual(code, 0, json.dumps(result["checks"]))
+        self.assertEqual(result["status"], "OK")
+        self.assertIn("not the fixture oracle", result["statement"])
+        self.assertEqual({c["name"]: c["status"] for c in result["checks"]},
+                         {"conservation": "PASS", "locked_vs_holds": "PASS", "holds_live": "PASS", "order_holds": "PASS",
+                          "non_negativity": "PASS", "core_counters": "INDETERMINATE"})
+
+    def test_a_hold_on_an_order_that_is_not_live_is_a_residual_hold(self):
+        d, orders = CLEAN
+        dead = [dict(orders[0], status="CANCELLED", remaining=0), orders[1]]
+        result, code, _ = sweep(FakeCore([(d, dead)]))
+        self.assertEqual(code, 2)
+        texts = [core_expected.residual_text(r) for r in result["residual_holds"]]
+        self.assertEqual(texts, [f"residual hold: user 1 asset 0 {100 * M}"])
+        print("\ncore expected side, residual hold:", texts[0], "exit", code)
+
+    def test_a_hold_of_a_vanished_order_and_a_live_order_without_hold(self):
+        d, orders = CLEAN
+        result, code, _ = sweep(FakeCore([(d, orders[1:] + [order(13, 1, "BUY", 1 * M, 1 * M)])]))
+        self.assertEqual(code, 2)
+        names = {c["name"]: c for c in result["checks"]}
+        self.assertEqual(names["holds_live"]["drifts"][0]["orderId"], 11)
+        self.assertEqual(names["order_holds"]["drifts"][0]["reason"], "live order without a hold")
+
+    def test_a_live_hold_that_differs_from_the_recomputation(self):
+        d = dump_doc([(1, 0, 900 * M, 101 * M), (2, 1, 5 * M, 5 * M)], [(11, 1, 0, 101 * M), (12, 2, 1, 5 * M)])
+        result, code, _ = sweep(FakeCore([(d, CLEAN[1])]), funding=lambda: ({0: 1001 * M, 1: 10 * M}, {}, None))
+        self.assertEqual(code, 2)
+        names = {c["name"]: c["status"] for c in result["checks"]}
+        self.assertEqual(names["order_holds"], "FAIL")
+        self.assertEqual(names["conservation"], "PASS")
+
+    def test_a_partly_filled_buy_is_bounded_by_its_price_improvement(self):
+        # BUY 10 @ 10, 4 filled at 9: the core holds 100 - 36 = 64 > 10 x 6 = 60 (price improvement held to the end)
+        o = order(11, 1, "BUY", 10 * M, 10 * M, filled=4 * M, status="PARTIALLY_FILLED")
+        d = dump_doc([(1, 0, 900 * M, 64 * M), (1, 1, 4 * M, 0)], [(11, 1, 0, 64 * M)])
+        result, code, _ = sweep(FakeCore([(d, [o])]), funding=lambda: ({0: 964 * M, 1: 4 * M}, {}, None))
+        self.assertEqual(code, 0, json.dumps(result["checks"]))
+        d2 = dump_doc([(1, 0, 900 * M, 59 * M), (1, 1, 4 * M, 0)], [(11, 1, 0, 59 * M)])
+        _, code, _ = sweep(FakeCore([(d2, [o])]), funding=lambda: ({0: 959 * M, 1: 4 * M}, {}, None))
+        self.assertEqual(code, 2)   # below price x remaining: under-collateralized
+
+    def test_conservation_against_the_money_history(self):
+        _, code, _ = sweep(FakeCore([CLEAN]), funding=lambda: ({0: 1000 * M, 1: 10 * M}, {0: 1 * M}, None))
+        self.assertEqual(code, 2)
+
+    def test_a_money_history_behind_the_core_is_not_judged(self):
+        counters = lambda: {"m0": {"core_pending_commands": 0, "core_release_backlog": 0, "core_journal_seq": 9}}
+        result, code, _ = sweep(FakeCore([CLEAN]), funding=lambda: ({0: 1 * M}, {}, 7), counters_source=counters)
+        names = {c["name"]: c for c in result["checks"]}
+        self.assertEqual((code, names["conservation"]["status"]), (0, "INDETERMINATE"))
+        self.assertIn("journal 7 of 9", names["conservation"]["reason"])
+        self.assertEqual(names["core_counters"]["status"], "PASS")
+        _, code, _ = sweep(FakeCore([CLEAN]), funding=lambda: ({0: 1 * M}, {}, 9), counters_source=counters)
+        self.assertEqual(code, 2)     # at the head the gap is judged
+
+    def test_zero_hold_users(self):
+        result, code, _ = sweep(FakeCore([CLEAN]), zero_users=[(2, 2)])
+        self.assertEqual(code, 2)
+        self.assertEqual([core_expected.residual_text(r) for r in result["residual_holds"]],
+                         [f"residual hold: user 2 asset 1 {5 * M}"])
+
+    def test_live_traffic_is_unstable_then_stable(self):
+        moving = [(dump_doc([(1, 0, 900 * M - i, 100 * M)], [(11, 1, 0, 100 * M)]), CLEAN[1][:1]) for i in range(5)]
+        still = [(dump_doc([(1, 0, 900 * M, 100 * M)], [(11, 1, 0, 100 * M)]), CLEAN[1][:1])]
+        result, code, logs = sweep(FakeCore(moving + still * 10), funding=lambda: ({0: 1000 * M}, {}, None), retries=5)
+        unstable = [l for l in logs if l.startswith("UNSTABLE")]
+        self.assertGreaterEqual(len(unstable), 2, logs)
+        self.assertEqual((code, result["status"]), (0, "OK"))
+        print("\ncore expected side, live traffic:", len(unstable), "UNSTABLE attempts, then", result["status"])
+
+    def test_unstable_to_the_end_exits_3(self):
+        moving = [(dump_doc([(1, 0, i, 0)], []), []) for i in range(100)]
+        result, code, logs = sweep(FakeCore(moving), funding=lambda: ({}, {}, None), retries=3)
+        self.assertEqual((code, result["status"], len(logs)), (3, "UNSTABLE", 3))
+
+    def test_coredump_exit_3_is_an_operational_error_never_unstable(self):
+        with self.assertRaisesRegex(core_expected.OperationalError, "^CoreDump timeout"):
+            sweep(FakeCore([CLEAN], dump_rc=3))
+        with self.assertRaisesRegex(core_expected.OperationalError, "^CoreDump timeout"):
+            sweep(FakeCore([CLEAN], timeout=True))
+
+    def test_main_maps_an_unreachable_core_to_1(self):
         import contextlib
         import io
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        keys = []
+        for name in ("tool", "admin"):
+            p = os.path.join(tmp.name, name)
+            with open(p, "w") as fh:
+                fh.write("1:TOOL:00\n")
+            os.chmod(p, 0o600)
+            keys.append(p)
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            self.assertEqual(main(["--store", "core", "--oms-url", "http://127.0.0.1:9"]), 1)
-        self.assertIn("needs --cut MANIFEST", err.getvalue())
+            code = main(["--store", "core", "--tool-key-file", keys[0], "--admin-key-file", keys[1], "--cut",
+                         os.path.join(tmp.name, "missing.json")])
+        self.assertEqual(code, 1)
+        guard_clean_is_not_unreachable(code)
+        self.assertIn("operational error", err.getvalue())
+
+    def test_oms_flags_are_refused_with_the_core_store(self):
+        import contextlib
+        import io
+        for argv in (["--store", "core", "--oms-url", "http://127.0.0.1:9"], ["--store=core", "--sim-log", "x"]):
+            err = io.StringIO()
+            with self.subTest(argv=argv), contextlib.redirect_stderr(err):
+                self.assertEqual(main(argv), 64)
+            self.assertIn("has no meaning with --store core", err.getvalue())
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(main(["--store", "nope"]), 64)   # a usage error is 64, never 2
+
+    def test_a_read_killed_at_the_bound_leaves_no_driver_directory(self):
+        import subprocess
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        pidfile = os.path.join(tmp.name, "pid")
+        script = ("import os,time; os.makedirs('/dev/shm/aeron-aedump-%d' % os.getpid()); "
+                  f"open({pidfile!r}, 'w').write(str(os.getpid())); time.sleep(30)")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            core_expected.run_child([sys.executable, "-c", script], timeout=2)
+        with open(pidfile) as fh:
+            pid = fh.read()
+        self.assertFalse(os.path.exists(f"/dev/shm/aeron-aedump-{pid}"))
+
+    # ---- the three controls: each switches a rule off in a test copy and must fail with its text
+
+    def test_control_stability_reduced_to_the_markers(self):
+        # Every instant is consistent (state a, then state b: order 12 cancelled, its hold released), the content
+        # moves between the third and the fourth read while the markers stay equal: the reduced check judges the dump of
+        # one instant against the orders of another.
+        a = CLEAN
+        b = (dump_doc([(1, 0, 900 * M, 100 * M), (2, 1, 10 * M, 0)], [(11, 1, 0, 100 * M)]),
+             [order(11, 1, "BUY", 10 * M, 10 * M), order(12, 2, "SELL", 20 * M, 5 * M, status="CANCELLED")])
+        states = [a, a, a] + [b] * 20
+        _, code, _ = sweep(FakeCore(states, by_read=True))
+        self.assertEqual(code, 0)
+        guard_one_instant(True, code)   # the product check: content stability, no mismatch
+        _, reduced, _ = sweep(FakeCore(states, by_read=True), stable=core_expected.markers_stable)
+        with self.assertRaises(AssertionError) as caught:
+            guard_one_instant(True, reduced)
+        self.assertEqual(str(caught.exception), "mismatch reported across two instants")
+        print("\nCONTROL stability reduced to the markers ->", caught.exception)
+
+    def test_control_unreachable_mapped_to_clean(self):
+        def sweep_copy():
+            try:
+                sweep(FakeCore([CLEAN], timeout=True))
+            except core_expected.OperationalError:
+                return 0    # the planted mistake: an unreachable core read as clean
+            return 1
+        with self.assertRaises(AssertionError) as caught:
+            guard_clean_is_not_unreachable(sweep_copy())
+        self.assertEqual(str(caught.exception), "unreachable core reported as clean")
+        print("\nCONTROL unreachable mapped to clean ->", caught.exception)
+
+    def test_control_coredump_exit_3_passed_through(self):
+        def sweep_copy():
+            core = FakeCore([CLEAN], dump_rc=3)
+            p = core.run(["java", "CoreDump"])
+            return p.returncode     # the planted mistake: CoreDump's own exit code passed through
+        with self.assertRaises(AssertionError) as caught:
+            guard_timeout_is_operational(sweep_copy())
+        self.assertEqual(str(caught.exception), "CoreDump timeout reported as UNSTABLE")
+        print("\nCONTROL CoreDump exit 3 passed through ->", caught.exception)
 
 
 if __name__ == "__main__":

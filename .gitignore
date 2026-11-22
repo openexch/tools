@@ -1,5 +1,6 @@
 # Compiled binaries
 market-sim/market-sim
+obs-sampler/obs-sampler
 *.exe
 *.exe~
 *.dll
