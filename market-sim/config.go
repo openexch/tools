@@ -100,6 +100,8 @@ type Config struct {
 	KeyedStatsEvery  time.Duration
 	KeyedWindowsKept int
 	FaucetMax        map[int]oms.Money // per-request deposit cap per asset
+	SeedWorkers      int               // bot users funded at once
+	FaucetInterval   time.Duration     // least time between two deposits of one user
 
 	// bandMarginPct keeps the anchor this % inside the hard band so the 10%
 	// price collar and band rejects never fire at the edges.

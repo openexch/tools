@@ -292,9 +292,17 @@ func (c *Client) sendAttempt(ctx context.Context, kind KeyedKind, method, path s
 		start = att.Since
 	}
 	attempts := c.Retry.attempts()
+	seenUnknown := false
 	for n := 1; ; n++ {
 		r, err := c.once(ctx, method, path, asUser, body, key)
 		ok, unknown, wait := resendable(r, err)
+		// An earlier send of this key whose outcome was unknown stays
+		// unknown until an answer carries the core's decision: a later
+		// gateway refusal (429 or 503 before the core) says nothing about it.
+		seenUnknown = seenUnknown || unknown
+		if seenUnknown && !unknown && !coreDecided(r, err) {
+			unknown = true
+		}
 		if !ok || ctx.Err() != nil || n >= attempts {
 			c.done(kind, asUser, r, err, unknown)
 			return r, att, unknown, err
@@ -318,6 +326,23 @@ func (c *Client) sendAttempt(ctx context.Context, kind KeyedKind, method, path s
 			c.Keyed.Retry(asUser)
 		}
 	}
+}
+
+// coreDecided: the answer carries the core's decision for the key (a
+// success, a stored reject, or a core reason outside the transient 429 and
+// 503 answers).
+func coreDecided(r reply, err error) bool {
+	if err != nil {
+		return false
+	}
+	if r.status >= 200 && r.status < 300 {
+		return true
+	}
+	e := decodeError(r)
+	if e == nil {
+		return false
+	}
+	return e.KeyFinal || e.ReasonName() != "" && e.HTTP != 429 && e.HTTP != 503
 }
 
 func (c *Client) done(kind KeyedKind, user int64, r reply, err error, unknown bool) {
@@ -507,6 +532,19 @@ func (c *Client) Deposit(ctx context.Context, userID int64, assetID int, amount 
 // resends it with that attempt rather than reading the balance and funding
 // the shortfall under a new key.
 func (c *Client) DepositKeyed(ctx context.Context, userID int64, assetID int, amount Money, prev *KeyedAttempt) (*DepositResponse, *KeyedAttempt, error) {
+	d, att, unknown, err := c.DepositAttempt(ctx, userID, assetID, amount, prev)
+	if unknown {
+		return nil, &att, err
+	}
+	return d, nil, err
+}
+
+// DepositAttempt is DepositKeyed that always returns the attempt (its key and
+// first-send time; zero when nothing was sent) and says whether the outcome
+// is unknown. A caller that is refused by the gateway before the core saw the
+// request (429 RATE_LIMITED without a core reason) can resend the same
+// attempt after the Retry-After instead of minting a new key.
+func (c *Client) DepositAttempt(ctx context.Context, userID int64, assetID int, amount Money, prev *KeyedAttempt) (*DepositResponse, KeyedAttempt, bool, error) {
 	const path = "/balances/deposit"
 	body := struct {
 		AssetID ID    `json:"assetId"`
@@ -517,16 +555,16 @@ func (c *Client) DepositKeyed(ctx context.Context, userID int64, assetID int, am
 		if err == nil {
 			err = errorFrom(http.MethodPost, path, r)
 		}
-		return nil, &att, err
+		return nil, att, true, err
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, att, false, err
 	}
 	var out DepositResponse
 	if err := decodeInto(http.MethodPost, path, r, &out); err != nil {
-		return nil, nil, err
+		return nil, att, false, err
 	}
-	return &out, nil, nil
+	return &out, att, false, nil
 }
 
 // Markets is the public GET /markets (the core config: tick, lot, band).

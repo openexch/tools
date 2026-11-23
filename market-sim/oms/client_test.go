@@ -475,3 +475,36 @@ func TestMissingKeyIsRefusedBeforeSending(t *testing.T) {
 		t.Fatalf("%d sends without a credential", n)
 	}
 }
+
+// A gateway refusal after an unknown outcome does not settle the key: the
+// deposit comes back with its attempt, so the caller resends it under that
+// key instead of funding the shortfall under a new one.
+func TestDepositUnknownStaysUnknownAfterGatewayRefusal(t *testing.T) {
+	unknown := status(504, `{"error":"the core did not answer in time","code":"OUTCOME_UNKNOWN","reason":null,"detail":null,"keyFinal":false}`)
+	bucket := status(429, `{"error":"too many requests","code":"RATE_LIMITED","reason":null,"detail":"faucet","keyFinal":false}`, "Retry-After", "1")
+	rec := &recorder{replies: []func(http.ResponseWriter){unknown, bucket}}
+	c, _ := newTestClient(t, rec)
+	c.Retry.Attempts = 2
+	_, att, unknownOut, err := c.DepositAttempt(context.Background(), 900001, 0, MustMoney("10"), nil)
+	if err == nil || !unknownOut {
+		t.Fatalf("unknown=%v err=%v, want the 504 outcome to stay unknown after a 429", unknownOut, err)
+	}
+	r := rec.all()
+	if len(r) != 2 || r[0].Key != r[1].Key || att.Key != r[0].Key {
+		t.Fatalf("sends %d, attempt key %q", len(r), att.Key)
+	}
+	recK := &recorder{replies: []func(http.ResponseWriter){unknown, bucket}}
+	cK, _ := newTestClient(t, recK)
+	cK.Retry.Attempts = 2
+	if _, a2, err := cK.DepositKeyed(context.Background(), 900001, 0, MustMoney("10"), nil); err == nil || a2 == nil {
+		t.Fatalf("DepositKeyed: attempt %v err %v, want an attempt to resend", a2, err)
+	}
+
+	// A stored core decision after the unknown send settles the key.
+	rec2 := &recorder{replies: []func(http.ResponseWriter){unknown, status(201, `{"assetId":"0","amount":"10","available":"10","duplicate":true}`)}}
+	c2, _ := newTestClient(t, rec2)
+	c2.Retry.Attempts = 2
+	if _, _, u, err := c2.DepositAttempt(context.Background(), 900001, 0, MustMoney("10"), nil); err != nil || u {
+		t.Fatalf("unknown=%v err=%v, want the resend's success to settle it", u, err)
+	}
+}

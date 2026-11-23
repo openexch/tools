@@ -45,6 +45,8 @@ func main() {
 	flag.DurationVar(&cfg.KeyedStatsEvery, "keyed-stats-interval", 30*time.Second, "how often the keyed stats line is logged and the file rewritten")
 	flag.IntVar(&cfg.KeyedWindowsKept, "keyed-windows-kept", 64, "closed windows kept in the stats file")
 	faucetMax := flag.String("faucet-max", envOr("SIM_FAUCET_MAX", ""), "per-request deposit cap as assetId:amount,... (the gateway's GATEWAY_FAUCET_MAX_AMOUNT); a larger shortfall is sent as several deposits")
+	seedWorkers := flag.String("seed-workers", envOr("SIM_SEED_WORKERS", strconv.Itoa(accounts.DefaultWorkers)), "bot users funded at once while seeding (each user's deposits stay sequential)")
+	faucetInterval := flag.String("faucet-interval", envOr("SIM_FAUCET_INTERVAL", accounts.DefaultFaucetInterval.String()), "least time between two deposits of one user: the period of the gateway's GATEWAY_FAUCET_RATE (1/s = 1s)")
 	markets := flag.String("markets", "", "comma-separated market symbols to simulate (default: all)")
 	flag.Int64Var(&cfg.BotBase, "bot-base", cfg.BotBase, "first bot userId (population is contiguous)")
 	flag.IntVar(&cfg.BotsPerMarket, "bots-per-market", cfg.BotsPerMarket, "bots per market")
@@ -77,6 +79,12 @@ func main() {
 	var err error
 	if cfg.FaucetMax, err = parseFaucetMax(*faucetMax); err != nil {
 		refuseConfig("SIM_FAUCET_MAX", "-faucet-max: %v", err)
+	}
+	if cfg.SeedWorkers, err = strconv.Atoi(*seedWorkers); err != nil || cfg.SeedWorkers < 1 {
+		refuseConfig("SIM_SEED_WORKERS", "-seed-workers %q: want a whole number of at least 1", *seedWorkers)
+	}
+	if cfg.FaucetInterval, err = time.ParseDuration(*faucetInterval); err != nil || cfg.FaucetInterval <= 0 {
+		refuseConfig("SIM_FAUCET_INTERVAL", "-faucet-interval %q: want a duration above zero, e.g. 1s", *faucetInterval)
 	}
 	creds, err := loadCredentials(*keysFile, *devAuth, cfg.Users())
 	if err != nil {
@@ -331,7 +339,7 @@ func seed(ctx context.Context, cfg *Config, client *oms.Client) error {
 	// The canary bot trades every market at tiny size; fund USD only plus a
 	// sliver of each base asset via the first market's target row.
 	targets = append(targets, accounts.Target{UserID: cfg.CanaryBot, USD: cfg.USDFloat})
-	s := &accounts.Seeder{Client: client, FaucetMax: cfg.FaucetMax}
+	s := &accounts.Seeder{Client: client, FaucetMax: cfg.FaucetMax, Workers: cfg.SeedWorkers, FaucetInterval: cfg.FaucetInterval}
 	// Retry the whole pass on transient failure (e.g. the core briefly
 	// unavailable at boot): a crash here disarms the sim service and takes the
 	// demo down. Every deposit is resent only with its own Idempotency-Key.
@@ -372,7 +380,7 @@ func onceCheck(ctx context.Context, cfg *Config, client *oms.Client) error {
 	bot := cfg.CanaryBot
 
 	// Fund the canary enough for one far bid.
-	s := &accounts.Seeder{Client: client, FaucetMax: cfg.FaucetMax}
+	s := &accounts.Seeder{Client: client, FaucetMax: cfg.FaucetMax, Workers: cfg.SeedWorkers, FaucetInterval: cfg.FaucetInterval}
 	if _, err := s.Seed(ctx, []accounts.Target{{UserID: bot, USD: cfg.USDFloat}}); err != nil {
 		return err
 	}

@@ -31,6 +31,7 @@ Gateway side: `GATEWAY_AUTH_MODES` and `STREAM_AUTH_MODES` include `api-key`, wi
 - **Dev auth.** `-dev-auth` sends `Authorization: Bearer dev:<userId>` instead. Only a gateway with `dev` in its auth modes and `GATEWAY_ALLOW_DEV_AUTH=1` accepts it.
 - **One key per logical request.** Every create, amend and deposit (and every single cancel with `-keyed-cancels`) gets a fresh UUID `Idempotency-Key`.
 - **Retries reuse that key.** A resend after a transport error, a 504, or a 503/429 `CORE_UNAVAILABLE`, `OVERLOADED` or `RATE_LIMITED` with `keyFinal:false` reuses the key. A keyed resend never starts later than `-retry-max-elapsed` after the first send (default: half of the gateway's `idempotencyWindowMs`); with no window known, a keyed request is never resent.
+- **Seeding runs users in parallel.** The gateway's faucet bucket (`GATEWAY_FAUCET_RATE`, 1/s) is per user, so `-seed-workers` users are funded at once. One user's deposits stay sequential, spaced by `-faucet-interval`; a faucet 429 is resent with the same key after its `Retry-After`.
 - **Unknown deposits are not funded twice.** A deposit whose outcome stayed unknown is remembered; the next seeding pass resends it with its own key before it reads the balance, and drops it once it is decided or past the window.
 
 ## Keyed request counters
@@ -54,6 +55,8 @@ Flags win over environment variables. `./market-sim -h` lists every flag with it
 | `-api-keys-file` | `SIM_API_KEYS_FILE` | none |
 | `-dev-auth` | `SIM_DEV_AUTH=1` | off |
 | `-faucet-max` | `SIM_FAUCET_MAX` | none; per-request deposit cap as `assetId:amount,...` (the gateway's `GATEWAY_FAUCET_MAX_AMOUNT`) |
+| `-seed-workers` | `SIM_SEED_WORKERS` | `16`; bot users funded at once while seeding |
+| `-faucet-interval` | `SIM_FAUCET_INTERVAL` | `1s`; least time between two deposits of one user, the period of the gateway's `GATEWAY_FAUCET_RATE` |
 | `-keyed-stats-file` | `SIM_KEYED_STATS_FILE` | none (stats line only) |
 | `-keyed-window`, `-keyed-stats-interval`, `-keyed-windows-kept` | | `0`, `30s`, `64` |
 | `-keyed-cancels` | | off |
