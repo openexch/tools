@@ -86,8 +86,8 @@ class JudgeTest(unittest.TestCase):
         confirmation.REQUIRED_ROWS = ()
         self.addCleanup(setattr, confirmation, 'REQUIRED_ROWS', saved)
 
-    def judge(self, runs, check=lambda m, k: []):
-        return confirmation.judge(self.plan, runs, self.cut, check=check)
+    def judge(self, runs, check=lambda m, k: [], **kw):
+        return confirmation.judge(self.plan, runs, self.cut, check=check, **kw)
 
     def test_all_pass(self):
         s = self.judge(runs_for(self.plan))
@@ -97,8 +97,8 @@ class JudgeTest(unittest.TestCase):
 
     def test_inconclusive_then_pass_is_pass_and_both_are_kept(self):
         runs = runs_for(self.plan)
-        runs.insert(0, dict(runs[0], status='INCONCLUSIVE', error='startup deadline exceeded'))
-        s = self.judge(runs)
+        runs.insert(0, dict(runs[0], status='INCONCLUSIVE', error='startup deadline exceeded', label='lostack-1'))
+        s = self.judge(runs, explanations={'lostack-1': 'harness startup deadline on a loaded box'})
         self.assertEqual(s['status'], 'PASS')
         self.assertEqual([r['status'] for r in s['legs'][0]['runs']], ['INCONCLUSIVE', 'PASS'])
 
@@ -108,10 +108,126 @@ class JudgeTest(unittest.TestCase):
         s = self.judge(runs[:2])
         self.assertEqual(s['findings'], ['INCONCLUSIVE left: core-drill-lostack on s17-ext: x', 'leg not run: core-red-1 on s17-red1'])
 
+    def test_a_control_held_with_a_fail_status(self):
+        runs = runs_for(self.plan)
+        runs[2]['status'] = 'FAIL'
+        runs[2]['control'] = {'held': True, 'expected_text': 'gap'}
+        self.assertEqual(self.judge(runs)['findings'], [])
+        runs[2]['control'] = {'held': False, 'expected_text': 'gap'}
+        self.assertEqual(len(self.judge(runs)['findings']), 2)
+
     def test_a_control_that_did_not_hold(self):
         runs = runs_for(self.plan)
         runs[2]['control'] = {'held': False, 'expected_text': 'gap'}
         self.assertEqual(self.judge(runs)['findings'], ["control did not hold on its own text: core-red-1 on s17-red1: 'gap'"])
+
+    def test_a_core_control_without_a_block_is_judged_on_its_status(self):
+        runs = runs_for(self.plan)
+        self.assertEqual(self.judge(runs)['findings'], [])
+        runs[2]['status'] = 'FAIL'
+        self.assertEqual(self.judge(runs)['findings'], [
+            'leg FAIL: core-red-1 on s17-red1',
+            f"control did not hold on its own text: core-red-1 on s17-red1: {confirmation.CONTROL_STATUS_TEXT!r}"])
+
+    def test_a_gateway_control_block_holds_on_status_and_failed_lines(self):
+        self.plan = {'entries': [entry(PLAN, 'gw-b3')]}
+        text = 'stored acceptance answered ADMISSION_CLOSED'
+        runs = runs_for(self.plan)
+        runs[0]['control'] = {'expected_text': text, 'failed_lines': ['stored_acceptance_answered'],
+                              'observed': {'stored_acceptance_answered': text}}
+        self.assertEqual(self.judge(runs)['findings'], [])
+        runs[0]['control'] = {'expected_text': text, 'failed_lines': [], 'observed': {}}
+        self.assertEqual(self.judge(runs)['findings'], [f'control did not hold on its own text: gw-b3 on gw-b3: {text!r}'])
+        runs[0]['status'] = 'FAIL'
+        self.assertEqual(self.judge(runs)['findings'], ['leg FAIL: gw-b3 on gw-b3',
+                                                        f'control did not hold on its own text: gw-b3 on gw-b3: {text!r}'])
+
+    def test_a_projection_control_block_holds_with_no_other_failed_line(self):
+        self.plan = {'entries': [entry(PLAN, 'pj-nc-dropone')]}
+        text = 'journalSeq missing in projection'
+        runs = runs_for(self.plan)
+        for r in runs:
+            r['control'] = {'control': text, 'failed_lines': ['events_dense_to_head'], 'other_failed_lines': [],
+                            'observed': {'events_dense_to_head': text}}
+        self.assertEqual(self.judge(runs)['findings'], [])
+        runs[1]['control'] = dict(runs[1]['control'], other_failed_lines=['history'])
+        self.assertEqual(self.judge(runs)['findings'],
+                         [f'control did not hold on its own text: pj-nc-dropone on pj-nc-dropone-ext: {text!r}'])
+
+    def test_a_held_block_with_other_failures_did_not_hold(self):
+        runs = runs_for(self.plan)
+        runs[2]['control'] = {'name': 'x', 'expected_text': 'gap', 'held': True, 'failed_lines': ['a'],
+                              'other_failures': {'money_oracle': 'money oracle not PASS'}}
+        self.assertEqual(self.judge(runs)['findings'], ["control did not hold on its own text: core-red-1 on s17-red1: 'gap'"])
+
+    def test_the_smoke_nomatch_block(self):
+        self.plan = {'entries': [entry(PLAN, 'core-control-smoke-nomatch')]}
+        runs = runs_for(self.plan, status='FAIL')
+        for r in runs:
+            r['control'] = {'name': 'nomatch', 'expected': 'not PASS; the order oracle names O7 or O10', 'held': True,
+                            'other_failures': {}}
+        self.assertEqual(self.judge(runs)['findings'], [])
+        runs[0]['control'] = dict(runs[0]['control'], held=False, other_failures={'money_oracle': 'money oracle not PASS'})
+        self.assertEqual(self.judge(runs)['findings'], [
+            'leg FAIL: core-control-smoke-nomatch on cps-nofwd',
+            "control did not hold on its own text: core-control-smoke-nomatch on cps-nofwd: "
+            "'not PASS; the order oracle names O7 or O10'"])
+
+    def test_more_than_two_reruns_is_a_finding(self):
+        runs = runs_for(self.plan)
+        first = [dict(runs[0], status='INCONCLUSIVE', label=f'r{n}') for n in range(3)]
+        s = self.judge(first + runs, explanations={'r0': 'a', 'r1': 'b', 'r2': 'c'})
+        self.assertEqual(s['findings'], ['more than 3 runs: core-drill-lostack on s17: 4 runs'])
+        s = self.judge(first[1:] + runs, explanations={'r1': 'b', 'r2': 'c'})
+        self.assertEqual(s['findings'], [])
+
+    def test_a_rerun_needs_an_explanation(self):
+        runs = runs_for(self.plan)
+        runs[0]['label'] = 'lostack-2'
+        runs.insert(0, dict(runs[0], status='FAIL', label='lostack-1', error='boom'))
+        s = self.judge(runs)
+        self.assertEqual(s['findings'], ['re-run without an explanation: lostack-1'])
+        s = self.judge(runs, explanations={'lostack-1': 'the box rebooted under the run'})
+        self.assertEqual((s['status'], s['findings']), ('PASS', []))
+        self.assertEqual(s['legs'][0]['runs'][0]['explanation'], 'the box rebooted under the run')
+        self.assertNotIn('explanation', s['legs'][0]['runs'][1])
+        # a PASS before the last run needs no explanation
+        runs[0]['status'] = 'PASS'
+        self.assertEqual(self.judge(runs)['findings'], [])
+
+    def test_an_accepted_failure_is_a_deviation(self):
+        runs = runs_for(self.plan)
+        runs[1].update(status='FAIL', label='lostack-ext', error='x')
+        s = self.judge(runs, accepted={'lostack-ext': 'owner: known ME defect, fixed in the next cut'})
+        self.assertEqual((s['status'], s['findings']), ('PASS', []))
+        self.assertEqual(s['accepted'], [{'entry': 'core-drill-lostack', 'kind': 's17-ext', 'label': 'lostack-ext',
+                                          'status': 'FAIL', 'error': 'x', 'evidence': None,
+                                          'accepted': 'owner: known ME defect, fixed in the next cut',
+                                          'findings': ['leg FAIL: core-drill-lostack on s17-ext: x']}])
+        # another finding keeps the status FAIL; the deviation is still listed
+        s = self.judge(runs[:2], accepted={'lostack-ext': 'owner'})
+        self.assertEqual((s['status'], s['findings'], len(s['accepted'])), ('FAIL', ['leg not run: core-red-1 on s17-red1'], 1))
+        # an INCONCLUSIVE last run is not accepted
+        runs[1]['status'] = 'INCONCLUSIVE'
+        s = self.judge(runs, accepted={'lostack-ext': 'owner'})
+        self.assertEqual(s['findings'], ['INCONCLUSIVE left: core-drill-lostack on s17-ext: x',
+                                         'accepted deviation names no last-run FAIL: lostack-ext'])
+
+    def test_an_accepted_control_failure_covers_its_control_text(self):
+        runs = runs_for(self.plan)
+        runs[2].update(status='FAIL', label='red1')
+        s = self.judge(runs, accepted={'red1': 'owner'})
+        self.assertEqual((s['status'], len(s['accepted'][0]['findings'])), ('PASS', 2))
+
+    def test_the_explain_file(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        f = Path(tmp.name) / 'explain.json'
+        f.write_text(json.dumps({'a-1': 'why', 'explanations': {'b-1': 'why b'}, 'accepted': {'c': 'owner'}}))
+        self.assertEqual(confirmation.load_explanations(f), ({'a-1': 'why', 'b-1': 'why b'}, {'c': 'owner'}))
+        f.write_text(json.dumps({'a-1': ' '}))
+        with self.assertRaises(confirmation.PlanError):
+            confirmation.load_explanations(f)
+        self.assertEqual(confirmation.load_explanations(None), ({}, {}))
 
     def test_a_manifest_of_another_cut_is_refused_with_the_checker_text(self):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)

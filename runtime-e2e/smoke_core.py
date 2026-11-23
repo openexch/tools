@@ -981,9 +981,52 @@ def workload_lines(log, sample, work, rest_id):
     }
 
 
+# The smoke lines that fail when both forwarder slots are empty, each with its reason read from the core at the cut
+# (core-cluster OrderEngine, 35d445b). With no forwarder the core's CREATE dispatches are never carried to the ME: every
+# order stays PENDING_NEW with its create unresolved (F_DISPATCH_PENDING). Any other failing line, above all the money
+# oracle, means the control did not hold.
+NOMATCH_EXPECTED = {
+    'order_oracle': 'the control\'s own line: O7 or O10 names the orders the ME never answered',
+    'fills': 'no order reaches the ME, so the ME journal holds no trade',
+    'workload_partial_fill': 'no fill: the resting order never rests at the ME',
+    'workload_amend': 'an amend of an order whose create is unresolved is refused NOT_OPEN (OrderEngine.applyAmend, '
+                      'F_DISPATCH_PENDING with PK_CREATE)',
+    'workload_cancel': 'a cancel of an order whose create is unresolved is acknowledged PENDING_CANCEL and only flagged; '
+                       'the single cancel is minted when the create ACK lands (OrderEngine.cancelBody, C8b), so the order '
+                       'stays PENDING_NEW',
+    'holds_after_cancel_all': 'the hold is released only at the terminal apply (OrderEngine.terminalize); a cancel of an '
+                              'unresolved create waits for the ME ACK (C8b), because the dispatched CREATE may still reach '
+                              'the ME and fill',
+    'request_log': 'the core mints no CANCEL dispatch while the create is unresolved (C8b): the log\'s cancels have no '
+                   'core CANCEL (only a cancels difference with nothing core-only is expected)',
+    'public_tape': 'no trade: the public tape has nothing to compare (INCONCLUSIVE)',
+    'market_history': 'no trade: md_trades has nothing to compare (INCONCLUSIVE)',
+    'book_resting_level': 'no order rests at the ME, so the book never shows the resting level',
+}
+
+
+def nomatch_unexpected(lines):
+    """{line: text} of the failing lines the nomatch control does not expect (NOMATCH_EXPECTED; a request-log
+    difference other than cancels the log has and the core has not counts as unexpected)."""
+    out = {}
+    for k, v in lines.items():
+        if v.get('holds'):
+            continue
+        if k == 'request_log':
+            diff = (v.get('detail') or {}).get('differences') or {}
+            cancels = diff.get('cancels') or {}
+            if set(diff) == {'cancels'} and not cancels.get('core_only'):
+                continue
+        elif k in NOMATCH_EXPECTED:
+            continue
+        out[k] = v.get('text') or k
+    return out
+
+
 class NoMatchDrill(SmokeDrill):
-    """The smoke's non-vacuity: the same workload with both forwarder slots empty. The smoke must not PASS and the order
-    oracle must name O7 or O10; with any fill the control is vacuous (INCONCLUSIVE)."""
+    """The smoke's non-vacuity: the same workload with both forwarder slots empty. The smoke must not PASS, the order
+    oracle must name O7 or O10, and no line outside NOMATCH_EXPECTED may fail (the money oracle above all); with any
+    fill the control is vacuous (INCONCLUSIVE)."""
     nomatch = True
 
     def finish(self, lines):
@@ -991,14 +1034,20 @@ class NoMatchDrill(SmokeDrill):
         smoke_status, _ = verdict(lines)
         order = (lines.get('order_oracle') or {}).get('detail') or {}
         named = sorted(set(order.get('failing') or []) & {'O7', 'O10'}) + sorted(set(order.get('inconclusive') or []) & {'O7', 'O10'})
-        held = smoke_status != 'PASS' and bool(named) and trades == 0
+        others = nomatch_unexpected(lines)
+        held = smoke_status != 'PASS' and bool(named) and trades == 0 and not others
         control = {'name': 'nomatch', 'expected': 'not PASS; the order oracle names O7 or O10', 'held': held,
                    'smoke_status': smoke_status, 'named': named, 'fills': trades,
+                   'expected_failures': sorted(k for k, v in lines.items() if not v.get('holds') and k not in others),
+                   'other_failures': others,
                    'forwarders': [self.f.m['slot_artifacts'].get(s) for s in ('fwd0', 'fwd1')]}
         if trades > 0:
             status, error = 'INCONCLUSIVE', VACUOUS_TEXT
         elif held:
             status, error = 'FAIL', 'order oracle not PASS: ' + ', '.join(named)
+        elif others and named:
+            status, error = 'FAIL', 'nomatch control: unexpected failing line(s): ' + '; '.join(
+                f'{k}: {t}' for k, t in sorted(others.items()))
         else:
             status, error = 'FAIL', f'smoke {smoke_status} without an order oracle naming O7 or O10'
         result = {'status': status, 'lines': lines, 'record': self.record, 'control': control, 'error': error}

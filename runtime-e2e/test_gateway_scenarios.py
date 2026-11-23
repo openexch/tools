@@ -12,6 +12,7 @@ import unittest
 import unittest.mock
 
 from contracts import FP, Inconclusive
+import core_contracts
 import gateway_probe
 import gateway_scenarios as gs
 from gateway_shim import request_id
@@ -411,6 +412,33 @@ class SessionClosesTest(unittest.TestCase):
         self.assertEqual((one['total'], one['discard_closed']), (1.0, None))
         self.assertEqual(gs.session_closes({'resumable_closed': 0.0, 'discard_closed': 0.0},
                                            {'resumable_closed': None, 'discard_closed': 0.0})['total'], 0.0)
+
+
+class CeilingLineTest(unittest.TestCase):
+    lowered = {'core_jvm_properties': {'core.egress.max.capacity.bytes': '262144'}}
+    ceiling = {'resumable_closed': 1.0, 'discard_closed': 0.0, 'path': [gs.CLOSE_PATHS['resumable_closed']]}
+    discard = {'resumable_closed': 0.0, 'discard_closed': 1.0, 'path': [gs.CLOSE_PATHS['discard_closed']]}
+
+    def test_a_lowered_kind_asserts_the_ceiling_path(self):
+        # nights 20261123T020513Z/20 (gw-slow-ext) and 20261123T044635Z/37 (gw-slow): resumable_closed 1, discard 0
+        self.assertTrue(gs.ceiling_line(self.ceiling, self.lowered, None)['holds'])
+        # a broken ceiling that still closes through the discard path no longer passes
+        through_discard = gs.ceiling_line(self.discard, self.lowered, None)
+        self.assertEqual((through_discard['holds'], through_discard['text']), (False, gs.CEILING_TEXT))
+
+    def test_a_kind_at_the_default_has_no_line_unless_it_is_the_control(self):
+        self.assertIsNone(gs.ceiling_line(self.discard, {'core_jvm_properties': {}}, None))
+        control = gs.ceiling_line(self.discard, {'core_jvm_properties': {}}, gs.CEILING_TEXT)
+        # out/gw-slow-ceiling16m: the 16 MiB default closed through discard, so the control fails on the line's text
+        self.assertEqual((control['holds'], control['text']), (False, gs.CEILING_TEXT))
+        self.assertEqual(core_contracts.GATEWAY_KINDS['gw-slow-ceiling16m']['control_text'], gs.CEILING_TEXT)
+
+    def test_an_unreadable_counter_is_inconclusive_without_the_text(self):
+        unread = gs.ceiling_line({'resumable_closed': None, 'discard_closed': 1.0, 'path': None}, self.lowered, None)
+        self.assertTrue(unread['inconclusive'])
+        self.assertNotIn('text', unread)
+        unread = gs.ceiling_line({'resumable_closed': None, 'discard_closed': 1.0, 'path': None}, {}, gs.CEILING_TEXT)
+        self.assertNotIn('text', unread)
 
 
 class GateSettleTest(unittest.TestCase):

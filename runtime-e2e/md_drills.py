@@ -44,6 +44,7 @@ import json
 import os
 from pathlib import Path
 import re
+import threading
 import time
 
 from contracts import FP, Inconclusive, Violation
@@ -77,8 +78,10 @@ SETTINGS = {
     # default), and how long md0 is watched for an exit after its embedded driver's directory is unlinked (past that timeout)
     'MD_EXIT_BOUND_S': 60, 'MD_EMBEDDED_WATCH_S': 20,
     # core-md-frozen: the freeze, the service's MD_EGRESS_STALE_MS it must exceed (the service runs on its default), the
-    # sample period while frozen and the bound on the forwarders' ME egress age (drill bounds, never limits of a binary)
+    # sample period while frozen, the fewest readable egress-age samples a freeze needs inside its frozen window, and the
+    # bound on the forwarders' ME egress age (drill bounds, never limits of a binary)
     'MD_FREEZE_S': 20, 'MD_EGRESS_STALE_MS': 10000, 'MD_FREEZE_SAMPLE_MS': 1000, 'MD_EGRESS_AGE_BOUND_MS': 5000,
+    'MD_FREEZE_MIN_SAMPLES': 3,
     'MD_POLL_MS': 500, 'MD_TAP_S': 3600,
 }
 # MD_CONTROL -> (scenario, the text its line fails with, whether the run then ends INCONCLUSIVE)
@@ -1021,6 +1024,55 @@ class DriverKill(MdDrill):
         return row
 
 
+EGRESS_UNSAMPLED_TEXT = 'egress age was never sampled'
+EGRESS_AGE_TEXT = 'ME egress age above the drill bound while the market service was frozen'
+
+
+def max_age(ages):
+    """The larger of the readable ages, None when none is readable (an unreadable metric is never an age of 0)."""
+    read = [x for x in ages if x is not None]
+    return max(read) if read else None
+
+
+class AgeSampler:
+    """Samples ``read()`` every ``period_s`` from a thread until stopped; each sample is a value or None (unreadable)."""
+
+    def __init__(self, read, period_s):
+        self.read, self.period_s = read, period_s
+        self.samples, self._stop = [], threading.Event()
+        self._thread = threading.Thread(target=self._loop, name='md-egress-age', daemon=True)
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                self.samples.append(self.read())
+            except Exception:           # a failed read is an unread sample, never a stopped sampler
+                self.samples.append(None)
+            self._stop.wait(self.period_s)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join()
+        return list(self.samples)
+
+
+def egress_age_line(freezes, bound_ms, min_samples):
+    """Every freeze kept the forwarders' ME egress age under the bound, judged on at least ``min_samples`` readable
+    samples inside its frozen window: fewer (none sampled, or the metric unreadable) is INCONCLUSIVE, never an age of 0."""
+    detail = {'bound_ms': bound_ms, 'min_samples': min_samples,
+              'max_ms': [x.get('egress_age_max_ms') for x in freezes],
+              'samples': [x.get('egress_age_samples', 0) for x in freezes],
+              'unread': [x.get('egress_age_unread', 0) for x in freezes]}
+    if not freezes or any((x.get('egress_age_samples') or 0) < min_samples or x.get('egress_age_max_ms') is None
+                          for x in freezes):
+        return line(False, detail, EGRESS_UNSAMPLED_TEXT, inconclusive=True)
+    return line(all(x['egress_age_max_ms'] < bound_ms for x in freezes), detail, EGRESS_AGE_TEXT)
+
+
 class Frozen(MdDrill):
     """core-md-frozen: md0 frozen with SIGSTOP past its egress stale time, twice, while the story trades."""
 
@@ -1057,10 +1109,8 @@ class Frozen(MdDrill):
                  {'freezes': [{k: x.get(k) for k in ('cycle', 'book_frames_delta', 'dispatch_delta', 'bridge_cursor_delta',
                                                      'round_filled')} for x in freezes]},
                  'matching or settlement stalled while the market service was frozen'), 'frozen')
-        lines['egress_age'] = consequence(
-            line(bool(freezes) and all((x['egress_age_max_ms'] or 0) < md['MD_EGRESS_AGE_BOUND_MS'] for x in freezes),
-                 {'bound_ms': md['MD_EGRESS_AGE_BOUND_MS'], 'max_ms': [x['egress_age_max_ms'] for x in freezes]},
-                 'ME egress age above the drill bound while the market service was frozen'), 'frozen')
+        lines['egress_age'] = consequence(egress_age_line(freezes, md['MD_EGRESS_AGE_BOUND_MS'], md['MD_FREEZE_MIN_SAMPLES']),
+                                          'frozen')
         lines['book_healed'] = consequence(
             line(bool(freezes) and all(x.get('book_ready_after_thaw') for x in freezes),
                  {'freezes': [{k: x.get(k) for k in ('cycle', 'book_ready_before', 'book_ready_after_thaw', 'book_ready_s',
@@ -1071,7 +1121,8 @@ class Frozen(MdDrill):
 
     def counters(self):
         f, ports = self.f, self.f.m['ports']
-        out = {'book_frames': 0, 'dispatch': 0, 'egress_age_ms': 0}
+        out = {'book_frames': 0, 'dispatch': 0, 'egress_age_ms': None}
+        ages = []
         for slot in ('fwd0', 'fwd1'):
             try:
                 m = f.metrics(slot, ports['forwarder_http'])
@@ -1079,7 +1130,8 @@ class Frozen(MdDrill):
                 continue
             out['book_frames'] += metric(m, 'forwarder_book_frames_total') or 0
             out['dispatch'] += metric(m, 'forwarder_dispatch_sent_total') or 0
-            out['egress_age_ms'] = max(out['egress_age_ms'], metric(m, 'forwarder_me_egress_age_ms') or 0)
+            ages.append(metric(m, 'forwarder_me_egress_age_ms'))
+        out['egress_age_ms'] = max_age(ages)
         try:
             out['bridge_cursor'] = metric(f.metrics('bridge0', ports['bridge_http']), 'bridge_core_cursor') or 0
         except Inconclusive:
@@ -1095,6 +1147,16 @@ class Frozen(MdDrill):
                 pass
         return out
 
+    def egress_age(self):
+        """The forwarders' ME egress age now (the larger of the readable ones), None when no forwarder metric is readable."""
+        ages = []
+        for slot in ('fwd0', 'fwd1'):
+            try:
+                ages.append(metric(self.f.metrics(slot, self.f.m['ports']['forwarder_http']), 'forwarder_me_egress_age_ms'))
+            except Inconclusive:
+                ages.append(None)
+        return max_age(ages)
+
     def freeze(self, a, b, cycle, seconds):
         md, f = self.md, self.f
         # the precondition: the book is ready before the freeze, so a heal after it means something
@@ -1104,11 +1166,14 @@ class Frozen(MdDrill):
         row = {'cycle': cycle, 'book_ready_before': book_ready, 'freeze': f.freeze_main('md0', duration_s=seconds)}
         frozen_at = self.clock()
         self.mark(f'freeze{cycle}')
-        rows = self.story(a, b, f'story-frozen{cycle}', base_qty=3 + cycle)
-        ages = []
-        while self.clock() - frozen_at < seconds:
-            ages.append(self.counters()['egress_age_ms'])
-            self.sleep(md['MD_FREEZE_SAMPLE_MS'] / 1000)
+        # the egress age is sampled from a thread across the whole frozen window, the story included
+        sampler = AgeSampler(self.egress_age, md['MD_FREEZE_SAMPLE_MS'] / 1000).start()
+        try:
+            rows = self.story(a, b, f'story-frozen{cycle}', base_qty=3 + cycle)
+            while self.clock() - frozen_at < seconds:
+                self.sleep(md['MD_FREEZE_SAMPLE_MS'] / 1000)
+        finally:
+            ages = sampler.stop()
         after = self.counters()
         row['thaw'] = f.thaw_main('md0')
         row['frozen_s'] = round(self.clock() - frozen_at, 3)
@@ -1116,7 +1181,9 @@ class Frozen(MdDrill):
         self.mark(f'thaw{cycle}')
         orders = sorted({smoke_core.order_id_of(r) for r in rows} - {None})
         row.update(book_frames_delta=after['book_frames'] - before['book_frames'], dispatch_delta=after['dispatch'] - before['dispatch'],
-                   bridge_cursor_delta=after['bridge_cursor'] - before['bridge_cursor'], egress_age_max_ms=max(ages or [0]),
+                   bridge_cursor_delta=after['bridge_cursor'] - before['bridge_cursor'],
+                   egress_age_max_ms=max_age(ages), egress_age_samples=sum(1 for x in ages if x is not None),
+                   egress_age_unread=sum(1 for x in ages if x is None),
                    me_before=before.get('me'), me_after=after.get('me'),
                    round_orders=orders if len(orders) == len(rows) else [])
         # a process frozen past its own bounds may exit when it runs again (the product's choice, recorded): restarted as

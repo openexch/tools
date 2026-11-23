@@ -64,6 +64,49 @@ class FakeFixture:
                                                        'gw0-driver')}}
 
 
+class ExtFixture(FakeFixture):
+    m = dict(FakeFixture.m, engine_driver='external', probe_libs={'aeronmd': {'path': '/a/aeronmd', 'sha256': 'x'}},
+             nodes=dict(FakeFixture.m['nodes'], ae1='10.0.0.11', ae2='10.0.0.12'),
+             ports=dict(FakeFixture.m['ports'], ae_base=9300))
+
+    def engine_driver(self):
+        return self.m.get('engine_driver', 'embedded')
+
+
+class EmbFixture(ExtFixture):
+    m = {k: v for k, v in ExtFixture.m.items() if k != 'engine_driver'}
+
+
+class MoneyCheckCommand(unittest.TestCase):
+    def test_the_driver_mode_is_the_fixtures(self):
+        ext = od.money_check_argv(ExtFixture(), 'Q0', [93001, 93002])
+        self.assertEqual(od.money_check_driver(ExtFixture()), ('external', '/dev/shm/probe-aeron'))
+        self.assertEqual(ext[ext.index('--driver-mode') + 1], 'external')
+        self.assertEqual(ext[ext.index('--aeron-dir') + 1], '/dev/shm/probe-aeron')
+        emb = od.money_check_argv(EmbFixture(), 'Q2', [93001, 93002])
+        self.assertEqual(od.money_check_driver(EmbFixture()), ('embedded', None))
+        self.assertEqual(emb[emb.index('--driver-mode') + 1], 'embedded')
+        self.assertNotIn('--aeron-dir', emb)       # money-check refuses --aeron-dir with embedded
+        # everything else is the same command in both modes
+        strip = lambda argv: [a for a in argv if a not in ('external', 'embedded', '--aeron-dir', '/dev/shm/probe-aeron')]
+        self.assertEqual(strip(ext), strip([a.replace('Q2', 'Q0') for a in emb]))
+        self.assertEqual(emb[emb.index('--zero-hold-users') + 1], '93001-93002')
+        self.assertEqual(emb[emb.index('--funding-file') + 1], '/data/mc/funding-Q2.json')
+        self.assertEqual(ext[ext.index('--core-metrics') + 1],
+                         'http://10.0.0.10:19700/metrics,http://10.0.0.11:19700/metrics,http://10.0.0.12:19700/metrics')
+
+    def test_an_external_kind_never_falls_back_to_embedded(self):
+        class NoDriver(ExtFixture):
+            m = {k: v for k, v in ExtFixture.m.items() if k != 'probe_libs'}
+        with self.assertRaisesRegex(Inconclusive, "external driver mode needs the probe's aeronmd"):
+            od.money_check_argv(NoDriver(), 'Q0', [93001, 93002])
+
+        class Odd(ExtFixture):
+            m = dict(ExtFixture.m, engine_driver='shared')
+        with self.assertRaisesRegex(Inconclusive, 'no driver mode'):
+            od.money_check_driver(Odd())
+
+
 class SamplerConfig(unittest.TestCase):
     def test_every_slot_with_its_kind_and_routes(self):
         c = od.sampler_config(FakeFixture(), '/out/samples/s.jsonl', [11, 12])

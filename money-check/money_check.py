@@ -34,9 +34,11 @@ Stores:
                            re-hashed against it); funding from the money history. No OMS. The OMS and sim-log flags are
                            refused with this store (exit 64).
 
-Exit codes:  0 = all green   2 = an invariant was violated   1 = operational error (core unreachable, CoreDump timeout:
-             CoreDump's own exit 3 is mapped here, never to 3)   3 = UNSTABLE: the core's content kept moving through
-             every stable-read attempt (--store core)
+Exit codes:  0 = all green (--store core: every check judged and passed)   2 = an invariant was violated
+             1 = operational error (core unreachable, a missing setting, CoreDump timeout: CoreDump's own exit 3 is
+             mapped here, never to 3)   3 = UNSTABLE: the core's content kept moving through every stable-read attempt
+             (--store core)   4 = INDETERMINATE: nothing violated, and at least one check could not be judged, so the
+             sweep is not green (--store core)
              64 = a retired flag or value (--ae-dump-cmd, --core-dump-cmd, --ae-timeout, --store ae), a flag that has no
                   meaning with --store core, or any other usage error: the line names it.
 """
@@ -685,7 +687,8 @@ def build_arg_parser():
     p.add_argument("--jvm-opt", action="append", default=None,
                   help="core: a JVM option of the two reads, repeatable; replaces the default --add-opens set")
     p.add_argument("--core-metrics", default=None,
-                  help="core: comma list of member /metrics URLs; checks core_pending_commands and core_release_backlog")
+                  help="core: comma list of member /metrics URLs (required): checks core_pending_commands and "
+                       "core_release_backlog, and reads the money journal head conservation is judged at")
     p.add_argument("--zero-hold-users", default=None,
                   help="core: users that must hold nothing at all, e.g. 900000-900999 (the simulator's own)")
     p.add_argument("--stable-retries", type=int, default=int(os.environ.get("MONEY_CHECK_STABLE_RETRIES", 5)),
@@ -785,7 +788,7 @@ def print_core(result):
     print(f"   {result['statement']}")
     for a in result.get("attempts", []):
         if not a["stable"]:
-            print(f"   UNSTABLE attempt {a['attempt']}: the dump or the order snapshot changed between two reads")
+            print(f"   UNSTABLE attempt {a['attempt']}: {core_expected.UNSTABLE_TEXT}")
     if result.get("position"):
         print(f"   core position: consume={result['position']['consumePosition']} "
               f"lastAppliedTradeId={result['position']['lastAppliedTradeId']}; {result.get('accounts')} accounts, "
@@ -802,8 +805,13 @@ def print_core(result):
 
 
 def core_main(args):
-    """--store core: one sweep with the core's own expected side. Exit 0 green, 2 violated, 3 unstable, 1 operational."""
+    """--store core: one sweep with the core's own expected side. Exit 0 green, 2 violated, 3 unstable, 4 indeterminate
+    (a check was not judged), 1 operational."""
     try:
+        urls = [u.strip() for u in (args.core_metrics or "").split(",") if u.strip()]
+        if not urls:
+            raise core_expected.OperationalError("--store core needs --core-metrics: without the members' /metrics the "
+                                                 "core counters and the money journal head are not read")
         tool_key = core_expected.read_key(args.tool_key_file, "--tool-key-file")
         admin_key = core_expected.read_key(args.admin_key_file, "--admin-key-file")
         java = [args.java, *(core_expected.JVM_FLAGS if args.jvm_opt is None else args.jvm_opt)]
@@ -816,10 +824,7 @@ def core_main(args):
             funding = lambda: core_expected.funding_from_history(args.money_history_dsn, args.psql)
         else:
             funding = lambda: core_expected.funding_from_file(args.funding_file)
-        counters = None
-        if args.core_metrics:
-            urls = [u.strip() for u in args.core_metrics.split(",") if u.strip()]
-            counters = lambda: core_expected.core_counters(urls)
+        counters = lambda: core_expected.core_counters(urls)
         zero = [tuple(r) for r in ranges_of(args.zero_hold_users)] if args.zero_hold_users else ()
         reader = core_expected.CoreReader(dump_argv, probe_argv, env, args.core_timeout)
         result, code = core_expected.sweep(reader, funding, zero, counters, args.stable_retries, args.stable_wait_ms,

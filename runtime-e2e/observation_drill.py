@@ -6,7 +6,8 @@ The drill is the fixture twin of the box observation. On a critical-path kind (`
 funds two users through the gateway, runs money-check with the core expected side at Q0, starts the observation sampler
 on this host (the fixture is the one-host case: docker is the supervisor) and a crossing-pairs load through gw0 for
 OBS_DRILL_WINDOW_S, plants at most one fault, stops the load, quiesces (cancel-all, the money history at the core's
-head, money-check at Q2), merges the sample set and runs the verdict over it.
+head, money-check at Q2), merges the sample set and runs the verdict over it. money-check runs in the fixture's own
+driver mode (``cps``: embedded; ``cps-ext``: external, on the probe's staged aeronmd), recorded as money_check_driver.
 
 OBS_DRILL_FAULT (one per run; the verdict must name exactly the planted line and the planted service):
   none              the clean run: the verdict PASSes
@@ -45,6 +46,7 @@ import time
 
 from contracts import Inconclusive, Violation
 import core_contracts
+from core_fixture import PROBE_AERON_DIR
 import observation
 import smoke_core
 from smoke_core import CriticalPathDrill, money_call, order_call
@@ -134,6 +136,42 @@ def _line(holds, detail, text=None, inconclusive=False):
     if inconclusive:
         out['inconclusive'] = True
     return out
+
+
+# ------------------------------------------------------------------ money-check in the probe container
+
+# Exit codes of money-check that are evidence, not a failed command: 0 green, 1 operational, 2 violated, 3 unstable,
+# 4 indeterminate (a check was not judged). Only 0 holds the drill's money_check lines.
+MONEY_CHECK_EXITS = (0, 1, 2, 3, 4)
+
+
+def money_check_driver(fixture):
+    """(driver mode, aeron dir) of the drill's money-check: the fixture's own driver mode, so the external kind
+    (cps-ext) runs both reads on the probe's staged aeronmd, as the box does, and the embedded kind on their own
+    driver. An external kind without the probe's aeronmd is not run in the other mode: INCONCLUSIVE."""
+    mode = fixture.engine_driver()
+    if mode == 'embedded':
+        return 'embedded', None
+    if mode != 'external':
+        raise Inconclusive(f'money-check has no driver mode for engine_driver {mode!r}')
+    if not (fixture.m.get('probe_libs') or {}).get('aeronmd'):
+        raise Inconclusive('money-check in external driver mode needs the probe\'s aeronmd: the manifest pins no '
+                           'probe_libs.aeronmd')
+    return 'external', PROBE_AERON_DIR
+
+
+def money_check_argv(fixture, point, users):
+    """The money-check command of one quiesce point, as it runs in the probe container."""
+    nodes, ports = fixture.m['nodes'], fixture.m['ports']
+    mode, aeron_dir = money_check_driver(fixture)
+    return ['python3', '-I', '/data/mc/money_check.py', '--store', 'core', '--cut', '/data/mc/cut.json',
+            '--artifact-root', '/data/mc/jars', '--core-addresses', ','.join(nodes[f'ae{i}'] for i in range(3)),
+            '--core-port-base', str(ports['ae_base']), '--core-port-stride', '100', '--local-host', nodes['probe'],
+            '--driver-mode', mode, *(['--aeron-dir', aeron_dir] if aeron_dir else []),
+            '--tool-key-file', '/data/mc/tool.key', '--admin-key-file', '/data/mc/admin.key',
+            '--funding-file', f'/data/mc/funding-{point}.json', '--zero-hold-users', f'{users[0]}-{users[-1]}',
+            '--core-metrics', ','.join(f'http://{nodes[f"ae{i}"]}:{ports["ae_metrics"]}/metrics' for i in range(3)),
+            '--json']
 
 
 # ------------------------------------------------------------------ the sampler configuration of the fixture host
@@ -287,17 +325,11 @@ class ObservationDrill(CriticalPathDrill):
         """The money history at the core's head, then money-check with the core expected side in the probe container."""
         _, waited = self.wait_for(self.money_history_caught_up, self.o['OBS_DRILL_CATCHUP_S'])
         self.funding_file(point)
-        nodes, ports = self.f.m['nodes'], self.f.m['ports']
-        lo, hi = self.users()[0], self.users()[-1]
-        argv = ['python3', '-I', '/data/mc/money_check.py', '--store', 'core', '--cut', '/data/mc/cut.json',
-                '--artifact-root', '/data/mc/jars', '--core-addresses', ','.join(nodes[f'ae{i}'] for i in range(3)),
-                '--core-port-base', str(ports['ae_base']), '--core-port-stride', '100', '--local-host', nodes['probe'],
-                '--driver-mode', 'embedded', '--tool-key-file', '/data/mc/tool.key', '--admin-key-file', '/data/mc/admin.key',
-                '--funding-file', f'/data/mc/funding-{point}.json', '--zero-hold-users', f'{lo}-{hi}',
-                '--core-metrics', ','.join(f'http://{nodes[f"ae{i}"]}:{ports["ae_metrics"]}/metrics' for i in range(3)),
-                '--json']
+        argv = money_check_argv(self.f, point, self.users())
+        mode, aeron_dir = money_check_driver(self.f)
+        self.record['money_check_driver'] = {'mode': mode, 'aeron_dir': aeron_dir}
         t0 = time.time()
-        out = self.f.execute('probe', argv, timeout=600, check=False, accepted=(0, 1, 2, 3))
+        out = self.f.execute('probe', argv, timeout=600, check=False, accepted=MONEY_CHECK_EXITS)
         doc = None
         for text in reversed((out.stdout or '').splitlines()):
             if text.startswith('{'):
@@ -305,6 +337,7 @@ class ObservationDrill(CriticalPathDrill):
                 break
         doc = doc or {'status': 'ERROR', 'error': (out.stderr or '')[-400:]}
         doc['exit_code'] = out.returncode
+        doc['driver_mode'] = mode
         doc['history_wait_s'] = waited
         doc['wall_s'] = round(time.time() - t0, 1)
         (self.out / f'{point}.json').write_text(json.dumps(doc, indent=1) + '\n')

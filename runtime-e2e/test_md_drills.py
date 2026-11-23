@@ -305,5 +305,53 @@ class EnvironmentTest(unittest.TestCase):
             f.marketdata_env('md0')
 
 
+class FrozenEgressAgeTest(unittest.TestCase):
+    """core-md-frozen: the egress age is judged only on samples taken inside the frozen window."""
+
+    def freeze(self, max_ms, samples, unread=0):
+        return {'egress_age_max_ms': max_ms, 'egress_age_samples': samples, 'egress_age_unread': unread}
+
+    def test_samples_under_the_bound_hold(self):
+        out = md.egress_age_line([self.freeze(120, 20), self.freeze(300, 19)], 5000, 3)
+        self.assertTrue(out['holds'])
+
+    def test_an_age_over_the_bound_fails(self):
+        out = md.egress_age_line([self.freeze(120, 20), self.freeze(6000, 20)], 5000, 3)
+        self.assertEqual((out['holds'], out['text']), (False, md.EGRESS_AGE_TEXT))
+        self.assertNotIn('inconclusive', out)
+
+    def test_no_sample_or_an_unreadable_metric_is_inconclusive(self):
+        for freezes in ([self.freeze(None, 0)],                       # the story outlived the window: never sampled
+                        [self.freeze(None, 0, unread=20)],            # the forwarder metric unreadable throughout
+                        [self.freeze(100, 2, unread=18)],             # too few readable samples
+                        []):
+            with self.subTest(freezes):
+                out = md.egress_age_line(freezes, 5000, 3)
+                self.assertEqual((out['holds'], out['text'], out.get('inconclusive')),
+                                 (False, md.EGRESS_UNSAMPLED_TEXT, True))
+
+    def test_an_unreadable_age_is_never_zero(self):
+        self.assertIsNone(md.max_age([None, None]))
+        self.assertEqual(md.max_age([None, 40, 7]), 40)
+        self.assertEqual(md.max_age([0, None]), 0)
+
+    def test_the_sampler_runs_while_the_caller_is_busy(self):
+        import threading
+        reads = iter([10, None, RuntimeError('metrics down')] + [5] * 1000)
+        got_three = threading.Event()
+
+        def read():
+            value = next(reads)
+            if got_three.is_set() is False and value == 5:
+                got_three.set()
+            if isinstance(value, Exception):
+                raise value
+            return value
+        sampler = md.AgeSampler(read, 0.001).start()
+        self.assertTrue(got_three.wait(5))                 # the caller (the story) never yields to the sampler
+        samples = sampler.stop()
+        self.assertEqual(samples[:4], [10, None, None, 5])
+
+
 if __name__ == '__main__':
     unittest.main()

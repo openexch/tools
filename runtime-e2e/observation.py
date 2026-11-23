@@ -74,7 +74,9 @@ SETTINGS = {
     'OBS_GATEWAY_HISTORY_STALE_MS': 5000, 'OBS_MD_HISTORY_STALE_MS': 5000,
     # V5: kinds whose idle strategy spins by design (a busy-spin driver): their CPU is recorded, never judged
     'OBS_SPIN_EXEMPT': [],
-    # V9: the simulator's users, whose every hold must be zero at a quiesce point (a list of [low, high] ranges)
+    # V9: the simulator's users, whose every hold must be zero at a quiesce point (a list of [low, high] ranges). When
+    # set, each quiesce document must carry a zero_holds check over exactly these users with status PASS (money-check
+    # --zero-hold-users); a document without it was not judged on this rule: INCONCLUSIVE
     'OBS_ZERO_HOLD_USERS': [],
 }
 
@@ -782,8 +784,19 @@ def v9(view, line):
         if doc.get('violated') and not _residuals(doc):
             line.fail(f'money check violated at {point}: ' + ', '.join(c['name'] for c in doc.get('checks', [])
                                                                        if c.get('status') == 'FAIL'))
-        if doc.get('status') in ('UNSTABLE', 'ERROR') or doc.get('indeterminate'):
+        if doc.get('status') in ('UNSTABLE', 'ERROR', 'INDETERMINATE') or doc.get('indeterminate'):
             line.gap(f'money check not exact at {point}: {doc.get("status") or "indeterminate"}')
+        if s['OBS_ZERO_HOLD_USERS'] and doc.get('status') not in ('UNSTABLE', 'ERROR'):
+            want = sorted(list(r) for r in s['OBS_ZERO_HOLD_USERS'])
+            zero = [c for c in doc.get('checks') or [] if c.get('name') == 'zero_holds']
+            if not zero:
+                line.gap(f'zero-hold check missing at {point}: OBS_ZERO_HOLD_USERS is set and the money check ran '
+                         f'without --zero-hold-users')
+            elif sorted(list(r) for r in zero[0].get('users') or []) != want:
+                line.gap(f'zero-hold check at {point} ran over other users: {zero[0].get("users")}, '
+                         f'OBS_ZERO_HOLD_USERS is {want}')
+            elif zero[0].get('status') not in ('PASS', 'FAIL'):     # a FAIL is in the residual holds above
+                line.gap(f'zero-hold check not judged at {point}: {zero[0].get("status")}')
     stall = s['OBS_STALL_S'] * 1000
     for m in view.of_kind('core member'):
         since = None
