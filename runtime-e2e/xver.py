@@ -152,15 +152,15 @@ def case_for(scenario, kind):
 
 # ------------------------------------------------------------------ the refusal-site table (the envelope-reader texts at the cut commits)
 
-COMMITS = {'match': 'c35689577e8cd524d91692bce6d964c02b45daef', 'assets': 'eb559a7f9070296bae9c73a3087e49a01efb5852',
-           'cluster-kit': '947fe50aa2161ae9f302a90c6e1a6bad7eb0eb32', 'cluster-tools': 'e56a4ce5b1118e9c57b975725be6c6010bfdb52d'}
+COMMITS = {'match': '16e29c8331fbab81a2f48443607ba30c6bb97395', 'assets': '35d445b0f8961e45ed5f37e48b84499d7a80485e',
+           'cluster-kit': 'f861192d01268bcc639301304967b364f5578044', 'cluster-tools': 'bbfb6621bb11d342e5f888bcddf573563b213d4a'}
 # the kit's reason text before and after the rename (old tagged jars print the first, current ones the second)
 _R0 = (r'CRITICAL: principal-less session in log: [^,()]*history[^,()]*, clean genesis '
        r'required \(({}), clusterSessionId=(-?[0-9]+), '
        r'logPosition=(-?[0-9]+)\)')
 ACS_ME = 'match-cluster/src/main/java/com/match/infrastructure/persistence/AppClusteredService.java'
-ACS_AE = 'assets-cluster/src/main/java/com/openexchange/assets/infrastructure/persistence/AssetsClusteredService.java'
-KIT_GATE = 'cluster-kit src/main/java/com/openexchange/cluster/auth/PrincipalGate.java:15,40-42'
+ACS_AE = 'core-cluster/src/main/java/com/openexchange/core/infrastructure/persistence/CoreClusteredService.java'
+KIT_GATE = 'cluster-kit src/main/java/com/openexchange/cluster/auth/PrincipalGate.java:16,40-42'
 def check_sites(cut):
     """The refusal-site table was read at COMMITS; a cut on other commits makes every site citation stale."""
     repos = dict((cut or {}).get('repos') or {})
@@ -171,52 +171,52 @@ def check_sites(cut):
 
 SITES = {
     'me-r0-restored': {'engine': 'me', 're': _R0.format('restored session'), 'layer': 'application (kit PrincipalGate)',
-                       'reads': f'match {ACS_ME}:1452 (the restored session principal, onStart)', 'prints': f'{ACS_ME}:231-237',
+                       'reads': f'match {ACS_ME}:1482 (the restored session principal, onStart)', 'prints': f'{ACS_ME}:239-245',
                        'rule': KIT_GATE, 'commit': COMMITS['match']},
     'me-r0-session-open': {'engine': 'me', 're': _R0.format('session open'), 'layer': 'application (kit PrincipalGate)',
-                           'reads': f'match {ACS_ME}:1635 (onSessionOpen replayed from the log)', 'prints': f'{ACS_ME}:231-237',
+                           'reads': f'match {ACS_ME}:1672 (onSessionOpen replayed from the log)', 'prints': f'{ACS_ME}:239-245',
                            'rule': KIT_GATE, 'commit': COMMITS['match']},
     'me-r0-ingress': {'engine': 'me', 're': _R0.format('ingress frame'), 'layer': 'application (kit PrincipalGate)',
-                      'reads': f'match {ACS_ME}:1737 (an ingress frame of a principal-less session)', 'prints': f'{ACS_ME}:231-237',
+                      'reads': f'match {ACS_ME}:1774 (an ingress frame of a principal-less session)', 'prints': f'{ACS_ME}:239-245',
                       'rule': KIT_GATE, 'commit': COMMITS['match']},
     'me-envelope': {'engine': 'me', 're': r'CRITICAL: snapshot refused: snapshot envelope magic missing \(length=-?[0-9]+\)',
                     'layer': 'application (R-ME-1)',
-                    'reads': 'match match-cluster/src/main/java/com/match/infrastructure/persistence/SnapshotCodec.java:334-337',
-                    'prints': f'{ACS_ME}:1510', 'commit': COMMITS['match']},
+                    'reads': 'match match-cluster/src/main/java/com/match/infrastructure/persistence/SnapshotCodec.java:370-373',
+                    'prints': f'{ACS_ME}:1542', 'commit': COMMITS['match']},
     'me-lossy-restore': {'engine': 'me', 're': r'order\(s\) dropped during restore', 'layer': 'application (R-ME-2)',
-                         'reads': f'match {ACS_ME}:1598', 'prints': f'{ACS_ME}:1510', 'commit': COMMITS['match']},
+                         'reads': f'match {ACS_ME}:1635', 'prints': f'{ACS_ME}:1542', 'commit': COMMITS['match']},
     'ae-r0-restored': {'engine': 'ae', 're': _R0.format('restored session'), 'layer': 'application (kit PrincipalGate)',
-                       'reads': f'assets {ACS_AE}:293 and SessionRegistry.java:158 (section-9 rows print logPosition -1)',
-                       'prints': f'{ACS_AE}:280-285', 'rule': KIT_GATE, 'commit': COMMITS['assets']},
+                       'reads': f'assets {ACS_AE}:484 and SessionRegistry.java:158 (section-9 rows print logPosition -1)',
+                       'prints': f'{ACS_AE}:471-475', 'rule': KIT_GATE, 'commit': COMMITS['assets']},
     'ae-r0-session-open': {'engine': 'ae', 're': _R0.format('session open'), 'layer': 'application (kit PrincipalGate)',
-                           'reads': 'assets assets-cluster/src/main/java/com/openexchange/assets/infrastructure/persistence/'
-                                    'AssetsLogApplier.java:170 (the applier, a replayed SessionOpen)',
-                           'prints': f'{ACS_AE}:280-285', 'rule': KIT_GATE, 'commit': COMMITS['assets']},
+                           'reads': 'assets core-cluster/src/main/java/com/openexchange/core/infrastructure/persistence/'
+                                    'CoreLogApplier.java:178 (the applier, a replayed SessionOpen)',
+                           'prints': f'{ACS_AE}:471-475', 'rule': KIT_GATE, 'commit': COMMITS['assets']},
     'ae-r0-ingress': {'engine': 'ae', 're': _R0.format('ingress frame'), 'layer': 'application (kit PrincipalGate)',
-                      'reads': f'assets {ACS_AE}:722-729 (a container session with no registry row)',
-                      'prints': f'{ACS_AE}:280-285', 'rule': KIT_GATE, 'commit': COMMITS['assets']},
+                      'reads': f'assets {ACS_AE}:1358-1365 (a container session with no registry row)',
+                      'prints': f'{ACS_AE}:471-475', 'rule': KIT_GATE, 'commit': COMMITS['assets']},
     'ae-envelope': {'engine': 'ae', 're': r'FATAL snapshot refused: snapshot envelope magic missing \(length=-?[0-9]+\)',
                     'layer': 'application (kit SnapshotEnvelope)',
-                    'reads': 'cluster-kit src/main/java/com/openexchange/cluster/SnapshotEnvelope.java:72-73',
-                    'prints': f'{ACS_AE}:1102', 'commit': COMMITS['cluster-kit']},
+                    'reads': 'cluster-kit src/main/java/com/openexchange/cluster/SnapshotEnvelope.java:93-94',
+                    'prints': f'{ACS_AE}:1850', 'commit': COMMITS['cluster-kit']},
     'quorum': {'engine': '*', 're': r'no cluster quorum observed within ([0-9]+) ms since the consensus module launched',
                'layer': 'kit QuorumWatchdog', 'reads': 'cluster-kit src/main/java/com/openexchange/cluster/QuorumWatchdog.java:174',
-               'prints': 'cluster-kit EngineLifecycle.java:251-253', 'commit': COMMITS['cluster-kit']},
+               'prints': 'cluster-kit EngineLifecycle.java:535-536', 'commit': COMMITS['cluster-kit']},
     'bridge-foreign-head': {'engine': 'bridge', 're': r'foreign journal at the chain head', 'layer': 'bridge B1',
                             'reads': 'cluster-tools domain/bridge/src/BridgeDomain.cpp:1484 (foreignHeadEverywhere)',
-                            'prints': 'cluster-tools app/bridge/BridgeAgent.h:1403', 'commit': COMMITS['cluster-tools']},
+                            'prints': 'cluster-tools app/bridge/BridgeAgent.h:1405', 'commit': COMMITS['cluster-tools']},
     'admin-ack-40': {'engine': 'driver', 're': r'ADMIN OPEN GLOBAL never accepted: last reason 40 FEED_HALTED', 'code': 40,
                      'name': 'FEED_HALTED', 'layer': 'core admission',
-                     'reads': 'assets assets-cluster/src/main/java/com/openexchange/assets/application/engine/AssetsEngine.java:1824',
-                     'prints': 'cluster-tools app/forwarder/it/T1CoreDriver.java:248', 'commit': COMMITS['assets']},
+                     'reads': 'assets core-cluster/src/main/java/com/openexchange/core/application/engine/CoreEngine.java:1995',
+                     'prints': 'cluster-tools app/forwarder/it/ItCoreDriver.java:248', 'commit': COMMITS['assets']},
     'admin-ack-41': {'engine': 'driver', 're': r'ADMIN OPEN GLOBAL never accepted: last reason 41 ME_LANE_INACTIVE', 'code': 41,
                      'name': 'ME_LANE_INACTIVE', 'layer': 'core admission',
-                     'reads': 'assets assets-cluster/src/main/java/com/openexchange/assets/application/engine/AssetsEngine.java:1828',
-                     'prints': 'cluster-tools app/forwarder/it/T1CoreDriver.java:248', 'commit': COMMITS['assets']},
+                     'reads': 'assets core-cluster/src/main/java/com/openexchange/core/application/engine/CoreEngine.java:1999',
+                     'prints': 'cluster-tools app/forwarder/it/ItCoreDriver.java:248', 'commit': COMMITS['assets']},
     'admin-ack-45': {'engine': 'driver', 're': r'ADMIN OPEN GLOBAL never accepted: last reason 45 HALT_HOLDER_PENDING', 'code': 45,
                      'name': 'HALT_HOLDER_PENDING', 'layer': 'core admission (halt holder)',
-                     'reads': 'assets assets-cluster/src/main/java/com/openexchange/assets/application/engine/AssetsEngine.java:1836, '
-                              'CoreRejectReason.java:66', 'prints': 'cluster-tools app/forwarder/it/T1CoreDriver.java:248',
+                     'reads': 'assets core-cluster/src/main/java/com/openexchange/core/application/engine/CoreEngine.java:2007, '
+                              'CoreRejectReason.java:66', 'prints': 'cluster-tools app/forwarder/it/ItCoreDriver.java:248',
                      'commit': COMMITS['assets']},
 }
 SUBSTRATE = [r'(?i)active mark file', r'(?i)archive\.catalog|archive catalog', r'(?i)mark file', r'(?i)cnc\.dat|CnC file',

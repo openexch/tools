@@ -557,12 +557,14 @@ ENV = {"common": {}, "dump": {}, "probe": {}}
 CLEAN = (dump_doc([(1, 0, 900 * M, 100 * M), (2, 1, 5 * M, 5 * M)], [(11, 1, 0, 100 * M), (12, 2, 1, 5 * M)]),
          [order(11, 1, "BUY", 10 * M, 10 * M), order(12, 2, "SELL", 20 * M, 5 * M)])
 FUNDING = lambda: ({0: 1000 * M, 1: 10 * M}, {}, None)
+COUNTERS = lambda: {"m0": {"core_pending_commands": 0, "core_release_backlog": 0, "core_journal_seq": 9}}
 
 
 def sweep(core, **kw):
     reader = core_expected.CoreReader(["java", "CoreDump"], ["java", "CoreProbe", "order-dump"], ENV, 5, run=core.run)
     logs = []
     kw.setdefault("sleep", lambda s: None)
+    kw.setdefault("counters_source", COUNTERS)
     result, code = core_expected.sweep(reader, kw.pop("funding", FUNDING), log=logs.append, **kw)
     return result, code, logs
 
@@ -591,7 +593,35 @@ class CoreExpectedSide(unittest.TestCase):
         self.assertIn("not the fixture oracle", result["statement"])
         self.assertEqual({c["name"]: c["status"] for c in result["checks"]},
                          {"conservation": "PASS", "locked_vs_holds": "PASS", "holds_live": "PASS", "order_holds": "PASS",
-                          "non_negativity": "PASS", "core_counters": "INDETERMINATE"})
+                          "non_negativity": "PASS", "core_counters": "PASS"})
+        self.assertFalse(result["indeterminate"])
+
+    def test_a_check_that_was_not_judged_is_never_green(self):
+        # no core counters read: nothing is violated, and the sweep is INDETERMINATE with its own exit code, never OK
+        result, code, _ = sweep(FakeCore([CLEAN]), counters_source=None)
+        names = {c["name"]: c["status"] for c in result["checks"]}
+        self.assertEqual((code, result["status"], names["core_counters"]), (4, "INDETERMINATE", "INDETERMINATE"))
+        self.assertTrue(result["indeterminate"])
+        # a counter missing on one member, and no funding source: the same
+        partial = lambda: {"m0": COUNTERS()["m0"], "m1": {"core_pending_commands": 0}}
+        result, code, _ = sweep(FakeCore([CLEAN]), counters_source=partial)
+        self.assertEqual((code, result["status"]), (4, "INDETERMINATE"))
+        result, code, _ = sweep(FakeCore([CLEAN]), funding=None)
+        self.assertEqual((code, result["status"]), (4, "INDETERMINATE"))
+        # a violation outranks it
+        d, orders = CLEAN
+        result, code, _ = sweep(FakeCore([(d, orders[1:])]), counters_source=None)
+        self.assertEqual((code, result["status"], result["indeterminate"]), (2, "VIOLATED", True))
+        print("\ncore expected side, a check not judged: exit 4 INDETERMINATE, never OK")
+
+    def test_main_refuses_the_core_store_without_core_metrics(self):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = main(["--store", "core"])
+        self.assertEqual(code, 1)
+        self.assertIn("--store core needs --core-metrics", err.getvalue())
 
     def test_a_hold_on_an_order_that_is_not_live_is_a_residual_hold(self):
         d, orders = CLEAN
@@ -633,18 +663,54 @@ class CoreExpectedSide(unittest.TestCase):
         self.assertEqual(code, 2)
 
     def test_a_money_history_behind_the_core_is_not_judged(self):
-        counters = lambda: {"m0": {"core_pending_commands": 0, "core_release_backlog": 0, "core_journal_seq": 9}}
+        counters = COUNTERS
         result, code, _ = sweep(FakeCore([CLEAN]), funding=lambda: ({0: 1 * M}, {}, 7), counters_source=counters)
         names = {c["name"]: c for c in result["checks"]}
-        self.assertEqual((code, names["conservation"]["status"]), (0, "INDETERMINATE"))
+        self.assertEqual((code, result["status"], names["conservation"]["status"]), (4, "INDETERMINATE", "INDETERMINATE"))
         self.assertIn("journal 7 of 9", names["conservation"]["reason"])
         self.assertEqual(names["core_counters"]["status"], "PASS")
         _, code, _ = sweep(FakeCore([CLEAN]), funding=lambda: ({0: 1 * M}, {}, 9), counters_source=counters)
         self.assertEqual(code, 2)     # at the head the gap is judged
 
+    def test_a_money_history_is_not_judged_without_the_core_journal_head(self):
+        # the lag guard does not depend on the counters being read: no head, no judgement (a lagging history would
+        # otherwise read as a conservation FAIL)
+        no_head = lambda: {"m0": {"core_pending_commands": 0, "core_release_backlog": 0}}
+        for counters in (None, no_head):
+            with self.subTest(counters=counters):
+                result, code, _ = sweep(FakeCore([CLEAN]), funding=lambda: ({0: 1 * M}, {}, 7), counters_source=counters)
+                names = {c["name"]: c for c in result["checks"]}
+                self.assertEqual((code, names["conservation"]["status"]), (4, "INDETERMINATE"))
+                self.assertIn("was not read", names["conservation"]["reason"])
+
+    def test_the_funding_source_is_read_inside_the_stable_window(self):
+        # A deposit of 5 lands after the second dump and before the funding read that follows it: the core dumps still
+        # show 1000, the money history already shows 1005. Read after the window this was a false conservation FAIL.
+        reads = []
+
+        def funding():
+            reads.append(len(reads))
+            late = len(reads) == 2          # the second read of the first attempt sees the deposit
+            return ({0: (1005 if late else 1000) * M, 1: 10 * M}, {}, 9)
+        result, code, logs = sweep(FakeCore([CLEAN]), funding=funding)
+        self.assertEqual((code, result["status"]), (0, "OK"), json.dumps(result["checks"]))
+        self.assertEqual([a["stable"] for a in result["attempts"]], [False, True])
+        self.assertIn("the funding source changed", logs[0])
+        self.assertEqual(len(reads), 4)      # two reads per attempt, none after the window
+        # a funding source that never settles is UNSTABLE to the end, never judged
+        moving = lambda: ({0: len(reads) * M}, {}, reads.append(0))
+        print("\ncore expected side, a deposit next to the reads: 1 UNSTABLE attempt, then", result["status"])
+        result, code, _ = sweep(FakeCore([CLEAN]), funding=moving, retries=3)
+        self.assertEqual((code, result["status"]), (3, "UNSTABLE"))
+
     def test_zero_hold_users(self):
         result, code, _ = sweep(FakeCore([CLEAN]), zero_users=[(2, 2)])
         self.assertEqual(code, 2)
+        self.assertEqual([c["users"] for c in result["checks"] if c["name"] == "zero_holds"], [[[2, 2]]])
+        other, code2, _ = sweep(FakeCore([CLEAN]), zero_users=[(7, 9)])
+        self.assertEqual((code2, [c["status"] for c in other["checks"] if c["name"] == "zero_holds"]), (0, ["PASS"]))
+        none, _, _ = sweep(FakeCore([CLEAN]))
+        self.assertNotIn("zero_holds", [c["name"] for c in none["checks"]])   # no flag, no check (the verdict asks for it)
         self.assertEqual([core_expected.residual_text(r) for r in result["residual_holds"]],
                          [f"residual hold: user 2 asset 1 {5 * M}"])
 
@@ -683,8 +749,9 @@ class CoreExpectedSide(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             code = main(["--store", "core", "--tool-key-file", keys[0], "--admin-key-file", keys[1], "--cut",
-                         os.path.join(tmp.name, "missing.json")])
+                         os.path.join(tmp.name, "missing.json"), "--core-metrics", "http://127.0.0.1:9/metrics"])
         self.assertEqual(code, 1)
+        self.assertIn("not a readable cut manifest", err.getvalue())
         guard_clean_is_not_unreachable(code)
         self.assertIn("operational error", err.getvalue())
 

@@ -961,6 +961,9 @@ class SlowConsumer(GatewayDrill):
                                              'discard_closed_delta': closes['discard_closed'], 'path': closes['path'],
                                              'close_s': self.record['throttle']['close_s'],
                                              'bound_s': s['SLOW_CLOSE_BOUND_S']}, 'slow session not closed within bound')
+        ceiling = ceiling_line(closes, f.m, self.control)
+        if ceiling is not None:
+            lines['closed_at_ceiling'] = ceiling
         lines['closed_session_is_st0'] = st0_close_line(samples, first, closed_at, lifted_ns, clean)
         commits = [r['commit'] for r in samples if r['commit'] is not None]
         flat = sum(1 for a, b in zip(commits, commits[1:]) if b <= a)
@@ -1020,6 +1023,28 @@ def session_closes(first, row):
     out['total'] = total
     out['path'] = [CLOSE_PATHS[k] for k in CLOSE_PATHS if out[k]] or None
     return out
+
+
+CEILING_PROPERTY = 'core.egress.max.capacity.bytes'
+CEILING_TEXT = 'slow session not closed at the egress ceiling'
+
+
+def ceiling_line(closes, manifest, control):
+    """The ceiling path itself: on a kind that lowers the core's egress ceiling (``core_jvm_properties``), the slow
+    session closes at the ceiling (``resumable_closed`` delta 1). ``slow_session_closed`` counts either path (a failed
+    offer after a delivery closes a slow session too, ``discard_closed``), so without this line a broken ceiling would
+    still PASS through the discard path. The control kind (the core's 16 MiB default) carries the line too and must
+    fail on its text. An unreadable counter is INCONCLUSIVE, never a failure with the text. None when neither applies."""
+    lowered = (manifest.get('core_jvm_properties') or {}).get(CEILING_PROPERTY)
+    if lowered is None and control is None:
+        return None
+    delta = closes.get('resumable_closed')
+    detail = {'ceiling_bytes': lowered if lowered is not None else 'core default (16 MiB)', 'resumable_closed_delta': delta,
+              'discard_closed_delta': closes.get('discard_closed'), 'path': closes.get('path')}
+    if delta is None:
+        detail['unread'] = 'the resumable_closed counter was unreadable'
+        return line(False, detail, inconclusive=True)
+    return line(delta == 1, detail, CEILING_TEXT)
 
 
 def st0_saw_close(samples, first, closed_at):

@@ -586,7 +586,9 @@ GATEWAY_KINDS = {
 #   gw-freshkey(-ext)          gateway-kill-restart: gw0 mints a fresh request id per attempt (GW_NC_FRESH_KEY)
 #   gw-b3                      gateway-kill-restart: the core left at behaviour 3, where the gate is checked before the
 #                              requestId lookup, so a stored acceptance sent again under a closed gate is refused
-#   gw-slow-ceiling16m         stream-slow-consumer: the egress ceiling left at the core's 16 MiB
+#   gw-slow-ceiling16m         stream-slow-consumer: the egress ceiling left at the core's 16 MiB; the drill's own line
+#                              closed_at_ceiling (added on every kind that lowers the ceiling) fails on its text: the
+#                              session closes through a failed offer (discard_closed), not at the ceiling
 #   gw-timeout-shortfreeze     gateway-session-timeout: gw0 frozen for less than the core's session timeout, so its
 #                              keepalives resume before the core closes the session
 #   gw-fill-muted              fill-visibility-core: both streams frozen while the pairs run
@@ -599,7 +601,8 @@ GATEWAY_KINDS.update({
     'gw-freshkey-ext': dict(GATEWAY_KINDS['gw-freshkey-ext'], control='gateway-kill-restart'),
     'gw-b3': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'behavior': 3, 'control': 'gateway-kill-restart',
               'control_text': 'stored acceptance answered ADMISSION_CLOSED'},
-    'gw-slow-ceiling16m': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'control': 'stream-slow-consumer'},
+    'gw-slow-ceiling16m': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'control': 'stream-slow-consumer',
+                           'control_text': 'slow session not closed at the egress ceiling'},
     'gw-timeout-shortfreeze': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'control': 'gateway-session-timeout',
                                'drill': {'TIMEOUT_FREEZE_S': 4}},
     'gw-fill-muted': {'driver': 'embedded', 'slots': dict(_ALL), 'core_jvm': {}, 'control': 'fill-visibility-core',

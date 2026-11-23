@@ -47,14 +47,16 @@ cut manifest; `--artifact-root DIR` names the directory the jars were copied to,
 - the expected holds: the core's own order snapshot for every user, read with an ADMIN key by `CoreProbe order-dump` (the
   cut's `harness.core_probe` jar on its `core-cluster.jar`).
 
-Stability is defined by content: the tool reads dump, orders, dump, orders and judges only when both dumps and both order
-snapshots are equal. Otherwise the attempt is UNSTABLE and it reads again after `--stable-wait-ms` (default 1000,
-`MONEY_CHECK_STABLE_WAIT_MS`), up to `--stable-retries` attempts (default 5, `MONEY_CHECK_STABLE_RETRIES`). It never
-reports a mismatch from two instants.
+Stability is defined by content: the tool reads dump, orders, funding, dump, orders, funding and judges only when both
+dumps, both order snapshots and both funding reads are equal (the funding source is read inside the window, so a deposit
+next to the reads is never judged against a dump of another instant). Otherwise the attempt is UNSTABLE and it reads
+again after `--stable-wait-ms` (default 1000, `MONEY_CHECK_STABLE_WAIT_MS`), up to `--stable-retries` attempts (default
+5, `MONEY_CHECK_STABLE_RETRIES`). It never reports a mismatch from two instants.
 
 The invariants, exact for every user: conservation per asset against the core's own deposits and withdrawals (the money
-history, `--money-history-dsn`, or `--funding-file` written from it; judged only when the history is at the core's money
-journal head, read with `--core-metrics`); locked equals the sum of holds; every hold belongs to a live order (else a
+history, `--money-history-dsn`, or `--funding-file` written from it; the money history is judged only when it is at the
+core's money journal head, `core_journal_seq` of `--core-metrics`: behind the head, or with no head read, conservation
+is INDETERMINATE; a funding file carries no journal position, the caller answers for its instant); locked equals the sum of holds; every hold belongs to a live order (else a
 `residual hold: user <u> asset <a> <amount>`); every live order's hold equals the value recomputed from its fields (SELL
 remaining; an unfilled priced BUY price x remaining; a partly filled BUY at least price x remaining and at most its hold
 amount, since a fill below the limit keeps the price improvement held until the order ends); `--zero-hold-users` hold
@@ -75,12 +77,17 @@ python3 money_check.py --store core --cut /abs/cut-manifest.json --artifact-root
 
 Required with `--store core`: `--cut`, `--core-addresses`, `--core-port-base`, `--local-host`, `--driver-mode` (`embedded`,
 or `external` with `--aeron-dir`; the two reads get `COREDUMP_DRIVER_MODE` and `CORE_PROBE_DRIVER_MODE`), the two key
-files (`keyId:CLASS:secretHex`, mode 600: a key file readable by others is refused), and exactly one funding source.
+files (`keyId:CLASS:secretHex`, mode 600: a key file readable by others is refused), exactly one funding source, and
+`--core-metrics` (every member's `/metrics`).
 Optional: `--core-port-stride` (100), `--core-timeout` (40 s per read), `--java` and `--jvm-opt` (default: the three
 `--add-opens` options Aeron needs on Java 21), `--psql`. The OMS and sim-log flags are refused with exit 64.
 
-Exit codes in this mode: `0` green, `2` an invariant was violated, `3` UNSTABLE through every attempt, `1` operational
-error (a missing setting, the core unreachable, `CoreDump timeout`: CoreDump's own exit 3 is mapped to 1, never to 3).
+Exit codes in this mode: `0` green (status `OK`: every check was judged and passed), `2` an invariant was violated
+(`VIOLATED`), `3` UNSTABLE through every attempt, `4` INDETERMINATE (nothing violated, and at least one check could not
+be judged: the money history behind the core's journal head, a counter missing on a member; the check's reason says
+which), `1` operational error (a missing setting, the core unreachable, `CoreDump timeout`: CoreDump's own exit 3 is
+mapped to 1, never to 3). Only `0` is green; `--zero-hold-users` is the one check that exists only when its flag is given
+(the observation verdict requires it in each quiesce document when `OBS_ZERO_HOLD_USERS` is set).
 
 ## Usage (`--store redis`)
 
@@ -102,7 +109,7 @@ Flags: `--store {redis,core}`, `--oms-url`, `--sim-log` (repeatable, globs allow
 
 Default asset map, matching the market-sim `DefaultMarkets` table: `USD=0, BTC=1, ETH=2, SOL=3, XRP=4, DOGE=5`. Override with `--asset-map` if a deployment numbers assets differently.
 
-Exit codes: `0` all green, `2` an invariant was violated, `1` operational error (store or OMS unreachable), `64` a usage error: a retired flag or value (`--ae-dump-cmd`, `--ae-timeout`, `--store ae`, `--core-dump-cmd`: use `--cut`), a flag that has no meaning with `--store core`, or any other bad argument. With `--loop` the process runs until Ctrl-C or `--max-sweeps` and exits `2` if any sweep violated.
+Exit codes (`--store redis`): `0` all green, `2` an invariant was violated, `1` operational error (store or OMS unreachable), `64` a usage error: a retired flag or value (`--ae-dump-cmd`, `--ae-timeout`, `--store ae`, `--core-dump-cmd`: use `--cut`), a flag that has no meaning with `--store core`, or any other bad argument. With `--loop` the process runs until Ctrl-C or `--max-sweeps` and exits `2` if any sweep violated.
 
 ## Reading results on a live stack
 

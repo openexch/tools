@@ -8,16 +8,19 @@ Two read-only reads, each its own process, each started from the release cut's o
   orders   CoreProbe ``order-dump`` (the cut's harness core_probe jar on the cut's core-cluster.jar, an ADMIN key): the
            core's own order snapshot for every user (RequestOrderSnapshot, userId 0), every page.
 
-Stability is defined by content, not by a marker: the tool reads dump, orders, dump, orders and judges only when both
-dumps are equal and both order snapshots are equal (the markers consumePosition and lastAppliedTradeId move with the
-ME feed and not with a create, a cancel, an amend or a deposit, so they cannot stand for the content). Otherwise the
-attempt is UNSTABLE and the tool waits and reads again, up to its retries; it never reports a mismatch from two
-different instants.
+Stability is defined by content, not by a marker: the tool reads dump, orders, funding, dump, orders, funding and judges
+only when both dumps are equal, both order snapshots are equal and both funding reads are equal (the markers
+consumePosition and lastAppliedTradeId move with the ME feed and not with a create, a cancel, an amend or a deposit, so
+they cannot stand for the content). The funding source is read inside that window, so a deposit that lands next to the
+reads moves one of the three and is never judged against a dump of another instant. Otherwise the attempt is UNSTABLE
+and the tool waits and reads again, up to its retries; it never reports a mismatch from two different instants.
 
 The invariants, each exact for every user:
   conservation     per asset, the sum of available + locked equals deposits - withdrawals of the core's own money
                    history (the money projector's money_journal, read over a PostgreSQL connection, or a funding file
-                   written from it)
+                   written from it). The money history is judged only when it is at the core's money journal head
+                   (core_journal_seq of --core-metrics): behind the head, or with no head read, it is INDETERMINATE.
+                   A funding file carries no journal position: the caller answers for its instant
   locked_vs_holds  locked equals the sum of the core's hold entries per user and asset
   holds_live       every hold belongs to a live order of the same user and hold asset (else: a residual hold)
   order_holds      every live order has a hold, and it equals the value recomputed from the order's fields:
@@ -28,7 +31,11 @@ The invariants, each exact for every user:
                    cannot see: judged as "at most the hold amount"
   zero_holds       the named users (the simulator's own) hold nothing at all
   non_negativity   no available and no locked below zero
-  core_counters    core_pending_commands and core_release_backlog are 0 on every member (when --core-metrics is given)
+  core_counters    core_pending_commands and core_release_backlog are 0 on every member (--core-metrics; not read:
+                   INDETERMINATE)
+
+A check that could not be judged is INDETERMINATE, and one such check makes the whole sweep INDETERMINATE (exit 4):
+the status is OK and the exit code 0 only when every check was judged and passed.
 
 This compares the core with itself and with the tool's recomputation. It is weaker than the fixture oracle, which
 anchors on the client's own request log, and it is exact only at a quiesce point.
@@ -53,6 +60,9 @@ PROBE_KEY = "core_probe"
 PROBE_MAIN = "CoreProbe"
 CORE_JAR = "core-cluster.jar"
 TIMEOUT_TEXT = "CoreDump timeout"
+# The exit codes of a core sweep (1 is the operational error, 64 the usage error, both raised by money_check.py)
+EXIT_OK, EXIT_VIOLATED, EXIT_UNSTABLE, EXIT_INDETERMINATE = 0, 2, 3, 4
+UNSTABLE_TEXT = "the dump, the order snapshot or the funding source changed between two reads"
 SETTINGS = {"MONEY_CHECK_STABLE_RETRIES": 5, "MONEY_CHECK_STABLE_WAIT_MS": 1000}
 # The JVM options every Aeron client on Java 21 needs (Agrona's buffers and Aeron's channels reach into the JDK)
 JVM_FLAGS = ["--add-opens", "java.base/jdk.internal.misc=ALL-UNNAMED", "--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED",
@@ -209,21 +219,24 @@ def markers_stable(d1, o1, d2, o2):
     return d1["markers"] == d2["markers"]
 
 
-def stable_read(reader, retries, wait_ms, sleep=time.sleep, stable=content_stable, log=None):
-    """(dump, orders, attempts) of the first stable attempt, or (None, None, attempts) after ``retries`` attempts."""
+def stable_read(reader, retries, wait_ms, sleep=time.sleep, stable=content_stable, log=None, funding_source=None):
+    """(dump, orders, funding, attempts) of the first stable attempt, or (None, None, None, attempts) after ``retries``
+    attempts. The funding source is read inside the window, after each dump and order snapshot, and both reads must be
+    equal: the funding judged is the funding of the instant of the dump (``funding`` is None with no source)."""
     attempts = []
+    read_funding = funding_source or (lambda: None)
     for n in range(1, retries + 1):
-        d1, o1 = reader.dump(), reader.orders()
-        d2, o2 = reader.dump(), reader.orders()
-        ok = stable(d1, o1, d2, o2)
+        d1, o1, f1 = reader.dump(), reader.orders(), read_funding()
+        d2, o2, f2 = reader.dump(), reader.orders(), read_funding()
+        ok = stable(d1, o1, d2, o2) and f1 == f2
         attempts.append({"attempt": n, "stable": ok, "markers": [d1["markers"], d2["markers"]]})
         if ok:
-            return d2, o2, attempts
+            return d2, o2, f2, attempts
         if log:
-            log(f"UNSTABLE: the dump or the order snapshot changed between two reads (attempt {n} of {retries})")
+            log(f"UNSTABLE: {UNSTABLE_TEXT} (attempt {n} of {retries})")
         if n < retries:
             sleep(wait_ms / 1000)
-    return None, None, attempts
+    return None, None, None, attempts
 
 
 # --------------------------------------------------------------------------- funding source
@@ -321,11 +334,16 @@ def judge(dump, orders, funding, zero_users=(), counters=None):
             live[int(o["order"])] = o
 
     # conservation
-    core_head = max((v.get("core_journal_seq", -1) for v in (counters or {}).values()), default=None)
+    core_head = max((v["core_journal_seq"] for v in (counters or {}).values() if "core_journal_seq" in v), default=None)
     history_head = funding[2] if funding is not None else None
     if funding is None:
         checks.append({"name": "conservation", "status": "INDETERMINATE", "reason": "no funding source", "drifts": []})
-    elif history_head is not None and core_head is not None and history_head < core_head:
+    elif history_head is not None and core_head is None:
+        # the lag guard never depends on an optional read: a history that cannot be placed against the core is not judged
+        checks.append({"name": "conservation", "status": "INDETERMINATE", "drifts": [],
+                       "reason": f"the core's money journal head (core_journal_seq) was not read: the money history at "
+                                 f"journal {history_head} cannot be placed against the core"})
+    elif history_head is not None and history_head < core_head:
         checks.append({"name": "conservation", "status": "INDETERMINATE", "drifts": [],
                        "reason": f"the money history is behind the core: journal {history_head} of {core_head}"})
     else:
@@ -386,7 +404,8 @@ def judge(dump, orders, funding, zero_users=(), counters=None):
     if zero_users:
         drifts = [_drift("zero_holds", orderId=oid, userId=u, assetId=a, actual=rem, expected=0, gap=rem)
                   for oid in sorted(holds) for u, a, rem in holds[oid] if in_ranges(u, zero_users) and rem]
-        checks.append({"name": "zero_holds", "status": "FAIL" if drifts else "PASS", "drifts": drifts})
+        checks.append({"name": "zero_holds", "status": "FAIL" if drifts else "PASS", "drifts": drifts,
+                       "users": [list(r) for r in zero_users]})
 
     drifts = [_drift("non_negativity", userId=u, assetId=a, field=f, expected=0, actual=v, gap=v)
               for (u, a), (av, lk) in sorted(bal.items()) for f, v in (("available", av), ("locked", lk)) if v < 0]
@@ -414,21 +433,22 @@ def residual_text(d):
 
 def sweep(reader, funding_source, zero_users=(), counters_source=None, retries=5, wait_ms=1000, sleep=time.sleep,
           stable=content_stable, log=None):
-    """One core-mode sweep: the result document and its exit code (0 green, 2 violated, 3 unstable to the end)."""
+    """One core-mode sweep: the result document and its exit code (0 green: every check judged and passed, 2 violated,
+    3 unstable to the end, 4 indeterminate: nothing violated and at least one check not judged)."""
     t0 = time.time()
-    dump, orders, attempts = stable_read(reader, retries, wait_ms, sleep, stable, log)
+    dump, orders, funding, attempts = stable_read(reader, retries, wait_ms, sleep, stable, log, funding_source)
     result = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "mode": "core", "statement": STATEMENT, "attempts": attempts}
     if dump is None:
         result.update(status="UNSTABLE", checks=[], violated=False, indeterminate=True,
                       duration_ms=int((time.time() - t0) * 1000))
-        return result, 3
-    funding = funding_source() if funding_source else None
+        return result, EXIT_UNSTABLE
     counters = counters_source() if counters_source else None
     checks, residual, n_live = judge(dump, orders, funding, zero_users, counters)
     violated = any(c["status"] == "FAIL" for c in checks)
-    result.update(status="VIOLATED" if violated else "OK", checks=checks, residual_holds=residual, position=dump["markers"],
+    # Anything that is not PASS or FAIL was not judged: it never reads as OK
+    indeterminate = any(c["status"] not in ("PASS", "FAIL") for c in checks)
+    result.update(status="VIOLATED" if violated else "INDETERMINATE" if indeterminate else "OK", checks=checks, residual_holds=residual, position=dump["markers"],
                   live_orders=n_live, hold_entries=len(dump["holds"]), balance_rows=len(dump["balances"]),
                   accounts=len({b[0] for b in dump["balances"]}), violated=violated,
-                  indeterminate=any(c["status"] == "INDETERMINATE" for c in checks),
-                  duration_ms=int((time.time() - t0) * 1000))
-    return result, 2 if violated else 0
+                  indeterminate=indeterminate, duration_ms=int((time.time() - t0) * 1000))
+    return result, EXIT_VIOLATED if violated else EXIT_INDETERMINATE if indeterminate else EXIT_OK

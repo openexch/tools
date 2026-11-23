@@ -330,6 +330,52 @@ class PlantedSets(unittest.TestCase):
                     seen.add(line)
         self.assertEqual(seen, set(observation.LINES))
 
+    def test_zero_hold_users_setting_requires_the_check_in_each_quiesce_document(self):
+        users = [[900000, 900999]]
+        check = {'name': 'zero_holds', 'status': 'PASS', 'drifts': [], 'users': users}
+        with_check = dict(CLEAN_Q, checks=CLEAN_Q['checks'] + [check])
+
+        def planted(q0, q2):
+            ss = SampleSet()
+            ss.settings['OBS_ZERO_HOLD_USERS'] = users
+            ss.quiesce = {'Q0': q0, 'Q2': q2}
+            return ss
+        # the check ran at both points and passed: the set is clean
+        self.assertEqual(judge_set(planted(with_check, with_check))['status'], 'PASS')
+        # planted: Q2 was produced without --zero-hold-users. Nothing says the simulator holds nothing: INCONCLUSIVE
+        text = ('zero-hold check missing at Q2: OBS_ZERO_HOLD_USERS is set and the money check ran without '
+                '--zero-hold-users')
+        ss = planted(with_check, CLEAN_Q)
+        v = judge_set(ss)
+        self.assertEqual((v['status'], v['failures'], v['inconclusive']), ('INCONCLUSIVE', [], [f'V9 {text}']))
+        others = [d for d in v['lines'] if d['line'] != 'V9' and d['status'] not in ('PASS', 'NA')]
+        self.assertEqual(others, [], 'lines other than V9 did not pass')
+        # the check over other users, or not judged, is not the check the setting asks for
+        for label, other, want in (
+                ('other users', dict(check, users=[[1, 2]]), 'V9 zero-hold check at Q2 ran over other users: [[1, 2]], '
+                                                             'OBS_ZERO_HOLD_USERS is [[900000, 900999]]'),
+                ('not judged', dict(check, status='INDETERMINATE'), 'V9 zero-hold check not judged at Q2: INDETERMINATE')):
+            with self.subTest(label=label):
+                v = judge_set(planted(with_check, dict(CLEAN_Q, checks=CLEAN_Q['checks'] + [other])))
+                self.assertEqual((v['status'], v['inconclusive']), ('INCONCLUSIVE', [want]))
+        # a simulator hold at Q2 is the residual hold FAIL, named once
+        failed = dict(CLEAN_Q, status='VIOLATED', violated=True, checks=CLEAN_Q['checks'] + [dict(check, status='FAIL')],
+                      residual_holds=[{'userId': 900001, 'assetId': 0, 'actual': 500000000}])
+        v = judge_set(planted(with_check, failed))
+        self.assertEqual((v['status'], v['failures'], v['inconclusive']),
+                         ('FAIL', ['V9 residual hold: user 900001 asset 0 500000000'], []))
+        # vacuity control: with V9 off the missing check is not seen
+        self.assertEqual(judge_set(ss, {'V9'})['status'], 'PASS')
+        # without the setting the verdict asks for no such check (the clean set carries none)
+        self.assertEqual(judge_set(SampleSet())['status'], 'PASS')
+        print(f'\nV9 zero-hold check missing -> INCONCLUSIVE: {text}')
+
+    def test_an_indeterminate_money_check_is_never_exact(self):
+        ss = SampleSet()
+        ss.quiesce = {'Q0': CLEAN_Q, 'Q2': dict(CLEAN_Q, status='INDETERMINATE', exit_code=4)}
+        v = judge_set(ss)
+        self.assertEqual((v['status'], v['inconclusive']), ('INCONCLUSIVE', ['V9 money check not exact at Q2: INDETERMINATE']))
+
     def test_every_v3_kind_has_a_set(self):
         kinds = {label.removeprefix('stall ') for label, line, _, _ in planted_sets() if label.startswith('stall ')}
         self.assertEqual(kinds, set(observation.KINDS))

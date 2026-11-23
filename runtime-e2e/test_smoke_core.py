@@ -318,6 +318,68 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual(sc.verdict({'o': sc.line(False, {}, never[1], inconclusive=True)}, never)[0], 'INCONCLUSIVE')
 
 
+class NoMatchControlTest(unittest.TestCase):
+    """The nomatch control holds only when the failing lines are the ones a run with no forwarder must fail."""
+
+    def nomatch_lines(self):
+        ok = sc.line(True, {})
+        lines = {'money_oracle': ok,
+                 'order_oracle': sc.line(False, {'status': 'FAIL', 'failing': ['O10', 'O7'], 'inconclusive': []},
+                                         'order oracle not PASS'),
+                 'fills': sc.line(False, {'trades': 0}, 'no fill: no trade in the ME journal'),
+                 'workload_funding': ok, 'workload_partial_fill': sc.line(False, {}, 'smoke workload incomplete: partial fill'),
+                 'workload_amend': sc.line(False, {}, 'smoke workload incomplete: amend'),
+                 'workload_cancel': sc.line(False, {}, 'smoke workload incomplete: cancel'),
+                 'holds_after_cancel_all': sc.line(False, {'holds_left': [{'order': 1}]}, 'hold remains after cancel-all'),
+                 'request_log': sc.line(False, {'differences': {'cancels': {'log_only': [2], 'core_only': []}}},
+                                        sc.REQUEST_LOG_TEXT),
+                 'history': ok, 'stream': ok,
+                 'public_tape': sc.line(False, {}, 'public tape differs', inconclusive=True)}
+        return lines
+
+    def finish(self, lines):
+        drill = sc.NoMatchDrill.__new__(sc.NoMatchDrill)
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        drill.out, drill.record, drill.log = Path(tmp.name), {}, []
+        drill.f = mock.Mock(m={'slot_artifacts': {'fwd0': None, 'fwd1': None}})
+        return drill.finish(lines)
+
+    def test_the_expected_lines_hold_the_control(self):
+        result = self.finish(self.nomatch_lines())
+        self.assertEqual(result['status'], 'FAIL')
+        self.assertTrue(result['control']['held'])
+        self.assertEqual(result['control']['other_failures'], {})
+        self.assertIn('holds_after_cancel_all', result['control']['expected_failures'])
+
+    def test_a_money_oracle_failure_is_not_held(self):
+        lines = self.nomatch_lines()
+        lines['money_oracle'] = sc.line(False, {'status': 'FAIL'}, 'money oracle not PASS')
+        result = self.finish(lines)
+        self.assertFalse(result['control']['held'])
+        self.assertEqual(result['control']['other_failures'], {'money_oracle': 'money oracle not PASS'})
+        self.assertIn('unexpected failing line(s): money_oracle', result['error'])
+
+    def test_any_other_line_is_not_held(self):
+        for name in ('history', 'stream', 'workload_funding'):
+            with self.subTest(name):
+                lines = self.nomatch_lines()
+                lines[name] = sc.line(False, {}, 'x')
+                self.assertFalse(self.finish(lines)['control']['held'])
+
+    def test_a_request_log_difference_beyond_the_cancels_is_not_held(self):
+        lines = self.nomatch_lines()
+        lines['request_log']['detail']['differences']['creates'] = {'log_only': [3], 'core_only': []}
+        self.assertFalse(self.finish(lines)['control']['held'])
+        lines = self.nomatch_lines()
+        lines['request_log']['detail']['differences']['cancels']['core_only'] = [9]
+        self.assertFalse(self.finish(lines)['control']['held'])
+
+    def test_a_fill_is_vacuous(self):
+        lines = self.nomatch_lines()
+        lines['fills'] = sc.line(True, {'trades': 2})
+        self.assertEqual(self.finish(lines)['status'], 'INCONCLUSIVE')
+
+
 class OracleRowsTest(unittest.TestCase):
     def test_creates_amends_cancels_and_funding(self):
         body = gateway_probe.order_body(1, 'BUY', 'LIMIT', 'GTC', 90 * FP, 10 * sc.UNIT)
