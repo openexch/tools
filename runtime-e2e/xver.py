@@ -6,7 +6,8 @@ Scenarios (runner.py dispatches every ``core-xver-*``, ``core-act-*`` and ``core
   core-xver-ae-new-on-old-{snaptail,log}             X-3a/b,   v1 core jar on a v0.5.0-beta AE state  (s17-xver | s17-xver-ext)
   core-xver-bridge-on-old-archive                    X-7, the C++ bridge on a v0.5.0-beta ME journal archive (s17-xver[-ext])
   core-act-{leaderkill,toolkill,toolkill-2,nobridge,latemember,fwdfirst}   X-A1..X-A5 (toolkill = after CoreConfig 1,
-                                                     toolkill-2 = after CoreConfig 1 and 2: the two runs of X-A2)     (s17-act)
+                                                     toolkill-2 = after CoreConfig 1 and 2: the two runs of X-A2)
+                                                     (s17-act, engines external | s17-act-embedded)
   core-rollback-old-line                             X-R                                                              (s17-rollback)
   controls: core-xver-ctl-{me-same,me-old-same,ae-same,ae-old-same,x7-wiped}, core-rollback-ctl-omit-{journal,pgdump}
 
@@ -110,7 +111,8 @@ CASES['X-7'] = {'row': '20', 'scenario': 'core-xver-bridge-on-old-archive', 'see
 for _case, _row, _names in (('X-A1', '33', ('core-act-leaderkill',)), ('X-A2', '34, 35', ('core-act-toolkill', 'core-act-toolkill-2')),
                             ('X-A3', '36', ('core-act-nobridge',)), ('X-A4', '37', ('core-act-latemember',)),
                             ('X-A5', '39', ('core-act-fwdfirst',))):
-    CASES[_case] = {'row': _row, 'scenario': _names[0], 'scenarios': _names, 'binary': 'rc2', 'kinds': ('s17-act',)}
+    CASES[_case] = {'row': _row, 'scenario': _names[0], 'scenarios': _names, 'binary': 'rc2',
+                    'kinds': ('s17-act', 's17-act-embedded')}
 CASES['X-R'] = {'row': '49', 'scenario': 'core-rollback-old-line', 'seed': 'R', 'binary': 'rc2', 'kinds': ('s17-rollback',)}
 CONTROLS = {
     'core-xver-ctl-me-same': {'engine': 'me', 'under_test': 'rc2', 'kinds': XVER_KINDS, 'of': 'X-1'},

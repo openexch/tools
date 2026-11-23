@@ -48,10 +48,11 @@ class CaseTableTest(unittest.TestCase):
         self.assertEqual(xver.case_for('core-xver-bridge-on-old-archive', 's17-xver'), 'X-7')
         self.assertEqual(xver.case_for('core-act-latemember', 's17-act'), 'X-A4')
         self.assertEqual(xver.case_for('core-act-toolkill-2', 's17-act'), 'X-A2')
+        self.assertEqual(xver.case_for('core-act-latemember', 's17-act-embedded'), 'X-A4')
         self.assertEqual(xver.case_for('core-rollback-old-line', 's17-rollback'), 'X-R')
         with self.assertRaisesRegex(Inconclusive, 'runs on the s17-xver or s17-xver-ext kinds'):
             xver.case_for('core-xver-me-new-on-old-log', 's17-ext')
-        with self.assertRaisesRegex(Inconclusive, 'runs on the s17-act kind'):
+        with self.assertRaisesRegex(Inconclusive, 'runs on the s17-act or s17-act-embedded kinds'):
             xver.case_for('core-act-nobridge', 's17-xver')
         with self.assertRaisesRegex(Inconclusive, 'unknown cross-version scenario'):
             xver.case_for('core-xver-me-old-on-new', 's17-xver')
