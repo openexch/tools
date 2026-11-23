@@ -385,9 +385,10 @@ BASE_KINDS = {'s16', 's16-ext', 's16-embedded', 's16-n1', 's16-a03', 's16-a03-em
              's16-red-a03', 's16-red-a04', 's16-ctl-edk-cnctimeout'}
 # The s17 kinds, derived from the cut manifest by ``mk_manifests.py --cut``. The RED and A03 kinds
 # stage negative targets of a test-config build of the cut's cluster-tools commit.
-CUT_KINDS = {'s17', 's17-ext', 's17-embedded', 's17-n1', 's17-xver', 's17-xver-ext', 's17-act', 's17-rollback', 's17-a05',
-             's17-a05-embedded', 's17-a05-keep', 's17-a05-reverse', 's17-ctl-edk-cnctimeout',
-             's17-a03', 's17-a03-embedded', 's17-red-a03', 's17-red-a04', 's17-red1', 's17-red2'}
+CUT_KINDS = {'s17', 's17-ext', 's17-embedded', 's17-n1', 's17-xver', 's17-xver-ext', 's17-act', 's17-act-embedded',
+             's17-rollback', 's17-a05', 's17-a05-embedded', 's17-a05-ext', 's17-a05-keep', 's17-a05-keep-ext', 's17-a05-reverse',
+             's17-ctl-edk-cnctimeout', 's17-a03', 's17-a03-embedded', 's17-a03-ext', 's17-red-a03', 's17-red-a04', 's17-red1',
+             's17-red2'}
 # The replica kinds, named by content and derived from the cut like the s17 kinds. Each runs the core jar as the shadow
 # replica in shadow0 and its AE members in SNAPSHOT_MODE=shadow; the env each adds to the common shadow block
 # (core_fixture.engine_env / replica_env) is the kind's, because env lives in manifests (one kind per control setting).
@@ -773,7 +774,7 @@ def health_build_expected(entry):
 
 # A dated exception to "negative builds never share a manifest with build B": the A03 kinds of the base set and
 # of the cut (mk_manifests KINDS / CUT_KINDS, slot plan A03). The runner keyed it on 's16-a03'.
-A03_KINDS = {'s16-a03', 's16-a03-embedded', 's17-a03', 's17-a03-embedded'}
+A03_KINDS = {'s16-a03', 's16-a03-embedded', 's17-a03', 's17-a03-embedded', 's17-a03-ext'}
 
 
 def a03_phase1_declared(manifest):

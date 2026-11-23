@@ -1,0 +1,1475 @@
+{
+ "money_schema_version": 9,
+ "note": "Confirmation plan of the cutover cut (confirmation.py): the union of the embedded and external night sets, the external-engine legs of the failover drills and the embedded legs of the activation cases, the gateway and projection control kinds, the cutover smoke with its controls, the red proofs, the observation drill, the market-data drills, core-boot, the kept cross-version cases and the console rollout gate. Every entry runs both engine driver modes unless its class is one-mode with a cite.",
+ "rows": {
+  "RC1": [
+   "core-boot",
+   "core-drill-lifecycle",
+   "core-drill-lifecycle-faults"
+  ],
+  "RC2-A01": [
+   "core-drill-lostack",
+   "core-drill-coreleader",
+   "core-drill-meleader",
+   "core-drill-fwdrestart",
+   "core-drill-partition",
+   "core-drill-fwdpause",
+   "core-drill-driverkill",
+   "core-red-1"
+  ],
+  "RC2-A02": [
+   "core-drill-lifecycle",
+   "core-drill-lifecycle-faults",
+   "core-red-2"
+  ],
+  "RC2-A03": [
+   "core-drill-a03-lifetime",
+   "core-red-a03"
+  ],
+  "RC2-A04": [
+   "core-drill-a04-regenesis",
+   "core-drill-a04-one-bridge-halt",
+   "core-red-a04"
+  ],
+  "RC2-A05": [
+   "core-drill-a05-fwd-upgrade",
+   "core-drill-a05-fwd-kill",
+   "core-drill-a05-bridge-upgrade",
+   "core-drill-a05-keep"
+  ],
+  "RC2-A06": [
+   "core-drill-a06-two-forwarders-ticks",
+   "core-drill-meleader",
+   "core-drill-a01-fwdring",
+   "core-boots-10",
+   "core-drill-c13-enginedriverkill",
+   "core-control-edk-cnctimeout"
+  ],
+  "RC2-X": [
+   "core-act-fwdfirst",
+   "core-act-latemember",
+   "core-act-leaderkill",
+   "core-act-nobridge",
+   "core-act-toolkill",
+   "core-act-toolkill-2",
+   "core-xver-ae-new-on-old-log",
+   "core-xver-ae-new-on-old-snaptail",
+   "core-xver-bridge-on-old-archive",
+   "core-xver-ctl-ae-same",
+   "core-xver-ctl-me-same",
+   "core-xver-ctl-x7-wiped",
+   "core-xver-me-new-on-old-log",
+   "core-xver-me-new-on-old-snapquiet",
+   "core-xver-me-new-on-old-snaptail"
+  ],
+  "RCS": [
+   "core-control-kill9-fullmode",
+   "core-control-peerloss-loud-unblocked",
+   "core-control-peerloss-loud-unblocked-kitwait",
+   "core-control-rebootstrap-detectoronly",
+   "core-control-rebootstrap-nowitness",
+   "core-control-supplierloss-cooldown30",
+   "core-drill-leaderloss-promotion",
+   "core-drill-member-kill9",
+   "core-drill-peerloss",
+   "core-drill-peerloss-loud",
+   "core-drill-replica-rebootstrap",
+   "core-drill-replica-restart",
+   "core-drill-replica-wipe",
+   "core-drill-shadow-catalog",
+   "core-drill-supplierloss"
+  ],
+  "RC3": [
+   "gateway-kill-restart",
+   "stream-slow-consumer",
+   "gateway-session-timeout",
+   "fill-visibility-core",
+   "tick-live-path",
+   "gw-freshkey",
+   "gw-b3",
+   "gw-slow-ceiling16m",
+   "gw-timeout-shortfreeze",
+   "gw-fill-muted",
+   "gw-tick-nofwd",
+   "gw-noreoffer",
+   "gw-noassetcheck"
+  ],
+  "RC4": [
+   "projector-me-restart-follow",
+   "projection-byte-equal-replay",
+   "history-freshness",
+   "pj-nc-pinrecording",
+   "pj-nc-nostopreplay-ext",
+   "pj-nc-wallclock",
+   "pj-nc-dropone",
+   "pj-nc-beatalways",
+   "pj-nc-nostale"
+  ],
+  "1.1": [
+   "critical-path-smoke-core"
+  ],
+  "1.2": [
+   "core-control-smoke-nomatch"
+  ],
+  "1.3": [
+   "core-gate-brake"
+  ],
+  "1.4": [
+   "critical-path-smoke-core"
+  ],
+  "1.5": [
+   "critical-path-smoke-core"
+  ],
+  "1.6": [
+   "core-history-loss"
+  ],
+  "2.1": [
+   "core-control-pgorders-lagging",
+   "core-control-pgorders"
+  ],
+  "2.3": [
+   "core-control-stale-money-history"
+  ],
+  "2.4": [
+   "core-table-owners"
+  ],
+  "3.2": [
+   "core-observation-drill",
+   "core-observation-drill-freeze-bridge",
+   "core-observation-drill-freeze-projector",
+   "core-observation-drill-grow-file",
+   "core-observation-drill-kill-core"
+  ],
+  "M3": [
+   "core-md-exactly-once"
+  ],
+  "M4": [
+   "core-md-failover"
+  ],
+  "M5": [
+   "core-md-history-loss"
+  ],
+  "M6": [
+   "core-md-epoch"
+  ],
+  "M9": [
+   "core-md-driverkill"
+  ],
+  "M16": [
+   "core-md-frozen"
+  ],
+  "console-roll-gate": [
+   "core-console-roll-gate"
+  ]
+ },
+ "entries": [
+  {
+   "id": "core-drill-lostack",
+   "scenario": "core-drill-lostack",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17"
+    },
+    {
+     "kind": "s17-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-coreleader",
+   "scenario": "core-drill-coreleader",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17"
+    },
+    {
+     "kind": "s17-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-meleader",
+   "scenario": "core-drill-meleader",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17"
+    },
+    {
+     "kind": "s17-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-partition",
+   "scenario": "core-drill-partition",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17"
+    },
+    {
+     "kind": "s17-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-fwdpause",
+   "scenario": "core-drill-fwdpause",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17"
+    },
+    {
+     "kind": "s17-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-driverkill",
+   "scenario": "core-drill-driverkill",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17"
+    },
+    {
+     "kind": "s17-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-lifecycle-faults",
+   "scenario": "core-drill-lifecycle-faults",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17"
+    },
+    {
+     "kind": "s17-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-a04-one-bridge-halt",
+   "scenario": "core-drill-a04-one-bridge-halt",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17"
+    },
+    {
+     "kind": "s17-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-a06-two-forwarders-ticks",
+   "scenario": "core-drill-a06-two-forwarders-ticks",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17"
+    },
+    {
+     "kind": "s17-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-a01-fwdring",
+   "scenario": "core-drill-a01-fwdring",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17"
+    },
+    {
+     "kind": "s17-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-boots-10",
+   "scenario": "core-boots-10",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17"
+    },
+    {
+     "kind": "s17-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-a05-fwd-kill",
+   "scenario": "core-drill-a05-fwd-kill",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-a05"
+    },
+    {
+     "kind": "s17-a05-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-a05-bridge-upgrade",
+   "scenario": "core-drill-a05-bridge-upgrade",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-a05"
+    },
+    {
+     "kind": "s17-a05-reverse"
+    },
+    {
+     "kind": "s17-a05-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-a05-keep",
+   "scenario": "core-drill-a05-keep",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-a05-keep"
+    },
+    {
+     "kind": "s17-a05-keep-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-fwdrestart",
+   "scenario": "core-drill-fwdrestart",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17"
+    },
+    {
+     "kind": "s17-embedded"
+    },
+    {
+     "kind": "s17-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-lifecycle",
+   "scenario": "core-drill-lifecycle",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17"
+    },
+    {
+     "kind": "s17-embedded"
+    },
+    {
+     "kind": "s17-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-a03-lifetime",
+   "scenario": "core-drill-a03-lifetime",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-a03"
+    },
+    {
+     "kind": "s17-a03-embedded"
+    },
+    {
+     "kind": "s17-a03-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-a05-fwd-upgrade",
+   "scenario": "core-drill-a05-fwd-upgrade",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-a05"
+    },
+    {
+     "kind": "s17-a05-embedded"
+    },
+    {
+     "kind": "s17-a05-reverse"
+    },
+    {
+     "kind": "s17-a05-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-a04-regenesis",
+   "scenario": "core-drill-a04-regenesis",
+   "class": "one-mode",
+   "cite": "RC2 S16 contract.md:414-416: A04-T2-regenesis and RED-A04 run on the external profile",
+   "legs": [
+    {
+     "kind": "s17-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-red-a04",
+   "scenario": "core-red-a04",
+   "class": "one-mode",
+   "cite": "RC2 S16 contract.md:414-416: A04-T2-regenesis and RED-A04 run on the external profile",
+   "legs": [
+    {
+     "kind": "s17-red-a04"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "core-drill-c13-enginedriverkill",
+   "scenario": "core-drill-c13-enginedriverkill",
+   "class": "one-mode",
+   "cite": "the drill kills the engine aeronmd (core_drills.py, run_cnc_timeout and the c13 fault): external engines only",
+   "legs": [
+    {
+     "kind": "s17-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-control-edk-cnctimeout",
+   "scenario": "core-control-edk-cnctimeout",
+   "class": "one-mode",
+   "cite": "the drill kills the engine aeronmd (core_drills.py, run_cnc_timeout and the c13 fault): external engines only",
+   "legs": [
+    {
+     "kind": "s17-ctl-edk-cnctimeout"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "core-red-a03",
+   "scenario": "core-red-a03",
+   "class": "one-mode",
+   "cite": "harness rule: the drills' controls run in one mode each (core_contracts.py, the gateway and projection control kinds)",
+   "legs": [
+    {
+     "kind": "s17-red-a03"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "core-red-1",
+   "scenario": "core-red-1",
+   "class": "one-mode",
+   "cite": "harness rule: the drills' controls run in one mode each (core_contracts.py, the gateway and projection control kinds)",
+   "legs": [
+    {
+     "kind": "s17-red1"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "core-red-2",
+   "scenario": "core-red-2",
+   "class": "one-mode",
+   "cite": "harness rule: the drills' controls run in one mode each (core_contracts.py, the gateway and projection control kinds)",
+   "legs": [
+    {
+     "kind": "s17-red2"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "core-drill-peerloss-loud",
+   "scenario": "core-drill-peerloss-loud",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "shadow"
+    },
+    {
+     "kind": "shadow-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-supplierloss",
+   "scenario": "core-drill-supplierloss",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "shadow"
+    },
+    {
+     "kind": "shadow-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-replica-restart",
+   "scenario": "core-drill-replica-restart",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "shadow"
+    },
+    {
+     "kind": "shadow-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-replica-wipe",
+   "scenario": "core-drill-replica-wipe",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "shadow"
+    },
+    {
+     "kind": "shadow-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-replica-rebootstrap",
+   "scenario": "core-drill-replica-rebootstrap",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "shadow-anyverified"
+    },
+    {
+     "kind": "shadow-anyverified-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-member-kill9",
+   "scenario": "core-drill-member-kill9",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "shadow"
+    },
+    {
+     "kind": "shadow-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-peerloss",
+   "scenario": "core-drill-peerloss",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "shadow"
+    },
+    {
+     "kind": "shadow-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-shadow-catalog",
+   "scenario": "core-drill-shadow-catalog",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "shadow-query"
+    },
+    {
+     "kind": "shadow-query-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-drill-leaderloss-promotion",
+   "scenario": "core-drill-leaderloss-promotion",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "shadow-query"
+    },
+    {
+     "kind": "shadow-query-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-control-kill9-fullmode",
+   "scenario": "core-control-kill9-fullmode",
+   "class": "one-mode",
+   "cite": "harness rule: the drills' controls run in one mode each (core_contracts.py, the gateway and projection control kinds)",
+   "legs": [
+    {
+     "kind": "full"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "core-control-peerloss-loud-unblocked",
+   "scenario": "core-control-peerloss-loud-unblocked",
+   "class": "one-mode",
+   "cite": "harness rule: the drills' controls run in one mode each (core_contracts.py, the gateway and projection control kinds)",
+   "legs": [
+    {
+     "kind": "shadow"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "core-control-peerloss-loud-unblocked-kitwait",
+   "scenario": "core-control-peerloss-loud-unblocked-kitwait",
+   "class": "one-mode",
+   "cite": "harness rule: the drills' controls run in one mode each (core_contracts.py, the gateway and projection control kinds)",
+   "legs": [
+    {
+     "kind": "shadow"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "core-control-supplierloss-cooldown30",
+   "scenario": "core-control-supplierloss-cooldown30",
+   "class": "one-mode",
+   "cite": "harness rule: the drills' controls run in one mode each (core_contracts.py, the gateway and projection control kinds)",
+   "legs": [
+    {
+     "kind": "shadow-cooldown30"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "core-control-rebootstrap-detectoronly",
+   "scenario": "core-control-rebootstrap-detectoronly",
+   "class": "one-mode",
+   "cite": "harness rule: the drills' controls run in one mode each (core_contracts.py, the gateway and projection control kinds)",
+   "legs": [
+    {
+     "kind": "shadow-detectoronly"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "core-control-rebootstrap-nowitness",
+   "scenario": "core-control-rebootstrap-nowitness",
+   "class": "one-mode",
+   "cite": "harness rule: the drills' controls run in one mode each (core_contracts.py, the gateway and projection control kinds)",
+   "legs": [
+    {
+     "kind": "shadow"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "gateway-kill-restart",
+   "scenario": "gateway-kill-restart",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "gw"
+    },
+    {
+     "kind": "gw-ext"
+    }
+   ]
+  },
+  {
+   "id": "stream-slow-consumer",
+   "scenario": "stream-slow-consumer",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "gw-slow"
+    },
+    {
+     "kind": "gw-slow-ext"
+    }
+   ]
+  },
+  {
+   "id": "gateway-session-timeout",
+   "scenario": "gateway-session-timeout",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "gw"
+    },
+    {
+     "kind": "gw-ext"
+    }
+   ]
+  },
+  {
+   "id": "fill-visibility-core",
+   "scenario": "fill-visibility-core",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "gw"
+    },
+    {
+     "kind": "gw-ext"
+    }
+   ]
+  },
+  {
+   "id": "tick-live-path",
+   "scenario": "tick-live-path",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "gw"
+    },
+    {
+     "kind": "gw-ext"
+    }
+   ]
+  },
+  {
+   "id": "projector-me-restart-follow",
+   "scenario": "projector-me-restart-follow",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "pj"
+    },
+    {
+     "kind": "pj-ext"
+    }
+   ]
+  },
+  {
+   "id": "projection-byte-equal-replay",
+   "scenario": "projection-byte-equal-replay",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "pj"
+    },
+    {
+     "kind": "pj-ext"
+    }
+   ]
+  },
+  {
+   "id": "history-freshness",
+   "scenario": "history-freshness",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "pj"
+    },
+    {
+     "kind": "pj-ext"
+    }
+   ]
+  },
+  {
+   "id": "gw-freshkey",
+   "scenario": "gateway-kill-restart",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "gw-freshkey"
+    },
+    {
+     "kind": "gw-freshkey-ext"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "pj-nc-pinrecording",
+   "scenario": "projector-me-restart-follow",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "pj-nc-pinrecording"
+    },
+    {
+     "kind": "pj-nc-pinrecording-ext"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "pj-nc-wallclock",
+   "scenario": "projection-byte-equal-replay",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "pj-nc-wallclock"
+    },
+    {
+     "kind": "pj-nc-wallclock-ext"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "pj-nc-dropone",
+   "scenario": "projection-byte-equal-replay",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "pj-nc-dropone"
+    },
+    {
+     "kind": "pj-nc-dropone-ext"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "pj-nc-beatalways",
+   "scenario": "history-freshness",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "pj-nc-beatalways"
+    },
+    {
+     "kind": "pj-nc-beatalways-ext"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "pj-nc-nostale",
+   "scenario": "history-freshness",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "pj-nc-nostale"
+    },
+    {
+     "kind": "pj-nc-nostale-ext"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "pj-nc-nostopreplay-ext",
+   "scenario": "projector-me-restart-follow",
+   "class": "one-mode",
+   "cite": "core_contracts.py: the no-stop control has no embedded leg (a stopped copy keeps no subscription on the embedded driver)",
+   "legs": [
+    {
+     "kind": "pj-nc-nostopreplay-ext"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "gw-b3",
+   "scenario": "gateway-kill-restart",
+   "class": "one-mode",
+   "cite": "harness rule: the drills' controls run in one mode each (core_contracts.py, the gateway and projection control kinds)",
+   "legs": [
+    {
+     "kind": "gw-b3"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "gw-slow-ceiling16m",
+   "scenario": "stream-slow-consumer",
+   "class": "one-mode",
+   "cite": "harness rule: the drills' controls run in one mode each (core_contracts.py, the gateway and projection control kinds)",
+   "legs": [
+    {
+     "kind": "gw-slow-ceiling16m"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "gw-timeout-shortfreeze",
+   "scenario": "gateway-session-timeout",
+   "class": "one-mode",
+   "cite": "harness rule: the drills' controls run in one mode each (core_contracts.py, the gateway and projection control kinds)",
+   "legs": [
+    {
+     "kind": "gw-timeout-shortfreeze"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "gw-fill-muted",
+   "scenario": "fill-visibility-core",
+   "class": "one-mode",
+   "cite": "harness rule: the drills' controls run in one mode each (core_contracts.py, the gateway and projection control kinds)",
+   "legs": [
+    {
+     "kind": "gw-fill-muted"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "gw-tick-nofwd",
+   "scenario": "tick-live-path",
+   "class": "one-mode",
+   "cite": "harness rule: the drills' controls run in one mode each (core_contracts.py, the gateway and projection control kinds)",
+   "legs": [
+    {
+     "kind": "gw-tick-nofwd"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "gw-noreoffer",
+   "scenario": "gateway-kill-restart",
+   "class": "one-mode",
+   "cite": "harness rule: the drills' controls run in one mode each (core_contracts.py, the gateway and projection control kinds)",
+   "legs": [
+    {
+     "kind": "gw-noreoffer"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "gw-noassetcheck",
+   "scenario": "fill-visibility-core",
+   "class": "one-mode",
+   "cite": "harness rule: the drills' controls run in one mode each (core_contracts.py, the gateway and projection control kinds)",
+   "legs": [
+    {
+     "kind": "gw-noassetcheck"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "critical-path-smoke-core",
+   "scenario": "critical-path-smoke-core",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "cps"
+    },
+    {
+     "kind": "cps-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-control-smoke-nomatch",
+   "scenario": "core-control-smoke-nomatch",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "cps-nofwd"
+    },
+    {
+     "kind": "cps-nofwd-ext"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "core-gate-brake",
+   "scenario": "core-gate-brake",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "cps"
+    },
+    {
+     "kind": "cps-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-history-loss",
+   "scenario": "core-history-loss",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "cps"
+    },
+    {
+     "kind": "cps-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-control-pgorders-lagging",
+   "scenario": "core-control-pgorders",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "pj-nc-dropone"
+    },
+    {
+     "kind": "pj-nc-dropone-ext"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "core-control-pgorders",
+   "scenario": "core-control-pgorders",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "cps"
+    },
+    {
+     "kind": "cps-ext"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "core-control-stale-money-history",
+   "scenario": "core-control-stale-money-history",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "cps"
+    },
+    {
+     "kind": "cps-ext"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "core-table-owners",
+   "scenario": "core-table-owners",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "cps"
+    },
+    {
+     "kind": "cps-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-observation-drill",
+   "scenario": "core-observation-drill",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "cps"
+    },
+    {
+     "kind": "cps-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-observation-drill-freeze-projector",
+   "scenario": "core-observation-drill",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "cps",
+     "settings": {
+      "OBS_DRILL_FAULT": "freeze-projector"
+     }
+    },
+    {
+     "kind": "cps-ext",
+     "settings": {
+      "OBS_DRILL_FAULT": "freeze-projector"
+     }
+    }
+   ]
+  },
+  {
+   "id": "core-observation-drill-freeze-bridge",
+   "scenario": "core-observation-drill",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "cps",
+     "settings": {
+      "OBS_DRILL_FAULT": "freeze-bridge"
+     }
+    },
+    {
+     "kind": "cps-ext",
+     "settings": {
+      "OBS_DRILL_FAULT": "freeze-bridge"
+     }
+    }
+   ]
+  },
+  {
+   "id": "core-observation-drill-kill-core",
+   "scenario": "core-observation-drill",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "cps",
+     "settings": {
+      "OBS_DRILL_FAULT": "kill-core"
+     }
+    },
+    {
+     "kind": "cps-ext",
+     "settings": {
+      "OBS_DRILL_FAULT": "kill-core"
+     }
+    }
+   ]
+  },
+  {
+   "id": "core-observation-drill-grow-file",
+   "scenario": "core-observation-drill",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "cps",
+     "settings": {
+      "OBS_DRILL_FAULT": "grow-file"
+     }
+    },
+    {
+     "kind": "cps-ext",
+     "settings": {
+      "OBS_DRILL_FAULT": "grow-file"
+     }
+    }
+   ]
+  },
+  {
+   "id": "core-md-exactly-once",
+   "scenario": "core-md-exactly-once",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "cps-mdtc"
+    },
+    {
+     "kind": "cps-mdtc-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-md-failover",
+   "scenario": "core-md-failover",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "cps"
+    },
+    {
+     "kind": "cps-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-md-history-loss",
+   "scenario": "core-md-history-loss",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "cps"
+    },
+    {
+     "kind": "cps-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-md-epoch",
+   "scenario": "core-md-epoch",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "cps"
+    },
+    {
+     "kind": "cps-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-md-driverkill",
+   "scenario": "core-md-driverkill",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "cps"
+    },
+    {
+     "kind": "cps-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-md-frozen",
+   "scenario": "core-md-frozen",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "cps"
+    },
+    {
+     "kind": "cps-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-boot",
+   "scenario": "core-boot",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17"
+    },
+    {
+     "kind": "s17-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-xver-me-new-on-old-snaptail",
+   "scenario": "core-xver-me-new-on-old-snaptail",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-xver"
+    },
+    {
+     "kind": "s17-xver-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-xver-me-new-on-old-snapquiet",
+   "scenario": "core-xver-me-new-on-old-snapquiet",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-xver"
+    },
+    {
+     "kind": "s17-xver-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-xver-me-new-on-old-log",
+   "scenario": "core-xver-me-new-on-old-log",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-xver"
+    },
+    {
+     "kind": "s17-xver-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-xver-ae-new-on-old-snaptail",
+   "scenario": "core-xver-ae-new-on-old-snaptail",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-xver"
+    },
+    {
+     "kind": "s17-xver-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-xver-ae-new-on-old-log",
+   "scenario": "core-xver-ae-new-on-old-log",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-xver"
+    },
+    {
+     "kind": "s17-xver-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-xver-bridge-on-old-archive",
+   "scenario": "core-xver-bridge-on-old-archive",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-xver"
+    },
+    {
+     "kind": "s17-xver-ext"
+    }
+   ]
+  },
+  {
+   "id": "core-xver-ctl-me-same",
+   "scenario": "core-xver-ctl-me-same",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-xver"
+    },
+    {
+     "kind": "s17-xver-ext"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "core-xver-ctl-ae-same",
+   "scenario": "core-xver-ctl-ae-same",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-xver"
+    },
+    {
+     "kind": "s17-xver-ext"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "core-xver-ctl-x7-wiped",
+   "scenario": "core-xver-ctl-x7-wiped",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-xver"
+    },
+    {
+     "kind": "s17-xver-ext"
+    }
+   ],
+   "control": true
+  },
+  {
+   "id": "core-act-leaderkill",
+   "scenario": "core-act-leaderkill",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-act-embedded"
+    },
+    {
+     "kind": "s17-act"
+    }
+   ]
+  },
+  {
+   "id": "core-act-toolkill",
+   "scenario": "core-act-toolkill",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-act-embedded"
+    },
+    {
+     "kind": "s17-act"
+    }
+   ]
+  },
+  {
+   "id": "core-act-toolkill-2",
+   "scenario": "core-act-toolkill-2",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-act-embedded"
+    },
+    {
+     "kind": "s17-act"
+    }
+   ]
+  },
+  {
+   "id": "core-act-nobridge",
+   "scenario": "core-act-nobridge",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-act-embedded"
+    },
+    {
+     "kind": "s17-act"
+    }
+   ]
+  },
+  {
+   "id": "core-act-latemember",
+   "scenario": "core-act-latemember",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-act-embedded"
+    },
+    {
+     "kind": "s17-act"
+    }
+   ]
+  },
+  {
+   "id": "core-act-fwdfirst",
+   "scenario": "core-act-fwdfirst",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "s17-act-embedded"
+    },
+    {
+     "kind": "s17-act"
+    }
+   ]
+  },
+  {
+   "id": "core-console-roll-gate",
+   "scenario": "core-console-roll-gate",
+   "class": "both",
+   "legs": [
+    {
+     "kind": "console-embedded",
+     "mode": "embedded"
+    },
+    {
+     "kind": "console-external",
+     "mode": "external"
+    }
+   ]
+  }
+ ]
+}

@@ -312,15 +312,21 @@ CUT_KINDS = {
     's17-xver': ('external', 'embedded', 'CUT', 'A', {}),
     's17-xver-ext': ('external', 'external', 'CUT', 'A', {}),
     's17-act': ('external', 'external', 'CUT', 'A', {}),
+    # the activation entries' embedded-engine leg (every entry runs both engine driver modes)
+    's17-act-embedded': ('external', 'embedded', 'CUT', 'A', {}),
     's17-rollback': ('external', 'external', 'CUT', 'A', {}),
     's17-a05': ('external', 'embedded', 'A', 'A', {'forwarder_b': 'CUT', 'bridge_b': 'CUT'}),
     's17-a05-embedded': ('embedded', 'embedded', 'A', 'A', {'forwarder_b': 'CUT', 'bridge_b': 'CUT'}),
     's17-a05-keep': ('external', 'embedded', 'A', 'A', {'forwarder_b': 'CUT', 'bridge_b': 'CUT'}),
+    # the external-engine legs of the A05 entries (slots as s17-a05 / s17-a05-keep, engines on the staged aeronmd)
+    's17-a05-ext': ('external', 'external', 'A', 'A', {'forwarder_b': 'CUT', 'bridge_b': 'CUT'}),
+    's17-a05-keep-ext': ('external', 'external', 'A', 'A', {'forwarder_b': 'CUT', 'bridge_b': 'CUT'}),
     's17-a05-reverse': ('external', 'embedded', 'CUT', 'A', {'forwarder_b': 'A', 'bridge_b': 'A'}),
     's17-ctl-edk-cnctimeout': ('external', 'external', 'CUT', 'A', {}),
     # the negative kinds stage nc targets of a TEST-config build of the cut's cluster-tools commit (cut_nc_dir), never a product
     's17-a03': ('external', 'embedded', 'CUT', 'A03', {'forwarder_b': 'ct_forwarder_nc_norelease'}),
     's17-a03-embedded': ('embedded', 'embedded', 'CUT', 'A03', {'forwarder_b': 'ct_forwarder_nc_norelease'}),
+    's17-a03-ext': ('external', 'external', 'CUT', 'A03', {'forwarder_b': 'ct_forwarder_nc_norelease'}),
     's17-red-a03': ('external', 'embedded', 'CUT', 'REDA03', {'forwarder_b': 'ct_forwarder_nc_norelease', 'forwarder': None}),
     's17-red-a04': ('external', 'external', 'CUT', 'REDA04', {'bridge_b': 'ct_bridge_nc_noepoch', 'bridge': None}),
     # RED-1 (forwarder without RESYNC) and RED-2 (legacy bridge) on the cut
