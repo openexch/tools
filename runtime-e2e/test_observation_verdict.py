@@ -497,3 +497,23 @@ class PlantedSets(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ReplicaShadowAge(unittest.TestCase):
+    """The replica writes one shadow per member snapshot, so its shadow age climbs to the snapshot interval between
+    two shadows; V3 judges that age against the snapshot-age bound, not the stall bound."""
+
+    def sawtooth(self, settings):
+        ss = SampleSet()
+        ss.settings = dict(ss.settings, **settings)
+        ss.metric_hooks.append(series_at('core-replica/r0', 'shadow_last_age_ms',
+                                         lambda i: 1000 + (i * PERIOD_S * 1000) % 300000, set(range(200))))
+        return judge_set(ss)
+
+    def test_a_five_minute_shadow_cadence_is_progress(self):
+        v = self.sawtooth({'OBS_SNAPSHOT_AGE_S': None, 'OBS_SNAPSHOT_INTERVAL_S': 300})
+        self.assertFalse([f for f in v['failures'] if 'core-replica' in f], v['failures'])
+
+    def test_without_a_snapshot_bound_the_stall_bound_still_applies(self):
+        v = self.sawtooth({'OBS_SNAPSHOT_AGE_S': None, 'OBS_SNAPSHOT_INTERVAL_S': None})
+        self.assertIn('healthy without progress: core-replica/r0 shadow_last_age_ms', ' '.join(v['failures']))
