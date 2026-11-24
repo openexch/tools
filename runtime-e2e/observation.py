@@ -541,7 +541,12 @@ def v5(view, line):
             lf = life(svc)
             cpu = ((svc or {}).get('proc') or {}).get('cpu_ticks')
             work = _work(svc, rule, s['OBS_STALL_S'] * 1000)
-            if prev is None or lf is None or lf != prev[1] or cpu is None:
+            if cpu is None:
+                # no CPU reading (the process died or was unreadable between two samples): the run of spin evidence
+                # ends here, and this sample is never the base of a CPU share
+                prev, spin_since = None, None
+                continue
+            if prev is None or lf is None or lf != prev[1]:
                 prev, spin_since = (ts, lf, cpu, work), None
                 continue
             dt = (ts - prev[0]) / 1000

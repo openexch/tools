@@ -461,6 +461,33 @@ class PlantedSets(unittest.TestCase):
         self.assertEqual(v['status'], 'INCONCLUSIVE')
         self.assertTrue(any('sample chain broken: h1 line 11' in t for t in v['inconclusive']), v['inconclusive'])
 
+    def test_a_sample_without_cpu_ticks_is_never_the_base_of_a_cpu_share(self):
+        # the process dies between two samples: the record still says alive, but its CPU reading is gone
+        for gone in ({20}, {20, 21}, {0}, {N - 1}):
+            with self.subTest(gone=sorted(gone)):
+                ss = SampleSet()
+                ss.svc_hooks.append(lambda n, k, i, s, gone=gone: s if n != 'oe-stream/st0' or i not in gone else
+                                    dict(s, proc={x: y for x, y in s['proc'].items() if x != 'cpu_ticks'}))
+                v = judge_set(ss)
+                self.assertEqual(v['status'], 'PASS', json.dumps(v['failures'] + v['inconclusive']))
+
+    def test_a_missing_cpu_reading_ends_a_spin_run(self):
+        spin = lambda n, k, i, m: m if n != 'oe-stream/st0' else dict(m, stream_ws_connections=0, stream_ws_frames_sent_total=0)
+        hot = lambda gone: lambda n, k, i, s: s if n != 'oe-stream/st0' else dict(s, proc=(
+            {x: y for x, y in s['proc'].items() if x != 'cpu_ticks'} if i in gone else
+            dict(s['proc'], cpu_ticks=6 * i + (5400 * (i - 20) if i >= 20 else 0))))
+        # a reading lost every 4 samples: no run of spin evidence reaches OBS_SPIN_S (300 s), so V5 does not judge it
+        ss = SampleSet()
+        ss.metric_hooks.append(spin)
+        ss.svc_hooks.append(hot(set(range(20, N, 4))))
+        self.assertEqual(judge_set(ss)['status'], 'PASS')
+        # one lost reading: the run starts again after it and still reaches the bound
+        ss = SampleSet()
+        ss.metric_hooks.append(spin)
+        ss.svc_hooks.append(hot({22}))
+        v = judge_set(ss)
+        self.assertEqual(v['failures'], ['V5 spin: oe-stream/st0'])
+
     def test_the_shadow_core_half_is_never_silent(self):
         ss = SampleSet()
         ss.metric_hooks.append(lambda n, k, i, m: {x: y for x, y in m.items() if x != 'shadow_log_purge_position'} if m else m)

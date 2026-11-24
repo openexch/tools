@@ -28,6 +28,7 @@ from money_check import (  # noqa: E402
     SCALE,
     build_arg_parser,
     check_core_internal,
+    core_env,
     check_conservation,
     check_locked,
     check_nonnegative,
@@ -422,6 +423,45 @@ class RetiredFlags(unittest.TestCase):
         self.assertIsNone(retired_refusal(argv))
         args = build_arg_parser().parse_args(argv)
         self.assertEqual((args.store, args.cut, args.core_timeout), ("core", "cut.json", 5))
+
+
+class CoreReadEnvironment(unittest.TestCase):
+    """CoreDump and the order snapshot reader address the same core: each gets every addressing value it reads, in its
+    own names. CoreDump builds its ingress endpoints with the cluster-kit port math, whose stride defaults to 0, so a
+    dump without the stride sends all three members' requests to one port on a box that runs several members."""
+
+    ARGV = ["--store", "core", "--core-addresses", "10.0.0.1,10.0.0.2,10.0.0.3", "--core-port-base", "9300",
+            "--local-host", "10.0.0.9", "--driver-mode", "embedded"]
+
+    # CoreDump's names (BridgeConfig.fromEnv, ClusterPorts.stride) against the reader's names (CoreProbe)
+    SAME_VALUE = (("BRIDGE_CORE_CLUSTER_ADDRESSES", "CORE_ADDRESSES"), ("BRIDGE_CORE_PORT_BASE", "CORE_PORT_BASE"),
+                  ("CLUSTER_PORT_STRIDE", "CLUSTER_PORT_STRIDE"), ("BRIDGE_LOCAL_HOST", "CORE_LOCAL_HOST"),
+                  ("COREDUMP_DRIVER_MODE", "CORE_PROBE_DRIVER_MODE"))
+
+    def env(self, *extra):
+        return core_env(build_arg_parser().parse_args(self.ARGV + list(extra)), "tool-key", "admin-key")
+
+    def test_the_dump_carries_the_default_stride(self):
+        self.assertEqual(self.env()["dump"].get("CLUSTER_PORT_STRIDE"), "100")
+
+    def test_the_dump_carries_a_given_stride(self):
+        for stride in ("0", "7", "100"):
+            with self.subTest(stride=stride):
+                env = self.env("--core-port-stride", stride)
+                self.assertEqual(env["dump"].get("CLUSTER_PORT_STRIDE"), stride)
+                self.assertEqual(env["probe"]["CLUSTER_PORT_STRIDE"], stride)
+
+    def test_both_reads_address_the_same_core(self):
+        env = self.env("--core-port-stride", "100")
+        for dump_name, probe_name in self.SAME_VALUE:
+            with self.subTest(dump=dump_name, probe=probe_name):
+                self.assertIn(dump_name, env["dump"])
+                self.assertEqual(env["dump"][dump_name], env["probe"][probe_name])
+
+    def test_each_read_presents_its_own_key(self):
+        env = self.env()
+        self.assertEqual((env["dump"]["CORE_AUTH_CREDENTIAL"], env["probe"]["CORE_AUTH_CREDENTIAL"]),
+                         ("tool-key", "admin-key"))
 
 
 class CoreProgramsFromTheCut(unittest.TestCase):
