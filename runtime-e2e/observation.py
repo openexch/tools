@@ -420,13 +420,15 @@ def _input_value(view, ts, name, rule):
     return parts
 
 
-def _work(svc, rule, stall_ms):
-    """{counter: value or None}; an age gauge maps to 'fresh' (under the stall bound) or 'old'."""
+def _work(svc, rule, stall_ms, age_ms=None):
+    """{counter: value or None}; an age gauge maps to 'fresh' (under its bound) or 'old'. The bound is age_ms when
+    given (an age that follows the snapshot cadence, such as the replica's shadow age), else the stall bound."""
+    bound = stall_ms if age_ms is None else age_ms
     out = {}
     for w in rule['work']:
         if w.startswith('age:'):
             v = metric(svc, w[4:])
-            out[w[4:]] = None if v is None else ('fresh' if v < stall_ms else 'old')
+            out[w[4:]] = None if v is None else ('fresh' if v < bound else 'old')
         else:
             out[w] = metric(svc, w)
     return out
@@ -436,8 +438,21 @@ def _paused(view, name, ts):
     return view.window_actions({'pause', 'stop', 'restart'}, ts, name)
 
 
+def snapshot_age_bound_s(s):
+    """The snapshot-age bound in seconds (OBS_SNAPSHOT_AGE_S, else 3 x OBS_SNAPSHOT_INTERVAL_S), or None."""
+    if s['OBS_SNAPSHOT_AGE_S'] is not None:
+        return s['OBS_SNAPSHOT_AGE_S']
+    if s['OBS_SNAPSHOT_INTERVAL_S'] is not None:
+        return 3 * s['OBS_SNAPSHOT_INTERVAL_S']
+    return None
+
+
 def v3(view, line):
     stall = view.settings['OBS_STALL_S'] * 1000
+    # The replica writes a shadow per member snapshot, so its shadow age climbs to the snapshot interval between two
+    # shadows: judge that age against the snapshot-age bound, not the stall bound.
+    snap = snapshot_age_bound_s(view.settings)
+    age_bound = None if snap is None else max(stall, snap * 1000)
     for name in sorted(view.services):
         kind = view.services[name][1]
         rule = view.kinds.get(kind)
@@ -464,7 +479,7 @@ def v3(view, line):
                 vals = [v for v in vals if v is not None]
                 work = {rule['work'][0]: max(vals) if vals else None}
             else:
-                work = _work(svc, rule, stall)
+                work = _work(svc, rule, stall, age_bound)
             moved = False
             readable = False
             for k, v in work.items():
@@ -572,9 +587,7 @@ def absent(view, line, text):
 
 def v6(view, line):
     s = view.settings
-    bound = s['OBS_SNAPSHOT_AGE_S']
-    if bound is None and s['OBS_SNAPSHOT_INTERVAL_S'] is not None:
-        bound = 3 * s['OBS_SNAPSHOT_INTERVAL_S']
+    bound = snapshot_age_bound_s(s)
     if bound is None:
         line.gap('snapshot age not judged: neither OBS_SNAPSHOT_AGE_S nor OBS_SNAPSHOT_INTERVAL_S is set')
     for kind, series in SNAPSHOT_AGE.items():
