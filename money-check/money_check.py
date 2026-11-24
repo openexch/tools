@@ -776,7 +776,10 @@ def core_env(args, tool_key, admin_key):
     common = {"AERON_DIR": args.aeron_dir} if args.aeron_dir else {}
     dump = {"COREDUMP_DRIVER_MODE": args.driver_mode, "CORE_AUTH_CREDENTIAL": tool_key,
             "BRIDGE_CORE_CLUSTER_ADDRESSES": args.core_addresses, "BRIDGE_CORE_PORT_BASE": str(args.core_port_base),
-            "BRIDGE_LOCAL_HOST": args.local_host}
+            "BRIDGE_LOCAL_HOST": args.local_host,
+            # CoreDump derives the ingress endpoints with the cluster-kit port math, whose stride defaults to 0: without
+            # it the members' endpoints collapse onto one port on a box that runs several members
+            "CLUSTER_PORT_STRIDE": str(stride)}
     probe = {"CORE_PROBE_DRIVER_MODE": args.driver_mode, "CORE_AUTH_CREDENTIAL": admin_key,
              "CORE_ADDRESSES": args.core_addresses, "CORE_PORT_BASE": str(args.core_port_base),
              "CLUSTER_PORT_STRIDE": str(stride), "CORE_LOCAL_HOST": args.local_host}
