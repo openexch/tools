@@ -55,41 +55,40 @@ SCHEMA4 = '''<?xml version="1.0" encoding="UTF-8"?>
 
 class JournalDecodeTest(unittest.TestCase):
     def setUp(self):
-        self.profile = journal_decode.load_profile('me-journal-v1')
-        self.journal = sbe_layout.load(SCHEMAS / 'settlement-journal-schema.xml')
-        self.orders = sbe_layout.load(SCHEMAS / 'order-schema.xml')
+        self.profile = journal_decode.load_profile('me-journal-4')
+        self.journal = sbe_layout.load(SCHEMAS / 'me-journal-schema-4.xml')
 
-    def test_block_lengths_match_the_generated_codecs(self):
-        # match-common generated BLOCK_LENGTH: JournalTrade 93, JournalTerminal 45, JournalCommandOutcome 116.
-        self.assertEqual(self.journal.messages[1].block_length, 93)
-        self.assertEqual(self.journal.messages[2].block_length, 45)
-        self.assertEqual(self.orders.messages[28].block_length, 116)
+    def test_only_the_me_journal_profile_is_left(self):
+        # The schema 3 settlement journal of match is gone (nothing writes it; id 3 is the core money journal).
+        self.assertEqual(sorted(journal_decode.profiles_spec()), ['me-journal-4'])
+        self.assertFalse((SCHEMAS / 'settlement-journal-schema.xml').exists())
+        with self.assertRaisesRegex(journal_decode.JournalSchemaError, 'me-journal-v1'):
+            journal_decode.load_profile('me-journal-v1')
 
-    def test_current_journal_round_trip(self):
-        trade = encode(self.journal, 1, {'tradeId': 7, 'marketId': 1, 'takerOrderId': 5002, 'takerUserId': 71001,
-                                         'makerOrderId': 5001, 'makerUserId': 71002, 'price': 10, 'quantity': 3,
-                                         'takerIsBuy': 'TRUE', 'takerOmsOrderId': 1002, 'makerOmsOrderId': 1001})
-        terminal = encode(self.journal, 2, {'orderId': 5002, 'userId': 71001, 'marketId': 1, 'status': 'FILLED', 'omsOrderId': 1002})
-        outcome = encode(self.orders, 28, {'commandIdHigh': 1002, 'commandIdLow': 0, 'orderId': 5002, 'appliedPosition': 640,
-                                           'result': 0, 'omsOrderId': 1002})
-        events = journal_decode.decode_dump([row(outcome, 0), row(trade, 160), row(terminal, 288)], self.profile)
-        self.assertEqual([e['type'] for e in events], ['outcome', 'trade', 'terminal'])
-        self.assertEqual(events[1]['taker_is_buy'], True)
-        self.assertEqual(events[1]['trade_id'], 7)
-        self.assertEqual(events[2]['status'], 'FILLED')
-        self.assertEqual((events[0]['command_id_high'], events[0]['leg'], events[0]['applied_position']), (1002, 5002, 640))
-        self.assertIsNone(events[0]['journal_seq'])
+    def test_trade_and_terminal_round_trip(self):
+        trade = encode(self.journal, 1, {'journalSeq': 1, 'meEpoch': 2, 'tradeId': 7, 'marketId': 1, 'takerOrderId': 5002,
+                                         'takerUserId': 71001, 'makerOrderId': 5001, 'makerUserId': 71002, 'price': 10,
+                                         'quantity': 3, 'takerIsBuy': 'TRUE', 'takerOmsOrderId': 1002, 'makerOmsOrderId': 1001})
+        terminal = encode(self.journal, 2, {'journalSeq': 2, 'meEpoch': 2, 'orderId': 5002, 'userId': 71001, 'marketId': 1,
+                                            'status': 'FILLED', 'omsOrderId': 1002})
+        events = journal_decode.decode_dump([row(trade, 160), row(terminal, 288)], self.profile)
+        self.assertEqual([e['type'] for e in events], ['trade', 'terminal'])
+        self.assertEqual(events[0]['taker_is_buy'], True)
+        self.assertEqual(events[0]['trade_id'], 7)
+        self.assertEqual(events[1]['status'], 'FILLED')
+        self.assertEqual([e['journal_seq'] for e in events], [1, 2])
 
-    def test_unknown_template_stops_loudly(self):
-        snapshot = encode(self.orders, 7, {})   # RequestOpenOrdersSnapshot is not a journal record
+    def test_unknown_template_and_foreign_schema_stop_loudly(self):
+        unknown = struct.pack('<HHHH', 8, 9, 4, 1) + bytes(8)   # schema 4 declares no template 9
         with self.assertRaisesRegex(journal_decode.JournalSchemaError, 'unknown journal record'):
-            journal_decode.decode_dump([row(snapshot, 0)], self.profile)
-        foreign = bytearray(encode(self.journal, 1, {})); foreign[4:6] = (9).to_bytes(2, 'little')
-        with self.assertRaisesRegex(journal_decode.JournalSchemaError, 'schema 9'):
-            journal_decode.decode_dump([row(bytes(foreign), 0)], self.profile)
+            journal_decode.decode_dump([row(unknown, 0)], self.profile)
+        for schema_id in (3, 9):   # 3 is the core money journal: never an ME journal record
+            foreign = bytearray(encode(self.journal, 1, {})); foreign[4:6] = schema_id.to_bytes(2, 'little')
+            with self.assertRaisesRegex(journal_decode.JournalSchemaError, f'schema {schema_id}'):
+                journal_decode.decode_dump([row(bytes(foreign), 0)], self.profile)
 
     def test_wrong_length_version_fragment_and_order_stop_loudly(self):
-        trade = encode(self.journal, 1, {'takerIsBuy': 'FALSE'})
+        trade = encode(self.journal, 1, {'journalSeq': 1, 'meEpoch': 1, 'takerIsBuy': 'FALSE'})
         for frame in [trade[:-1], trade + b'\0']:
             with self.assertRaises(journal_decode.JournalSchemaError):
                 journal_decode.decode_dump([row(frame, 0)], self.profile)
@@ -100,12 +99,14 @@ class JournalDecodeTest(unittest.TestCase):
             journal_decode.decode_dump([row(trade, 0, fragmented=True)], self.profile)
         with self.assertRaisesRegex(journal_decode.JournalSchemaError, 'not increasing'):
             journal_decode.decode_dump([row(trade, 64), row(trade, 64)], self.profile)
-        bad_status = encode(self.journal, 2, {'status': 2}); bad_status = bad_status[:8 + 28] + b'\x07' + bad_status[8 + 29:]
+        status = next(f for f in self.journal.messages[2].fields if f.name == 'status')
+        bad_status = bytearray(encode(self.journal, 2, {'journalSeq': 1, 'meEpoch': 1, 'status': 2}))
+        bad_status[8 + status.offset] = 7
         with self.assertRaises(journal_decode.JournalSchemaError):
-            journal_decode.decode_dump([row(bad_status, 0)], self.profile)
+            journal_decode.decode_dump([row(bytes(bad_status), 0)], self.profile)
 
     def test_dump_completeness_marker(self):
-        trade = encode(self.journal, 1, {'takerIsBuy': 'TRUE'})
+        trade = encode(self.journal, 1, {'journalSeq': 1, 'meEpoch': 1, 'takerIsBuy': 'TRUE'})
         recording = json.dumps({'kind': 'recording', 'source': 'me0', 'recording': 0, 'start': 0, 'stop': 160, 'active': True})
         end = lambda n: json.dumps({'kind': 'end', 'source': 'me0', 'recordings': 1, 'frames': n})
         self.assertEqual(len(journal_decode.decode_dump([recording, row(trade, 0), end(1)], self.profile, require_end=True)), 1)
@@ -124,8 +125,6 @@ class JournalDecodeTest(unittest.TestCase):
 
     def _dropped(self, temp, xml, pin=True):
         directory = Path(temp)
-        for name in ['settlement-journal-schema.xml', 'order-schema.xml']:
-            shutil.copyfile(SCHEMAS / name, directory / name)
         (directory / 'me-journal-schema-4.xml').write_text(xml)
         spec = json.loads((SCHEMAS / 'journal-profiles.json').read_text())
         profile = spec['profiles']['me-journal-4']
@@ -153,12 +152,6 @@ class JournalDecodeTest(unittest.TestCase):
             directory = self._dropped(temp, SCHEMA4.replace('meEpoch', 'epochId'))
             with self.assertRaisesRegex(journal_decode.JournalSchemaError, 'lacks mapped fields'):
                 journal_decode.load_profile('me-journal-4', directory / 'profiles.json', directory)
-
-    def test_group_bearing_template_is_not_a_journal_record(self):
-        with self.assertRaises(sbe_layout.SchemaError):
-            self.orders.decode(encode(self.orders, 27, {}) if not self.orders.messages[27].variable else
-                               struct.pack('<HHHH', self.orders.messages[27].block_length, 27, 1, 11)
-                               + bytes(self.orders.messages[27].block_length))
 
 
 # ---------------------------------------------------------------- profile 4 and group support

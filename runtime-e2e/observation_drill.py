@@ -170,16 +170,17 @@ def money_check_argv(fixture, point, users):
             '--driver-mode', mode, *(['--aeron-dir', aeron_dir] if aeron_dir else []),
             '--tool-key-file', '/data/mc/tool.key', '--admin-key-file', '/data/mc/admin.key',
             '--funding-file', f'/data/mc/funding-{point}.json', '--zero-hold-users', f'{users[0]}-{users[-1]}',
-            '--core-metrics', ','.join(f'http://{nodes[f"ae{i}"]}:{ports["ae_metrics"]}/metrics' for i in range(3)),
+            '--core-metrics', ','.join(f'http://{nodes[f"ae{i}"]}:{core_contracts.engine_http_port(ports, f"ae{i}")}/metrics' for i in range(3)),
             '--json']
 
 
 # ------------------------------------------------------------------ the sampler configuration of the fixture host
 
-SERVICE_KINDS = {'ae': ('core', 'core member', 'ae_metrics'), 'me': ('match', 'ME member', 'me_metrics'),
+# The last field is the manifest port key; None for an engine slot, whose port is computed by the cluster-kit rule
+SERVICE_KINDS = {'ae': ('core', 'core member', None), 'me': ('match', 'ME member', None),
                  'bridge': ('ct-bridge', 'ct-bridge', 'bridge_http'), 'fwd': ('ct-forwarder', 'ct-forwarder', 'forwarder_http'),
                  'projector': ('money-projector', 'money projector', 'projector_http'),
-                 'shadow': ('core-replica', 'core-replica', 'shadow_metrics'),
+                 'shadow': ('core-replica', 'core-replica', None),
                  'gw': ('oe-gateway', 'oe-gateway', 'gateway_admin'), 'st': ('oe-stream', 'oe-stream', 'stream_admin'),
                  'pj': ('oe-projector', 'oe-projector', 'projector_admin'), 'md': ('oe-marketdata', 'oe-marketdata', 'md_admin')}
 
@@ -219,7 +220,8 @@ def sampler_config(fixture, out_file, shm_pids):
         if prefix not in SERVICE_KINDS or slot not in nodes:
             continue
         _, kind, port_key = SERVICE_KINDS[prefix]
-        base = f'http://{nodes[slot]}:{ports[port_key]}'
+        port = core_contracts.engine_http_port(ports, slot) if port_key is None else ports[port_key]
+        base = f'http://{nodes[slot]}:{port}'
         svc = {'name': service_name(slot), 'kind': kind, 'container': containers[slot], 'metrics': base + '/metrics',
                'health': base + '/health'}
         if prefix != 'projector':
@@ -287,16 +289,16 @@ class ObservationDrill(CriticalPathDrill):
     def leader_value(self, series):
         vals = []
         for i in range(3):
-            v = self.metric(f'ae{i}', 'ae_metrics', series)
-            role = self.metric(f'ae{i}', 'ae_metrics', 'core_cluster_role')
+            v = self.metric(f'ae{i}', series)
+            role = self.metric(f'ae{i}', 'core_cluster_role')
             if role == 2 and v is not None:
                 return v
             if v is not None:
                 vals.append(v)
         return max(vals) if vals else None
 
-    def metric(self, slot, port_key, series):
-        r = self.f.http(slot, self.f.m['ports'][port_key], '/metrics')
+    def metric(self, slot, series):
+        r = self.f.http(slot, core_contracts.engine_http_port(self.f.m['ports'], slot), '/metrics')
         for text in (r.get('body') or '').splitlines():
             parts = text.split()
             if len(parts) >= 2 and parts[0] == series:
@@ -348,7 +350,7 @@ class ObservationDrill(CriticalPathDrill):
 
     def follower(self):
         for slot in ('ae2', 'ae1', 'ae0'):
-            if self.metric(slot, 'ae_metrics', 'core_cluster_role') == 0:
+            if self.metric(slot, 'core_cluster_role') == 0:
                 return slot
         raise Inconclusive('no core follower found to kill')
 
@@ -407,7 +409,7 @@ class ObservationDrill(CriticalPathDrill):
             head = lambda: self.leader_value('core_order_journal_seq')
             seen = lambda: self.metric(self.target, 'projector_admin', 'projector_applied_seq')
         else:
-            head = lambda: max(v for v in (self.metric(f'me{i}', 'me_metrics', 'match_engine_next_journal_seq') for i in range(3))
+            head = lambda: max(v for v in (self.metric(f'me{i}', 'match_engine_next_journal_seq') for i in range(3))
                                if v is not None) - 1
             seen = lambda: self.metric('bridge0', 'bridge_http', 'bridge_core_cursor')
         target = head()
@@ -499,7 +501,7 @@ class ObservationDrill(CriticalPathDrill):
         (d / 'actions.jsonl').write_text(''.join(json.dumps(a) + '\n' for a in self.actions))
         (d / 'Q0.json').write_text(json.dumps(q0))
         (d / 'Q2.json').write_text(json.dumps(q2))
-        mode = self.metric('ae0', 'ae_metrics', 'core_snapshot_mode')
+        mode = self.metric('ae0', 'core_snapshot_mode')
         interval = self.snapshot_interval_s()
         settings = {'OBS_WINDOW_S': o['OBS_DRILL_WINDOW_S'], 'OBS_MAX_GAP_S': 3 * o['OBS_DRILL_SAMPLE_S'],
                     'OBS_STALL_S': o['OBS_DRILL_STALL_S'], 'OBS_SPIN_S': 2 * o['OBS_DRILL_STALL_S'],

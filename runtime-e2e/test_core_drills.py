@@ -677,7 +677,7 @@ class PartitionPhase1Test(unittest.TestCase):
     def sampler(self, me_seq_at, drop_effect=True):
         """sample_me_progress on a stub: a fake monotonic clock that the stub sleep and every read advance."""
         clock = {'t': 100.0}
-        f = types.SimpleNamespace(m={'ports': {'me_metrics': 9101, 'forwarder_http': 9700}})
+        f = types.SimpleNamespace(m={'ports': {'me_base': 9000, 'stride': 100, 'forwarder_http': 9700}})
         calls = []
 
         def metrics(role, port):
@@ -1850,7 +1850,7 @@ class ObserveLife1Test(unittest.TestCase):
         replies = {'money-dump': money, 'order-dump': {'orders': []}, 'pending-dump': {'count': 0, 'head': 9, 'entries': []}}
         metrics = {'core_settle_faults_total': 0.0, 'core_settle_rejects_total': 0.0, 'core_cluster_role': 2.0,
                    **{m: 0.0 for m in core_scenarios.COUNTER_METRICS.values()}}
-        f = types.SimpleNamespace(m={'ports': {'ae_metrics': 9, 'me_metrics': 8, 'forwarder_http': 7, 'bridge_http': 6},
+        f = types.SimpleNamespace(m={'ports': {'ae_base': 19300, 'me_base': 9000, 'stride': 100, 'forwarder_http': 7, 'bridge_http': 6},
                                      'me_journal_profile': 'me-journal-4'}, slots={},
                                   core=lambda verb, principal, **kw: ('ANSWERED', replies[verb]),
                                   journal_dump=me, me_open_legs=me,
@@ -2232,8 +2232,8 @@ class ScheduleDrillsTest(unittest.TestCase):
             self.assertEqual(slept, [], drill)
 
     def test_a06_scrapes_the_core_around_the_kill_and_brackets_the_restart(self):
-        run, calls = self.run_for('a06-two-forwarders-ticks', ports={'ae_metrics': 9})
-        run.f.m['ports'] = {'ae_metrics': 9, 'forwarder_http': 7}
+        run, calls = self.run_for('a06-two-forwarders-ticks', ports={'ae_base': 19300, 'stride': 100})
+        run.f.m['ports'] = {'ae_base': 19300, 'stride': 100, 'forwarder_http': 7}
         run.f.metrics = lambda role, port: calls.append(('metrics', role)) or {'core_ticks_applied_total': 1.0}
         run.snaps = {'before': scrape(ae2=dict(lead('ae')))}
         run.snap = lambda label: run.snaps.__setitem__(label, scrape(ae2=dict(lead('ae')))) or run.snaps[label]

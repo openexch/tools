@@ -43,7 +43,7 @@ def _ok(meaning, reply, what):
 def unauthorised_total(fixture):
     values = []
     for i in range(3):
-        metrics = fixture.metrics(f'ae{i}', fixture.m['ports']['ae_metrics'])
+        metrics = fixture.metrics(f'ae{i}', core_contracts.engine_http_port(fixture.m['ports'], f'ae{i}'))
         if 'core_ingress_unauthorised_total' not in metrics:
             raise Inconclusive('AE does not export core_ingress_unauthorised_total')
         values.append(int(metrics['core_ingress_unauthorised_total']))
@@ -247,12 +247,12 @@ def barrier_scrape(fixture, skip_me=False):
     sample.counters, this is evidence); a slot that is not STARTED is not scraped. ``skip_me``: A04 life 1
     is judged on the ME frozen before the wipe, so the fresh ME is not read."""
     ports = fixture.m['ports']
-    targets = [(f'{e}{i}', e, ports[e + '_metrics']) for e in (('ae',) if skip_me else ('ae', 'me')) for i in range(3)]
+    targets = [(f'{e}{i}', e, core_contracts.engine_http_port(ports, f'{e}{i}')) for e in (('ae',) if skip_me else ('ae', 'me')) for i in range(3)]
     for slot, state in (getattr(fixture, 'slots', None) or {}).items():
         if state.get('state') != 'STARTED':
             continue
         if slot == 'shadow0':           # the replica: its own metrics port, its shadow_* names
-            targets.append((slot, 'shadow', ports['shadow_metrics']))
+            targets.append((slot, 'shadow', core_contracts.engine_http_port(ports, slot)))
         else:
             targets.append((slot, 'fwd' if slot.startswith('fwd') else 'bridge', ports['forwarder_http' if slot.startswith('fwd') else 'bridge_http']))
     scrape = {}
@@ -296,7 +296,7 @@ def observe(fixture, frozen=None):
     mj, mlegs = money_journal(fixture)
     gauges, leaders, by_member = {}, [], {}
     for i in range(3):
-        metrics = fixture.metrics(f'ae{i}', fixture.m['ports']['ae_metrics'])
+        metrics = fixture.metrics(f'ae{i}', core_contracts.engine_http_port(fixture.m['ports'], f'ae{i}'))
         gauges[f'ae{i}'] = {k: int(metrics[k]) for k in ['core_settle_faults_total', 'core_settle_rejects_total']}
         if metrics.get('core_cluster_role') == 2.0:
             leaders.append(metrics)

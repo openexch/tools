@@ -235,6 +235,7 @@ class KindsTest(unittest.TestCase):
         import release_cut
         builder = test_mk_manifests.CutManifestBuilderTest('test_every_s17_kind_builds_validates_and_passes_the_checker')
         builder.setUp()
+        self.addCleanup(builder.doCleanups)       # its patches (release_cut.git_blob) end with this test
         self.addCleanup(builder.tearDown)
         for kind, spec in core_contracts.GATEWAY_KINDS.items():
             if not spec.get('marketdata_defines'):

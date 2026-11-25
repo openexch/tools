@@ -58,7 +58,7 @@ def manifest(directory):
                           'source_sha256': journal_src['sha256']},
         'credentials': {'ae': dict(core_contracts.AE_CREDENTIAL_ENV),
                         'me': {'mode': 'not_enforced_by_artifact', 'keys_env': 'ME_AUTH_KEYS', 'credential_env': 'ME_AUTH_CREDENTIAL'}},
-        'me_journal_profile': 'me-journal-v1', 'postgres_bin': '/usr/lib/postgresql/16/bin', 'postgres_port': 55500,
+        'me_journal_profile': 'me-journal-4', 'postgres_bin': '/usr/lib/postgresql/16/bin', 'postgres_port': 55500,
     }
 
 
@@ -721,7 +721,7 @@ class FaultHelperTest(unittest.TestCase):
         self.f.wait_http = lambda name, port, path, **k: waits.append((name, port, path)) or {'status': 200, 'body': ''}
         witness = self.f.restart('ae0')
         self.assertAlmostEqual(sum(self.sleeps), 8.5, places=2)
-        self.assertEqual(waits, [('ae0', 19700, '/ready')])
+        self.assertEqual(waits, [('ae0', 19306, '/ready')])
         self.assertTrue(witness['ready']); self.assertEqual(witness['waited_after_kill_s'] >= 12.5, True)
         self.assertNotIn('ae0', self.f.registry['fault_targets'])
 
@@ -1712,7 +1712,7 @@ class FaultTargetsV4Test(LifecycleBase):
             def members(engine):
                 for role in ('fwd1',):
                     self.docker.state['c-' + role].update(Running=False, ExitCode=78)
-                return f.wait_http('me1', 19500, '/ready')
+                return f.wait_http('me1', 9106, '/ready')
             f.start_members = members
             f.regenesis({}, 'me')
         self.assertEqual(f.registry['fault_targets']['fwd1']['reason'], 'regenesis me: F8 epoch fence expected')

@@ -786,10 +786,10 @@ class ReplicaDrillRun(DrillRun):
         return [f'ae{i}' for i in range(3)]
 
     def mm(self, role):
-        return self.f.metrics(role, self.f.m['ports']['ae_metrics'])
+        return self.f.metrics(role, core_contracts.engine_http_port(self.f.m['ports'], role))
 
     def rm(self):
-        return self.f.metrics('shadow0', self.f.m['ports']['shadow_metrics'])
+        return self.f.metrics('shadow0', core_contracts.engine_http_port(self.f.m['ports'], 'shadow0'))
 
     def try_read(self, read):
         try:

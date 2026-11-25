@@ -760,14 +760,15 @@ class CoreFixture(Fixture):
     def engine_env(self, engine, index):
         addresses = ','.join(self.m['nodes'][engine + str(i)] for i in range(3))
         env = {**ENGINE_COMMON, 'CLUSTER_NODE': str(index), 'CLUSTER_ADDRESSES': addresses,
-               'CLUSTER_PORT_BASE': str(self.m['ports'][engine + '_base'])}
+               'CLUSTER_PORT_BASE': str(self.m['ports'][engine + '_base']),
+               'CLUSTER_PORT_STRIDE': str(self.m['ports']['stride'])}
         if engine == 'me':
-            env.update(METRICS_PORT=str(self.m['ports']['me_metrics']), SETTLEMENT_JOURNAL_ENABLED='true',
+            env.update(METRICS_PORT=str(core_contracts.engine_http_port(self.m['ports'], f'me{index}')), SETTLEMENT_JOURNAL_ENABLED='true',
                        SETTLEMENT_JOURNAL_DIR='/data/journal', SETTLEMENT_JOURNAL_ARCHIVE_BIND='0.0.0.0')
             env['MATCH_ENGINE_FROM_CONFIG'] = 'true'    # RUN:158: the replicated EngineConfig decides, not an env knob
             env[self.m['credentials']['me']['keys_env']] = self.keys.table('me')
         else:
-            env['CORE_NODE_PORT'] = str(self.m['ports']['ae_metrics'])
+            env['CORE_NODE_PORT'] = str(core_contracts.engine_http_port(self.m['ports'], f'ae{index}'))
             env['CORE_AUTH_KEYS'] = self.keys.table('ae')
             if self.projector_binary():
                 # the member's replay gauge counts the history projector's replays (its reader budget reads it)
@@ -814,7 +815,7 @@ class CoreFixture(Fixture):
         env = {**core_contracts.REPLICA_ENV, 'BASE_DIR': ENGINE_COMMON['BASE_DIR'],
                'CLUSTER_ADDRESSES': ','.join(nodes[f'ae{i}'] for i in range(3)), 'CLUSTER_PORT_BASE': str(ports['ae_base']),
                'CLUSTER_PORT_STRIDE': str(ports['stride']), 'CLUSTER_REPLICA_ADDRESS': nodes['shadow0'],
-               'CORE_NODE_PORT': str(ports['shadow_metrics']),
+               'CORE_NODE_PORT': str(core_contracts.engine_http_port(ports, 'shadow0')),
                'SHADOW_PULL_SOURCES': ','.join(self.archive_endpoint(f'ae{i}') for i in range(3)),
                'TRANSPORT_LOG_TERM_LENGTH': ENGINE_COMMON['TRANSPORT_LOG_TERM_LENGTH'],
                'ARCHIVE_SEGMENT_LENGTH': ARCHIVE_SEGMENT_LENGTH_SETTING,
@@ -1051,8 +1052,8 @@ class CoreFixture(Fixture):
         out = host / name
         out.mkdir()
         nodes, ports = self.m['nodes'], self.m['ports']
-        members = ','.join(f'http://{nodes[f"ae{i}"]}:{ports["ae_metrics"]}/metrics' for i in range(3))
-        replica = f'http://{nodes["shadow0"]}:{ports["shadow_metrics"]}/metrics'
+        members = ','.join(f'http://{nodes[f"ae{i}"]}:{core_contracts.engine_http_port(ports, f"ae{i}")}/metrics' for i in range(3))
+        replica = f'http://{nodes["shadow0"]}:{core_contracts.engine_http_port(ports, "shadow0")}/metrics'
         argv = ['python3', '-I', '/data/lag_sampler.py', '--members', members, '--replica', replica, '--out', f'/data/{name}',
                 '--hz', str(hz), '--term-bytes', str(term_bytes), '--stop-file', f'/data/{name}/stop']
         cid = self.registry['containers']['probe']; self.inspect('container', cid)
@@ -1109,7 +1110,7 @@ class CoreFixture(Fixture):
         leaders = []
         for i in range(3):
             try:
-                if self.metrics(f'{engine}{i}', self.m['ports'][engine + '_metrics']).get(metric) == 2.0:
+                if self.metrics(f'{engine}{i}', core_contracts.engine_http_port(self.m['ports'], f'{engine}{i}')).get(metric) == 2.0:
                     leaders.append(f'{engine}{i}')
             except Inconclusive:
                 continue
@@ -1138,8 +1139,8 @@ class CoreFixture(Fixture):
         for engine in ('ae', 'me'):
             for i in range(3):
                 self.spawn(engine + str(i), self.engine_command(engine, i), self.engine_env(engine, i))
-        for engine, port in [('ae', self.m['ports']['ae_metrics']), ('me', self.m['ports']['me_metrics'])]:
-            for i in range(3): self.wait_http(engine + str(i), port, '/ready')
+        for engine in ('ae', 'me'):
+            for i in range(3): self.wait_http(engine + str(i), core_contracts.engine_http_port(self.m['ports'], engine + str(i)), '/ready')
         if self.engine_driver() == 'external':
             # Every external engine's driver is registered, so restart() demands a NEW driver
             for role in ENGINES:
@@ -1652,9 +1653,9 @@ class CoreFixture(Fixture):
         if role == 'projector':
             return ports['projector_http'], '/health'
         if role in ENGINES:
-            return ports[role[:2] + '_metrics'], '/ready'
+            return core_contracts.engine_http_port(ports, role), '/ready'
         if role == 'shadow0' and self.slot_artifact('shadow0') == 'shadow':
-            return ports['shadow_metrics'], '/ready'
+            return core_contracts.engine_http_port(ports, 'shadow0'), '/ready'
         if role in core_contracts.GATEWAY_SLOTS and self.slot_artifact(role):
             return self.gateway_ready_target(role)
         if role in core_contracts.PROJECTION_SLOTS and self.slot_artifact(role):
@@ -1806,8 +1807,8 @@ class CoreFixture(Fixture):
         else:
             # The engine status feed polls each node's own endpoint over the network (never a shared disk)
             env.update(STREAM_WS_BIND=f'{nodes[slot]}:{ports["stream_ws"]}', STREAM_ADMIN_BIND=f'{nodes[slot]}:{ports["stream_admin"]}',
-                       STREAM_CORE_NODE_ENDPOINTS=','.join(f'{i}@{nodes[f"ae{i}"]}:{ports["ae_metrics"]}' for i in range(3)),
-                       STREAM_ME_NODE_ENDPOINTS=','.join(f'{i}@{nodes[f"me{i}"]}:{ports["me_metrics"]}' for i in range(3)))
+                       STREAM_CORE_NODE_ENDPOINTS=','.join(f'{i}@{nodes[f"ae{i}"]}:{core_contracts.engine_http_port(ports, f"ae{i}")}' for i in range(3)),
+                       STREAM_ME_NODE_ENDPOINTS=','.join(f'{i}@{nodes[f"me{i}"]}:{core_contracts.engine_http_port(ports, f"me{i}")}' for i in range(3)))
         return env
 
     def stub_arguments(self, slot):
@@ -2050,7 +2051,7 @@ class CoreFixture(Fixture):
                'HISTORY_PROJECTOR_INSTANCE_ID': str(self.keys.keys[(slot, 'ae')][0]),
                'HISTORY_PROJECTOR_ADMIN_BIND': f'{nodes[slot]}:{ports["projector_admin"]}',
                'HISTORY_PROJECTOR_JOURNAL_ARCHIVES': ','.join(self.archive_endpoint(m) for m in members),
-               'HISTORY_PROJECTOR_JOURNAL_NODE_ENDPOINTS': ','.join(f'{nodes[m]}:{ports["ae_metrics"]}' for m in members),
+               'HISTORY_PROJECTOR_JOURNAL_NODE_ENDPOINTS': ','.join(f'{nodes[m]}:{core_contracts.engine_http_port(ports, m)}' for m in members),
                'HISTORY_PROJECTOR_LOCAL_HOST': nodes[slot],
                'HISTORY_PROJECTOR_CLUSTER_MEMBERS': ','.join(f'{i}={nodes[f"ae{i}"]}:{ports["ae_base"] + i * ports["stride"] + 2}'
                                                              for i in range(3)),
@@ -2120,7 +2121,7 @@ class CoreFixture(Fixture):
         env = {'STUB_ADMIN_BIND': f'{nodes[slot]}:{ports["projector_admin"]}',
                'STUB_PG_URL': self.projection_pg_url(self.projection_database(slot)), 'STUB_INSTANCE': slot,
                'STUB_MODE': artifact['mode'], 'STUB_CORE_PROBE': '/artifacts/core-probe.jar:/artifacts/ae.jar',
-               'STUB_MEMBER_METRICS': ','.join(f'ae{i}@{nodes[f"ae{i}"]}:{ports["ae_metrics"]}' for i in range(3)),
+               'STUB_MEMBER_METRICS': ','.join(f'ae{i}@{nodes[f"ae{i}"]}:{core_contracts.engine_http_port(ports, f"ae{i}")}' for i in range(3)),
                **self.probe_env(None), 'CORE_LOCAL_HOST': nodes[slot], 'CORE_AUTH_CREDENTIAL': self.keys.credential(slot, 'ae')}
         env.update({k: str(v) for k, v in (getattr(self, 'projection_stub_settings', None) or {}).items()})
         return env
@@ -2771,9 +2772,8 @@ class CoreFixture(Fixture):
                 if remaining > 0:
                     self.sleep(remaining)
             self.command(['docker', 'start', cid])
-        port = self.m['ports'][engine + '_metrics']
         for role in roles:
-            self.wait_http(role, port, '/ready', timeout=ready_timeout)
+            self.wait_http(role, core_contracts.engine_http_port(self.m['ports'], role), '/ready', timeout=ready_timeout)
         drivers = {}
         for role in roles:
             if old[role] is not None:

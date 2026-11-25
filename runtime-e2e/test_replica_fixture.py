@@ -86,8 +86,17 @@ class ReplicaContractsTest(unittest.TestCase):
         self.assertFalse(core_contracts.cut_derived('s16'))
         self.assertEqual(set(core_contracts.REPLICA_KINDS), set(REPLICA_KINDS))
 
-    def test_the_port_profile_names_the_replica_metrics_port(self):
-        self.assertEqual(core_contracts.PORT_PROFILE['shadow_metrics'], 19703)
+    def test_the_engine_endpoint_port_follows_the_cluster_kit_rule(self):
+        ports = core_contracts.PORT_PROFILE
+        self.assertEqual(core_contracts.NODE_ENDPOINT_OFFSET, 6)
+        self.assertEqual([core_contracts.engine_http_port(ports, f'ae{i}') for i in range(3)], [19306, 19406, 19506])
+        self.assertEqual([core_contracts.engine_http_port(ports, f'me{i}') for i in range(3)], [9006, 9106, 9206])
+        # the replica sits in slot 3 of the core's port base
+        self.assertEqual(core_contracts.engine_http_port(ports, 'shadow0'), 19606)
+        self.assertEqual(core_contracts.engine_http_port({**ports, 'stride': 0}, 'ae2'), 19306)
+        for bad in ('fwd0', 'ae', 'ae-1', 'shadow1'):
+            with self.assertRaises(ValueError):
+                core_contracts.engine_http_port(ports, bad)
 
     def test_the_shadow_artifact_is_the_core_jar_on_the_engines_driver(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -131,7 +140,7 @@ class ReplicaFixtureTest(unittest.TestCase):
 
     def test_ready_target_names_the_replica_port(self):
         f = bare_fixture(replica_manifest(self.dir))
-        self.assertEqual(f.ready_target('shadow0'), (19703, '/ready'))
+        self.assertEqual(f.ready_target('shadow0'), (19606, '/ready'))
 
     def test_start_slot_launches_the_replica_through_the_engines_wrapper_embedded(self):
         f = bare_fixture(replica_manifest(self.dir))
@@ -148,7 +157,7 @@ class ReplicaFixtureTest(unittest.TestCase):
         self.assertEqual(env['CORE_ROLE'], 'replica')
         self.assertEqual(env['CLUSTER_REPLICA_SLOT'], '3')
         self.assertEqual(env['CLUSTER_REPLICA_ADDRESS'], f.m['nodes']['shadow0'])
-        self.assertEqual(env['CORE_NODE_PORT'], '19703')
+        self.assertEqual(env['CORE_NODE_PORT'], '19606')
         self.assertEqual(env['REPLICA_BACKUP_SOURCE'], 'FOLLOWER')
         self.assertEqual(env['REPLICA_CATCHUP_RCV_WND'], '512k')
         self.assertEqual(env['TRANSPORT_LOG_TERM_LENGTH'], '1m')
@@ -299,7 +308,7 @@ class ReplicaFixtureTest(unittest.TestCase):
             return {'shadow_replica_applied_position': 5.0, 'core_x': 1.0} if role == 'shadow0' else {}
         f.metrics = metrics
         scrape = core_scenarios.barrier_scrape(f)
-        self.assertIn(('shadow0', 19703), seen)
+        self.assertIn(('shadow0', 19606), seen)
         self.assertEqual(scrape['shadow0'], {'shadow_replica_applied_position': 5.0})
 
     def test_the_archive_listing_reads_the_log_start_from_the_segment_files(self):

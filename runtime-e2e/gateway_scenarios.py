@@ -328,7 +328,7 @@ class GatewayDrill:
         snap = {}
         for i in range(3):
             try:
-                snap[f'ae{i}'] = self.f.metrics(f'ae{i}', self.f.m['ports']['ae_metrics'])
+                snap[f'ae{i}'] = self.f.metrics(f'ae{i}', core_contracts.engine_http_port(self.f.m['ports'], f'ae{i}'))
             except Inconclusive as error:
                 snap[f'ae{i}'] = {'error': str(error)}
         leader = next((r for r, v in snap.items() if v.get('core_cluster_role') == 2.0), None)

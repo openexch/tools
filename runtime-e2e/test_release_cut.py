@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The cut checker. One RED per rule K1-K11, each refused with its rule and accepted with
+"""The cut checker. One RED per rule K1-K12, each refused with its rule and accepted with
 that rule switched off (the rules seam); the K4 exemption refused in a product kind; the guarded-row REDs (rows 02, 11, 22,
 24, 26, 41, 52); a passing cut. No Docker, no real artifact: every jar and binary is a small file in a temp tree."""
 import contextlib
@@ -23,6 +23,7 @@ OLD_SCHEMA = 'rc2-cut/1'        # cuts written before the rename: repo key asset
 SCHEMA_TEXT = {'money': b'<money v7/>', 'order': b'<order v12/>', 'me_journal': b'<journal v1/>'}
 OLD_SCHEMA_TEXT = {'money': b'<money v4/>', 'order': b'<order v7/>'}
 KIT_PIN = '0.1.12-runtime.20261104.rc2s17w12.g43847fb'
+REGISTRY = b'# ids\n1 com.match.infrastructure.generated match:order-schema.xml\n'
 
 
 def h(data):
@@ -116,6 +117,7 @@ class World:
             p = self.put('harness/' + key, b'old probe ' + key.encode())
             harness[key] = {'path': str(p), 'sha256': h(p.read_bytes()), 'kind': 'harness', 'driver_mode': 'external'}
         self.ct_lock = None
+        self.registry = {k: REGISTRY for k in release_cut.SBE_SCHEMA_ID_REPOS}     # K12: one copy per registry repo
         patches = []
         if lay.get('aeron_patches'):
             # the cluster-tools lock's Aeron patch file, as the cut's driver build applied it (the git seam serves the lock)
@@ -157,6 +159,9 @@ class World:
         """The git seam: the harness source at the cut's commit is the source file the World wrote."""
         name = {v[1]: k for k, v in release_cut.HARNESS_SOURCES.items()}.get(rel)
         want = self.m['harness_commit'] if repo == 'tools' else self.m['repos']['cluster-tools']
+        if rel == release_cut.SBE_SCHEMA_IDS:
+            key = release_cut.layout(self.m['schema'])['repo'] if repo == 'core' else repo
+            return self.registry.get(repo) if commit == self.m['repos'].get(key) else None
         if repo == 'cluster-tools' and rel == release_cut.CT_LOCK:
             return self.ct_lock if commit == want else None
         if name is None or commit != want:
@@ -481,6 +486,91 @@ class RuleRedTest(CheckerBase):
         self.w.refresh_record(m)
         m['artifacts'][PROJECTOR] = World.entry(p, SHAS['core'], 'rebuild-equal')
         self.refused(m, {'K10'})
+
+    def test_k12_schema_id_registry_differs_between_pinned_repos(self):
+        """A cut whose gateway copy of sbe-schema-ids.txt differs is refused naming both groups of repos; the same cut with
+        every copy equal passes (the negative control is the passing cut, test_the_cut_passes)."""
+        self.w.registry['gateway'] = REGISTRY + b'3 com.match.infrastructure.journal.generated match:x.xml\n'
+        found = self.refused(copy.deepcopy(self.w.m), {'K12'})
+        self.assertEqual(found.items, [('K12', 'sbe-schema-ids.txt is not byte-identical across the pinned repos: '
+                                               f'core, match, cluster-tools, tools sha256 {h(REGISTRY)[:12]}; '
+                                               f'gateway sha256 {h(self.w.registry["gateway"])[:12]}')])
+
+    def test_k12_schema_id_registry_missing_in_a_pinned_repo(self):
+        del self.w.registry['match']
+        found = self.refused(copy.deepcopy(self.w.m), {'K12'})
+        self.assertEqual(found.items, [('K12', 'sbe-schema-ids.txt missing at the pinned commit of: match')])
+
+    def test_k12_the_core_repo_of_an_old_layout_is_read_by_its_repo_key(self):
+        w = World(Path(self.temp.name) / 'old', schema=OLD_SCHEMA)
+        w.registry['core'] = b'other'
+        with mock.patch.object(release_cut, 'git_blob', w.blob):
+            found = release_cut.check(w.m, old_pins=w.pins)
+        self.assertIn(('K12', 'sbe-schema-ids.txt is not byte-identical across the pinned repos: '
+                              f'match, cluster-tools, tools sha256 {h(REGISTRY)[:12]}; assets sha256 {h(b"other")[:12]}'),
+                      found.items)
+
+    def test_k12_runs_at_cut_time_only(self):
+        """A cut manifest checked by itself reads the registry copies; a fixture check re-reads the cut, never the repos."""
+        with mock.patch.object(release_cut, '_schema_ids_k12') as k12, \
+                mock.patch.object(release_cut, 'check_fixture', return_value=release_cut.Findings(release_cut.RULES)):
+            release_cut.check({'manifest_kind': 's17-x'}, cut=self.w.m, old_pins=self.w.pins)
+            k12.assert_not_called()
+            release_cut.check(self.w.m, old_pins=self.w.pins)
+            k12.assert_called_once()
+
+class SchemaIdRegistryGitTest(unittest.TestCase):
+    """K12 through real git: the registry is read at each repo's pinned commit (not the work tree), and a repo path that is
+    not set is a K12 refusal naming its variable."""
+
+    def setUp(self):
+        import os
+        import subprocess
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.paths, self.repos = {}, {}
+        env = {**os.environ, 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t',
+               'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}
+        self.git = lambda repo, *a: subprocess.run(['git', '-C', str(repo), *a], check=True, capture_output=True,
+                                                   env=env).stdout.decode().strip()
+        for key in release_cut.SBE_SCHEMA_ID_REPOS:
+            repo = Path(self.temp.name) / key
+            repo.mkdir()
+            self.git(repo, 'init', '-q')
+            (repo / 'sbe-schema-ids.txt').write_bytes(REGISTRY)
+            self.git(repo, 'add', 'sbe-schema-ids.txt')
+            self.git(repo, 'commit', '-q', '-m', 'registry')
+            self.paths[key], self.repos[key] = repo, self.git(repo, 'rev-parse', 'HEAD')
+        patch = mock.patch.dict(release_cut.REPO_PATHS, self.paths); patch.start(); self.addCleanup(patch.stop)
+
+    def k12(self):
+        f = release_cut.Findings(release_cut.RULES)
+        release_cut._schema_ids_k12(f, {'schema': release_cut.SCHEMA, 'repos': dict(self.repos)})
+        return f.items
+
+    def test_equal_copies_pass_and_a_later_commit_does_not_count(self):
+        self.assertEqual(self.k12(), [])
+        repo = self.paths['gateway']
+        (repo / 'sbe-schema-ids.txt').write_bytes(b'changed after the pin')       # work tree and a later commit: not pinned
+        self.git(repo, 'commit', '-q', '-am', 'later')
+        self.assertEqual(self.k12(), [])
+
+    def test_a_differing_pinned_copy_is_refused(self):
+        repo = self.paths['gateway']
+        (repo / 'sbe-schema-ids.txt').write_bytes(b'changed')
+        self.git(repo, 'commit', '-q', '-am', 'drift')
+        self.repos['gateway'] = self.git(repo, 'rev-parse', 'HEAD')
+        self.assertEqual(self.k12(), [('K12', 'sbe-schema-ids.txt is not byte-identical across the pinned repos: '
+                                              f'core, match, cluster-tools, tools sha256 {h(REGISTRY)[:12]}; '
+                                              f'gateway sha256 {h(b"changed")[:12]}')])
+
+    def test_an_unset_repo_path_is_refused_naming_its_variable(self):
+        from machine_paths import UnsetPath
+        release_cut.REPO_PATHS['match'] = UnsetPath('CUT_MATCH_REPO', 'the match git work tree')
+        items = self.k12()
+        self.assertEqual(len(items), 1, items)
+        self.assertEqual(items[0][0], 'K12')
+        self.assertIn('repos.match: sbe-schema-ids.txt not readable: CUT_MATCH_REPO is not set', items[0][1])
 
 
 class GuardedRowRedTest(CheckerBase):

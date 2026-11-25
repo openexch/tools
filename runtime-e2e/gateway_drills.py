@@ -201,7 +201,7 @@ class DryRun:
         out = {}
         for role in roles:
             try:
-                out[role] = self.f.metrics(role, self.f.m['ports']['ae_metrics'])
+                out[role] = self.f.metrics(role, core_contracts.engine_http_port(self.f.m['ports'], role))
             except Inconclusive as error:
                 out[role] = {'error': str(error)}
         return out

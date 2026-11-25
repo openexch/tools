@@ -44,8 +44,8 @@ A refused configuration exits 78 with the key's name; usage errors exit 64.
 ```json
 {"host": "box", "out": "/var/lib/obs/samples-box.jsonl", "supervisor": "systemd",
  "services": [{"name": "core/0", "kind": "core member", "unit": "oe-core@0",
-               "metrics": "http://127.0.0.1:19700/metrics", "health": "http://127.0.0.1:19700/health",
-               "ready": "http://127.0.0.1:19700/ready"}],
+               "metrics": "http://127.0.0.1:9306/metrics", "health": "http://127.0.0.1:9306/health",
+               "ready": "http://127.0.0.1:9306/ready"}],
  "volumes": ["/"], "shm": ["/dev/shm"],
  "dirs": [{"name": "core/0 state", "path": "/var/lib/oe/core0", "model": "core_log", "service": "core/0"},
           {"name": "money history", "model": "money_db", "db": "oe_money", "rows": "money_rows", "size": "money_size"}],

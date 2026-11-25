@@ -1139,7 +1139,7 @@ class Frozen(MdDrill):
         leader = f.leader('me')
         if leader:
             try:
-                m = f.metrics(leader, ports['me_metrics'])
+                m = f.metrics(leader, core_contracts.engine_http_port(ports, leader))
                 out['me'] = {'leader': leader, 'egress_offer_giveups': metric(m, 'match_egress_offer_giveups_total'),
                              'order_latency_sum_s': metric(m, 'match_order_latency_seconds_sum'),
                              'order_latency_count': metric(m, 'match_order_latency_seconds_count')}
