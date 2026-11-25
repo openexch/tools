@@ -24,9 +24,25 @@ REQUIRED_JARS = ['ae', 'me', 'projector']
 OPTIONAL_BINARIES = ['forwarder', 'forwarder_b', 'bridge', 'bridge_b', 'shadow']
 SLOT_ARTIFACTS = {'fwd0': {'forwarder', 'forwarder_b'}, 'fwd1': {'forwarder', 'forwarder_b'},
                   'bridge0': {'bridge', 'bridge_b'}, 'bridge1': {'bridge', 'bridge_b'}, 'shadow0': {'shadow'}}
-PORT_PROFILE = {'me_base': 9000, 'ae_base': 19300, 'stride': 100, 'me_metrics': 19500, 'ae_metrics': 19700,
-                'bridge_http': 9600, 'projector_http': 9601, 'forwarder_http': 9700, 'journal_replay': 19820,
-                'shadow_metrics': 19703}
+PORT_PROFILE = {'me_base': 9000, 'ae_base': 19300, 'stride': 100,
+                'bridge_http': 9600, 'projector_http': 9601, 'forwarder_http': 9700, 'journal_replay': 19820}
+# An engine member's HTTP endpoint (/health, /ready, /metrics) follows the cluster-kit port rule
+# base + node id x stride + NODE_ENDPOINT_OFFSET, beside the UDP offsets 1..5 (the engines refuse to boot when
+# CORE_NODE_PORT / METRICS_PORT disagrees with it). The profile carries no per-engine HTTP port of its own.
+NODE_ENDPOINT_OFFSET = 6
+REPLICA_SLOT = 3
+
+
+def engine_http_port(ports, role):
+    """The HTTP port of an engine slot: ``ae0``..``ae2``, ``me0``..``me2`` or ``shadow0`` (the replica, whose port
+    slot is REPLICA_SLOT of the core's base). The one place the rule is computed."""
+    if role == 'shadow0':
+        engine, index = 'ae', REPLICA_SLOT
+    elif len(role) == 3 and role[:2] in ('ae', 'me') and role[2:].isdigit():
+        engine, index = role[:2], int(role[2:])
+    else:
+        raise ValueError(f'not an engine slot: {role!r}')
+    return ports[engine + '_base'] + index * ports['stride'] + NODE_ENDPOINT_OFFSET
 # The user-facing slots: two order gateways (oe-gateway) and two user streams (oe-stream), each in its own 1-CPU container
 # and its own cluster session. A manifest declares all four roles or none (older manifests have none); a declared slot
 # may be null (skipped, never faked). Each slot may run the product binary or, in a rig kind, a test-only alternative:
@@ -231,7 +247,7 @@ def ports_of(manifest):
 
 
 # The replica's port slot (CLUSTER_REPLICA_SLOT): its ports are ae_base + slot x stride + offset, like a member's
-REPLICA_SLOT = 3
+# (REPLICA_SLOT, above)
 # A replica restarted right after a kill or an exit meets its own archive's mark file, as an AE member does (the same
 # measured 12.5 s, AE_RESTART_MIN_AFTER_KILL_S in core_fixture); a setting, recorded as waited_after_kill_s
 SHADOW_RESTART_MIN_AFTER_KILL_S = 12.5

@@ -1686,7 +1686,7 @@ class HistoryFreshness(ProjectionDrill):
                 for other in CORE_MEMBERS:
                     if other != member:
                         try:
-                            m = f.metrics(other, f.m['ports']['ae_metrics'])
+                            m = f.metrics(other, core_contracts.engine_http_port(f.m['ports'], other))
                             survivors[other] = {'role': m.get('core_cluster_role'), 'commit': m.get('core_log_position')}
                         except Inconclusive:
                             survivors[other] = None
@@ -1708,11 +1708,11 @@ class HistoryFreshness(ProjectionDrill):
         rejoin_started = self.clock()
         rejoin = {'bound_s': p['MEMBER_REJOIN_BOUND_S']}
         try:
-            f.wait_http(member, f.m['ports']['ae_metrics'], '/ready', timeout=p['MEMBER_REJOIN_BOUND_S'])
+            f.wait_http(member, core_contracts.engine_http_port(f.m['ports'], member), '/ready', timeout=p['MEMBER_REJOIN_BOUND_S'])
             rejoin['ready_s'] = round(self.clock() - rejoin_started, 3)
         except Inconclusive as error:
             rejoin['not_ready'] = str(error)
-            rejoin['ready_body'] = f.http(member, f.m['ports']['ae_metrics'], '/ready').get('body', '')[:300]
+            rejoin['ready_body'] = f.http(member, core_contracts.engine_http_port(f.m['ports'], member), '/ready').get('body', '')[:300]
             rejoin['restarted'] = self.kill_restart(member)
         healed = {'status': 200 if 'ready_s' in rejoin else None}
         after = self.evidence('d_cut', 'after', {'member': member, 'samples': samples[-3:], 'rejoin': rejoin})
@@ -1771,7 +1771,7 @@ class HistoryFreshness(ProjectionDrill):
         if not leader:
             return {'e_no_beat_in_leaderless_window': line(False, {}, 'no core leader', inconclusive=True)}
         survivors = [m for m in CORE_MEMBERS if m != leader]
-        plan = {'members': {m: f'http://{f.m["nodes"][m]}:{f.m["ports"]["ae_metrics"]}/metrics' for m in survivors},
+        plan = {'members': {m: f'http://{f.m["nodes"][m]}:{core_contracts.engine_http_port(f.m["ports"], m)}/metrics' for m in survivors},
                 'health': f'http://{f.m["nodes"]["pj0"]}:{f.m["ports"]["projector_admin"]}/health',
                 'bound_s': 60, 'watch_ms': p['WATCH_MS']}
         h0 = f.projection_health('pj0') or {}

@@ -1459,7 +1459,7 @@ class Sampler:
         for engine in ('ae', 'me'):
             for i in range(3):
                 role = f'{engine}{i}'
-                self.urls[role] = f'http://{nodes[role]}:{ports[engine + "_metrics"]}/metrics'
+                self.urls[role] = f'http://{nodes[role]}:{core_contracts.engine_http_port(ports, role)}/metrics'
                 self.wanted[role] = SAMPLE_NAMES[engine]
         if bridges:
             for b in BRIDGES:
@@ -1611,7 +1611,7 @@ class ScheduleDrills:
         if role is None:
             return {}
         try:
-            return {role: self.f.metrics(role, self.f.m['ports'][role[:2] + '_metrics'])}
+            return {role: self.f.metrics(role, core_contracts.engine_http_port(self.f.m['ports'], role))}
         except Inconclusive as error:
             return {role: {'unavailable': str(error)}}
 
@@ -2703,7 +2703,7 @@ class DrillRun(ScheduleDrills):
         if me is None:
             return None
         try:
-            return self.f.metrics(me, self.f.m['ports']['me_metrics']).get('match_engine_next_journal_seq')
+            return self.f.metrics(me, core_contracts.engine_http_port(self.f.m['ports'], me)).get('match_engine_next_journal_seq')
         except Inconclusive:
             return None
 
@@ -2717,7 +2717,7 @@ class DrillRun(ScheduleDrills):
                 return self.f.metrics(role, port).get(name)
             except Inconclusive:
                 return None
-        seq = get(me, self.f.m['ports']['me_metrics'], 'match_engine_next_journal_seq')
+        seq = get(me, core_contracts.engine_http_port(self.f.m['ports'], me), 'match_engine_next_journal_seq')
         if not full:     # The ME seq alone (one GET) keeps the cadence near 150 ms; the core side every 4th read
             return {'t0': round(t0, 3), 't1': round(time.monotonic() - started, 3), 'phase': phase, 'me_seq': seq,
                     'core_head': None, 'core_pending': None}
@@ -2726,7 +2726,7 @@ class DrillRun(ScheduleDrills):
         # run: 2121 for the whole drop). The AE leader's pending-command gauge is the core's side: it rises while the core
         # dispatches and the ME applies nothing.
         ae = getattr(self, 'phase1_ae', None)
-        pending = get(ae, self.f.m['ports']['ae_metrics'], 'core_pending_commands') if ae else None
+        pending = get(ae, core_contracts.engine_http_port(self.f.m['ports'], ae), 'core_pending_commands') if ae else None
         return {'t0': round(t0, 3), 't1': round(time.monotonic() - started, 3), 'phase': phase, 'me_seq': seq,
                 'core_head': max((h for h in heads if h is not None), default=None), 'core_pending': pending}
 

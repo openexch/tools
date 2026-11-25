@@ -71,7 +71,7 @@ python3 money_check.py --store core --cut /abs/cut-manifest.json --artifact-root
     --driver-mode external --aeron-dir /dev/shm/aeron \
     --tool-key-file ~/.oe/tool.key --admin-key-file ~/.oe/admin.key \
     --money-history-dsn "host=127.0.0.1 dbname=oe_money user=obs" \
-    --core-metrics http://10.0.0.1:19700/metrics,http://10.0.0.2:19700/metrics,http://10.0.0.3:19700/metrics \
+    --core-metrics http://10.0.0.1:9306/metrics,http://10.0.0.2:9306/metrics,http://10.0.0.3:9306/metrics \
     --zero-hold-users 900000-900999 --json
 ```
 

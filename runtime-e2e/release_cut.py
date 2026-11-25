@@ -35,6 +35,9 @@ refuses, 0 when none does. The rules:
   K11 (an arm64 sibling manifest, schema ``arm64-sibling/1``, checked against its cut) an artifact whose declared source sha,
       or the source sha the binary carries, is not the commit the cut names for its repo; a C++ artifact of the cut or a Go
       tool missing from the set; a Go tool whose two builds differ; a sibling that names another cut
+  K12 (a cut manifest checked by itself, at cut time) the SBE schema id registry ``sbe-schema-ids.txt`` is not byte-identical
+      in every pinned repo that carries it (core, match, cluster-tools, gateway, tools), or one of them has none at its
+      pinned commit; the refusal names the repos of each distinct copy
 
 ``rules`` is the test seam: a RED manifest is refused with the rule's text, and passes with that rule switched off.
 
@@ -42,6 +45,8 @@ Environment (no machine defaults; a path that is needed and unset stops with a m
   CUT_OLD_PINS    the old-artifact pins file (``old-artifacts.sha256``) when ``--old-pins`` is not given
   CUT_TOOLS_REPO  the tools git work tree the probe sources are read from (default: the checkout this file lives in)
   CUT_CT_REPO     the cluster-tools git work tree the T1 driver sources are read from
+  CUT_CORE_REPO, CUT_MATCH_REPO, CUT_GATEWAY_REPO
+                  the core, match and gateway git work trees the schema id registry is read from (K12, cut manifests only)
 """
 import argparse
 import hashlib
@@ -53,6 +58,7 @@ import re
 import sys
 import zipfile
 
+from contracts import Violation
 from machine_paths import env_path
 
 SCHEMA = 'rc2-cut/5'                      # what a new cut manifest declares
@@ -77,7 +83,7 @@ LAYOUTS = {
                   'aeron_patches': True, 'marketdata': True, 'genesis_tool': True, 'simulator': True},
 }
 SCHEMAS = tuple(LAYOUTS)
-RULES = tuple(f'K{n}' for n in range(1, 12))
+RULES = tuple(f'K{n}' for n in range(1, 13))
 CLASSES = ('product', 'rig', 'rig-xver', 'nightly')
 RIG_CLASSES = ('rig', 'rig-xver', 'nightly')
 OTHER_REPOS = ('match', 'cluster-kit', 'cluster-tools', 'tools')
@@ -386,7 +392,10 @@ HARNESS_SOURCES = {'core_probe': ('tools', 'runtime-e2e/java/CoreProbe.java'),
                    't1_me_driver': ('cluster-tools', 'app/forwarder/it/ItMeDriver.java'),
                    't1_core_driver': ('cluster-tools', 'app/forwarder/it/ItCoreDriver.java')}
 REPO_PATHS = {'tools': Path(os.environ.get('CUT_TOOLS_REPO', str(Path(__file__).resolve().parent.parent))),
-              'cluster-tools': env_path('CUT_CT_REPO', 'the cluster-tools git work tree the T1 driver sources are read from')}
+              'cluster-tools': env_path('CUT_CT_REPO', 'the cluster-tools git work tree the T1 driver sources are read from'),
+              'core': env_path('CUT_CORE_REPO', 'the core git work tree the schema id registry is read from'),
+              'match': env_path('CUT_MATCH_REPO', 'the match git work tree the schema id registry is read from'),
+              'gateway': env_path('CUT_GATEWAY_REPO', 'the gateway git work tree the schema id registry is read from')}
 
 
 def git_blob(repo, commit, rel):
@@ -411,6 +420,44 @@ def _harness_at_commit(f, m, harness, repos):
         elif hashlib.sha256(blob).hexdigest() != entry['source_sha256']:
             f.add('K4', f'harness.{name}: source_sha256 {entry["source_sha256"][:12]} is not {rel} at {where} {at} '
                         f'({hashlib.sha256(blob).hexdigest()[:12]}): a stale probe')
+
+
+# K12: every repo that carries the SBE schema id registry holds the same bytes at its pinned commit. Each repo's own test holds
+# its schema files and id constants to its copy; only the cut sees all the copies at once. Keys are REPO_PATHS keys; the
+# core repo is ``assets`` in an rc2-cut/1 cut.
+SBE_SCHEMA_IDS = 'sbe-schema-ids.txt'
+SBE_SCHEMA_ID_REPOS = ('core', 'match', 'cluster-tools', 'gateway', 'tools')
+
+
+def _schema_ids_k12(f, m):
+    """K12: the registry copies at the cut's pinned commits are byte-identical; a refusal names the repos of each copy."""
+    if not isinstance(m, dict):
+        return
+    repos = m.get('repos') if isinstance(m.get('repos'), dict) else {}
+    core_key = layout(m.get('schema'))['repo']
+    copies, missing = {}, []
+    for key in SBE_SCHEMA_ID_REPOS:
+        name = core_key if key == 'core' else key
+        if name not in repos_of(m.get('schema')):
+            continue
+        commit = repos.get(name)
+        if not (isinstance(commit, str) and HEX40.fullmatch(commit)):
+            continue                                  # K9 refuses the commit itself
+        try:
+            blob = git_blob(key, commit, SBE_SCHEMA_IDS)
+        except Violation as e:
+            f.add('K12', f'repos.{name}: {SBE_SCHEMA_IDS} not readable: {e}')
+            continue
+        if blob is None:
+            missing.append(name)
+        else:
+            copies.setdefault(hashlib.sha256(blob).hexdigest(), []).append(name)
+    if missing:
+        f.add('K12', f'{SBE_SCHEMA_IDS} missing at the pinned commit of: ' + ', '.join(missing))
+    if len(copies) > 1:
+        groups = sorted(copies.items(), key=lambda kv: (-len(kv[1]), kv[1]))
+        f.add('K12', f'{SBE_SCHEMA_IDS} is not byte-identical across the pinned repos: '
+                     + '; '.join(f'{", ".join(names)} sha256 {digest[:12]}' for digest, names in groups))
 
 
 AERON_VERSION_CLASS = 'io/aeron/AeronVersion.class'
@@ -1107,7 +1154,9 @@ def check(manifest, cut=None, cls=None, rules=RULES, old_pins=None, cut_sha256=N
     if isinstance(manifest, dict) and manifest.get('schema') == SIBLING_SCHEMA:
         return check_sibling(manifest, cut, rules, cut_sha256)
     if isinstance(manifest, dict) and manifest.get('schema') in SCHEMAS:
-        return check_cut(manifest, rules, cls, old_pins)
+        f = check_cut(manifest, rules, cls, old_pins)
+        _schema_ids_k12(f, manifest)              # cut time only: a fixture check re-reads the cut, not the repos
+        return f
     if cut is None:
         f = Findings(rules)
         f.add('K9', 'a fixture manifest is checked against its cut: --cut <rc2-cut-manifest.json>')

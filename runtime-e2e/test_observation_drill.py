@@ -57,7 +57,7 @@ class FakeFixture:
     gateway = '172.30.1.1'
     m = {'nodes': {'ae0': '10.0.0.10', 'me0': '10.0.0.17', 'bridge0': '10.0.0.13', 'projector': '10.0.0.21',
                    'gw0': '10.0.0.40', 'pj0': '10.0.0.44', 'md0': '10.0.0.46', 'probe': '10.0.0.20'},
-         'ports': {'ae_metrics': 19700, 'me_metrics': 19500, 'bridge_http': 9600, 'projector_http': 9601,
+         'ports': {'ae_base': 19300, 'me_base': 9000, 'stride': 100, 'bridge_http': 9600, 'projector_http': 9601,
                    'gateway_admin': 8081, 'projector_admin': 8095, 'md_admin': 8111},
          'postgres_port': 55000}
     registry = {'containers': {k: 'c-' + k for k in ('ae0', 'me0', 'bridge0', 'projector', 'gw0', 'pj0', 'md0', 'probe',
@@ -93,7 +93,7 @@ class MoneyCheckCommand(unittest.TestCase):
         self.assertEqual(emb[emb.index('--zero-hold-users') + 1], '93001-93002')
         self.assertEqual(emb[emb.index('--funding-file') + 1], '/data/mc/funding-Q2.json')
         self.assertEqual(ext[ext.index('--core-metrics') + 1],
-                         'http://10.0.0.10:19700/metrics,http://10.0.0.11:19700/metrics,http://10.0.0.12:19700/metrics')
+                         'http://10.0.0.10:9306/metrics,http://10.0.0.11:9406/metrics,http://10.0.0.12:9506/metrics')
 
     def test_an_external_kind_never_falls_back_to_embedded(self):
         class NoDriver(ExtFixture):
