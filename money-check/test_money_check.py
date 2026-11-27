@@ -862,5 +862,254 @@ class CoreExpectedSide(unittest.TestCase):
         print("\nCONTROL CoreDump exit 3 passed through ->", caught.exception)
 
 
+class FakePsql:
+    """psql behind funding_from_history: the probe's answer, then the history statement's."""
+
+    def __init__(self, has_totals, rows, rc=0):
+        self.has_totals, self.rows, self.rc, self.sql = has_totals, rows, rc, []
+
+    def run(self, argv, **kw):
+        self.sql.append(argv[-1])
+        if "to_regclass" in argv[-1]:
+            return Proc(0, "1\n" if self.has_totals else "0\n")
+        return Proc(self.rc, "\n".join(self.rows) + "\n", "ERROR: boom")
+
+
+class PrunedMoneyHistory(unittest.TestCase):
+    """Conservation over a money history that age retention has cut: the totals of the deleted deposits and
+    withdrawals are added, the check says so, and a history cut without totals is not judged."""
+
+    def test_a_schema_without_retention_is_read_as_before(self):
+        psql = FakePsql(False, ["J,0,2,100000000000,3", "J,1,2,1000000000,1", "J,0,3,5,1", "H,9,0,0,0"])
+        dep, wd, head, pruned = core_expected.funding_from_history("dsn", run=psql.run)
+        self.assertEqual((dep, wd, head, pruned), ({0: 1000 * M, 1: 10 * M}, {0: 5}, 9, None))
+        self.assertNotIn("money_journal_pruned", psql.sql[1])
+        self.assertEqual(len(psql.sql), 2)      # the probe, then ONE statement for rows and head (one snapshot)
+
+    def test_the_totals_of_the_deleted_movements_are_added(self):
+        rows = ["J,0,2,500000000,1", "J,0,3,500000000,1", "H,7,0,0,0", "N,6,0,0,0",
+                "T,0,2,110000000000,2", "T,0,3,10000000000,1", "T,1,2,1000000000,1", "M,5,0,0,0"]
+        psql = FakePsql(True, rows)
+        dep, wd, head, pruned = core_expected.funding_from_history("dsn", run=psql.run)
+        self.assertEqual((dep, wd, head), ({0: 1105 * M, 1: 10 * M}, {0: 105 * M}, 7))
+        self.assertEqual(pruned, {"through_seq": 5, "movements": 4, "totals_unknown_through": 0})
+        self.assertIn("money_journal_pruned_totals", psql.sql[1])
+        # judged, green, and the check says where part of the sum comes from
+        counters = lambda: {"m0": {"core_pending_commands": 0, "core_release_backlog": 0, "core_journal_seq": 7}}
+        result, code, _ = sweep(FakeCore([CLEAN]), funding=lambda: (dep, wd, head, pruned), counters_source=counters)
+        cons = [c for c in result["checks"] if c["name"] == "conservation"][0]
+        self.assertEqual((code, cons["status"]), (0, "PASS"), json.dumps(result["checks"]))
+        self.assertEqual(cons["note"], "4 deposits and withdrawals at or below journal seq 5 come from the pruned totals "
+                                       "(age retention deleted their rows)")
+        self.assertEqual(cons["pruned"]["through_seq"], 5)
+        import contextlib
+        import io
+        from money_check import print_core
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            print_core(result)
+        self.assertIn("come from the pruned totals", out.getvalue())
+        # control: the totals ignored (the check before it knew them): a false conservation FAIL on a healthy ledger
+        dep0, wd0, head0, pruned0 = core_expected.funding_from_history("dsn", run=FakePsql(True, rows).run,
+                                                                       pruned_totals=False)
+        self.assertEqual((dep0, wd0), ({0: 5 * M}, {0: 5 * M}))
+        _, code0, _ = sweep(FakeCore([CLEAN]), funding=lambda: (dep0, wd0, head0, pruned0), counters_source=counters)
+        self.assertEqual(code0, 2)
+
+    def test_a_mark_with_nothing_deleted_is_no_pruning(self):
+        psql = FakePsql(True, ["J,0,2,100000000000,3", "H,3,0,0,0", "M,0,0,0,0"])
+        self.assertIsNone(core_expected.funding_from_history("dsn", run=psql.run)[3])
+
+    def test_a_history_cut_without_totals_is_not_judged(self):
+        # an adopted database: rows start above the mark, and nothing knows what the deleted ones summed to
+        psql = FakePsql(True, ["J,0,2,500000000,1", "H,7,0,0,0", "N,6,0,0,0", "M,5,5,0,0"])
+        funding = core_expected.funding_from_history("dsn", run=psql.run)
+        self.assertEqual(funding[3], {"through_seq": 5, "movements": 0, "totals_unknown_through": 5})
+        counters = lambda: {"m0": {"core_pending_commands": 0, "core_release_backlog": 0, "core_journal_seq": 7}}
+        result, code, _ = sweep(FakeCore([CLEAN]), funding=lambda: funding, counters_source=counters)
+        cons = [c for c in result["checks"] if c["name"] == "conservation"][0]
+        self.assertEqual((code, result["status"], cons["status"]), (4, "INDETERMINATE", "INDETERMINATE"))
+        self.assertIn("at or below journal seq 5 and no totals of them", cons["reason"])
+        self.assertEqual(cons["drifts"], [])
+
+    def test_a_mark_or_totals_that_do_not_fit_the_stored_rows_are_not_judged(self):
+        counters = lambda: {"m0": {"core_pending_commands": 0, "core_release_backlog": 0, "core_journal_seq": 7}}
+        # a history rebuilt from journal seq 1 under the mark and totals of an earlier one: the totals would be counted
+        # on top of the same movements stored again (a false FAIL), or hide a loss of exactly that size (a false PASS)
+        rebuilt = ["J,0,2,100000000000,3", "J,1,2,1000000000,1", "H,7,0,0,0", "N,1,0,0,0", "T,0,2,110000000000,2", "M,5,0,0,0"]
+        # totals rows left while the mark says nothing was deleted
+        orphan = ["J,0,2,100000000000,3", "J,1,2,1000000000,1", "H,7,0,0,0", "N,1,0,0,0", "T,0,2,5,1", "M,0,0,0,0"]
+        # rows missing right above the mark
+        missing = ["J,0,2,500000000,1", "H,7,0,0,0", "N,7,0,0,0", "T,0,2,99500000000,2", "T,1,2,1000000000,1", "M,5,0,0,0"]
+        for name, rows, part in (("rebuilt", rebuilt, "the first stored journal seq is 1, not 6"),
+                                 ("orphan totals", orphan, "while the retention mark is 0"),
+                                 ("missing above the mark", missing, "the first stored journal seq is 7, not 6")):
+            with self.subTest(name):
+                funding = core_expected.funding_from_history("dsn", run=FakePsql(True, rows).run)
+                result, code, _ = sweep(FakeCore([CLEAN]), funding=lambda: funding, counters_source=counters)
+                cons = [c for c in result["checks"] if c["name"] == "conservation"][0]
+                self.assertEqual((code, cons["status"], cons["drifts"]), (4, "INDETERMINATE", []), json.dumps(cons))
+                self.assertIn(part, cons["reason"])
+        # "missing above the mark" adds up to the core's totals: without the rule it would have been a PASS
+        dep, wd, head, pruned = core_expected.funding_from_history("dsn", run=FakePsql(True, missing).run)
+        self.assertEqual((dep, wd), ({0: 1000 * M, 1: 10 * M}, {}))
+
+    def test_an_answer_that_is_not_understood_is_operational(self):
+        for rows in (["J,0,2,10"], ["X,0,2,10,1", "H,1,0,0,0"], ["J,0,2,ten,1", "H,1,0,0,0"], ["J,0,2,10,1"]):
+            with self.subTest(rows=rows), self.assertRaises(core_expected.OperationalError):
+                core_expected.funding_from_history("dsn", run=FakePsql(False, rows).run)
+        with self.assertRaises(core_expected.OperationalError):
+            core_expected.funding_from_history("dsn", run=FakePsql(False, [], rc=1).run)
+
+    def test_a_funding_file_may_carry_the_mark(self):
+        d = tempfile.mkdtemp()
+        try:
+            path = os.path.join(d, "funding.json")
+            with open(path, "w") as fh:
+                json.dump({"0": {"deposits": 1000 * M, "withdrawals": 0}, "1": {"deposits": 10 * M},
+                           "pruned": {"through_seq": 5, "movements": 4, "totals_unknown_through": 5}}, fh)
+            funding = core_expected.funding_from_file(path)
+            self.assertEqual(funding[:3], ({0: 1000 * M, 1: 10 * M}, {0: 0, 1: 0}, None))
+            result, code, _ = sweep(FakeCore([CLEAN]), funding=lambda: funding)
+            self.assertEqual(code, 4)       # totals unknown: not judged
+            with open(path, "w") as fh:
+                json.dump({"0": {"deposits": 1000 * M}, "1": {"deposits": 10 * M}}, fh)
+            self.assertEqual(sweep(FakeCore([CLEAN]), funding=lambda: core_expected.funding_from_file(path))[1], 0)
+            with open(path, "w") as fh:
+                json.dump({"0": {"deposits": 1}, "pruned": {"through_seq": 5}}, fh)
+            with self.assertRaises(core_expected.OperationalError):
+                core_expected.funding_from_file(path)
+        finally:
+            shutil.rmtree(d)
+
+
+def pg_bin():
+    """The newest PostgreSQL server binaries (MONEY_CHECK_PG_BIN, or /usr/lib/postgresql/<n>/bin), or None."""
+    env = os.environ.get("MONEY_CHECK_PG_BIN")
+    if env:
+        return env if os.access(os.path.join(env, "initdb"), os.X_OK) else None
+    root, best = "/usr/lib/postgresql", None
+    for v in sorted(os.listdir(root) if os.path.isdir(root) else [], key=lambda n: int(n) if n.isdigit() else -1):
+        b = os.path.join(root, v, "bin")
+        if all(os.access(os.path.join(b, x), os.X_OK) for x in ("initdb", "pg_ctl", "psql")):
+            best = b
+    return best
+
+
+@unittest.skipUnless(os.environ.get("MONEY_CHECK_CORE_MIGRATIONS") and pg_bin(),
+                     "set MONEY_CHECK_CORE_MIGRATIONS to the core repository's core-projector/src/main/resources/"
+                     "db/migration (with the retention migration) and have PostgreSQL server binaries")
+class PrunedMoneyHistoryOnPostgres(unittest.TestCase):
+    """On a real server with the core's own migrations: conservation is computed from a seeded money history, age
+    retention deletes most of it with the schema's own function, and conservation is computed again: the same funding,
+    the same verdict. Control: the same read without the totals is a false conservation FAIL."""
+
+    COUNTERS = staticmethod(lambda: {"m0": {"core_pending_commands": 0, "core_release_backlog": 0, "core_journal_seq": 7}})
+
+    def setUp(self):
+        import socket
+        import subprocess
+        self.subprocess, self.bin = subprocess, pg_bin()
+        self.dir = tempfile.mkdtemp(prefix="mc-pg-", dir="/tmp")
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        self.port = sock.getsockname()[1]
+        sock.close()
+        data = os.path.join(self.dir, "data")
+        self.sh([os.path.join(self.bin, "initdb"), "-D", data, "-U", "core", "-A", "trust", "--no-locale", "-E", "UTF8"])
+        self.sh([os.path.join(self.bin, "pg_ctl"), "-D", data, "-w", "-l", os.path.join(self.dir, "log"), "-o",
+                 f"-p {self.port} -c listen_addresses=127.0.0.1 -c unix_socket_directories=''", "start"])
+        self.addCleanup(self.stop)
+        self.psql_bin = os.path.join(self.bin, "psql")
+        self.dsn = f"host=127.0.0.1 port={self.port} dbname=money user=core"
+        self.sql("CREATE DATABASE money", db="postgres")
+        migrations = os.environ["MONEY_CHECK_CORE_MIGRATIONS"]
+        for name in sorted(n for n in os.listdir(migrations) if n.startswith("V") and n.endswith(".sql")):
+            self.sh([self.psql_bin, self.dsn, "-X", "-q", "-1", "-v", "ON_ERROR_STOP=1", "-f", os.path.join(migrations, name)])
+        # 1..5 are sixty days old (three deposits, a withdrawal, a settle), 6 and 7 an hour (a deposit, a withdrawal)
+        old = "(extract(epoch FROM now() - interval '60 days') * 1000)::bigint"
+        new = "(extract(epoch FROM now() - interval '1 hour') * 1000)::bigint"
+        self.sql(f"""
+INSERT INTO money_journal (journal_seq, log_position, movement_type, cluster_time_ms, user_id, asset_id, amount, balance_after) VALUES
+  (1, 100, 2, {old}, 1, 0, {700 * M}, {700 * M}), (2, 200, 2, {old}, 2, 1, {10 * M}, {10 * M}),
+  (3, 300, 2, {old}, 1, 0, {400 * M}, {1100 * M}), (4, 400, 3, {old}, 1, 0, {100 * M}, {1000 * M}),
+  (6, 600, 2, {new}, 1, 0, {5 * M}, {1005 * M}), (7, 700, 3, {new}, 1, 0, {5 * M}, {1000 * M});
+INSERT INTO money_journal (journal_seq, log_position, movement_type, cluster_time_ms, trade_id, market_id, price, quantity,
+  buyer_user_id, seller_user_id, taker_is_buy) VALUES (5, 500, 4, {old}, 9, 1, {M}, {M}, 1, 2, true);
+INSERT INTO money_journal_leg (journal_seq, leg_no, user_id, asset_id, asset_role, balance_after, delta) VALUES
+  (1, 0, 1, 0, NULL, 1, NULL), (2, 0, 2, 1, NULL, 1, NULL), (3, 0, 1, 0, NULL, 1, NULL), (4, 0, 1, 0, NULL, 1, NULL),
+  (5, 0, 1, NULL, 0, 1, NULL), (5, 1, 1, NULL, 1, 1, NULL), (5, 2, 2, NULL, 0, 1, NULL), (5, 3, 2, NULL, 1, 1, NULL),
+  (6, 0, 1, 0, NULL, 1, NULL), (7, 0, 1, 0, NULL, 1, NULL);""")
+
+    def stop(self):
+        self.subprocess.run([os.path.join(self.bin, "pg_ctl"), "-D", os.path.join(self.dir, "data"), "-m", "immediate",
+                             "stop"], capture_output=True)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def sh(self, argv):
+        p = self.subprocess.run(argv, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr[-800:])
+        return p.stdout
+
+    def sql(self, statement, db=None):
+        dsn = self.dsn if db is None else f"host=127.0.0.1 port={self.port} dbname={db} user=core"
+        return self.sh([self.psql_bin, dsn, "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", statement]).strip()
+
+    def conservation(self, **kw):
+        funding = core_expected.funding_from_history(self.dsn, self.psql_bin, **kw)
+        result, code, _ = sweep(FakeCore([CLEAN]), funding=lambda: funding, counters_source=self.COUNTERS)
+        return funding, code, [c for c in result["checks"] if c["name"] == "conservation"][0]
+
+    def test_conservation_is_the_same_before_and_after_a_delete(self):
+        before, code, check = self.conservation()
+        self.assertEqual((code, check["status"]), (0, "PASS"), json.dumps(check))
+        self.assertEqual(before, ({0: 1105 * M, 1: 10 * M}, {0: 105 * M}, 7, None))
+        self.assertNotIn("note", check)
+        cutoff = "(extract(epoch FROM now() - interval '1 day') * 1000)::bigint"
+        # in two batches, the check run between them and after them
+        self.assertEqual(self.sql(f"SELECT journal_deleted || '/' || legs_deleted FROM money_history_prune_v1({cutoff}, 2)"), "2/2")
+        middle, code, check = self.conservation()
+        self.assertEqual((code, check["status"], middle[:3]), (0, "PASS", before[:3]), json.dumps(check))
+        self.assertEqual(self.sql(f"SELECT journal_deleted || '/' || legs_deleted FROM money_history_prune_v1({cutoff}, 100)"), "3/6")
+        self.assertEqual(self.sql("SELECT string_agg(journal_seq::text, ',' ORDER BY journal_seq) FROM money_journal"), "6,7")
+        after, code, check = self.conservation()
+        self.assertEqual((code, check["status"]), (0, "PASS"), json.dumps(check))
+        self.assertEqual(after[:3], before[:3])              # deposits, withdrawals and head: the same numbers
+        self.assertEqual(after[3], {"through_seq": 5, "movements": 4, "totals_unknown_through": 0})
+        self.assertEqual(check["note"], "4 deposits and withdrawals at or below journal seq 5 come from the pruned totals "
+                                        "(age retention deleted their rows)")
+        # control: without the totals the healthy ledger reads as a conservation breach of exactly the deleted funding
+        ignored, code, check = self.conservation(pruned_totals=False)
+        self.assertEqual((code, check["status"]), (2, "FAIL"))
+        self.assertEqual(sorted((d["assetId"], d["gap"]) for d in check["drifts"]), [(0, 1000 * M), (1, 10 * M)])
+        print("\nmoney history cut by retention: conservation PASS before and after, the same funding;",
+              "control without the totals: FAIL, gaps", sorted((d["assetId"], d["gap"]) for d in check["drifts"]))
+
+    def test_totals_with_a_reset_mark_are_not_judged(self):
+        cutoff = "(extract(epoch FROM now() - interval '1 day') * 1000)::bigint"
+        self.sql(f"SELECT * FROM money_history_prune_v1({cutoff}, 100)")
+        self.assertEqual(self.conservation()[1], 0)
+        self.sql("UPDATE money_journal_pruned SET through_seq = 0")           # by hand: totals left, the mark gone
+        funding, code, check = self.conservation()
+        self.assertEqual((code, check["status"]), (4, "INDETERMINATE"))
+        self.assertIn("while the retention mark is 0", check["reason"])
+        self.sql("UPDATE money_journal_pruned SET through_seq = 4")           # a mark that is not right below the rows
+        _, code, check = self.conservation()
+        self.assertEqual((code, check["status"]), (4, "INDETERMINATE"))
+        self.assertIn("the first stored journal seq is 6, not 5", check["reason"])
+
+    def test_a_history_another_delete_cut_is_not_judged(self):
+        # rows deleted by a delete that knows no totals, then adopted by the owner: the sums below the mark are unknown
+        self.sql("DELETE FROM money_journal_leg WHERE journal_seq <= 2; DELETE FROM money_journal WHERE journal_seq <= 2")
+        _, code, check = self.conservation()
+        self.assertEqual((code, check["status"]), (2, "FAIL"))      # before the adoption nothing says rows are gone
+        cutoff = "(extract(epoch FROM now() - interval '1 day') * 1000)::bigint"
+        self.assertEqual(self.sql(f"SELECT adopted_through FROM money_history_adopt_v1({cutoff})"), "2")
+        funding, code, check = self.conservation()
+        self.assertEqual((code, check["status"]), (4, "INDETERMINATE"))
+        self.assertEqual(funding[3]["totals_unknown_through"], 2)
+        self.assertIn("at or below journal seq 2 and no totals of them", check["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -928,7 +928,8 @@ class BarrierCountersTest(unittest.TestCase):
         patches = [mock.patch.object(core_scenarios, 'money_dump', lambda f: {'balances': [], 'holds': [], 'lastAppliedTradeId': 0}),
                    mock.patch.object(core_scenarios, 'order_dump', lambda f: []),
                    mock.patch.object(core_scenarios, 'me_journal', lambda f: ([], True)),
-                   mock.patch.object(core_scenarios, 'money_journal', lambda f: ([], []))]
+                   mock.patch.object(core_scenarios, 'money_journal', lambda f: ([], [])),
+                   mock.patch.object(core_scenarios, 'money_journal_pruned', lambda f: None)]
         for p in patches: p.start()
         try:
             return core_scenarios.observe(fixture)
@@ -1302,12 +1303,14 @@ class ResetProjectionTest(LifecycleBase):
         self.assertLess(max(i for i, s in enumerate(sqls) if ' t' in s and 'json_agg' in s), drop)
         self.assertEqual(sqls[drop + 1], 'CREATE DATABASE r01_money OWNER core')
         # the role plan's grants and default privileges, then the packaged migrations re-applied as the money projector's
-        # login role (it owns the money tables), then the retention role's SELECT on the two tables its age delete reads
+        # login role (it owns the money tables), then the retention role left with TRUNCATE alone on the two history tables
         defaults = next(i for i, s in enumerate(sqls) if s.startswith('ALTER DEFAULT PRIVILEGES FOR ROLE core'))
         migration = next(i for i, c in enumerate(calls) if 'CREATE TABLE money_journal' in c[1])
         self.assertLess(defaults, migration)
         self.assertEqual(calls[migration][2], 'core')
-        self.assertIn('GRANT SELECT ON public.money_journal TO history_retention', sqls[-2])
+        self.assertIn("'REVOKE ALL ON public.money_journal FROM history_retention'; EXECUTE "
+                      "'GRANT TRUNCATE ON public.money_journal TO history_retention'", sqls[-2])
+        self.assertIn('ALTER DEFAULT PRIVILEGES FOR ROLE core GRANT TRUNCATE ON TABLES TO history_retention', sqls)
         self.assertEqual((w['kind'], w['life'], w['tables']), ('reset_projection', 1, {'money_journal': 2, 'money_journal_leg': 1}))
         self.assertEqual(json.loads(dump.read_text().splitlines()[0]), {'table': 'money_journal', 'row': {'journal_seq': 1}})
         self.assertEqual(f.registry['projection_dumps']['1'],                    # the wipe precondition's record

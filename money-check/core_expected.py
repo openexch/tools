@@ -20,7 +20,12 @@ The invariants, each exact for every user:
                    history (the money projector's money_journal, read over a PostgreSQL connection, or a funding file
                    written from it). The money history is judged only when it is at the core's money journal head
                    (core_journal_seq of --core-metrics): behind the head, or with no head read, it is INDETERMINATE.
-                   A funding file carries no journal position: the caller answers for its instant
+                   A funding file carries no journal position: the caller answers for its instant.
+                   A money history that age retention has cut (the projector's money_history_prune_v1) keeps the sums
+                   of the deleted deposits and withdrawals in money_journal_pruned_totals: they are read in the same
+                   statement as the stored rows and added, so the result is the same before and after a delete, and
+                   the check says how many movements below which journal seq come from those totals. A history cut
+                   without totals (money_journal_pruned.totals_unknown_through > 0) is INDETERMINATE
   locked_vs_holds  locked equals the sum of the core's hold entries per user and asset
   holds_live       every hold belongs to a live order of the same user and hold asset (else: a residual hold)
   order_holds      every live order has a hold, and it equals the value recomputed from the order's fields:
@@ -241,10 +246,23 @@ def stable_read(reader, retries, wait_ms, sleep=time.sleep, stable=content_stabl
 
 # --------------------------------------------------------------------------- funding source
 
-def funding_from_history(dsn, psql="psql", run=subprocess.run, timeout=30):
-    """Per-asset (deposits, withdrawals) from the money projector's money_journal (movement 2 deposit, 3 withdraw)."""
-    sql = ("SELECT asset_id, movement_type, COALESCE(sum(amount), 0) FROM money_journal "
-           "WHERE movement_type IN (2, 3) GROUP BY 1, 2 ORDER BY 1, 2")
+HISTORY_PROBE_SQL = ("SELECT (to_regclass('money_journal_pruned') IS NOT NULL "
+                     "AND to_regclass('money_journal_pruned_totals') IS NOT NULL)::int")
+# One statement, one snapshot: the stored deposits and withdrawals (J), the head (H), the first stored journal seq (N)
+# and, on a schema with age retention, the sums of the deleted ones (T) and the retention mark (M). Whether the schema
+# has the retention tables is a statement of its own before it (a statement cannot name a table that may not exist);
+# tables do not come and go between the two. A delete moves rows from J to T in one
+# transaction, so J + T of one snapshot is the whole history whenever it is read.
+HISTORY_SQL = ("SELECT 'J', asset_id, movement_type, COALESCE(sum(amount), 0), count(*) FROM money_journal "
+               "WHERE movement_type IN (2, 3) GROUP BY 2, 3 "
+               "UNION ALL SELECT 'H', COALESCE(max(journal_seq), 0), 0, 0, 0 FROM money_journal "
+               "UNION ALL SELECT 'N', COALESCE(min(journal_seq), 0), 0, 0, 0 FROM money_journal")
+HISTORY_PRUNED_SQL = (" UNION ALL SELECT 'T', asset_id, movement_type, amount, movements FROM money_journal_pruned_totals "
+                      "WHERE movement_type IN (2, 3) "
+                      "UNION ALL SELECT 'M', through_seq, totals_unknown_through, 0, 0 FROM money_journal_pruned")
+
+
+def _history_psql(dsn, psql, run, timeout, sql):
     try:
         p = run([psql, dsn, "-X", "-q", "-A", "-t", "-F", ",", "-v", "ON_ERROR_STOP=1", "-c", sql],
                 capture_output=True, text=True, timeout=timeout)
@@ -252,26 +270,74 @@ def funding_from_history(dsn, psql="psql", run=subprocess.run, timeout=30):
         raise OperationalError(f"money history unreadable: {e}")
     if p.returncode != 0:
         raise OperationalError(f"money history unreadable: {p.stderr.strip()[-300:]}")
-    dep, wd = {}, {}
-    for line in p.stdout.split():
-        asset, kind, amount = line.split(",")
-        (dep if kind == "2" else wd)[int(asset)] = int(amount)
-    head = run([psql, dsn, "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c",
-                "SELECT COALESCE(max(journal_seq), 0) FROM money_journal"], capture_output=True, text=True, timeout=timeout)
-    if head.returncode != 0:
-        raise OperationalError(f"money history unreadable: {head.stderr.strip()[-300:]}")
-    return dep, wd, int(head.stdout.strip() or 0)
+    return p.stdout
+
+
+def funding_from_history(dsn, psql="psql", run=subprocess.run, timeout=30, pruned_totals=True):
+    """(deposits, withdrawals, head, pruned) per asset from the money projector's money_journal (movement 2 deposit, 3
+    withdraw) plus, where age retention deleted old movements, the sums it kept of them. ``pruned`` is None on a history
+    nothing was deleted from, else {"through_seq", "movements", "totals_unknown_through"}: ``movements`` deposits and
+    withdrawals at or below journal seq ``through_seq`` are in the result from the totals, not from stored rows. A mark
+    and totals that do not fit the stored rows (the first stored journal seq is not the mark plus one, or totals with
+    the mark at 0) add ``"inconsistent"``, the reason: the sums cannot be trusted either way and are not judged.
+    ``pruned_totals=False`` is a control only: the totals are not added (the check as it was before it knew them)."""
+    has_totals = _history_psql(dsn, psql, run, timeout, HISTORY_PROBE_SQL).strip() == "1"
+    out = _history_psql(dsn, psql, run, timeout, HISTORY_SQL + (HISTORY_PRUNED_SQL if has_totals else ""))
+    dep, wd, head, first, mark, from_totals, total_rows = {}, {}, None, None, None, 0, 0
+    for line in out.split():
+        f = line.split(",")
+        try:
+            if len(f) != 5:
+                raise ValueError("not five fields")
+            kind, a, b, c, d = f[0], int(f[1]), int(f[2]), int(f[3]), int(f[4])
+        except ValueError as e:
+            raise OperationalError(f"money history answer not understood: {line!r}: {e}")
+        if kind == "H":
+            head = a
+        elif kind == "N":
+            first = a
+        elif kind == "M":
+            mark = (a, b)
+        elif kind in ("J", "T") and b in (2, 3):
+            if kind == "T":
+                from_totals += d
+                total_rows += 1
+                if not pruned_totals:
+                    continue
+            side = dep if b == 2 else wd
+            side[a] = side.get(a, 0) + c
+        else:
+            raise OperationalError(f"money history answer not understood: {line!r}")
+    if head is None:
+        raise OperationalError("money history answer carries no head")
+    pruned = None
+    if mark is not None and (mark[0] > 0 or total_rows):
+        pruned = {"through_seq": mark[0], "movements": from_totals, "totals_unknown_through": mark[1]}
+        if mark[0] == 0:
+            pruned["inconsistent"] = (f"money_journal_pruned_totals holds {from_totals} movements while the retention mark "
+                                      f"is 0 (nothing deleted): the totals and the stored rows may count a movement twice")
+        elif first != mark[0] + 1:
+            pruned["inconsistent"] = (f"the retention mark is at journal seq {mark[0]} and the first stored journal seq is "
+                                      f"{first or 'none'}, not {mark[0] + 1}: rows are missing above the mark, or the history "
+                                      f"was rebuilt under the mark and totals of an earlier one")
+    return dep, wd, head, pruned
 
 
 def funding_from_file(path):
-    """{"<asset>": {"deposits": n, "withdrawals": n}} written from the money history."""
+    """{"<asset>": {"deposits": n, "withdrawals": n}} written from the money history (the stored rows plus the totals
+    of what age retention deleted). An optional key "pruned" carries the retention mark of the history the file was
+    written from ({"through_seq", "movements", "totals_unknown_through"}), judged as for a history read directly."""
     try:
         with open(path) as fh:
             doc = json.load(fh)
-    except (OSError, ValueError) as e:
+        pruned = doc.pop("pruned", None)
+        if pruned is not None:
+            pruned = dict({k: int(pruned[k]) for k in ("through_seq", "movements", "totals_unknown_through")},
+                          **({"inconsistent": str(pruned["inconsistent"])} if pruned.get("inconsistent") else {}))
+        return ({int(a): int(v.get("deposits", 0)) for a, v in doc.items()},
+                {int(a): int(v.get("withdrawals", 0)) for a, v in doc.items()}, None, pruned)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
         raise OperationalError(f"--funding-file {path}: {e}")
-    return ({int(a): int(v.get("deposits", 0)) for a, v in doc.items()},
-            {int(a): int(v.get("withdrawals", 0)) for a, v in doc.items()}, None)
 
 
 def core_counters(urls, timeout=5):
@@ -336,6 +402,7 @@ def judge(dump, orders, funding, zero_users=(), counters=None):
     # conservation
     core_head = max((v["core_journal_seq"] for v in (counters or {}).values() if "core_journal_seq" in v), default=None)
     history_head = funding[2] if funding is not None else None
+    pruned = funding[3] if funding is not None and len(funding) > 3 else None
     if funding is None:
         checks.append({"name": "conservation", "status": "INDETERMINATE", "reason": "no funding source", "drifts": []})
     elif history_head is not None and core_head is None:
@@ -346,6 +413,16 @@ def judge(dump, orders, funding, zero_users=(), counters=None):
     elif history_head is not None and history_head < core_head:
         checks.append({"name": "conservation", "status": "INDETERMINATE", "drifts": [],
                        "reason": f"the money history is behind the core: journal {history_head} of {core_head}"})
+    elif pruned and pruned.get("inconsistent"):
+        # neither a breach nor a pass: the pieces the sum is made of do not belong together
+        checks.append({"name": "conservation", "status": "INDETERMINATE", "drifts": [], "pruned": pruned,
+                       "reason": pruned["inconsistent"]})
+    elif pruned and pruned["totals_unknown_through"] > 0:
+        # a history cut by a delete that kept no sums: any number computed from what is left would be a guess
+        checks.append({"name": "conservation", "status": "INDETERMINATE", "drifts": [], "pruned": pruned,
+                       "reason": f"the money history holds no movement at or below journal seq "
+                                 f"{pruned['totals_unknown_through']} and no totals of them (deleted before the retention "
+                                 f"totals existed): deposits and withdrawals below it are unknown"})
     else:
         dep, wd = funding[0], funding[1]
         per = {}
@@ -357,7 +434,12 @@ def judge(dump, orders, funding, zero_users=(), counters=None):
             if per.get(a, 0) != exp:
                 drifts.append(_drift("conservation", userId=None, assetId=a, expected=exp, actual=per.get(a, 0),
                                      gap=per.get(a, 0) - exp))
-        checks.append({"name": "conservation", "status": "FAIL" if drifts else "PASS", "drifts": drifts})
+        check = {"name": "conservation", "status": "FAIL" if drifts else "PASS", "drifts": drifts}
+        if pruned:
+            check["pruned"] = pruned
+            check["note"] = (f"{pruned['movements']} deposits and withdrawals at or below journal seq "
+                             f"{pruned['through_seq']} come from the pruned totals (age retention deleted their rows)")
+        checks.append(check)
 
     # locked equals the sum of holds
     sums = {}

@@ -209,6 +209,33 @@ class CoreOracleTest(unittest.TestCase):
     def test_m13_money_journal_gap(self):
         self.assertRule(variant(clean_sample(), lambda s: s['money_journal'][3].update(seq=9)), 'M13')
 
+    def test_a_money_history_cut_by_retention_is_neither_a_loss_nor_a_pass(self):
+        # age retention deleted the first three movements (and their legs); the mark says so
+        def cut(s):
+            gone = {r['seq'] for r in s['money_journal'][:3]}
+            s['money_journal'] = [r for r in s['money_journal'] if r['seq'] not in gone]
+            s['money_journal_legs'] = [l for l in s['money_journal_legs'] if l['seq'] not in gone]
+            s['money_journal_pruned'] = {'through_seq': 3, 'totals_unknown_through': 0}
+        result = core_oracle.judge(variant(clean_sample(), cut))
+        rules = {k: v['status'] for k, v in result['rules'].items()}
+        self.assertEqual(rules['M13'], 'PASS', result)                       # dense from right above the mark
+        for rule in ('M8', 'M9', 'M14'):
+            self.assertEqual(rules[rule], 'INCONCLUSIVE', result)
+            self.assertIn('deleted at or below journal seq 3 by age retention', result['rules'][rule]['detail'])
+        self.assertNotIn('FAIL', rules.values(), result)
+        self.assertEqual(result['status'], 'INCONCLUSIVE')
+        # control: the same rows gone with no mark is a loss
+        def lost(s):
+            cut(s); del s['money_journal_pruned']
+        self.assertRule(variant(clean_sample(), lost), 'M13')
+        # a mark that is not right below the first stored movement is a gap (a row above the mark is gone)
+        def above(s):
+            cut(s); s['money_journal_pruned']['through_seq'] = 2
+        self.assertRule(variant(clean_sample(), above), 'M13')
+        # a mark with nothing deleted changes nothing
+        untouched = variant(clean_sample(), lambda s: s.update(money_journal_pruned={'through_seq': 0, 'totals_unknown_through': 0}))
+        self.assertEqual(core_oracle.judge(untouched)['status'], 'PASS')
+
     def test_m14_journal_replay_disagrees_with_dump(self):
         def edit(s):
             s['money_journal_legs'][-1]['balance_after'] += 1

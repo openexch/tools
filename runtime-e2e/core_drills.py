@@ -3014,6 +3014,7 @@ class DrillRun(ScheduleDrills):
                   'core_events': tap['order_event'], 'admission': tap['admission'], 'dispatch_tap': second['dispatch_tap'],
                   **{k: second[k] for k in ['core', 'me_journal', 'me_journal_seq', 'me_open_legs', 'money_journal',
                                             'money_journal_legs']},
+                  **({'money_journal_pruned': second['money_journal_pruned']} if second.get('money_journal_pruned') else {}),
                   'faults': {'settle_fault': max(g['core_settle_faults_total'] for g in second['gauges'].values()),
                              'settle_rejected': max(g['core_settle_rejects_total'] for g in second['gauges'].values()),
                              'order_fault': len(tap['order_fault']),

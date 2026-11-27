@@ -29,7 +29,9 @@ grant to the role or to a group it belongs to). The logins come from two sources
                                <rel>``; DELETE or TRUNCATE missing -> ``retention role has no grant: <rel>``; anything else
                                (SELECT outside the relations its age delete reads, REFERENCES, TRIGGER) or any grant where
                                the table gives it no place -> ``retention role has a grant outside its tables: <rel>``. On a
-                               view it may hold at most DELETE and TRUNCATE.
+                               view it may hold at most DELETE and TRUNCATE. On the money history tables it holds
+                               TRUNCATE alone (the reset; the age delete is the schema's own function): TRUNCATE missing
+                               -> ``retention role has no grant``, SELECT or DELETE -> ``a grant outside its tables``.
 * ``readers:<db>.<view>``      SELECT granted on a view to a role other than its owner and the named reader group ->
                                ``view readable by an unnamed role: <view>: <role>``
 
@@ -144,6 +146,7 @@ def judge(listing, declared, nodes, plan=None, retention=None, reader_group=None
     plan = core_contracts.TABLE_OWNERS if plan is None else plan
     retention = retention or core_contracts.RETENTION_ROLE
     retention_select = {db: set(p.get('retention_select') or []) for db, p in core_contracts.DATABASE_ROLE_PLAN.items()}
+    truncate_only = {db: set(p.get('retention_truncate_only') or []) for db, p in core_contracts.DATABASE_ROLE_PLAN.items()}
     supers = sorted(r['name'] for r in listing['roles'] if r.get('super'))
     lines = {}
 
@@ -179,7 +182,7 @@ def judge(listing, declared, nodes, plan=None, retention=None, reader_group=None
             continue
         named = dict(spec['tables'], **spec['views'])
         present = {r['name']: r for r in got}
-        for name in sorted(set(named) - set(present)):
+        for name in sorted(set(named) - set(present) - set(spec.get('optional') or [])):
             lines[f'relation:{db}.{name}'] = _line(False, {}, f'relation missing: {db}.{name}', inconclusive=True)
         for name, rel in sorted(present.items()):
             key = f'{db}.{name}'
@@ -207,6 +210,12 @@ def judge(listing, declared, nodes, plan=None, retention=None, reader_group=None
                 ok, text = False, f'retention role can insert: {name}'
             elif view:
                 ok, text = held <= {'DELETE', 'TRUNCATE'}, f'retention role has a grant outside its tables: {name}'
+            elif name in truncate_only.get(db, set()):
+                # the reset's TRUNCATE and nothing else: the age delete is the schema's own function (the pruner group)
+                if 'TRUNCATE' not in held:
+                    ok, text = False, f'retention role has no grant: {name}'
+                else:
+                    ok, text = held == {'TRUNCATE'}, f'retention role has a grant outside its tables: {name}'
             elif not {'DELETE', 'TRUNCATE'} <= held:
                 ok, text = False, f'retention role has no grant: {name}'
             else:
