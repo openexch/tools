@@ -800,6 +800,8 @@ def print_core(result):
         line = f"   {c['status']:<13} {c['name']}"
         if c.get("reason"):
             line += f"  ({c['reason']})"
+        if c.get("note"):
+            line += f"  [{c['note']}]"
         print(line)
         for d in c.get("drifts", [])[:50]:
             print(f"        {json.dumps(d, sort_keys=True)}")

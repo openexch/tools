@@ -296,7 +296,7 @@ def green_listing():
         for name, writer in spec['tables'].items():
             eff = {writer: list(ALL)}
             if spec['retention'] and (history is None or name in history):
-                eff[ret] = ['DELETE', 'TRUNCATE'] + (['SELECT'] if db == 'r01_money' else [])
+                eff[ret] = ['TRUNCATE'] if db == 'r01_money' else ['DELETE', 'TRUNCATE']
             rels.append(relation(name, 'r', writer, eff))
         for name, writer in spec['views'].items():
             readers = spec['view_readers'][name]
@@ -395,6 +395,27 @@ class TableOwnersTest(unittest.TestCase):
         self.assertEqual(failing(lines), ['unnamed delete role on money_journal: planted_cleaner'])
         self.assertEqual(smoke_core.verdict(lines, red_proofs.CONTROLS['owners-third-delete-role'])[0], 'PASS')
 
+    def test_the_money_history_gives_the_retention_role_truncate_alone(self):
+        # the age delete is the schema's own function: DELETE or SELECT on the money history is a grant outside its tables
+        for extra in ('DELETE', 'SELECT'):
+            listing = green_listing()
+            rel(listing, 'r01_money', 'money_journal')['effective']['history_retention'] = ['TRUNCATE', extra]
+            self.assertEqual(failing(table_owners.judge(listing, DECLARED, NODES)[0]),
+                             ['retention role has a grant outside its tables: money_journal'])
+        listing = green_listing()
+        rel(listing, 'r01_money', 'money_journal_leg')['effective'].pop('history_retention')
+        self.assertEqual(failing(table_owners.judge(listing, DECLARED, NODES)[0]), ['retention role has no grant: money_journal_leg'])
+        # the retention mark and totals: the projector's own, nothing for the retention role; absent on a cut whose
+        # projector does not create them, which is not a missing relation
+        listing = green_listing()
+        rel(listing, 'r01_money', 'money_journal_pruned')['effective']['history_retention'] = ['TRUNCATE']
+        self.assertEqual(failing(table_owners.judge(listing, DECLARED, NODES)[0]),
+                         ['retention role has a grant outside its tables: money_journal_pruned'])
+        listing = green_listing()
+        listing['databases']['r01_money']['relations'] = [r for r in listing['databases']['r01_money']['relations']
+                                                          if not r['name'].startswith('money_journal_pruned')]
+        self.assertEqual(failing(table_owners.judge(listing, DECLARED, NODES)[0]), [])
+
     def test_views_are_judged_apart(self):
         listing = green_listing()
         view = rel(listing, 'r01_gateway', 'gateway_fills_v1')
@@ -445,7 +466,8 @@ class TableOwnersTest(unittest.TestCase):
         self.assertNotIn(core_contracts.FIXTURE_SUPERUSER, core_contracts.LOGIN_ROLES)
         plan = core_contracts.DATABASE_ROLE_PLAN
         self.assertEqual(plan['r01_gateway']['writers'], ['oe_gateway', 'oe_projector'])
-        self.assertEqual(plan['r01_money']['retention_select'], ['money_journal', 'money_journal_leg'])
+        self.assertEqual(plan['r01_money']['retention_select'], [])
+        self.assertEqual(plan['r01_money']['retention_truncate_only'], ['money_journal', 'money_journal_leg'])
         self.assertFalse(plan['r01_history_b']['retention'])
         self.assertEqual(set(plan), set(core_contracts.TABLE_OWNERS))
 

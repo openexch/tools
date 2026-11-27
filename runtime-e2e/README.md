@@ -200,8 +200,13 @@ superuser `runtime_fixture`, which only the harness itself uses. The money proje
 its packaged migrations, so it owns the money tables), oe-projector as `oe_projector`, oe-gateway as `oe_gateway` (a
 member of `oe_history_reader`), oe-marketdata as `oe_marketdata_writer`; `oe_stream` is made but logs in nowhere on the
 fixture (api-key auth). The retention role `history_retention` holds DELETE and TRUNCATE through each writer's default
-privileges, set in each database before its writers start (none in `r01_history_b`), and SELECT on the two money tables
-its age delete reads. Each database is owned by its writer, CREATE on schema public is revoked from PUBLIC and granted to
+privileges, set in each database before its writers start (none in `r01_history_b`). On the money database it holds
+TRUNCATE alone, on the two history tables (the reset): the money history's age delete is the schema's own function
+(`money_history_prune_v1`, core projector V003), called through the group `oe_history_pruner`, which the fixture creates
+and of which the retention role is a member. The schema's retention mark and totals (`money_journal_pruned`,
+`money_journal_pruned_totals`) are the projector's own and optional in the ownership table (a cut whose projector has no
+V003 does not create them). The money oracle reads the mark: over a history that retention has cut, the rules that need
+every movement (M8, M9, M12's settle match, M14) are INCONCLUSIVE and M13 is dense from right above the mark. Each database is owned by its writer, CREATE on schema public is revoked from PUBLIC and granted to
 the writers. On a rig kind whose projection slots run the stand-in, the stand-in and the gateways still use the
 superuser.
 

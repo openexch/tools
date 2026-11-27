@@ -188,6 +188,18 @@ def money_journal(fixture):
     return journal, legs
 
 
+def money_journal_pruned(fixture):
+    """The money history's retention mark, or None on a schema without one (a projector older than its V003) or with
+    nothing deleted. The oracle reads it so that deleted rows are neither a loss nor a pass (core_oracle)."""
+    if fixture.psql('r01_money', "SELECT to_regclass('public.money_journal_pruned') IS NOT NULL").strip() not in ('t', 'true'):
+        return None
+    rows = json.loads(fixture.psql('r01_money', "SELECT COALESCE(json_agg(t), '[]'::json) FROM (SELECT through_seq, "
+                                                'totals_unknown_through FROM money_journal_pruned) t') or '[]')
+    if not rows or not rows[0]['through_seq']:
+        return None
+    return {'through_seq': rows[0]['through_seq'], 'totals_unknown_through': rows[0]['totals_unknown_through']}
+
+
 def merge_member_lives(events, has_journal_seq):
     """One member's journal as one logical sequence. A member that was killed and restarted starts a NEW archive recording
     and re-journals the whole log it replays from journalSeq 1 (found on me2 of lifecycle-faults, which held two
@@ -294,6 +306,7 @@ def observe(fixture, frozen=None):
     else:
         journal, has_seq, legs = frozen['me_journal'], frozen['me_journal_seq'], frozen['me_open_legs']
     mj, mlegs = money_journal(fixture)
+    pruned = money_journal_pruned(fixture)
     gauges, leaders, by_member = {}, [], {}
     for i in range(3):
         metrics = fixture.metrics(f'ae{i}', core_contracts.engine_http_port(fixture.m['ports'], f'ae{i}'))
@@ -322,7 +335,8 @@ def observe(fixture, frozen=None):
     if frozen is not None:
         scrape.update(frozen.get('scrape_me') or {})
     return {'core': core, 'me_journal': journal, 'me_journal_seq': has_seq, 'me_open_legs': legs,
-            'money_journal': mj, 'money_journal_legs': mlegs, 'gauges': gauges, 'pending': pending, 'counters': counters,
+            'money_journal': mj, 'money_journal_legs': mlegs, 'money_journal_pruned': pruned,
+            'gauges': gauges, 'pending': pending, 'counters': counters,
             'counters_member': counters_member, 'counters_by_member': counters_by_member, 'scrape': scrape}
 
 
@@ -345,6 +359,7 @@ def core_smoke(fixture):
               'creates': creates, 'amends': [], 'cancels': [],
               'core_events': tap['order_event'], 'admission': tap['admission'], 'dispatch_tap': tap['dispatch'],
               **{k: second[k] for k in ['core', 'me_journal', 'me_journal_seq', 'me_open_legs', 'money_journal', 'money_journal_legs']},
+              **({'money_journal_pruned': second['money_journal_pruned']} if second.get('money_journal_pruned') else {}),
               'faults': {'settle_fault': max(g['core_settle_faults_total'] for g in second['gauges'].values()),
                          'settle_rejected': max(g['core_settle_rejects_total'] for g in second['gauges'].values()),
                          'order_fault': len(tap['order_fault']),

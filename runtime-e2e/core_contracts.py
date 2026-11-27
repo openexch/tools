@@ -105,6 +105,9 @@ HISTORY_READER_GROUP = 'oe_history_reader'
 # The money database's read group of the balance movements view (core-projector V002 grants SELECT on the view to it and
 # creates it only when the migrating role may create roles; like the console, the fixture creates it first, NOLOGIN)
 MONEY_READER_GROUP = 'oe_money_reader'
+# The group that holds EXECUTE on the schemas' own age deletes (the core projector's money_history_prune_v1); the
+# retention role is its member. A schema file grants to it and cannot create it (its login has no CREATEROLE)
+HISTORY_PRUNER_GROUP = 'oe_history_pruner'
 HISTORY_READER_LOGIN = GATEWAY_LOGIN
 # The stand-in's modes: ``follow`` beats only at the core's head; ``beat-always`` beats whatever the head (the freshness
 # drill's control: stale history then reads fresh)
@@ -147,13 +150,15 @@ LOGIN_ROLES = {MONEY_PROJECTOR_LOGIN: 'money projector', GATEWAY_LOGIN: 'oe-gate
                HISTORY_PROJECTOR_LOGIN: 'oe-projector', MARKETDATA_WRITER: 'oe-marketdata', RETENTION_ROLE: 'console retention'}
 # The database step of each fixture database (the console's historyDatabases on the fixture's names): its owner at
 # creation, the roles granted CONNECT, the writers (USAGE and CREATE on schema public, and the retention role's default
-# privileges when ``retention``), the readers (USAGE), each writer's default SELECT grantees, and the relations the
-# retention role reads. CREATE on schema public is revoked from PUBLIC. r01_history_b (a second projection, drills only)
+# privileges when ``retention``), the readers (USAGE), each writer's default SELECT grantees, the relations the retention
+# role reads (none any more) and those on which it holds TRUNCATE and nothing else (``retention_truncate_only``: the money
+# history, whose age delete is the pruner group's function and whose reset is a TRUNCATE; the writers' default
+# privilege there is TRUNCATE alone). CREATE on schema public is revoked from PUBLIC. r01_history_b (a second projection, drills only)
 # has no retention role.
 DATABASE_ROLE_PLAN = {
     'r01_money': {'owner': MONEY_PROJECTOR_LOGIN, 'connect': [MONEY_PROJECTOR_LOGIN, RETENTION_ROLE],
                   'writers': [MONEY_PROJECTOR_LOGIN], 'readers': [], 'default_select': {}, 'retention': True,
-                  'retention_select': ['money_journal', 'money_journal_leg']},
+                  'retention_select': [], 'retention_truncate_only': ['money_journal', 'money_journal_leg']},
     'r01_gateway': {'owner': GATEWAY_LOGIN, 'connect': [GATEWAY_LOGIN, STREAM_LOGIN, HISTORY_PROJECTOR_LOGIN, RETENTION_ROLE],
                     'writers': [GATEWAY_LOGIN, HISTORY_PROJECTOR_LOGIN], 'readers': [STREAM_LOGIN, HISTORY_READER_GROUP],
                     'default_select': {GATEWAY_LOGIN: [STREAM_LOGIN]}, 'retention': True, 'retention_select': []},
@@ -168,12 +173,16 @@ DATABASE_ROLE_PLAN = {
 # readers of each view (``view_readers``: view -> roles), whether the retention role belongs there and, when only some of
 # its tables are history (``retention_tables``), which: every other relation of that database gives the retention role
 # nothing. Gateway's users store is not on the fixture (api-key auth). The money database carries the core projector's
-# V002 too: the market asset lookup table and two views, the balance movements view readable by oe_money_reader only.
+# V002 too: the market asset lookup table and two views, the balance movements view readable by oe_money_reader only,
+# and V003's retention mark and totals (``optional``: a cut whose projector has no V003 does not create them; present,
+# they are the projector's own and give the retention role nothing).
 _PROJECTION_TABLES = ('oe_orders', 'oe_fills', 'oe_order_events', 'oe_projection_state', 'oe_projection_source_memo',
                       'oe_projection_replay', 'oe_projection_schema')
 _PROJECTION_VIEWS = ('gateway_order_history_v1', 'gateway_fills_v1', 'gateway_order_trail_v1', 'gateway_history_heartbeat_v1')
 TABLE_OWNERS = {
-    'r01_money': {'tables': {t: MONEY_PROJECTOR_LOGIN for t in ('money_journal', 'money_journal_leg', 'money_market_asset')},
+    'r01_money': {'tables': {t: MONEY_PROJECTOR_LOGIN for t in ('money_journal', 'money_journal_leg', 'money_market_asset',
+                                                                'money_journal_pruned', 'money_journal_pruned_totals')},
+                  'optional': ['money_journal_pruned', 'money_journal_pruned_totals'],
                   'views': {v: MONEY_PROJECTOR_LOGIN for v in ('money_journal_leg_asset', 'gateway_balance_movements_v1')},
                   'view_readers': {'money_journal_leg_asset': [], 'gateway_balance_movements_v1': [MONEY_READER_GROUP]},
                   'retention': True, 'retention_tables': ['money_journal', 'money_journal_leg']},

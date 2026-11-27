@@ -33,6 +33,11 @@ user other than the creating user is a FAIL (M2, O4). Holds are recomputed from 
   money_journal    [{"seq","kind": "deposit"|"withdraw"|"settle", "user","asset","amount",
                      "trade","buyer","seller","market","price","quantity", "me_epoch" (optional)}]
   money_journal_legs [{"seq","user","asset" or null,"role" or null,"balance_after"}]
+  money_journal_pruned optional {"through_seq","totals_unknown_through"}: the money history's retention mark
+                     (money_journal_pruned of the projector's schema). Absent, or through_seq 0: nothing was deleted.
+                     With through_seq > 0 the rows at or below it are not stored, by design: a rule that needs every
+                     movement (M8, M9, M12's settle match, M14) is INCONCLUSIVE, never FAIL and never PASS, and the
+                     density rule (M13) starts right above the mark
   faults           {"settle_fault", "settle_rejected", "order_fault", "quarantined"}  observed counts
   counters         optional {"stale_outcomes","redundant_outcomes","stale_terminals","conflicts"} (the AE counter export)
   declared         {"settle_fault","settle_rejected","order_fault","quarantined","halt","fault_open",

@@ -468,12 +468,15 @@ class CoreFixture(Fixture):
         """The role plan's roles (core_contracts.LOGIN_ROLES and the reader group), each a login role with no superuser,
         createdb, createrole, replication or bypassrls right; idempotent."""
         sql = [f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{group}') THEN CREATE ROLE {group} NOLOGIN; "
-               f"END IF; END $$" for group in (core_contracts.HISTORY_READER_GROUP, core_contracts.MONEY_READER_GROUP)]
+               f"END IF; END $$" for group in (core_contracts.HISTORY_READER_GROUP, core_contracts.MONEY_READER_GROUP,
+                                               core_contracts.HISTORY_PRUNER_GROUP)]
         for role in sorted(core_contracts.LOGIN_ROLES):
             sql.append(f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{role}') THEN CREATE ROLE {role} "
                        f"LOGIN; END IF; END $$")
             sql.append(f'ALTER ROLE {role} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS')
         sql.append(f'GRANT {core_contracts.HISTORY_READER_GROUP} TO {core_contracts.GATEWAY_LOGIN}')
+        # the schemas' age deletes are called by the retention role through the pruner group
+        sql.append(f'GRANT {core_contracts.HISTORY_PRUNER_GROUP} TO {core_contracts.RETENTION_ROLE}')
         for statement in sql:
             self.psql('postgres', statement)
         self.registry['db_roles'] = {'superuser': core_contracts.FIXTURE_SUPERUSER, 'logins': dict(core_contracts.LOGIN_ROLES),
@@ -510,7 +513,8 @@ class CoreFixture(Fixture):
         plan = core_contracts.DATABASE_ROLE_PLAN[database]
         for writer in plan['writers']:
             if plan['retention']:
-                self.psql(database, f'ALTER DEFAULT PRIVILEGES FOR ROLE {writer} GRANT DELETE, TRUNCATE ON TABLES TO '
+                rights = 'TRUNCATE' if plan.get('retention_truncate_only') else 'DELETE, TRUNCATE'
+                self.psql(database, f'ALTER DEFAULT PRIVILEGES FOR ROLE {writer} GRANT {rights} ON TABLES TO '
                                     f'{core_contracts.RETENTION_ROLE}')
             readers = plan['default_select'].get(writer)
             if readers:
@@ -518,10 +522,16 @@ class CoreFixture(Fixture):
         self.registry.setdefault('default_privileges', {})[database] = time.time_ns(); self.save()
 
     def grant_retention_select(self, database):
-        """SELECT for the retention role on the relations its age delete reads, once each exists."""
-        for relation in core_contracts.DATABASE_ROLE_PLAN[database]['retention_select']:
+        """The retention role's grants that name relations, once each exists: SELECT on the relations the plan lets it
+        read, and TRUNCATE alone (whatever it held revoked first) on the plan's ``retention_truncate_only`` relations."""
+        plan = core_contracts.DATABASE_ROLE_PLAN[database]
+        for relation in plan['retention_select']:
             self.psql(database, f"DO $$ BEGIN IF to_regclass('public.{relation}') IS NOT NULL THEN EXECUTE "
                                 f"'GRANT SELECT ON public.{relation} TO {core_contracts.RETENTION_ROLE}'; END IF; END $$")
+        for relation in plan.get('retention_truncate_only') or []:
+            self.psql(database, f"DO $$ BEGIN IF to_regclass('public.{relation}') IS NOT NULL THEN EXECUTE "
+                                f"'REVOKE ALL ON public.{relation} FROM {core_contracts.RETENTION_ROLE}'; EXECUTE "
+                                f"'GRANT TRUNCATE ON public.{relation} TO {core_contracts.RETENTION_ROLE}'; END IF; END $$")
 
     def create_gateway_database(self):
         """The gateway's users store, empty: oe-gateway applies its own migration (db/migration, under an advisory lock,
@@ -638,17 +648,17 @@ class CoreFixture(Fixture):
 
     def create_money_database(self):
         """The run's money database and the projector jar's packaged migrations (start_database, and reset_projection),
-        applied as the money projector's login role, so it owns the money tables; the retention role's SELECT on the two
-        tables its age delete reads follows."""
+        applied as the money projector's login role, so it owns the money tables; the retention role is then left with
+        TRUNCATE alone on the two history tables (the reset; its age delete is the schema's own function)."""
         self.create_database('r01_money')
         with zipfile.ZipFile(self.m['artifacts']['projector']['path']) as jar:
             schemas = sorted(n for n in jar.namelist() if n.startswith('db/migration/V') and n.endswith('.sql'))
             if not schemas: raise Inconclusive('missing packaged projector schema')
             for name in schemas:
                 self.psql('r01_money', jar.read(name).decode(), role=core_contracts.MONEY_PROJECTOR_LOGIN)
-        # As the console after each money migration run: the writer's default privileges gave the retention role DELETE and
-        # TRUNCATE on every new relation; it keeps privileges on the money history tables only (a lookup table or a view
-        # is not history)
+        # As the console after each money migration run: the writer's default privileges gave the retention role a right
+        # on every new relation; it keeps TRUNCATE on the money history tables only (a lookup table, the retention mark
+        # or a view is not history)
         keep = core_contracts.TABLE_OWNERS['r01_money']['retention_tables']
         self.psql('r01_money', "DO $$ DECLARE r record; BEGIN FOR r IN SELECT c.relname FROM pg_class c JOIN pg_namespace n "
                                "ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm') "

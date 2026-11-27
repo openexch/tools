@@ -15,6 +15,23 @@ def _funding_key(row):
     return row['kind'], integer(row['user']), integer(row['asset']), integer(row['amount'])
 
 
+def pruned_through(m):
+    """The journal seq at or below which age retention deleted the money history's rows (0: nothing deleted)."""
+    mark = m.s.get('money_journal_pruned') or {}
+    through = integer(mark.get('through_seq', 0))
+    if through < 0:
+        raise Violation('money journal retention mark below 0')
+    return through
+
+
+def needs_whole_history(m, what):
+    """A rule that judges every movement cannot be judged over a history age retention has cut: neither a loss (the
+    rows are gone by design) nor a pass (nothing was compared)."""
+    through = pruned_through(m)
+    if through:
+        raise Inconclusive(f'money history deleted at or below journal seq {through} by age retention: {what}')
+
+
 def _external(m):
     """Per (user, asset): ACKed deposits minus ACKed withdrawals."""
     totals = defaultdict(int)
@@ -253,6 +270,7 @@ def m7(m):
 
 
 def m8(m):
+    needs_whole_history(m, 'the settle set cannot be matched with the ME trade set')
     settles = Counter((settle_epoch(m, row), integer(row['trade'])) for row in m.s['money_journal'] if row['kind'] == 'settle')
     dup = [k for k, n in settles.items() if n > 1]
     if dup:
@@ -277,6 +295,7 @@ def m9(m):
     requestId, so two identical movements are indistinguishable (money is still exact in that case)."""
     if any(r['outcome'] == 'UNKNOWN' for r in m.s['funding']):
         raise Inconclusive('funding outcome unknown; exactly-once cannot be judged')
+    needs_whole_history(m, 'funding rows cannot be matched one by one (their sums are in the retention totals)')
     expected = Counter(_funding_key(r) for r in m.s['funding'] if r['outcome'] == 'ACK')
     observed = Counter(_funding_key(r) for r in m.s['money_journal'] if r['kind'] in {'deposit', 'withdraw'})
     if expected != observed:
@@ -334,6 +353,7 @@ def m12(m):
         expected_seq[event['me_epoch']] += 1
         if event['journal_seq'] != expected_seq[event['me_epoch']]:
             raise Violation(f'epoch {event["me_epoch"]}: journalSeq {event["journal_seq"]} breaks density')
+    needs_whole_history(m, 'a swallowed trade cannot be told from a settle whose row was deleted')
     settled = {(settle_epoch(m, r), r['trade']) for r in m.s['money_journal'] if r['kind'] == 'settle'}
     for trade in m.trades:
         if (trade['me_epoch'], trade['trade_id']) not in settled:
@@ -341,7 +361,9 @@ def m12(m):
 
 
 def m13(m):
-    seq = 1
+    """Dense from 1, or, over a history age retention has cut, dense from right above its mark (the delete removes a
+    run without a hole from the first stored movement, so the first stored one is the mark plus one)."""
+    seq = pruned_through(m) + 1
     for row in m.s['money_journal']:
         if integer(row['seq']) != seq:
             raise Violation('money journal gap, duplicate or out-of-order record')
@@ -351,6 +373,7 @@ def m13(m):
 def m14(m):
     """Replay every money-journal movement in seq order: each leg's balance_after must equal the
     replayed total at that seq, and the replayed totals must equal the core's available + locked."""
+    needs_whole_history(m, 'the replay of every movement from the first has no starting balances')
     legs = defaultdict(dict)
     for leg in m.s['money_journal_legs']:
         key = (integer(leg['user']), leg['asset'], leg['role'])

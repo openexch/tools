@@ -56,7 +56,8 @@ again after `--stable-wait-ms` (default 1000, `MONEY_CHECK_STABLE_WAIT_MS`), up 
 The invariants, exact for every user: conservation per asset against the core's own deposits and withdrawals (the money
 history, `--money-history-dsn`, or `--funding-file` written from it; the money history is judged only when it is at the
 core's money journal head, `core_journal_seq` of `--core-metrics`: behind the head, or with no head read, conservation
-is INDETERMINATE; a funding file carries no journal position, the caller answers for its instant); locked equals the sum of holds; every hold belongs to a live order (else a
+is INDETERMINATE; a funding file carries no journal position, the caller answers for its instant; see "A money
+history cut by age retention" below); locked equals the sum of holds; every hold belongs to a live order (else a
 `residual hold: user <u> asset <a> <amount>`); every live order's hold equals the value recomputed from its fields (SELL
 remaining; an unfilled priced BUY price x remaining; a partly filled BUY at least price x remaining and at most its hold
 amount, since a fill below the limit keeps the price improvement held until the order ends); `--zero-hold-users` hold
@@ -74,6 +75,19 @@ python3 money_check.py --store core --cut /abs/cut-manifest.json --artifact-root
     --core-metrics http://10.0.0.1:9306/metrics,http://10.0.0.2:9306/metrics,http://10.0.0.3:9306/metrics \
     --zero-hold-users 900000-900999 --json
 ```
+
+A money history cut by age retention: the money projector's schema can delete old movements
+(`money_history_prune_v1`). In the transaction that deletes them it adds the sums of the deleted deposits and withdrawals
+to `money_journal_pruned_totals`, and the check reads those totals in the same statement (one snapshot) as the stored
+rows and adds them: conservation is the same number before and after a delete. The conservation line then carries
+`pruned` and a note, `N deposits and withdrawals at or below journal seq X come from the pruned totals`. A history that
+was cut without totals (`money_journal_pruned.totals_unknown_through > 0`, an adopted database) is INDETERMINATE:
+nothing computed from what is left would be exact. So is a mark or totals that do not fit the stored rows, read in the same
+statement: the first stored journal seq is not the mark plus one (rows missing above the mark, or a history rebuilt
+under an earlier mark), or totals exist while the mark is 0. The login of `--money-history-dsn` needs SELECT on `money_journal`,
+`money_journal_pruned` and `money_journal_pruned_totals` (a schema without the last two is read as before). A funding
+file written from such a history must include the totals in its sums and may carry the mark as `"pruned"`
+(`{"through_seq", "movements", "totals_unknown_through"}`).
 
 Required with `--store core`: `--cut`, `--core-addresses`, `--core-port-base`, `--local-host`, `--driver-mode` (`embedded`,
 or `external` with `--aeron-dir`; the two reads get `COREDUMP_DRIVER_MODE` and `CORE_PROBE_DRIVER_MODE`), the two key

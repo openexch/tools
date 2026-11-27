@@ -314,13 +314,28 @@ class ObservationDrill(CriticalPathDrill):
         return head is not None and seen is not None and seen >= head
 
     def funding_file(self, point):
-        rows = json.loads(self.f.psql('r01_money', "SELECT COALESCE(json_agg(t), '[]'::json) FROM (SELECT asset_id, "
-                                      'movement_type, sum(amount) AS amount FROM money_journal WHERE movement_type IN (2, 3) '
-                                      'GROUP BY 1, 2) t') or '[]')
-        out = {}
+        """The funding of the money history for money-check: the stored deposits and withdrawals plus, where age
+        retention deleted old movements, the totals it kept of them, read in one statement (one snapshot); the file
+        carries the retention mark so that money-check does not judge a history cut without totals."""
+        stored = ('SELECT asset_id, movement_type, sum(amount)::text AS amount, count(*) AS movements, false AS pruned '
+                  'FROM money_journal WHERE movement_type IN (2, 3) GROUP BY 1, 2')
+        has_totals = self.f.psql('r01_money', "SELECT to_regclass('public.money_journal_pruned_totals') IS NOT NULL "
+                                              "AND to_regclass('public.money_journal_pruned') IS NOT NULL").strip() in ('t', 'true')
+        if has_totals:
+            stored += (' UNION ALL SELECT asset_id, movement_type, amount::text, movements, true FROM '
+                       'money_journal_pruned_totals WHERE movement_type IN (2, 3) '
+                       'UNION ALL SELECT through_seq, 0, totals_unknown_through::text, 0, true FROM money_journal_pruned')
+        rows = json.loads(self.f.psql('r01_money', "SELECT COALESCE(json_agg(t), '[]'::json) FROM (" + stored + ') t') or '[]')
+        out, mark, from_totals = {}, None, 0
         for r in rows:
+            if r['movement_type'] == 0:
+                mark = (int(r['asset_id']), int(r['amount']))
+                continue
             entry = out.setdefault(str(r['asset_id']), {'deposits': 0, 'withdrawals': 0})
             entry['deposits' if r['movement_type'] == 2 else 'withdrawals'] += int(r['amount'])
+            from_totals += int(r['movements']) if r['pruned'] else 0
+        if mark and mark[0] > 0:
+            out['pruned'] = {'through_seq': mark[0], 'movements': from_totals, 'totals_unknown_through': mark[1]}
         (self.probe_dir / 'mc' / f'funding-{point}.json').write_text(json.dumps(out))
 
     def quiesce(self, point):
